@@ -189,7 +189,8 @@ public:
   ShaderDebugTrace *DebugVertex(uint32_t vertid, uint32_t instid, uint32_t idx, uint32_t instOffset,
                                 uint32_t vertOffset);
   ShaderDebugTrace *DebugPixel(uint32_t x, uint32_t y, uint32_t sample, uint32_t primitive);
-  ShaderDebugTrace *DebugThread(const uint32_t groupid[3], const uint32_t threadid[3]);
+  ShaderDebugTrace *DebugThread(const uint32_t groupid[3], const uint32_t threadid[3],
+                                std::function<bool()> cancelled);
   void FreeTrace(ShaderDebugTrace *trace);
 
   MeshFormat GetPostVSData(uint32_t instID, uint32_t viewID, MeshDataStage stage);

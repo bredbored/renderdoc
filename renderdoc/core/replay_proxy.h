@@ -527,7 +527,8 @@ public:
   IMPLEMENT_FUNCTION_PROXIED(ShaderDebugTrace, DebugPixel, uint32_t eventId, uint32_t x, uint32_t y,
                              uint32_t sample, uint32_t primitive);
   IMPLEMENT_FUNCTION_PROXIED(ShaderDebugTrace, DebugThread, uint32_t eventId,
-                             const uint32_t groupid[3], const uint32_t threadid[3]);
+                             const uint32_t groupid[3], const uint32_t threadid[3],
+                             std::function<bool()> cancelled);
 
   IMPLEMENT_FUNCTION_PROXIED(rdcarray<ShaderEncoding>, GetTargetShaderEncodings);
   IMPLEMENT_FUNCTION_PROXIED(void, BuildTargetShader, ShaderEncoding sourceEncoding, bytebuf source,

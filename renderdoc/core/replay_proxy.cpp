@@ -1493,7 +1493,8 @@ ShaderDebugTrace ReplayProxy::DebugPixel(uint32_t eventId, uint32_t x, uint32_t 
 template <typename ParamSerialiser, typename ReturnSerialiser>
 ShaderDebugTrace ReplayProxy::Proxied_DebugThread(ParamSerialiser &paramser, ReturnSerialiser &retser,
                                                   uint32_t eventId, const uint32_t groupid[3],
-                                                  const uint32_t threadid[3])
+                                                  const uint32_t threadid[3],
+                                                  std::function<bool()> cancelled)
 {
   const ReplayProxyPacket expectedPacket = eReplayProxy_DebugThread;
   ReplayProxyPacket packet = eReplayProxy_DebugThread;
@@ -1513,7 +1514,7 @@ ShaderDebugTrace ReplayProxy::Proxied_DebugThread(ParamSerialiser &paramser, Ret
   {
     REMOTE_EXECUTION();
     if(paramser.IsReading() && !paramser.IsErrored() && !m_IsErrored)
-      ret = m_Remote->DebugThread(eventId, GroupID, ThreadID);
+      ret = m_Remote->DebugThread(eventId, GroupID, ThreadID, cancelled);
   }
 
   SERIALISE_RETURN(ret);
@@ -1522,9 +1523,9 @@ ShaderDebugTrace ReplayProxy::Proxied_DebugThread(ParamSerialiser &paramser, Ret
 }
 
 ShaderDebugTrace ReplayProxy::DebugThread(uint32_t eventId, const uint32_t groupid[3],
-                                          const uint32_t threadid[3])
+                                          const uint32_t threadid[3], std::function<bool()> cancelled)
 {
-  PROXY_FUNCTION(DebugThread, eventId, groupid, threadid);
+  PROXY_FUNCTION(DebugThread, eventId, groupid, threadid, cancelled);
 }
 
 template <typename ParamSerialiser, typename ReturnSerialiser>
@@ -2632,7 +2633,7 @@ bool ReplayProxy::Tick(int type)
     {
       uint32_t dummy1[3] = {0};
       uint32_t dummy2[3] = {0};
-      DebugThread(0, dummy1, dummy2);
+      DebugThread(0, dummy1, dummy2, nullptr);
       break;
     }
     case eReplayProxy_RenderOverlay:

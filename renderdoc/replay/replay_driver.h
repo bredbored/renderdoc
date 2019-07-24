@@ -161,7 +161,8 @@ public:
   virtual ShaderDebugTrace DebugPixel(uint32_t eventId, uint32_t x, uint32_t y, uint32_t sample,
                                       uint32_t primitive) = 0;
   virtual ShaderDebugTrace DebugThread(uint32_t eventId, const uint32_t groupid[3],
-                                       const uint32_t threadid[3]) = 0;
+                                       const uint32_t threadid[3],
+                                       std::function<bool()> cancelled = nullptr) = 0;
 
   virtual ResourceId RenderOverlay(ResourceId texid, CompType typeHint, FloatVector clearCol,
                                    DebugOverlay overlay, uint32_t eventId,

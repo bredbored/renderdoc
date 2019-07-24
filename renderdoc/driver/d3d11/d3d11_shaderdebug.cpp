@@ -2424,7 +2424,7 @@ void ExtractInputsPS(PSInput IN, float4 debug_pixelPos : SV_Position, uint prim 
 }
 
 ShaderDebugTrace D3D11Replay::DebugThread(uint32_t eventId, const uint32_t groupid[3],
-                                          const uint32_t threadid[3])
+                                          const uint32_t threadid[3], std::function<bool()> cancelled)
 {
   using namespace DXBC;
   using namespace ShaderDebug;
@@ -2510,8 +2510,6 @@ ShaderDebugTrace D3D11Replay::DebugThread(uint32_t eventId, const uint32_t group
   // assume other threads have no effect on this thread
   // and only simulate this thread
   size_t destIdx = 0;
-  size_t cycleCounter = 0;
-  std::atomic_bool cancel = false;
   std::vector<State> group;
   if(!groupNumInstructions)
     group.push_back(initialState);
@@ -2559,7 +2557,7 @@ ShaderDebugTrace D3D11Replay::DebugThread(uint32_t eventId, const uint32_t group
 
         // simulate all threads up to the last group instruction, or until the user cancels
         bool finished = false, synced = true;
-        while(!finished && !cancel)
+        while(!finished && (!cancelled || !cancelled()))
         {
           finished = true;
           size_t threadSync = 0;
@@ -2616,13 +2614,6 @@ ShaderDebugTrace D3D11Replay::DebugThread(uint32_t eventId, const uint32_t group
                 states.push_back(state);
               }
             }
-
-            if(cycleCounter == SHADER_DEBUG_WARN_THRESHOLD)
-            {
-              if(PromptDebugTimeout(DXBC::TYPE_COMPUTE, uint32_t(cycleCounter)))
-                cancel = true;
-            }
-            ++cycleCounter;
           }
         }
       }));
@@ -2632,7 +2623,7 @@ ShaderDebugTrace D3D11Replay::DebugThread(uint32_t eventId, const uint32_t group
     for(std::thread &wave : waves)
       wave.join();
 
-    if(!cancel)
+    if(!cancelled || !cancelled())
     {
       State &state = group[destIdx];
       if(dxbc->m_DebugInfo)
@@ -2644,11 +2635,11 @@ ShaderDebugTrace D3D11Replay::DebugThread(uint32_t eventId, const uint32_t group
     }
   }
 
-  if(!cancel)
+  if(!cancelled || !cancelled())
   {
     // finish the target thread, if necessary
     State &state = group[destIdx];
-    while(!state.Finished())
+    while(!state.Finished() && (!cancelled || !cancelled()))
     {
       state = state.GetNext(global, NULL);
       if(dxbc->m_DebugInfo)
@@ -2657,13 +2648,6 @@ ShaderDebugTrace D3D11Replay::DebugThread(uint32_t eventId, const uint32_t group
         dxbc->m_DebugInfo->GetLocals(state.nextInstruction, op.offset, state.locals);
       }
       states.push_back(state);
-
-      if(cycleCounter == SHADER_DEBUG_WARN_THRESHOLD)
-      {
-        if(PromptDebugTimeout(DXBC::TYPE_COMPUTE, uint32_t(cycleCounter)))
-          break;
-      }
-      ++cycleCounter;
     }
   }
 
