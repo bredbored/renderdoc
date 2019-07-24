@@ -2557,9 +2557,20 @@ ShaderDebugTrace D3D11Replay::DebugThread(uint32_t eventId, const uint32_t group
 
         // simulate all threads up to the last group instruction, or until the user cancels
         bool finished = false, synced = true;
-        while(!finished && (!cancelled || !cancelled()))
+        while(!finished)
         {
           finished = true;
+          if(cancelled && cancelled())
+          {
+            // ensure blocked waves will wake
+            std::unique_lock<std::mutex> lock(mutex);
+            ++syncIndex;
+            waveSync = waveCount - 1;
+            lock.unlock();
+            condition.notify_all();
+            break;
+          }
+
           size_t threadSync = 0;
           for(size_t threadIndex = threadBegin; threadIndex != threadEnd; ++threadIndex)
           {
