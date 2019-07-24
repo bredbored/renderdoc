@@ -1247,11 +1247,13 @@ only ever have one result (only one entry point per shader).
 
 :param groupid: A list containing the 3D workgroup index.
 :param threadid: A list containing the 3D thread index within the above workgroup.
+:param cancelled: A thread-safe function returning whether the operation has been cancelled.
 :return: The resulting trace resulting from debugging. Destroy with
   :meth:`FreeTrace`.
 :rtype: ShaderDebugTrace
 )");
-  virtual ShaderDebugTrace *DebugThread(const uint32_t groupid[3], const uint32_t threadid[3]) = 0;
+  virtual ShaderDebugTrace *DebugThread(const uint32_t groupid[3], const uint32_t threadid[3],
+                                        std::function<bool()> cancelled = nullptr) = 0;
 
   DOCUMENT(R"(Free a debugging trace from running a shader invocation debug.
 

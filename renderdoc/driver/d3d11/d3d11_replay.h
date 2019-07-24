@@ -228,7 +228,7 @@ public:
   ShaderDebugTrace DebugPixel(uint32_t eventId, uint32_t x, uint32_t y, uint32_t sample,
                               uint32_t primitive);
   ShaderDebugTrace DebugThread(uint32_t eventId, const uint32_t groupid[3],
-                               const uint32_t threadid[3]);
+                               const uint32_t threadid[3], std::function<bool()> cancelled);
   void PickPixel(ResourceId texture, uint32_t x, uint32_t y, uint32_t sliceFace, uint32_t mip,
                  uint32_t sample, CompType typeHint, float pixel[4]);
   uint32_t PickVertex(uint32_t eventId, int32_t width, int32_t height, const MeshDisplay &cfg,

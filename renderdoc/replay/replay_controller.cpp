@@ -1691,13 +1691,14 @@ ShaderDebugTrace *ReplayController::DebugPixel(uint32_t x, uint32_t y, uint32_t 
   return ret;
 }
 
-ShaderDebugTrace *ReplayController::DebugThread(const uint32_t groupid[3], const uint32_t threadid[3])
+ShaderDebugTrace *ReplayController::DebugThread(const uint32_t groupid[3], const uint32_t threadid[3],
+                                                std::function<bool()> cancelled)
 {
   CHECK_REPLAY_THREAD();
 
   ShaderDebugTrace *ret = new ShaderDebugTrace;
 
-  *ret = m_pDevice->DebugThread(m_EventID, groupid, threadid);
+  *ret = m_pDevice->DebugThread(m_EventID, groupid, threadid, cancelled);
 
   SetFrameEvent(m_EventID, true);
 

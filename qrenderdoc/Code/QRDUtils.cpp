@@ -42,6 +42,7 @@
 #include <QProcess>
 #include <QProgressBar>
 #include <QProgressDialog>
+#include <QPushButton>
 #include <QRegularExpression>
 #include <QRegularExpressionMatch>
 #include <QStandardPaths>
@@ -1611,10 +1612,11 @@ QString Formatter::HumanFormat(uint64_t u)
 class RDProgressDialog : public QProgressDialog
 {
 public:
-  RDProgressDialog(const QString &labelText, QWidget *parent)
+  RDProgressDialog(const QString &labelText, QWidget *parent, bool canCancel = false)
       // we add 1 so that the progress value never hits maximum until we are actually finished
       : QProgressDialog(labelText, QString(), 0, maxProgress + 1, parent),
-        m_Label(this)
+        m_Label(this),
+        m_Button(tr("Cancel"), canCancel ? this : nullptr)
   {
     setWindowTitle(tr("Please Wait"));
     setWindowFlags(Qt::CustomizeWindowHint | Qt::Dialog | Qt::WindowTitleHint);
@@ -1631,6 +1633,8 @@ public:
     m_Label.setWordWrap(true);
 
     setLabel(&m_Label);
+    if(canCancel)
+      setCancelButton(&m_Button);
   }
 
   void setPercentage(float percent) { setValue(int(maxProgress * percent)); }
@@ -1667,6 +1671,7 @@ protected:
   }
 
   QLabel m_Label;
+  QPushButton m_Button;
 
   static const int maxProgress = 1000;
 };
@@ -1978,12 +1983,12 @@ QStringList ParseArgsList(const QString &args)
 }
 
 void ShowProgressDialog(QWidget *window, const QString &labelText, ProgressFinishedMethod finished,
-                        ProgressUpdateMethod update)
+                        ProgressUpdateMethod update, CancelMethod cancel)
 {
   if(finished())
     return;
 
-  RDProgressDialog dialog(labelText, window);
+  RDProgressDialog dialog(labelText, window, cancel != nullptr);
 
   // if we don't have an update function, set the progress display to be 'infinite spinner'
   dialog.setInfinite(!update);
@@ -2011,6 +2016,8 @@ void ShowProgressDialog(QWidget *window, const QString &labelText, ProgressFinis
 
   // show the dialog
   RDDialog::show(&dialog);
+  if(cancel)
+    cancel(dialog.wasCanceled());
 
   // signal the thread to exit if somehow we got here without it finishing, then wait for it thread
   // to clean itself up

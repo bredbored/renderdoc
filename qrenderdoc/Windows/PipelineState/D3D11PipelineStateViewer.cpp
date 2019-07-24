@@ -28,6 +28,7 @@
 #include <QMouseEvent>
 #include <QScrollBar>
 #include <QXmlStreamWriter>
+#include <atomic>
 #include "3rdparty/flowlayout/FlowLayout.h"
 #include "3rdparty/toolwindowmanager/ToolWindowManager.h"
 #include "Code/Resources.h"
@@ -3134,10 +3135,13 @@ void D3D11PipelineStateViewer::on_debugThread_clicked()
   bool done = false;
   ShaderDebugTrace *trace = NULL;
 
-  m_Ctx.Replay().AsyncInvoke([&trace, &done, thread](IReplayController *r) {
-    trace = r->DebugThread(thread.g, thread.t);
+  std::atomic<bool> atomicCancelled(false);
+  std::function<bool()> cancelled = [&atomicCancelled]() { return atomicCancelled.load(); };
 
-    if(trace->states.isEmpty())
+  m_Ctx.Replay().AsyncInvoke([&trace, &done, thread, cancelled](IReplayController *r) {
+    trace = r->DebugThread(thread.g, thread.t, cancelled);
+
+    if(trace->states.isEmpty() || cancelled())
     {
       r->FreeTrace(trace);
       trace = NULL;
@@ -3159,7 +3163,15 @@ void D3D11PipelineStateViewer::on_debugThread_clicked()
   for(int i = 0; !done && i < 100; i++)
     QThread::msleep(5);
 
-  ShowProgressDialog(this, tr("Debugging %1").arg(debugContext), [&done]() { return done; });
+  ShowProgressDialog(this, tr("Debugging %1").arg(debugContext), [&done]() { return done; },
+                     [&atomicCancelled](bool cancel) { atomicCancelled.store(cancel); });
+
+  if(cancelled())
+  {
+    while(!done)
+      QThread::msleep(5);
+    return;
+  }
 
   if(!trace)
   {
