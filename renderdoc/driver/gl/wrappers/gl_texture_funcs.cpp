@@ -240,11 +240,29 @@ bool WrappedOpenGL::Serialise_glBindTexture(SerialiserType &ser, GLenum target, 
 {
   SERIALISE_ELEMENT(target);
   SERIALISE_ELEMENT_LOCAL(texture, TextureRes(GetCtx(), textureHandle));
+  SERIALISE_ELEMENT_LOCAL(id, GetResourceManager()->GetID(texture))
+       .TypedAs("GLResource");
 
   SERIALISE_CHECK_READ_ERRORS();
 
   if(IsReplayingAndReading())
   {
+    if(GetResourceManager()->GetID(texture) == ResourceId())
+    {
+      GLuint real = 0;
+      GL.glGenTextures(1, &real);
+
+      GLResource res = TextureRes(GetCtx(), real);
+
+      ResourceId live = m_ResourceManager->RegisterResource(res);
+      GetResourceManager()->AddLiveResource(id, res);
+
+      AddResource(id, ResourceType::Texture, "Texture");
+
+      m_Textures[live].resource = res;
+      m_Textures[live].curType = eGL_NONE;
+    }
+
     GL.glBindTexture(target, texture.name);
 
     if(IsLoading(m_State) && texture.name)
@@ -267,8 +285,22 @@ void WrappedOpenGL::glBindTexture(GLenum target, GLuint texture)
 {
   SERIALISE_TIME_CALL(GL.glBindTexture(target, texture));
 
-  if(texture != 0 && GetResourceManager()->GetID(TextureRes(GetCtx(), texture)) == ResourceId())
-    return;
+  GLResource res = TextureRes(GetCtx(), texture);
+  if(texture != 0 && GetResourceManager()->GetID(res) == ResourceId())
+  {
+    ResourceId id = GetResourceManager()->RegisterResource(res);
+    if(IsCaptureMode(m_State))
+    {
+      GLResourceRecord *record = GetResourceManager()->AddResourceRecord(id);
+      RDCASSERT(record);
+    }
+    else
+    {
+      GetResourceManager()->AddLiveResource(id, res);
+      m_Textures[id].resource = res;
+      m_Textures[id].curType = eGL_NONE;
+    }
+  }
 
   if(IsActiveCapturing(m_State))
   {
