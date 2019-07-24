@@ -477,6 +477,19 @@ public:
   }
 };
 
+namespace debug
+{
+enum class BreakpointType
+{
+  code,
+  write,
+  readwrite = 3
+};
+
+bool SetBreakpoint(void *address, std::size_t size, BreakpointType type, bool excludeSelf = false);
+bool RemoveBreakpoint(void *address, std::size_t size, BreakpointType type, bool excludeSelf = false);
+}    // namespace debug
+
 template <typename NestedType, typename DescType, typename NestedType1>
 class WrappedTexture : public WrappedResource11<NestedType, DescType, NestedType1>
 {
@@ -502,8 +515,24 @@ public:
       {
         SCOPED_LOCK(m_pDevice->D3DLock());
 
+        // std::size_t offset = 0;
+        // for (std::size_t increment = 8; increment; increment >>= 1)
+        //{
+        //  for (; offset + increment <= sizeof(m_TextureList); offset += increment)
+        //    debug::SetBreakpoint(static_cast<char *>(static_cast<void *>(&m_TextureList)) +
+        //    offset, increment, debug::BreakpointType::write, true);
+        //}
+
         RDCASSERT(m_TextureList.find(GetResourceID()) == m_TextureList.end());
         m_TextureList[GetResourceID()] = TextureEntry(this, type);
+
+        // offset = 0;
+        // for (std::size_t increment = 8; increment; increment >>= 1)
+        //{
+        //  for (; offset + increment <= sizeof(m_TextureList); offset += increment)
+        //    debug::RemoveBreakpoint(static_cast<char *>(static_cast<void *>(&m_TextureList)) +
+        //    offset, increment, debug::BreakpointType::write, true);
+        //}
       }
     }
   }
@@ -514,8 +543,24 @@ public:
 
     if(RenderDoc::Inst().IsReplayApp())
     {
+      // std::size_t offset = 0;
+      // for (std::size_t increment = 8; increment; increment >>= 1)
+      //{
+      //  for (; offset + increment <= sizeof(m_TextureList); offset += increment)
+      //    debug::SetBreakpoint(static_cast<char *>(static_cast<void *>(&m_TextureList)) + offset,
+      //    increment, debug::BreakpointType::write, true);
+      //}
+
       if(m_TextureList.find(GetResourceID()) != m_TextureList.end())
         m_TextureList.erase(GetResourceID());
+
+      // offset = 0;
+      // for (std::size_t increment = 8; increment; increment >>= 1)
+      //{
+      //  for (; offset + increment <= sizeof(m_TextureList); offset += increment)
+      //    debug::RemoveBreakpoint(static_cast<char *>(static_cast<void *>(&m_TextureList)) +
+      //    offset, increment, debug::BreakpointType::write, true);
+      //}
     }
 
     Shutdown();

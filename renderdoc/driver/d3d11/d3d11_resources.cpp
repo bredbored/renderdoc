@@ -653,3 +653,199 @@ WrappedID3DDeviceContextState::~WrappedID3DDeviceContextState()
     WrappedID3DDeviceContextState::m_List.erase(it);
   }
 }
+
+#include <mutex>
+#include <process.h>
+#include <TlHelp32.h>
+
+namespace debug
+{
+  struct Breakpoint
+  {
+    void *address;
+    std::size_t size;
+    BreakpointType type;
+  };
+
+  struct BreakpointResult
+  {
+    DWORD excludeThreadId;
+    Breakpoint breakpoint;
+    bool result;
+  };
+
+  Breakpoint breakpoints[4];
+  std::mutex mutex;
+
+  bool SetBreakpoint(void *address, std::size_t size, BreakpointType type, bool excludeSelf);
+  bool RemoveBreakpoint(void *address, std::size_t size, BreakpointType type, bool excludeSelf);
+
+  unsigned __stdcall SetBreakpointThread(void *);
+  unsigned __stdcall RemoveBreakpointThread(void *);
+}
+
+unsigned __stdcall debug::SetBreakpointThread(void *p)
+{
+  BreakpointResult &breakpointResult = *static_cast<BreakpointResult*>(p);
+  Breakpoint &breakpoint = breakpointResult.breakpoint;
+
+  std::size_t sizeLog2 = 0;
+  for(std::size_t size = breakpoint.size >> 1; size; size >>= 1)
+    ++sizeLog2;
+  if(sizeLog2 > 3 || breakpoint.size != std::size_t(1) << sizeLog2)
+  {
+    breakpointResult.result = false;
+    return 0;
+  }
+
+  std::unique_lock<std::mutex> lock(mutex);
+  std::size_t debugRegisterIndex = 0;
+  for(; debugRegisterIndex != 4; ++debugRegisterIndex)
+  {
+    if(!breakpoints[debugRegisterIndex].address)
+    {
+      breakpoints[debugRegisterIndex] = breakpoint;
+      break;
+    }
+  }
+  if(debugRegisterIndex == 4)
+  {
+    breakpointResult.result = false;
+    return 0;
+  }
+
+  std::size_t dr7Mask = ~((std::size_t(0xF) << (4 * debugRegisterIndex + 16)) | (std::size_t(0x3) << (2 * debugRegisterIndex)));
+  std::size_t dr7Bits = (((sizeLog2 ^ (sizeLog2 > 1)) << 2 | std::size_t(breakpoint.type)) << (4 * debugRegisterIndex + 16)) | (std::size_t(1) << (2 * debugRegisterIndex));
+
+  CONTEXT context = {};
+  HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, GetCurrentProcessId());
+  if(snapshot != INVALID_HANDLE_VALUE)
+  {
+    THREADENTRY32 threadEntry;
+    threadEntry.dwSize = sizeof(threadEntry);
+    if(Thread32First(snapshot, &threadEntry))
+    {
+      do
+      {
+        if(offsetof(THREADENTRY32, th32ThreadID) + sizeof(threadEntry.th32ThreadID) <= threadEntry.dwSize)
+        {
+          if(threadEntry.th32ThreadID != GetCurrentThreadId() && threadEntry.th32ThreadID != breakpointResult.excludeThreadId)
+          {
+            if(HANDLE thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, threadEntry.th32ThreadID))
+            {
+              SuspendThread(thread);
+
+              context.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+              if(GetThreadContext(thread, &context))
+              {
+                DWORD64 &debugRegister = *(&context.Dr0 + debugRegisterIndex);
+                debugRegister = DWORD64(breakpoint.address);
+                context.Dr6 = 0;
+                context.Dr7 &= dr7Mask;
+                context.Dr7 |= dr7Bits;
+
+                context.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+                SetThreadContext(thread, &context);
+              }
+
+              ResumeThread(thread);
+              CloseHandle(thread);
+            }
+          }
+        }
+        threadEntry.dwSize = sizeof(threadEntry);
+      }
+      while(Thread32Next(snapshot, &threadEntry));
+    }
+    CloseHandle(snapshot);
+  }
+
+  breakpointResult.result = true;
+  return 0;
+}
+
+unsigned __stdcall debug::RemoveBreakpointThread(void *p)
+{
+  BreakpointResult &breakpointResult = *static_cast<BreakpointResult*>(p);
+  Breakpoint &breakpoint = breakpointResult.breakpoint;
+
+  std::unique_lock<std::mutex> lock(mutex);
+  std::size_t debugRegisterIndex = 0;
+  for(; debugRegisterIndex != 4; ++debugRegisterIndex)
+  {
+    if(breakpoints[debugRegisterIndex].address == breakpoint.address)
+    {
+      breakpoints[debugRegisterIndex].address = nullptr;
+      break;
+    }
+  }
+  if(debugRegisterIndex == 4)
+  {
+    breakpointResult.result = false;
+    return 0;
+  }
+
+  std::size_t dr7Mask = std::size_t(0x3) << (2 * debugRegisterIndex);
+
+  CONTEXT context = {};
+  HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, GetCurrentProcessId());
+  if(snapshot != INVALID_HANDLE_VALUE)
+  {
+    THREADENTRY32 threadEntry;
+    threadEntry.dwSize = sizeof(threadEntry);
+    if(Thread32First(snapshot, &threadEntry))
+    {
+      do
+      {
+        if(offsetof(THREADENTRY32, th32ThreadID) + sizeof(threadEntry.th32ThreadID) <= threadEntry.dwSize)
+        {
+          if(threadEntry.th32ThreadID != GetCurrentThreadId() && threadEntry.th32ThreadID != breakpointResult.excludeThreadId)
+          {
+            if(HANDLE thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, threadEntry.th32ThreadID))
+            {
+              SuspendThread(thread);
+
+              context.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+              if(GetThreadContext(thread, &context))
+              {
+                DWORD64 &debugRegister = *(&context.Dr0 + debugRegisterIndex);
+                debugRegister = DWORD64();
+                context.Dr7 &= dr7Mask;
+
+                context.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+                SetThreadContext(thread, &context);
+              }
+
+              ResumeThread(thread);
+              CloseHandle(thread);
+            }
+          }
+        }
+        threadEntry.dwSize = sizeof(threadEntry);
+      }
+      while(Thread32Next(snapshot, &threadEntry));
+    }
+    CloseHandle(snapshot);
+  }
+
+  breakpointResult.result = true;
+  return 0;
+}
+
+bool debug::SetBreakpoint(void *address, std::size_t size, BreakpointType type, bool excludeSelf)
+{
+  BreakpointResult breakpointResult = { excludeSelf ? GetCurrentThreadId() : 0, address, size, type };
+  uintptr_t handle = _beginthreadex(nullptr, 0, &SetBreakpointThread, &breakpointResult, 0, nullptr);
+  WaitForSingleObject(HANDLE(handle), INFINITE);
+  CloseHandle(HANDLE(handle));
+  return breakpointResult.result;
+}
+
+bool debug::RemoveBreakpoint(void *address, std::size_t size, BreakpointType type, bool excludeSelf)
+{
+  BreakpointResult breakpointResult = { excludeSelf ? GetCurrentThreadId() : 0, address, size, type };
+  uintptr_t handle = _beginthreadex(nullptr, 0, &RemoveBreakpointThread, &breakpointResult, 0, nullptr);
+  WaitForSingleObject(HANDLE(handle), INFINITE);
+  CloseHandle(HANDLE(handle));
+  return breakpointResult.result;
+}
