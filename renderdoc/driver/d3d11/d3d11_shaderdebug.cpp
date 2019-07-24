@@ -2541,21 +2541,21 @@ ShaderDebugTrace D3D11Replay::DebugThread(uint32_t eventId, const uint32_t group
     // allocate threads to "waves" based on the number of hardware contexts available
     std::mutex mutex;
     std::condition_variable condition;
-    size_t waveCount = RDCMIN(group.size(), size_t(std::thread::hardware_concurrency()));
+    size_t groupSize = group.size();
+    size_t waveCount = RDCMIN(groupSize, size_t(std::thread::hardware_concurrency()));
     size_t waveSync = 0, syncIndex = 0;
     std::vector<std::thread> waves;
     waves.reserve(waveCount);
     for(size_t waveIndex = 0; waveIndex != waveCount; ++waveIndex)
     {
       waves.push_back(std::thread([&, waveIndex]() {
+
         // find the threads for this wave
-        size_t threadEnd = group.size();
-        size_t threadCount = (threadEnd + waveCount - 1) / waveCount;
-        size_t threadBegin = waveIndex * threadCount;
-        if(waveIndex + 1 != waveCount)
-          threadEnd = threadBegin + threadCount;
-        else
-          threadCount = threadEnd - threadBegin;
+        size_t threadCount = groupSize / waveCount;
+        size_t threadRemainder = groupSize % waveCount;
+        size_t threadBegin = waveIndex < threadRemainder ? ++threadCount * waveIndex
+                                                         : threadCount * waveIndex + threadRemainder;
+        size_t threadEnd = threadBegin + threadCount;
 
         // simulate all threads up to the last group instruction, or until the user cancels
         bool finished = false, synced = true;
