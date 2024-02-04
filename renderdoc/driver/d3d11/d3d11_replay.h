@@ -101,6 +101,7 @@ enum TexDisplayFlags
 struct ShaderDebugging
 {
   void Init(WrappedID3D11Device *device);
+  void Init(const ShaderDebugging& debugData);
   void Release();
 
   ID3D11PixelShader *GetSamplePS(const int8_t offsets[3]);

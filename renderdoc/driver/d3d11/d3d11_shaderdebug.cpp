@@ -90,6 +90,9 @@ public:
 
 private:
   DXBC::ShaderType GetShaderType() { return m_dxbc ? m_dxbc->m_Type : DXBC::ShaderType::Pixel; }
+
+  Threading::CriticalSection m_immediateContextCS;
+
   WrappedID3D11Device *m_pDevice;
   const DXBC::DXBCContainer *m_dxbc;
   DXBCDebug::GlobalState &m_globalState;
@@ -444,7 +447,10 @@ ShaderVariable D3D11DebugAPIWrapper::GetSampleInfo(DXBCBytecode::OperandType typ
     ID3D11RenderTargetView *rtv[8] = {};
     ID3D11DepthStencilView *dsv = NULL;
 
-    context->OMGetRenderTargets(8, rtv, &dsv);
+    {
+      SCOPED_LOCK(m_immediateContextCS);
+      context->OMGetRenderTargets(8, rtv, &dsv);
+    }
 
     // try depth first - both should match sample count though to be valid
     if(dsv)
@@ -481,27 +487,30 @@ ShaderVariable D3D11DebugAPIWrapper::GetSampleInfo(DXBCBytecode::OperandType typ
   else if(type == DXBCBytecode::TYPE_RESOURCE && isAbsoluteResource)
   {
     ID3D11ShaderResourceView *srv = NULL;
-    switch(GetShaderType())
     {
-      case DXBC::ShaderType::Vertex:
-        context->VSGetShaderResources(slot.shaderRegister, 1, &srv);
-        break;
-      case DXBC::ShaderType::Hull:
-        context->HSGetShaderResources(slot.shaderRegister, 1, &srv);
-        break;
-      case DXBC::ShaderType::Domain:
-        context->DSGetShaderResources(slot.shaderRegister, 1, &srv);
-        break;
-      case DXBC::ShaderType::Geometry:
-        context->GSGetShaderResources(slot.shaderRegister, 1, &srv);
-        break;
-      case DXBC::ShaderType::Pixel:
-        context->PSGetShaderResources(slot.shaderRegister, 1, &srv);
-        break;
-      case DXBC::ShaderType::Compute:
-        context->CSGetShaderResources(slot.shaderRegister, 1, &srv);
-        break;
-      default: RDCERR("Unhandled shader type %d", GetShaderType()); break;
+      SCOPED_LOCK(m_immediateContextCS);
+      switch(GetShaderType())
+      {
+        case DXBC::ShaderType::Vertex:
+          context->VSGetShaderResources(slot.shaderRegister, 1, &srv);
+          break;
+        case DXBC::ShaderType::Hull:
+          context->HSGetShaderResources(slot.shaderRegister, 1, &srv);
+          break;
+        case DXBC::ShaderType::Domain:
+          context->DSGetShaderResources(slot.shaderRegister, 1, &srv);
+          break;
+        case DXBC::ShaderType::Geometry:
+          context->GSGetShaderResources(slot.shaderRegister, 1, &srv);
+          break;
+        case DXBC::ShaderType::Pixel:
+          context->PSGetShaderResources(slot.shaderRegister, 1, &srv);
+          break;
+        case DXBC::ShaderType::Compute:
+          context->CSGetShaderResources(slot.shaderRegister, 1, &srv);
+          break;
+        default: RDCERR("Unhandled shader type %d", GetShaderType()); break;
+      }
     }
 
     if(srv)
@@ -575,10 +584,14 @@ ShaderVariable D3D11DebugAPIWrapper::GetBufferInfo(DXBCBytecode::OperandType typ
   if(type == DXBCBytecode::TYPE_UNORDERED_ACCESS_VIEW)
   {
     ID3D11UnorderedAccessView *uav = NULL;
-    if(GetShaderType() == DXBC::ShaderType::Compute)
-      context->CSGetUnorderedAccessViews(slot.shaderRegister, 1, &uav);
-    else
-      context->OMGetRenderTargetsAndUnorderedAccessViews(0, NULL, NULL, slot.shaderRegister, 1, &uav);
+    {
+      SCOPED_LOCK(m_immediateContextCS);
+      if(GetShaderType() == DXBC::ShaderType::Compute)
+        context->CSGetUnorderedAccessViews(slot.shaderRegister, 1, &uav);
+      else
+        context->OMGetRenderTargetsAndUnorderedAccessViews(0, NULL, NULL,
+                                                           slot.shaderRegister, 1, &uav);
+    }
 
     if(uav)
     {
@@ -616,27 +629,30 @@ ShaderVariable D3D11DebugAPIWrapper::GetBufferInfo(DXBCBytecode::OperandType typ
   else
   {
     ID3D11ShaderResourceView *srv = NULL;
-    switch(GetShaderType())
     {
-      case DXBC::ShaderType::Vertex:
-        context->VSGetShaderResources(slot.shaderRegister, 1, &srv);
-        break;
-      case DXBC::ShaderType::Hull:
-        context->HSGetShaderResources(slot.shaderRegister, 1, &srv);
-        break;
-      case DXBC::ShaderType::Domain:
-        context->DSGetShaderResources(slot.shaderRegister, 1, &srv);
-        break;
-      case DXBC::ShaderType::Geometry:
-        context->GSGetShaderResources(slot.shaderRegister, 1, &srv);
-        break;
-      case DXBC::ShaderType::Pixel:
-        context->PSGetShaderResources(slot.shaderRegister, 1, &srv);
-        break;
-      case DXBC::ShaderType::Compute:
-        context->CSGetShaderResources(slot.shaderRegister, 1, &srv);
-        break;
-      default: RDCERR("Unhandled shader type %d", GetShaderType()); break;
+      SCOPED_LOCK(m_immediateContextCS);
+      switch(GetShaderType())
+      {
+        case DXBC::ShaderType::Vertex:
+          context->VSGetShaderResources(slot.shaderRegister, 1, &srv);
+          break;
+        case DXBC::ShaderType::Hull:
+          context->HSGetShaderResources(slot.shaderRegister, 1, &srv);
+          break;
+        case DXBC::ShaderType::Domain:
+          context->DSGetShaderResources(slot.shaderRegister, 1, &srv);
+          break;
+        case DXBC::ShaderType::Geometry:
+          context->GSGetShaderResources(slot.shaderRegister, 1, &srv);
+          break;
+        case DXBC::ShaderType::Pixel:
+          context->PSGetShaderResources(slot.shaderRegister, 1, &srv);
+          break;
+        case DXBC::ShaderType::Compute:
+          context->CSGetShaderResources(slot.shaderRegister, 1, &srv);
+          break;
+        default: RDCERR("Unhandled shader type %d", GetShaderType()); break;
+      }
     }
 
     if(srv)
@@ -694,27 +710,30 @@ ShaderVariable D3D11DebugAPIWrapper::GetResourceInfo(DXBCBytecode::OperandType t
   if(type != DXBCBytecode::TYPE_UNORDERED_ACCESS_VIEW)
   {
     ID3D11ShaderResourceView *srv = NULL;
-    switch(GetShaderType())
     {
-      case DXBC::ShaderType::Vertex:
-        context->VSGetShaderResources(slot.shaderRegister, 1, &srv);
-        break;
-      case DXBC::ShaderType::Hull:
-        context->HSGetShaderResources(slot.shaderRegister, 1, &srv);
-        break;
-      case DXBC::ShaderType::Domain:
-        context->DSGetShaderResources(slot.shaderRegister, 1, &srv);
-        break;
-      case DXBC::ShaderType::Geometry:
-        context->GSGetShaderResources(slot.shaderRegister, 1, &srv);
-        break;
-      case DXBC::ShaderType::Pixel:
-        context->PSGetShaderResources(slot.shaderRegister, 1, &srv);
-        break;
-      case DXBC::ShaderType::Compute:
-        context->CSGetShaderResources(slot.shaderRegister, 1, &srv);
-        break;
-      default: RDCERR("Unhandled shader type %d", GetShaderType()); break;
+      SCOPED_LOCK(m_immediateContextCS);
+      switch(GetShaderType())
+      {
+        case DXBC::ShaderType::Vertex:
+          context->VSGetShaderResources(slot.shaderRegister, 1, &srv);
+          break;
+        case DXBC::ShaderType::Hull:
+          context->HSGetShaderResources(slot.shaderRegister, 1, &srv);
+          break;
+        case DXBC::ShaderType::Domain:
+          context->DSGetShaderResources(slot.shaderRegister, 1, &srv);
+          break;
+        case DXBC::ShaderType::Geometry:
+          context->GSGetShaderResources(slot.shaderRegister, 1, &srv);
+          break;
+        case DXBC::ShaderType::Pixel:
+          context->PSGetShaderResources(slot.shaderRegister, 1, &srv);
+          break;
+        case DXBC::ShaderType::Compute:
+          context->CSGetShaderResources(slot.shaderRegister, 1, &srv);
+          break;
+        default: RDCERR("Unhandled shader type %d", GetShaderType()); break;
+      }
     }
 
     if(srv)
@@ -908,13 +927,18 @@ ShaderVariable D3D11DebugAPIWrapper::GetResourceInfo(DXBCBytecode::OperandType t
     ID3D11UnorderedAccessView *uav = NULL;
     if(GetShaderType() == DXBC::ShaderType::Compute)
     {
+      SCOPED_LOCK(m_immediateContextCS);
       context->CSGetUnorderedAccessViews(slot.shaderRegister, 1, &uav);
     }
     else
     {
       ID3D11RenderTargetView *rtvs[8] = {0};
       ID3D11DepthStencilView *dsv = NULL;
-      context->OMGetRenderTargetsAndUnorderedAccessViews(0, rtvs, &dsv, slot.shaderRegister, 1, &uav);
+      {
+        SCOPED_LOCK(m_immediateContextCS);
+        context->OMGetRenderTargetsAndUnorderedAccessViews(0, rtvs, &dsv,
+                                                           slot.shaderRegister, 1, &uav);
+      }
 
       for(int i = 0; i < 8; i++)
         SAFE_RELEASE(rtvs[i]);
@@ -1073,7 +1097,46 @@ bool D3D11DebugAPIWrapper::CalculateSampleGather(
   RDCCOMPILE_ASSERT((int)DXBCBytecode::OPCODE_LD_MS == DEBUG_SAMPLE_TEX_LD_MS,
                     "Opcode enum doesn't match shader define");
 
-  ShaderDebugging &debugData = m_pDevice->GetReplay()->GetShaderDebuggingData();
+  //ShaderDebugging &debugData = m_pDevice->GetReplay()->GetShaderDebuggingData();
+
+  struct Temporary
+  {
+    ShaderDebugging debugData;
+
+    ID3D11DeviceContext *context = NULL;
+    ID3D11DeviceContext *immediateContext = NULL;
+
+    ID3D11ShaderResourceView *usedSRV = NULL;
+    ID3D11SamplerState *usedSamp = NULL;
+
+    ID3D11Query *query = NULL;
+    ID3D11CommandList *commandList = NULL;
+
+    ID3D11DeviceContext3 *immediateContext3 = NULL;
+    HANDLE hEvent = NULL;
+
+    ~Temporary()
+    {
+      CloseHandle(hEvent);
+      SAFE_RELEASE(immediateContext3);
+
+      SAFE_RELEASE(commandList);
+      SAFE_RELEASE(query);
+
+      SAFE_RELEASE(usedSamp);
+      SAFE_RELEASE(usedSRV);
+
+      SAFE_RELEASE(immediateContext);
+      SAFE_RELEASE(context);
+
+      debugData.Release();
+    }
+  }
+  temporary;
+
+  ShaderDebugging &debugData = temporary.debugData;
+  //debugData.Init(m_pDevice);
+  debugData.Init(m_pDevice->GetReplay()->GetShaderDebuggingData());
 
   for(uint32_t i = 0; i < ddxCalc.columns; i++)
   {
@@ -1181,47 +1244,50 @@ bool D3D11DebugAPIWrapper::CalculateSampleGather(
   cbufferData.debugSampleOperation = (int)opcode;
   cbufferData.debugSampleLodCompare = lodOrCompareValue;
 
-  D3D11RenderStateTracker tracker(m_pDevice->GetImmediateContext());
+  //D3D11RenderStateTracker tracker(m_pDevice->GetImmediateContext());
 
-  ID3D11DeviceContext *context = NULL;
+  ID3D11DeviceContext *&context = temporary.context;
+  ID3D11DeviceContext *&immediateContext = temporary.immediateContext;
 
-  m_pDevice->GetImmediateContext(&context);
+  m_pDevice->CreateDeferredContext(0, &context);
+  m_pDevice->GetImmediateContext(&immediateContext);
 
-  // back up SRV/sampler on PS slot 0
-
-  ID3D11ShaderResourceView *usedSRV = NULL;
-  ID3D11SamplerState *usedSamp = NULL;
+  ID3D11ShaderResourceView *&usedSRV = temporary.usedSRV;
+  ID3D11SamplerState *&usedSamp = temporary.usedSamp;
 
   // fetch SRV and sampler from the shader stage we're debugging that this opcode wants to load from
   UINT texSlot = resourceData.binding.shaderRegister;
   UINT samplerSlot = samplerData.binding.shaderRegister;
-  switch(GetShaderType())
   {
-    case DXBC::ShaderType::Vertex:
-      context->VSGetShaderResources(texSlot, 1, &usedSRV);
-      context->VSGetSamplers(samplerSlot, 1, &usedSamp);
-      break;
-    case DXBC::ShaderType::Hull:
-      context->HSGetShaderResources(texSlot, 1, &usedSRV);
-      context->HSGetSamplers(samplerSlot, 1, &usedSamp);
-      break;
-    case DXBC::ShaderType::Domain:
-      context->DSGetShaderResources(texSlot, 1, &usedSRV);
-      context->DSGetSamplers(samplerSlot, 1, &usedSamp);
-      break;
-    case DXBC::ShaderType::Geometry:
-      context->GSGetShaderResources(texSlot, 1, &usedSRV);
-      context->GSGetSamplers(samplerSlot, 1, &usedSamp);
-      break;
-    case DXBC::ShaderType::Pixel:
-      context->PSGetShaderResources(texSlot, 1, &usedSRV);
-      context->PSGetSamplers(samplerSlot, 1, &usedSamp);
-      break;
-    case DXBC::ShaderType::Compute:
-      context->CSGetShaderResources(texSlot, 1, &usedSRV);
-      context->CSGetSamplers(samplerSlot, 1, &usedSamp);
-      break;
-    default: RDCERR("Unhandled shader type %d", GetShaderType()); break;
+    SCOPED_LOCK(m_immediateContextCS);
+    switch(GetShaderType())
+    {
+      case DXBC::ShaderType::Vertex:
+        immediateContext->VSGetShaderResources(texSlot, 1, &usedSRV);
+        immediateContext->VSGetSamplers(samplerSlot, 1, &usedSamp);
+        break;
+      case DXBC::ShaderType::Hull:
+        immediateContext->HSGetShaderResources(texSlot, 1, &usedSRV);
+        immediateContext->HSGetSamplers(samplerSlot, 1, &usedSamp);
+        break;
+      case DXBC::ShaderType::Domain:
+        immediateContext->DSGetShaderResources(texSlot, 1, &usedSRV);
+        immediateContext->DSGetSamplers(samplerSlot, 1, &usedSamp);
+        break;
+      case DXBC::ShaderType::Geometry:
+        immediateContext->GSGetShaderResources(texSlot, 1, &usedSRV);
+        immediateContext->GSGetSamplers(samplerSlot, 1, &usedSamp);
+        break;
+      case DXBC::ShaderType::Pixel:
+        immediateContext->PSGetShaderResources(texSlot, 1, &usedSRV);
+        immediateContext->PSGetSamplers(samplerSlot, 1, &usedSamp);
+        break;
+      case DXBC::ShaderType::Compute:
+        immediateContext->CSGetShaderResources(texSlot, 1, &usedSRV);
+        immediateContext->CSGetSamplers(samplerSlot, 1, &usedSamp);
+        break;
+      default: RDCERR("Unhandled shader type %d", GetShaderType()); break;
+    }
   }
 
   texSlot = (cbufferData.debugSampleTexDim - 1) + 5 * (cbufferData.debugSampleRetType - 1);
@@ -1301,42 +1367,77 @@ bool D3D11DebugAPIWrapper::CalculateSampleGather(
 
   context->CopyResource(debugData.OutStageBuf, debugData.OutBuf);
 
-  hr = context->Map(debugData.OutStageBuf, 0, D3D11_MAP_READ, 0, &mapped);
+  D3D11_QUERY_DESC queryDesc = {};
+  queryDesc.Query = D3D11_QUERY_EVENT;
+  queryDesc.MiscFlags = 0;
+  ID3D11Query *&query = temporary.query;
+  m_pDevice->CreateQuery(&queryDesc, &query);
 
-  if(FAILED(hr))
+  context->End(query);
+
+  ID3D11CommandList *&commandList = temporary.commandList;
+  context->FinishCommandList(FALSE, &commandList);
+
+  void *p = NULL;
+  HANDLE &hEvent = temporary.hEvent;
+  ID3D11DeviceContext3 *&immediateContext3 = temporary.immediateContext3;
+  if(SUCCEEDED(immediateContext->QueryInterface(IID_ID3D11DeviceContext3, &p)))
   {
-    RDCERR("Failed to map results HRESULT: %s", ToStr(hr).c_str());    // @NoCoverage
-    return false;                                                      // @NoCoverage
+    immediateContext3 = static_cast<ID3D11DeviceContext3 *>(p);
+    hEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
   }
 
   ShaderVariable lookupResult("tex", 0.0f, 0.0f, 0.0f, 0.0f);
-
-  float *retFloats = (float *)mapped.pData;
-  uint32_t *retUInts = (uint32_t *)(retFloats + 8);
-  int32_t *retSInts = (int32_t *)(retUInts + 8);
-
-  if(cbufferData.debugSampleRetType == DEBUG_SAMPLE_UINT)
   {
-    for(int i = 0; i < 4; i++)
-      lookupResult.value.u32v[i] = retUInts[swizzle[i]];
-  }
-  else if(cbufferData.debugSampleRetType == DEBUG_SAMPLE_INT)
-  {
-    for(int i = 0; i < 4; i++)
-      lookupResult.value.s32v[i] = retSInts[swizzle[i]];
-  }
-  else
-  {
-    for(int i = 0; i < 4; i++)
-      lookupResult.value.f32v[i] = retFloats[swizzle[i]];
-  }
+    SCOPED_LOCK(m_immediateContextCS);
+    immediateContext->ExecuteCommandList(commandList, TRUE);
+    if(immediateContext3)
+      immediateContext3->Flush1(D3D11_CONTEXT_TYPE_ALL, hEvent);
+    else
+      immediateContext->Flush();
+    for(;;)
+    {
+      if(immediateContext->GetData(query, NULL, 0, D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK)
+      {
+        hr = immediateContext->Map(debugData.OutStageBuf, 0, D3D11_MAP_READ, 0, &mapped);
 
-  context->Unmap(debugData.OutStageBuf, 0);
+        if(FAILED(hr))
+        {
+          RDCERR("Failed to map results HRESULT: %s", ToStr(hr).c_str());    // @NoCoverage
+          return false;                                                      // @NoCoverage
+        }
 
-  SAFE_RELEASE(context);
+        float *retFloats = (float *)mapped.pData;
+        uint32_t *retUInts = (uint32_t *)(retFloats + 8);
+        int32_t *retSInts = (int32_t *)(retUInts + 8);
 
-  SAFE_RELEASE(usedSRV);
-  SAFE_RELEASE(usedSamp);
+        if(cbufferData.debugSampleRetType == DEBUG_SAMPLE_UINT)
+        {
+          for(int i = 0; i < 4; i++)
+            lookupResult.value.u32v[i] = retUInts[swizzle[i]];
+        }
+        else if(cbufferData.debugSampleRetType == DEBUG_SAMPLE_INT)
+        {
+          for(int i = 0; i < 4; i++)
+            lookupResult.value.s32v[i] = retSInts[swizzle[i]];
+        }
+        else
+        {
+          for(int i = 0; i < 4; i++)
+            lookupResult.value.f32v[i] = retFloats[swizzle[i]];
+        }
+
+        immediateContext->Unmap(debugData.OutStageBuf, 0);
+        break;
+      }
+      m_immediateContextCS.Unlock();
+      if(hEvent)
+        WaitForSingleObject(hEvent, INFINITE);
+      else
+        Threading::Sleep(1);
+      m_immediateContextCS.Lock();
+    }
+  }
 
   output = lookupResult;
   return true;
@@ -1346,7 +1447,7 @@ bool D3D11DebugAPIWrapper::CalculateMathIntrinsic(DXBCBytecode::OpcodeType opcod
                                                   const ShaderVariable &input,
                                                   ShaderVariable &output1, ShaderVariable &output2)
 {
-  D3D11RenderStateTracker tracker(m_pDevice->GetImmediateContext());
+  //D3D11RenderStateTracker tracker(m_pDevice->GetImmediateContext());
 
   RDCCOMPILE_ASSERT((int)DXBCBytecode::OPCODE_RCP == DEBUG_SAMPLE_MATH_RCP,
                     "Opcode enum doesn't match shader define");
@@ -1359,10 +1460,45 @@ bool D3D11DebugAPIWrapper::CalculateMathIntrinsic(DXBCBytecode::OpcodeType opcod
   RDCCOMPILE_ASSERT((int)DXBCBytecode::OPCODE_SINCOS == DEBUG_SAMPLE_MATH_SINCOS,
                     "Opcode enum doesn't match shader define");
 
-  ID3D11DeviceContext *context = NULL;
-  m_pDevice->GetImmediateContext(&context);
+  struct Temporary
+  {
+    ShaderDebugging debugData;
 
-  const ShaderDebugging &debugData = m_pDevice->GetReplay()->GetShaderDebuggingData();
+    ID3D11DeviceContext *context = NULL;
+    ID3D11DeviceContext *immediateContext = NULL;
+
+    ID3D11Query *query = NULL;
+    ID3D11CommandList *commandList = NULL;
+
+    ID3D11DeviceContext3 *immediateContext3 = NULL;
+    HANDLE hEvent = NULL;
+
+    ~Temporary()
+    {
+      CloseHandle(hEvent);
+      SAFE_RELEASE(immediateContext3);
+
+      SAFE_RELEASE(commandList);
+      SAFE_RELEASE(query);
+
+      SAFE_RELEASE(immediateContext);
+      SAFE_RELEASE(context);
+
+      debugData.Release();
+    }
+  }
+  temporary;
+
+  ID3D11DeviceContext *&context = temporary.context;
+  ID3D11DeviceContext *&immediateContext = temporary.immediateContext;
+
+  m_pDevice->CreateDeferredContext(0, &context);
+  m_pDevice->GetImmediateContext(&immediateContext);
+
+  //const ShaderDebugging &debugData = m_pDevice->GetReplay()->GetShaderDebuggingData();
+  //temporary.debugData.Init(m_pDevice);
+  temporary.debugData.Init(m_pDevice->GetReplay()->GetShaderDebuggingData());
+  const ShaderDebugging &debugData = temporary.debugData;
 
   D3D11_MAPPED_SUBRESOURCE mapped;
   HRESULT hr = context->Map(debugData.ParamBuf, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
@@ -1387,23 +1523,60 @@ bool D3D11DebugAPIWrapper::CalculateMathIntrinsic(DXBCBytecode::OpcodeType opcod
 
   context->CopyResource(debugData.OutStageBuf, debugData.OutBuf);
 
-  hr = context->Map(debugData.OutStageBuf, 0, D3D11_MAP_READ, 0, &mapped);
+  D3D11_QUERY_DESC queryDesc = {};
+  queryDesc.Query = D3D11_QUERY_EVENT;
+  queryDesc.MiscFlags = 0;
+  ID3D11Query *&query = temporary.query;
+  m_pDevice->CreateQuery(&queryDesc, &query);
 
-  if(FAILED(hr))
+  context->End(query);
+
+  ID3D11CommandList *&commandList = temporary.commandList;
+  context->FinishCommandList(FALSE, &commandList);
+
+  void *p = NULL;
+  HANDLE &hEvent = temporary.hEvent;
+  ID3D11DeviceContext3 *&immediateContext3 = temporary.immediateContext3;
+  if(SUCCEEDED(immediateContext->QueryInterface(IID_ID3D11DeviceContext3, &p)))
   {
-    RDCERR("Failed to map results HRESULT: %s", ToStr(hr).c_str());    // @NoCoverage
-    return false;                                                      // @NoCoverage
+    immediateContext3 = static_cast<ID3D11DeviceContext3 *>(p);
+    hEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
   }
 
-  uint32_t *resA = (uint32_t *)mapped.pData;
-  uint32_t *resB = resA + 4;
+  SCOPED_LOCK(m_immediateContextCS);
+  immediateContext->ExecuteCommandList(commandList, TRUE);
+  if(immediateContext3)
+    immediateContext3->Flush1(D3D11_CONTEXT_TYPE_ALL, hEvent);
+  else
+    immediateContext->Flush();
+  for(;;)
+  {
+    if(immediateContext->GetData(query, NULL, 0, D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK)
+    {
+      hr = immediateContext->Map(debugData.OutStageBuf, 0, D3D11_MAP_READ, 0, &mapped);
 
-  memcpy(output1.value.u32v.data(), resA, sizeof(uint32_t) * 4);
-  memcpy(output2.value.u32v.data(), resB, sizeof(uint32_t) * 4);
+      if(FAILED(hr))
+      {
+        RDCERR("Failed to map results HRESULT: %s", ToStr(hr).c_str());
+        return false;
+      }
 
-  context->Unmap(debugData.OutStageBuf, 0);
+      uint32_t *resA = (uint32_t *)mapped.pData;
+      uint32_t *resB = resA + 4;
 
-  SAFE_RELEASE(context);
+      memcpy(output1.value.u32v.data(), resA, sizeof(uint32_t) * 4);
+      memcpy(output2.value.u32v.data(), resB, sizeof(uint32_t) * 4);
+
+      immediateContext->Unmap(debugData.OutStageBuf, 0);
+      break;
+    }
+    m_immediateContextCS.Unlock();
+    if(hEvent)
+      WaitForSingleObject(hEvent, INFINITE);
+    else
+      Threading::Sleep(1);
+    m_immediateContextCS.Lock();
+  }
 
   return true;
 }
@@ -2597,22 +2770,20 @@ ShaderDebugTrace *D3D11Replay::DebugThread(uint32_t eventId,
   interpreter->eventId = eventId;
   ShaderDebugTrace *ret = interpreter->BeginDebug(dxbc, refl, cs->GetMapping(), 0);
   GlobalState &global = interpreter->global;
-  ThreadState &state = interpreter->activeLane();
+  ThreadState initialState = interpreter->activeLane();
 
   AddCBuffersToGlobalState(*dxbc->GetDXBCByteCode(), *GetDebugManager(), global, ret->sourceVars,
                            rs->CS, refl, cs->GetMapping());
 
   for(int i = 0; i < 3; i++)
   {
-    state.semantics.GroupID[i] = groupid[i];
-    state.semantics.ThreadID[i] = threadid[i];
+    initialState.semantics.GroupID[i] = groupid[i];
+    initialState.semantics.ThreadID[i] = threadid[i];
   }
 
   ret->constantBlocks = global.constantBlocks;
 
   dxbc->FillTraceLineInfo(*ret);
-
-  std::vector<ShaderDebugState> states(1, initialState);
 
   // find the first instruction after the
   // last blocking sync instruction that
@@ -2620,10 +2791,11 @@ ShaderDebugTrace *D3D11Replay::DebugThread(uint32_t eventId,
   size_t loopCount = 0;
   size_t loopNumInstructions = 0;
   size_t groupNumInstructions = 0;
-  for(size_t instructionIndex = dxbc->GetNumInstructions(); instructionIndex;)
+  auto program = dxbc->GetDXBCByteCode();
+  for(size_t instructionIndex = program->GetNumInstructions(); instructionIndex;)
   {
-    const ASMOperation &op = dxbc->GetInstruction(--instructionIndex);
-    if(op.operation == OPCODE_SYNC && DXBC::Sync_Threads(op.syncFlags))
+    const Operation &op = program->GetInstruction(--instructionIndex);
+    if(op.operation == OPCODE_SYNC && DXBCBytecode::Sync_Threads(op.syncFlags))
     {
       groupNumInstructions = loopCount ? loopNumInstructions : 1 + instructionIndex;
       break;
@@ -2639,172 +2811,41 @@ ShaderDebugTrace *D3D11Replay::DebugThread(uint32_t eventId,
     }
   }
 
+  interpreter->groupNumInstructions = int(groupNumInstructions);
+
   // if there aren't any blocking syncs,
   // assume other threads have no effect on this thread
   // and only simulate this thread
   size_t destIdx = 0;
-  std::vector<State> group;
-  if(!groupNumInstructions)
-    group.push_back(initialState);
-  else
+  if(groupNumInstructions)
   {
     // prepare state for all threads in the group
-    group.resize(dxbc->DispatchThreadsDimension[0] * dxbc->DispatchThreadsDimension[1] *
-                     dxbc->DispatchThreadsDimension[2],
-                 initialState);
-    for(size_t i = 0, z = 0; z < dxbc->DispatchThreadsDimension[2]; z++)
+    auto &workgroup = interpreter->workgroup;
+    auto reflection = dxbc->GetReflection();
+    workgroup.fill(reflection->DispatchThreadsDimension[0] *
+                   reflection->DispatchThreadsDimension[1] *
+                   reflection->DispatchThreadsDimension[2],
+                   initialState);
+    for(size_t i = 0, z = 0; z < reflection->DispatchThreadsDimension[2]; z++)
     {
-      for(size_t y = 0; y < dxbc->DispatchThreadsDimension[1]; y++)
+      for(size_t y = 0; y < reflection->DispatchThreadsDimension[1]; y++)
       {
-        for(size_t x = 0; x < dxbc->DispatchThreadsDimension[0]; x++, i++)
+        for(size_t x = 0; x < reflection->DispatchThreadsDimension[0]; x++, i++)
         {
-          State &state = group[i];
+          ThreadState &state = workgroup[i];
           state.semantics.ThreadID[0] = uint32_t(x);
           state.semantics.ThreadID[1] = uint32_t(y);
           state.semantics.ThreadID[2] = uint32_t(z);
         }
       }
     }
-    destIdx = (threadid[2] * dxbc->DispatchThreadsDimension[1] + threadid[1]) *
-                  dxbc->DispatchThreadsDimension[0] +
-              threadid[0];
+    destIdx = (threadid[2] * reflection->DispatchThreadsDimension[1] + threadid[1]) *
+                  reflection->DispatchThreadsDimension[0] + threadid[0];
 
-    // allocate threads to "waves" based on the number of hardware contexts available
-    std::mutex mutex;
-    std::condition_variable condition;
-    size_t groupSize = group.size();
-    size_t waveCount = RDCMIN(groupSize, size_t(std::thread::hardware_concurrency()));
-    size_t waveSync = 0, syncIndex = 0;
-    std::vector<std::thread> waves;
-    waves.reserve(waveCount);
-    for(size_t waveIndex = 0; waveIndex != waveCount; ++waveIndex)
-    {
-      waves.push_back(std::thread([&, waveIndex]() {
-
-        // find the threads for this wave
-        size_t threadCount = groupSize / waveCount;
-        size_t threadRemainder = groupSize % waveCount;
-        size_t threadBegin = waveIndex < threadRemainder ? ++threadCount * waveIndex
-                                                         : threadCount * waveIndex + threadRemainder;
-        size_t threadEnd = threadBegin + threadCount;
-
-        // simulate all threads up to the last group instruction, or until the user cancels
-        bool finished = false, synced = true;
-        while(!finished)
-        {
-          finished = true;
-          if(cancelled && cancelled())
-          {
-            // ensure blocked waves will wake
-            std::unique_lock<std::mutex> lock(mutex);
-            ++syncIndex;
-            waveSync = waveCount - 1;
-            lock.unlock();
-            condition.notify_all();
-            break;
-          }
-
-          size_t threadSync = 0;
-          for(size_t threadIndex = threadBegin; threadIndex != threadEnd; ++threadIndex)
-          {
-            State &state = group[threadIndex];
-            if(!state.Finished() && state.nextInstruction < groupNumInstructions)
-            {
-              finished = false;
-
-              // don't allow any thread to pass a blocking sync until all the threads have reached
-              // it
-              const ASMOperation &op = dxbc->GetInstruction(size_t(state.nextInstruction));
-              if(!synced && op.operation == OPCODE_SYNC && DXBC::Sync_Threads(op.syncFlags))
-                ++threadSync;
-              else
-                state = state.GetNext(global, NULL);
-            }
-          }
-          synced = threadSync == threadCount;
-
-          if(synced)
-          {
-            // all the threads in this wave have reached the next blocking sync
-            std::unique_lock<std::mutex> lock(mutex);
-            if(++waveSync != waveCount)
-            {
-              // block until the sync index changes
-              condition.wait(lock, [&, currentSyncIndex = syncIndex ]() {
-                return currentSyncIndex != syncIndex;
-              });
-            }
-            else
-            {
-              // advance the sync index and wake all the waves
-              ++syncIndex;
-              waveSync = 0;
-              lock.unlock();
-              condition.notify_all();
-            }
-          }
-
-          if(threadBegin <= destIdx && destIdx < threadEnd)
-          {
-            // add the target thread's history
-            State &state = group[destIdx];
-            if(!state.Finished() && state.nextInstruction < groupNumInstructions)
-            {
-              const ASMOperation &op = dxbc->GetInstruction(size_t(state.nextInstruction));
-              if(synced || op.operation != OPCODE_SYNC || !DXBC::Sync_Threads(op.syncFlags))
-              {
-                if(dxbc->m_DebugInfo)
-                  dxbc->m_DebugInfo->GetLocals(state.nextInstruction, op.offset, state.locals);
-                states.push_back(state);
-              }
-            }
-          }
-        }
-      }));
-    }
-
-    // block until all waves are done
-    for(std::thread &wave : waves)
-      wave.join();
-
-    if(!cancelled || !cancelled())
-    {
-      State &state = group[destIdx];
-      if(dxbc->m_DebugInfo)
-      {
-        const ASMOperation &op = dxbc->GetInstruction(size_t(state.nextInstruction));
-        dxbc->m_DebugInfo->GetLocals(state.nextInstruction, op.offset, state.locals);
-      }
-      states.push_back(state);
-    }
+    interpreter->activeLaneIndex = int(destIdx);
   }
 
-  if(!cancelled || !cancelled())
-  {
-    // finish the target thread, if necessary
-    State &state = group[destIdx];
-    while(!state.Finished() && (!cancelled || !cancelled()))
-    {
-      state = state.GetNext(global, NULL);
-      if(dxbc->m_DebugInfo)
-      {
-        const ASMOperation &op = dxbc->GetInstruction(size_t(state.nextInstruction));
-        dxbc->m_DebugInfo->GetLocals(state.nextInstruction, op.offset, state.locals);
-      }
-      states.push_back(state);
-    }
-  }
-
-  ret.states = states;
-
-  ret.hasLocals = dxbc->m_DebugInfo && dxbc->m_DebugInfo->HasLocals();
-
-  ret.lineInfo.resize(dxbc->GetNumInstructions());
-  for(size_t i = 0; dxbc->m_DebugInfo && i < dxbc->GetNumInstructions(); i++)
-  {
-    const ASMOperation &op = dxbc->GetInstruction(i);
-    dxbc->m_DebugInfo->GetLineInfo(i, op.offset, ret.lineInfo[i]);
-  }
+  ThreadState &state = interpreter->activeLane();
 
   // add fake inputs for semantics
   for(size_t i = 0; i < dxbc->GetDXBCByteCode()->GetNumDeclarations(); i++)

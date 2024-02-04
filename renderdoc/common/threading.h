@@ -113,8 +113,10 @@ private:
 };
 
 #define SCOPED_LOCK(cs) Threading::ScopedLock CONCAT(scopedlock, __LINE__)(&cs);
+//#define SCOPED_LOCK_OPTIONAL(cs, cond) \
+//  Threading::ScopedLock CONCAT(scopedlock, __LINE__)(cond ? &cs : NULL);
 #define SCOPED_LOCK_OPTIONAL(cs, cond) \
-  Threading::ScopedLock CONCAT(scopedlock, __LINE__)(cond ? &cs : NULL);
+  SCOPED_LOCK(cs)
 
 #define SCOPED_READLOCK(rw) Threading::ScopedReadLock CONCAT(scopedlock, __LINE__)(rw);
 #define SCOPED_WRITELOCK(rw) Threading::ScopedWriteLock CONCAT(scopedlock, __LINE__)(rw);

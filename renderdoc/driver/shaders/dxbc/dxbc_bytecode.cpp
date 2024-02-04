@@ -1032,4 +1032,23 @@ bool IsOutput(OperandType oper)
   return false;
 }
 
+bool Sync_UAV_Global(uint32_t syncFlags)
+{
+  return Opcode::Sync_UAV_Global.Get(syncFlags);
+}
+
+bool Sync_UAV_Group(uint32_t syncFlags)
+{
+  return Opcode::Sync_UAV_Group.Get(syncFlags);
+}
+
+bool Sync_TGSM(uint32_t syncFlags)
+{
+  return Opcode::Sync_TGSM.Get(syncFlags);
+}
+
+bool Sync_Threads(uint32_t syncFlags)
+{
+  return Opcode::Sync_Threads.Get(syncFlags);
+}
 };    // namespace DXBCBytecode

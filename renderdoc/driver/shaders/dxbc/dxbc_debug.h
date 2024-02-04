@@ -344,11 +344,12 @@ struct InterpretDebugger : public ShaderDebugger
   ThreadState &activeLane() { return workgroup[activeLaneIndex]; }
   int activeLaneIndex = 0;
 
+  int groupNumInstructions = 0;
   int steps = 0;
 
   const DXBC::DXBCContainer *dxbc;
 
-  void CalcActiveMask(rdcarray<bool> &activeMask);
+  void CalcActiveMask(rdcarray<bool> &activeMask) const;
   rdcarray<ShaderDebugState> ContinueDebug(DebugAPIWrapper *apiWrapper);
 };
 

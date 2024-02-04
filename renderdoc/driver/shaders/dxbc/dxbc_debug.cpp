@@ -25,7 +25,13 @@
 
 #include "dxbc_debug.h"
 #include <algorithm>
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
+#include <vector>
 #include "common/formatting.h"
+#include "common/threading.h"
 #include "driver/dxgi/dxgi_common.h"
 #include "maths/formatpacking.h"
 #include "replay/replay_driver.h"
@@ -1976,6 +1982,8 @@ void ThreadState::StepNext(ShaderDebugState *state, DebugAPIWrapper *apiWrapper,
   for(size_t i = 1; i < op.operands.size(); i++)
     srcOpers.push_back(GetSrc(op.operands[i], op));
 
+  static Threading::CriticalSection atomicCS;
+
   switch(op.operation)
   {
       /////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -2934,6 +2942,8 @@ void ThreadState::StepNext(ShaderDebugState *state, DebugAPIWrapper *apiWrapper,
 
     case OPCODE_IMM_ATOMIC_ALLOC:
     {
+      SCOPED_LOCK(atomicCS);
+
       BindingSlot slot = GetBindingSlotForIdentifier(*program, TYPE_UNORDERED_ACCESS_VIEW,
                                                      srcOpers[0].value.u32v[0]);
       GlobalState::UAVIterator uav = global.uavs.find(slot);
@@ -2954,6 +2964,8 @@ void ThreadState::StepNext(ShaderDebugState *state, DebugAPIWrapper *apiWrapper,
 
     case OPCODE_IMM_ATOMIC_CONSUME:
     {
+      SCOPED_LOCK(atomicCS);
+
       BindingSlot slot = GetBindingSlotForIdentifier(*program, TYPE_UNORDERED_ACCESS_VIEW,
                                                      srcOpers[0].value.u32v[0]);
       GlobalState::UAVIterator uav = global.uavs.find(slot);
@@ -3136,6 +3148,8 @@ void ThreadState::StepNext(ShaderDebugState *state, DebugAPIWrapper *apiWrapper,
       // Also helper/inactive pixels are not allowed to modify UAVs
       if(data && offset + dstAddress->value.u32v[0] < numElems && !Finished())
       {
+        SCOPED_LOCK(atomicCS);
+
         uint32_t *udst = (uint32_t *)data;
         int32_t *idst = (int32_t *)data;
 
@@ -5585,7 +5599,7 @@ ShaderDebugTrace *InterpretDebugger::BeginDebug(const DXBC::DXBCContainer *dxbcC
   return ret;
 }
 
-void InterpretDebugger::CalcActiveMask(rdcarray<bool> &activeMask)
+void InterpretDebugger::CalcActiveMask(rdcarray<bool> &activeMask) const
 {
   // one bool per workgroup thread
   activeMask.resize(workgroup.size());
@@ -5702,6 +5716,150 @@ rdcarray<ShaderDebugState> InterpretDebugger::ContinueDebug(DXBCDebug::DebugAPIW
   rdcarray<DXBCDebug::ThreadState> oldworkgroup = workgroup;
 
   rdcarray<bool> activeMask;
+
+  if(dxbc->GetDXBCByteCode()->GetShaderType() == DXBC::ShaderType::Compute)
+  {
+    // if there aren't any blocking syncs,
+    // assume other threads have no effect on this thread
+    // and only simulate this thread
+    size_t destIdx = size_t(activeLaneIndex);
+    ShaderDebugState shaderDebugState;
+    if(groupNumInstructions)
+    {
+      // prepare state for all threads in the group
+      auto program = dxbc->GetDXBCByteCode();
+
+      // allocate threads to "waves" based on the number of hardware contexts available
+      std::mutex mutex;
+      std::condition_variable condition;
+      size_t groupSize = workgroup.size();
+      size_t waveCount = RDCMIN(groupSize, size_t(std::thread::hardware_concurrency()));
+      size_t waveSync = 0, syncIndex = 0;
+      std::vector<std::thread> waves;
+      waves.reserve(waveCount);
+      for(size_t waveIndex = 0; waveIndex != waveCount; ++waveIndex)
+      {
+        waves.push_back(std::thread([&, waveIndex]() {
+
+          // find the threads for this wave
+          size_t threadCount = groupSize / waveCount;
+          size_t threadRemainder = groupSize % waveCount;
+          size_t threadBegin = waveIndex < threadRemainder
+                                   ? ++threadCount * waveIndex
+                                   : threadCount * waveIndex + threadRemainder;
+          size_t threadEnd = threadBegin + threadCount;
+
+          // simulate all threads up to the last group instruction, or until the user cancels
+          bool finished = false, synced = true;
+          while(!finished)
+          {
+            finished = true;
+            //if(cancelled && cancelled())
+            //{
+            //   // ensure blocked waves will wake
+            //   std::unique_lock<std::mutex> lock(mutex);
+            //   ++syncIndex;
+            //   waveSync = waveCount - 1;
+            //   lock.unlock();
+            //   condition.notify_all();
+            //   break;
+            // }
+
+            size_t threadSync = 0;
+            for(size_t threadIndex = threadBegin; threadIndex != threadEnd; ++threadIndex)
+            {
+              ThreadState &threadState = workgroup[threadIndex];
+              if(!threadState.Finished() && threadState.nextInstruction < uint32_t(groupNumInstructions))
+              {
+                finished = false;
+
+                // don't allow any thread to pass a blocking sync until all the threads have reached
+                // it
+                const Operation &op = program->GetInstruction(size_t(threadState.nextInstruction));
+                if(!synced && op.operation == OPCODE_SYNC && DXBCBytecode::Sync_Threads(op.syncFlags))
+                  ++threadSync;
+                else
+                {
+                  //if(activeMask[threadIndex])
+                  {
+                    oldworkgroup[threadIndex].variables = threadState.variables;
+                    threadState.StepNext(threadIndex == destIdx ? &shaderDebugState : nullptr,
+                                         apiWrapper, oldworkgroup);
+                  }
+                }
+              }
+            }
+            synced = threadSync == threadCount;
+
+            if(synced)
+            {
+              // all the threads in this wave have reached the next blocking sync
+              std::unique_lock<std::mutex> lock(mutex);
+              if(++waveSync != waveCount)
+              {
+                // block until the sync index changes
+                condition.wait(lock, [&, currentSyncIndex = syncIndex]() {
+                  return currentSyncIndex != syncIndex;
+                });
+              }
+              else
+              {
+                // advance the sync index and wake all the waves
+                ++syncIndex;
+                waveSync = 0;
+                lock.unlock();
+                condition.notify_all();
+              }
+            }
+
+            if(threadBegin <= destIdx && destIdx < threadEnd)
+            {
+              // add the target thread's history
+              ThreadState &threadState = workgroup[destIdx];
+              if(!threadState.Finished() && threadState.nextInstruction < uint32_t(groupNumInstructions))
+              {
+                const Operation &op = program->GetInstruction(size_t(threadState.nextInstruction));
+                if(synced || op.operation != OPCODE_SYNC || !DXBCBytecode::Sync_Threads(op.syncFlags))
+                {
+                  shaderDebugState.stepIndex = steps++;
+                  shaderDebugState.nextInstruction = threadState.nextInstruction;
+                  ret.push_back(std::move(shaderDebugState));
+                }
+              }
+            }
+          }
+        }));
+      }
+
+      // block until all waves are done
+      for(std::thread &wave : waves)
+        wave.join();
+
+      //if(!cancelled || !cancelled())
+      {
+        ThreadState &threadState = workgroup[destIdx];
+        shaderDebugState.stepIndex = steps++;
+        shaderDebugState.nextInstruction = threadState.nextInstruction;
+        ret.push_back(std::move(shaderDebugState));
+      }
+    }
+
+    //if(!cancelled || !cancelled())
+    {
+      // finish the target thread, if necessary
+      ThreadState &threadState = workgroup[destIdx];
+      while(!threadState.Finished() /* && (!cancelled || !cancelled())*/)
+      {
+        oldworkgroup[destIdx].variables = threadState.variables;
+        threadState.StepNext(&shaderDebugState, apiWrapper, oldworkgroup);
+        shaderDebugState.stepIndex = steps++;
+        shaderDebugState.nextInstruction = threadState.nextInstruction;
+        ret.push_back(std::move(shaderDebugState));
+      }
+    }
+
+    return ret;
+  }
 
   // continue stepping until we have 100 target steps completed in a chunk. This may involve doing
   // more steps if our target thread is inactive

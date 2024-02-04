@@ -25,6 +25,7 @@
 #pragma once
 
 #include <map>
+#include "common/threading.h"
 #include "driver/dx/official/d3d11_4.h"
 
 class WrappedID3D11Device;
@@ -55,4 +56,6 @@ private:
 
   bool m_ShaderCacheDirty = false, m_CacheShaders = false;
   std::map<uint32_t, ID3DBlob *> m_ShaderCache;
+
+  Threading::CriticalSection m_CS;
 };

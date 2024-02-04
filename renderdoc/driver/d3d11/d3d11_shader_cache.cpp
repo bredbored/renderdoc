@@ -129,6 +129,8 @@ rdcstr D3D11ShaderCache::GetShaderBlob(const char *source, const char *entry,
                                        const rdcarray<rdcstr> &includeDirs, const char *profile,
                                        ID3DBlob **srcblob)
 {
+  SCOPED_LOCK(m_CS);
+
   rdcstr cbuffers = GetEmbeddedResource(hlsl_cbuffers_h);
   rdcstr texsample = GetEmbeddedResource(hlsl_texsample_h);
 
@@ -214,6 +216,8 @@ ID3D11VertexShader *D3D11ShaderCache::MakeVShader(const char *source, const char
                                                   D3D11_INPUT_ELEMENT_DESC *inputs,
                                                   ID3D11InputLayout **ret, rdcarray<byte> *blob)
 {
+  SCOPED_LOCK(m_CS);
+
   ID3DBlob *byteBlob = NULL;
 
   if(GetShaderBlob(source, entry, m_CompileFlags, {}, profile, &byteBlob) != "")
@@ -262,6 +266,8 @@ ID3D11VertexShader *D3D11ShaderCache::MakeVShader(const char *source, const char
 ID3D11GeometryShader *D3D11ShaderCache::MakeGShader(const char *source, const char *entry,
                                                     const char *profile)
 {
+  SCOPED_LOCK(m_CS);
+
   ID3DBlob *byteBlob = NULL;
 
   if(GetShaderBlob(source, entry, m_CompileFlags, {}, profile, &byteBlob) != "")
@@ -290,6 +296,8 @@ ID3D11GeometryShader *D3D11ShaderCache::MakeGShader(const char *source, const ch
 ID3D11PixelShader *D3D11ShaderCache::MakePShader(const char *source, const char *entry,
                                                  const char *profile)
 {
+  SCOPED_LOCK(m_CS);
+
   ID3DBlob *byteBlob = NULL;
 
   if(GetShaderBlob(source, entry, m_CompileFlags, {}, profile, &byteBlob) != "")
@@ -318,6 +326,8 @@ ID3D11PixelShader *D3D11ShaderCache::MakePShader(const char *source, const char 
 ID3D11ComputeShader *D3D11ShaderCache::MakeCShader(const char *source, const char *entry,
                                                    const char *profile)
 {
+  SCOPED_LOCK(m_CS);
+
   ID3DBlob *byteBlob = NULL;
 
   if(GetShaderBlob(source, entry, m_CompileFlags, {}, profile, &byteBlob) != "")

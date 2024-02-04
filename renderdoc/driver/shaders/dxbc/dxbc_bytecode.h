@@ -1296,4 +1296,9 @@ protected:
   void EncodeDecl(rdcarray<uint32_t> &tokenStream, const Declaration &decl);
   void EncodeOperation(rdcarray<uint32_t> &tokenStream, const Operation &op);
 };
+
+bool Sync_UAV_Global(uint32_t syncFlags);
+bool Sync_UAV_Group(uint32_t syncFlags);
+bool Sync_TGSM(uint32_t syncFlags);
+bool Sync_Threads(uint32_t syncFlags);
 };
