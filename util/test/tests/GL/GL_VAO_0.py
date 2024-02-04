@@ -6,17 +6,20 @@ class GL_VAO_0(rdtest.TestCase):
     demos_test_name = 'GL_VAO_0'
 
     def check_capture(self):
-        self.check_final_backbuffer()
+        action = self.find_action("Draw")
 
-        draw = self.find_draw("Draw")
-
-        # There are 4 draws with variations on client-memory VBs or IBs
+        # There are 4 actions with variations on client-memory VBs or IBs
         for i in range(0, 4):
-            self.check(draw is not None)
+            self.check(action is not None)
 
-            self.controller.SetFrameEvent(draw.eventId, False)
+            self.controller.SetFrameEvent(action.eventId, False)
 
-            postvs_data = self.get_postvs(rd.MeshDataStage.VSOut, 0, draw.numIndices)
+            pipe: rd.PipeState = self.controller.GetPipelineState()
+            vp: rd.Viewport = pipe.GetViewport(0)
+
+            self.check_triangle(vp=(vp.x, vp.y, vp.width, vp.height))
+
+            postvs_data = self.get_postvs(action, rd.MeshDataStage.VSOut, 0, action.numIndices)
 
             postvs_ref = {
                 0: {
@@ -24,7 +27,7 @@ class GL_VAO_0(rdtest.TestCase):
                     'idx': 0,
                     'gl_Position': [-0.5, -0.5, 0.0, 1.0],
                     'v2f_block.pos': [-0.5, -0.5, 0.0, 1.0],
-                    'v2f_block.col': [1.0, 0.0, 0.0, 1.0],
+                    'v2f_block.col': [0.0, 1.0, 0.0, 1.0],
                     'v2f_block.uv': [0.0, 0.0, 0.0, 1.0],
                 },
                 1: {
@@ -40,12 +43,33 @@ class GL_VAO_0(rdtest.TestCase):
                     'idx': 2,
                     'gl_Position': [0.5, -0.5, 0.0, 1.0],
                     'v2f_block.pos': [0.5, -0.5, 0.0, 1.0],
-                    'v2f_block.col': [0.0, 0.0, 1.0, 1.0],
+                    'v2f_block.col': [0.0, 1.0, 0.0, 1.0],
                     'v2f_block.uv': [1.0, 0.0, 0.0, 1.0],
                 },
             }
 
             self.check_mesh_data(postvs_ref, postvs_data)
 
-            draw = draw.next
+            action = action.next
 
+        action = self.find_action("Instanced")
+
+        self.check(action is not None)
+
+        self.controller.SetFrameEvent(action.eventId, False)
+
+        # Each instance should have color output of 0.5 * instance in blue
+        for i in range(0, action.numInstances):
+            postvs_data = self.get_postvs(action, rd.MeshDataStage.VSOut, 0, action.numIndices, i)
+
+            postvs_ref = {
+                0: {
+                    'vtx': 0,
+                    'idx': 0,
+                    'v2f_block.col': [0.0, 0.0, 0.5*(i+1), 0.0],
+                },
+            }
+
+            self.check_mesh_data(postvs_ref, postvs_data)
+
+            rdtest.log.success('Instance {} is OK'.format(i))

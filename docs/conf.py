@@ -15,6 +15,7 @@
 
 import sys
 import os
+import re
 import datetime
 
 # If extensions (or modules to document with autodoc) are in another directory,
@@ -26,9 +27,9 @@ import struct
 
 # path to module libraries for windows
 if struct.calcsize("P") == 8:
-	binpath = '../x64/'
+    binpath = '../x64/'
 else:
-	binpath = '../Win32/'
+    binpath = '../Win32/'
 
 # Prioritise release over development builds
 sys.path.insert(0, os.path.abspath(binpath + 'Development/pymodules'))
@@ -37,6 +38,10 @@ sys.path.insert(0, os.path.abspath(binpath + 'Release/pymodules'))
 # Add the build paths to PATH so renderdoc.dll can be located
 os.environ["PATH"] += os.pathsep + os.path.abspath(binpath + 'Development/')
 os.environ["PATH"] += os.pathsep + os.path.abspath(binpath + 'Release/')
+
+if sys.platform == 'win32' and sys.version_info[1] >= 8:
+    os.add_dll_directory(binpath + 'Release/')
+    os.add_dll_directory(binpath + 'Development/')
 
 # path to module libraries for linux
 sys.path.insert(0, os.path.abspath('../build/lib'))
@@ -82,11 +87,11 @@ major_version = 123
 minor_version = 999
 
 with open('../renderdoc/api/replay/version.h') as f:
-	for line in f:
-		if line.find('#define RENDERDOC_VERSION_MAJOR') >= 0:
-			major_version = line.split()[2]
-		if line.find('#define RENDERDOC_VERSION_MINOR') >= 0:
-			minor_version = line.split()[2]
+    for line in f:
+        if line.find('#define RENDERDOC_VERSION_MAJOR') >= 0:
+            major_version = line.split()[2]
+        if line.find('#define RENDERDOC_VERSION_MINOR') >= 0:
+            minor_version = line.split()[2]
 
 version = '{0}.{1}'.format(major_version, minor_version)
 # The full version, including alpha/beta/rc tags.
@@ -97,7 +102,7 @@ release = 'v{0}'.format(version)
 #
 # This is also used if you do content translation via gettext catalogs.
 # Usually you set "language" from the command line for these cases.
-language = None
+language = 'en'
 
 # There are two options for replacing |today|: either, you set today to some
 # non-false value, then it is used:
@@ -321,83 +326,127 @@ texinfo_documents = [
 
 # custom theme based on sphinx_rtd_theme
 if os.path.isdir('sphinx_rtd_theme_chm_friendly'):
-	html_theme = "sphinx_rtd_theme_chm_friendly"
-	html_theme_path = ["."]
+    html_theme = "sphinx_rtd_theme_chm_friendly"
+    html_theme_path = ["."]
 else:
-	html_theme = "sphinx_rtd_theme"
+    html_theme = "sphinx_rtd_theme"
 
 html_context = {
     'show_source': False,
     'html_show_sourcelink': False,
-	'display_github': True,
-	'github_user': 'baldurk',
-	'github_repo': 'renderdoc',
-	'github_version': 'v{0}'.format(version),
-	'conf_py_path': '/docs/',
+    'display_github': True,
+    'github_user': 'baldurk',
+    'github_repo': 'renderdoc',
+    'github_version': 'v{0}'.format(version),
+    'conf_py_path': '/docs/',
 }
 
 # We need 1.5 and above for the htmlhelp links to be handled properly without
 # needing separate ugly _blank links. If you don't care about that, you can
 # disable this
 if(tags.has('htmlhelp')):
-	print("**** We require sphinx 1.5 for htmlhelp build to have the fix for issue #2550 ****")
-	needs_sphinx = '1.5'
+    print("**** We require sphinx 1.5 for htmlhelp build to have the fix for issue #2550 ****")
+    needs_sphinx = '1.5'
 
 def maybe_skip_member(app, what, name, obj, skip, options):
-	# Hide these SWIG internals
-	if name == "this" or name == "thisown":
-		return True
-	# Allow hiding free module functions, or only showing free module functions
-	if 'exclude-members' in options and what == "module":
-		if 'free_functions__' in options['exclude-members'] and 'built-in function' in repr(obj):
-			return True
-		if 'non_free_functions__' in options['exclude-members'] and 'built-in function' not in repr(obj):
-			return True
-	# Allow hiding enum constant members (i.e. int constants). These can then be documented explicitly
-	# as we don't have a way in SWIG to attach docstrings to constants directly.
-	if 'exclude-members' in options and 'enum_constants__' in options['exclude-members'] and isinstance(obj, int):
-		return True
-	# Allow arbitrary globbing as a hack to exclude or include members
-	if 'exclude-members' in options:
-		for exclude in options['exclude-members']:
-			# Look for a hack that describes a name match
-			if exclude.startswith('name_match__'):
-				match = exclude.replace('name_match__', '')
+    # Hide these SWIG internals
+    if name == "this" or name == "thisown":
+        return True
+    # Allow hiding free module functions, or only showing free module functions
+    if 'exclude-members' in options and what == "module":
+        if 'free_functions__' in options['exclude-members'] and 'built-in function' in repr(obj):
+            return True
+        if 'non_free_functions__' in options['exclude-members'] and 'built-in function' not in repr(obj):
+            return True
+    # Allow hiding enum constant members (i.e. int constants). These can then be documented explicitly
+    # as we don't have a way in SWIG to attach docstrings to constants directly.
+    if 'exclude-members' in options and 'enum_constants__' in options['exclude-members'] and isinstance(obj, int):
+        return True
+    if 'exclude-members' in options and 'properties__' in options['exclude-members'] and 'getset_desc' in str(type(obj)):
+        return True
+    # Allow arbitrary globbing as a hack to exclude or include members
+    if 'exclude-members' in options:
+        for exclude in options['exclude-members']:
+            # Look for a hack that describes a name match
+            if exclude.startswith('name_match__'):
+                match = exclude.replace('name_match__', '')
 
-				include_only = False
+                include_only = False
 
-				# see if it wants to include only matches, or exclude matches (default)
-				if match.startswith('include_only__'):
-					match = match.replace('include_only__', '')
-					include_only = True
+                # see if it wants to include only matches, or exclude matches (default)
+                if match.startswith('include_only__'):
+                    match = match.replace('include_only__', '')
+                    include_only = True
 
-				objname = ""
-				if '__qualname__' in dir(obj):
-					objname = obj.__qualname__
-				else:
-					try:
-						objname = obj.__name__
-					except AttributeError:
-						objname = obj.__class__.__name__
-				ismatch = False
+                objname = ""
+                if '__qualname__' in dir(obj):
+                    objname = obj.__qualname__
+                else:
+                    try:
+                        objname = obj.__name__
+                    except AttributeError:
+                        objname = obj.__class__.__name__
+                ismatch = False
 
-				# see if we're matching a prefix, or doing just a glob
-				if match.startswith('startswith__'):
-					match = match.replace('startswith__', '')
-					ismatch = objname.startswith(match)
+                # see if we're matching a prefix, or doing just a glob
+                if match.startswith('startswith__'):
+                    match = match.replace('startswith__', '')
+                    ismatch = objname.startswith(match)
 
-				if match.startswith('in__'):
-					match = match.replace('in__', '')
-					ismatch = match in objname
+                if match.startswith('in__'):
+                    match = match.replace('in__', '')
+                    ismatch = match in objname
 
-				# if we want to include only matches and it didn't match, skip this
-				if include_only and not ismatch:
-					return True
+                # if we want to include only matches and it didn't match, skip this
+                if include_only and not ismatch:
+                    return True
 
-				# If we want to exclude matches and it DID match, skip
-				if not include_only and ismatch:
-					return True
-	return None
+                # If we want to exclude matches and it DID match, skip
+                if not include_only and ismatch:
+                    return True
+    return None
+
+def build_finished(app, exception):
+    import renderdoc as rd
+    import qrenderdoc as qrd
+
+    from sphinx.domains.python import PythonDomain
+    from sphinx.errors import SphinxError
+
+    if exception is not None:
+        return
+
+    print(rd)
+    print(qrd)
+
+    # Get list of documented/indexed python objects
+    pydomain = app.env.get_domain('py')
+    if not hasattr(pydomain, 'objects'):
+        print("WARNING: Sphinx version is too old to check objects validity. Upgrade to at least Sphinx 2.1.0")
+        return
+    objs = pydomain.objects
+
+    # Enumerate the namespaced objects in both modules
+    items = []
+    for module_name in ['renderdoc', 'qrenderdoc']:
+        module = sys.modules[module_name]
+        entries = dir(module)
+        for item in dir(module):
+            if 'INTERNAL:' not in str(module.__dict__[item].__doc__):
+                items.append('{}.{}'.format(module_name, item))
+
+    items = set(filter(lambda i: re.search('__|SWIG|ResourceId_Null|rdcfixedarray_of|rdcarray_of|Structured.*List', i) is None, items))
+
+    # Remove any documented/indexed python objects
+    items -= set(objs.keys())
+
+    # Print an error if any remain
+    if len(items) > 0:
+        items = sorted(list(items))
+        raise SphinxError("These {} global classes/functions are not included in the documentation index:\n* {}".format(len(items), '\n* '.join(items)))
+
+    print("All python objects are linked in the documentation.")
 
 def setup(app):
     app.connect('autodoc-skip-member', maybe_skip_member)
+    app.connect('build-finished', build_finished)

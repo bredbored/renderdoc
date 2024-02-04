@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2016-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -60,7 +60,11 @@ public:
   bool IsInjectMode() override { return m_Inject; }
   void SetInjectMode(bool inject) override;
 
-  void SetExecutableFilename(const rdcstr &filename) override;
+  void SetExecutableFilename(const rdcstr &filename) override
+  {
+    SetExecutableFilename(filename, false);
+  }
+
   void SetWorkingDirectory(const rdcstr &dir) override;
   void SetCommandLine(const rdcstr &cmd) override;
   void SetEnvironmentModifications(const rdcarray<EnvironmentModification> &modifications) override;
@@ -103,8 +107,11 @@ private slots:
   // manual slots
   void vulkanLayerWarn_mouseClick();
   void androidWarn_mouseClick();
+  void lineEdit_keyPress(QKeyEvent *);
 
 private:
+  void SetExecutableFilename(const rdcstr &filename, bool remoteSelection);
+
   Ui::CaptureDialog *ui;
   ICaptureContext &m_Ctx;
   MainWindow *m_Main;

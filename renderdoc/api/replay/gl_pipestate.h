@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  * Copyright (c) 2014 Crytek
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -26,7 +26,6 @@
 #pragma once
 
 #include "common_pipestate.h"
-#include "data_types.h"
 
 namespace GLPipe
 {
@@ -40,10 +39,11 @@ struct VertexAttribute
   DOCUMENT("");
   VertexAttribute() = default;
   VertexAttribute(const VertexAttribute &) = default;
+  VertexAttribute &operator=(const VertexAttribute &) = default;
 
   bool operator==(const VertexAttribute &o) const
   {
-    return enabled == o.enabled && format == o.format &&
+    return enabled == o.enabled && floatCast == o.floatCast && format == o.format &&
            !memcmp(&genericValue, &o.genericValue, sizeof(genericValue)) &&
            vertexBufferSlot == o.vertexBufferSlot && byteOffset == o.byteOffset;
   }
@@ -51,6 +51,8 @@ struct VertexAttribute
   {
     if(!(enabled == o.enabled))
       return enabled < o.enabled;
+    if(!(floatCast == o.floatCast))
+      return floatCast < o.floatCast;
     if(!(format == o.format))
       return format < o.format;
     if(memcmp(&genericValue, &o.genericValue, sizeof(genericValue)) < 0)
@@ -63,10 +65,24 @@ struct VertexAttribute
   }
   DOCUMENT("``True`` if this vertex attribute is enabled.");
   bool enabled = false;
-  DOCUMENT("The :class:`ResourceFormat` of the vertex attribute.");
+
+  DOCUMENT(R"(Only valid for integer formatted attributes, ``True`` if they are cast to float.
+
+This is because they were specified with an integer format but glVertexAttribFormat (not
+glVertexAttribIFormat) so they will be cast.
+)");
+  bool floatCast = false;
+
+  DOCUMENT(R"(The format describing how the vertex attribute is interpreted.
+
+:type: ResourceFormat
+)");
   ResourceFormat format;
 
-  DOCUMENT("A :class:`PixelValue` containing the generic value of a vertex attribute.");
+  DOCUMENT(R"(The generic value of the vertex attribute if no buffer is bound.
+
+:type: PixelValue
+)");
   PixelValue genericValue;
 
   DOCUMENT("The vertex buffer input slot where the data is sourced from.");
@@ -83,6 +99,7 @@ struct VertexBuffer
   DOCUMENT("");
   VertexBuffer() = default;
   VertexBuffer(const VertexBuffer &) = default;
+  VertexBuffer &operator=(const VertexBuffer &) = default;
 
   bool operator==(const VertexBuffer &o) const
   {
@@ -124,18 +141,40 @@ struct VertexInput
   DOCUMENT("");
   VertexInput() = default;
   VertexInput(const VertexInput &) = default;
+  VertexInput &operator=(const VertexInput &) = default;
 
   DOCUMENT("The :class:`ResourceId` of the vertex array object that's bound.");
   ResourceId vertexArrayObject;
 
-  DOCUMENT("A list of :class:`GLVertexAttribute` with the vertex attributes.");
+  DOCUMENT(R"(The vertex attributes.
+
+:type: List[GLVertexAttribute]
+)");
   rdcarray<VertexAttribute> attributes;
 
-  DOCUMENT("A list of :class:`GLVertexBuffer` with the vertex buffers.");
+  DOCUMENT(R"(The vertex buffers.
+
+:type: List[GLVertexBuffer]
+)");
   rdcarray<VertexBuffer> vertexBuffers;
 
   DOCUMENT("The :class:`ResourceId` of the index buffer.");
   ResourceId indexBuffer;
+  DOCUMENT(R"(The byte width of the index buffer - typically 1, 2 or 4 bytes. It can be 0 for
+non-indexed draws.
+
+.. note::
+  This does not correspond to a real GL state since the index type is specified per-action in the call
+  itself. This is an implicit state derived from the last (or current) action at any given event.
+)");
+  uint32_t indexByteStride = 0;
+  DOCUMENT(R"(The byte width of the index buffer - typically 1, 2 or 4 bytes.
+
+.. note::
+  This does not correspond to a real GL state since the topology is specified per-action in the call
+  itself. This is an implicit state derived from the last (or current) action at any given event.
+)");
+  Topology topology = Topology::Unknown;
   DOCUMENT("``True`` if primitive restart is enabled for strip primitives.");
   bool primitiveRestart = false;
   DOCUMENT("The index value to use to indicate a strip restart.");
@@ -154,6 +193,7 @@ struct Shader
   DOCUMENT("");
   Shader() = default;
   Shader(const Shader &) = default;
+  Shader &operator=(const Shader &) = default;
 
   DOCUMENT("The :class:`ResourceId` of the shader object itself.");
   ResourceId shaderResourceId;
@@ -161,17 +201,24 @@ struct Shader
   DOCUMENT("The :class:`ResourceId` of the program bound to this stage.");
   ResourceId programResourceId;
 
-  DOCUMENT("A :class:`ShaderReflection` describing the reflection data for this shader.");
+  DOCUMENT(R"(The reflection data for this shader.
+
+:type: ShaderReflection
+)");
   ShaderReflection *reflection = NULL;
-  DOCUMENT(R"(A :class:`ShaderBindpointMapping` to match :data:`reflection` with the bindpoint
-mapping data.
+  DOCUMENT(R"(The bindpoint mapping data to match :data:`reflection`.
+
+:type: ShaderBindpointMapping
 )");
   ShaderBindpointMapping bindpointMapping;
 
   DOCUMENT("A :class:`ShaderStage` identifying which stage this shader is bound to.");
   ShaderStage stage = ShaderStage::Vertex;
 
-  DOCUMENT("A list of integers with the subroutine values.");
+  DOCUMENT(R"(A list of integers with the subroutine values.
+
+:type: List[int]
+)");
   rdcarray<uint32_t> subroutines;
 };
 
@@ -181,16 +228,26 @@ struct FixedVertexProcessing
   DOCUMENT("");
   FixedVertexProcessing() = default;
   FixedVertexProcessing(const FixedVertexProcessing &) = default;
+  FixedVertexProcessing &operator=(const FixedVertexProcessing &) = default;
 
-  DOCUMENT("A list of ``float`` giving the default inner level of tessellation.");
-  float defaultInnerLevel[2] = {0.0f, 0.0f};
-  DOCUMENT("A list of ``float`` giving the default outer level of tessellation.");
-  float defaultOuterLevel[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  DOCUMENT(R"(A tuple of ``float`` giving the default inner level of tessellation.
+
+:type: Tuple[float,float]
+)");
+  rdcfixedarray<float, 2> defaultInnerLevel = {0.0f, 0.0f};
+  DOCUMENT(R"(A tuple of ``float`` giving the default outer level of tessellation.
+
+:type: Tuple[float,float,float,float]
+)");
+  rdcfixedarray<float, 4> defaultOuterLevel = {0.0f, 0.0f, 0.0f, 0.0f};
   DOCUMENT("``True`` if primitives should be discarded during rasterization.");
   bool discard = false;
 
-  DOCUMENT("A list of ``bool`` determining which user clipping planes are enabled.");
-  bool clipPlanes[8] = {false, false, false, false, false, false, false, false};
+  DOCUMENT(R"(An 8-tuple of ``bool`` determining which user clipping planes are enabled.
+
+:type: Tuple[bool,...]
+)");
+  rdcfixedarray<bool, 8> clipPlanes = {false, false, false, false, false, false, false, false};
   DOCUMENT(R"(``True`` if the clipping origin should be in the lower left.
 
 ``False`` if it's in the upper left.
@@ -209,13 +266,12 @@ struct Texture
   DOCUMENT("");
   Texture() = default;
   Texture(const Texture &) = default;
+  Texture &operator=(const Texture &) = default;
 
   bool operator==(const Texture &o) const
   {
     return resourceId == o.resourceId && firstMip == o.firstMip && numMips == o.numMips &&
-           type == o.type && swizzle[0] == o.swizzle[0] && swizzle[1] == o.swizzle[1] &&
-           swizzle[2] == o.swizzle[2] && swizzle[3] == o.swizzle[3] &&
-           depthReadChannel == o.depthReadChannel;
+           type == o.type && swizzle == o.swizzle && depthReadChannel == o.depthReadChannel;
   }
   bool operator<(const Texture &o) const
   {
@@ -227,14 +283,8 @@ struct Texture
       return numMips < o.numMips;
     if(!(type == o.type))
       return type < o.type;
-    if(!(swizzle[0] == o.swizzle[0]))
-      return swizzle[0] < o.swizzle[0];
-    if(!(swizzle[1] == o.swizzle[1]))
-      return swizzle[1] < o.swizzle[1];
-    if(!(swizzle[2] == o.swizzle[2]))
-      return swizzle[2] < o.swizzle[2];
-    if(!(swizzle[3] == o.swizzle[3]))
-      return swizzle[3] < o.swizzle[3];
+    if(!(swizzle == o.swizzle))
+      return swizzle < o.swizzle;
     if(!(depthReadChannel == o.depthReadChannel))
       return depthReadChannel < o.depthReadChannel;
     return false;
@@ -248,9 +298,11 @@ struct Texture
   DOCUMENT("The :class:`TextureType` of the texture.");
   TextureType type = TextureType::Unknown;
 
-  DOCUMENT("Four :class:`TextureSwizzle` elements indicating the swizzle applied to this texture.");
-  TextureSwizzle swizzle[4] = {TextureSwizzle::Red, TextureSwizzle::Green, TextureSwizzle::Blue,
-                               TextureSwizzle::Alpha};
+  DOCUMENT(R"(The swizzle applied to a texture.
+
+:type: TextureSwizzle4
+)");
+  TextureSwizzle4 swizzle;
   DOCUMENT(R"(The channel to read from in a depth-stencil texture.
 
 ``-1`` for non depth-stencil textures.
@@ -260,6 +312,21 @@ struct Texture
 ``1`` if stencil should be read.
 )");
   int32_t depthReadChannel = -1;
+
+  DOCUMENT(R"(The details of the texture's (in)completeness. If this string is empty, the texture is
+complete. Otherwise it contains an explanation of why the texture is believed to be incomplete.
+)");
+  rdcstr completeStatus;
+
+  DOCUMENT(R"(The details of any type conflict on this binding. This can happen if
+multiple uniforms are pointing to the same binding but with different types. In this case it is
+impossible to disambiguate which binding was used.
+
+
+If this string is empty, no conflict is present. Otherwise it contains the bindings which are
+in conflict and their types.
+)");
+  rdcstr typeConflict;
 };
 
 DOCUMENT("Describes the sampler properties of a texture.");
@@ -268,16 +335,15 @@ struct Sampler
   DOCUMENT("");
   Sampler() = default;
   Sampler(const Sampler &) = default;
+  Sampler &operator=(const Sampler &) = default;
 
   bool operator==(const Sampler &o) const
   {
     return resourceId == o.resourceId && addressS == o.addressS && addressT == o.addressT &&
-           addressR == o.addressR && borderColor[0] == o.borderColor[0] &&
-           borderColor[1] == o.borderColor[1] && borderColor[2] == o.borderColor[2] &&
-           borderColor[3] == o.borderColor[3] && compareFunction == o.compareFunction &&
-           filter == o.filter && seamlessCubeMap == o.seamlessCubeMap &&
-           maxAnisotropy == o.maxAnisotropy && maxLOD == o.maxLOD && minLOD == o.minLOD &&
-           mipLODBias == o.mipLODBias;
+           addressR == o.addressR && borderColor == o.borderColor &&
+           compareFunction == o.compareFunction && filter == o.filter &&
+           seamlessCubeMap == o.seamlessCubeMap && maxAnisotropy == o.maxAnisotropy &&
+           maxLOD == o.maxLOD && minLOD == o.minLOD && mipLODBias == o.mipLODBias;
   }
   bool operator<(const Sampler &o) const
   {
@@ -289,14 +355,8 @@ struct Sampler
       return addressT < o.addressT;
     if(!(addressR == o.addressR))
       return addressR < o.addressR;
-    if(!(borderColor[0] == o.borderColor[0]))
-      return borderColor[0] < o.borderColor[0];
-    if(!(borderColor[1] == o.borderColor[1]))
-      return borderColor[1] < o.borderColor[1];
-    if(!(borderColor[2] == o.borderColor[2]))
-      return borderColor[2] < o.borderColor[2];
-    if(!(borderColor[3] == o.borderColor[3]))
-      return borderColor[3] < o.borderColor[3];
+    if(!(borderColor == o.borderColor))
+      return borderColor < o.borderColor;
     if(!(compareFunction == o.compareFunction))
       return compareFunction < o.compareFunction;
     if(!(filter == o.filter))
@@ -321,11 +381,17 @@ struct Sampler
   AddressMode addressT = AddressMode::Wrap;
   DOCUMENT("The :class:`AddressMode` in the R direction.");
   AddressMode addressR = AddressMode::Wrap;
-  DOCUMENT("The RGBA border color.");
-  float borderColor[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  DOCUMENT(R"(The RGBA border color.
+  
+:type: Tuple[float,float,float,float]
+)");
+  rdcfixedarray<float, 4> borderColor = {0.0f, 0.0f, 0.0f, 0.0f};
   DOCUMENT("The :class:`CompareFunction` for comparison samplers.");
   CompareFunction compareFunction = CompareFunction::AlwaysTrue;
-  DOCUMENT("The :class:`TextureFilter` describing the filtering mode.");
+  DOCUMENT(R"(The filtering mode.
+
+:type: TextureFilter
+)");
   TextureFilter filter;
   DOCUMENT("``True`` if seamless cubemap filtering is enabled for this texture.");
   bool seamlessCubeMap = false;
@@ -341,7 +407,7 @@ struct Sampler
   DOCUMENT(R"(Check if the border color is used in this OpenGL sampler.
 
 :return: ``True`` if the border color is used, ``False`` otherwise.
-:rtype: ``bool``
+:rtype: bool
 )");
   bool UseBorder() const
   {
@@ -356,6 +422,7 @@ struct Buffer
   DOCUMENT("");
   Buffer() = default;
   Buffer(const Buffer &) = default;
+  Buffer &operator=(const Buffer &) = default;
 
   bool operator==(const Buffer &o) const
   {
@@ -385,6 +452,7 @@ struct ImageLoadStore
   DOCUMENT("");
   ImageLoadStore() = default;
   ImageLoadStore(const ImageLoadStore &) = default;
+  ImageLoadStore &operator=(const ImageLoadStore &) = default;
 
   bool operator==(const ImageLoadStore &o) const
   {
@@ -428,7 +496,10 @@ struct ImageLoadStore
   bool readAllowed = false;
   DOCUMENT("``True`` if storing to the image is allowed.");
   bool writeAllowed = false;
-  DOCUMENT("The :class:`ResourceFormat` that the image is bound as.");
+  DOCUMENT(R"(The format that the image is bound as.
+
+:type: ResourceFormat
+)");
   ResourceFormat imageFormat;
 };
 
@@ -438,15 +509,25 @@ struct Feedback
   DOCUMENT("");
   Feedback() = default;
   Feedback(const Feedback &) = default;
+  Feedback &operator=(const Feedback &) = default;
 
   DOCUMENT("The :class:`ResourceId` of the transform feedback binding.");
   ResourceId feedbackResourceId;
-  DOCUMENT("A list of :class:`ResourceId` with the buffer bindings.");
-  ResourceId bufferResourceId[4];
-  DOCUMENT("A list of ``int`` with the buffer byte offsets.");
-  uint64_t byteOffset[4] = {0, 0, 0, 0};
-  DOCUMENT("A list of ``int`` with the buffer byte sizes.");
-  uint64_t byteSize[4] = {0, 0, 0, 0};
+  DOCUMENT(R"(The buffer bindings.
+  
+:type: Tuple[ResourceId,ResourceId,ResourceId,ResourceId]
+)");
+  rdcfixedarray<ResourceId, 4> bufferResourceId;
+  DOCUMENT(R"(The buffer byte offsets.
+  
+:type: Tuple[int,int,int,int]
+)");
+  rdcfixedarray<uint64_t, 4> byteOffset = {0, 0, 0, 0};
+  DOCUMENT(R"(The buffer byte sizes.
+  
+:type: Tuple[int,int,int,int]
+)");
+  rdcfixedarray<uint64_t, 4> byteSize = {0, 0, 0, 0};
   DOCUMENT("``True`` if the transform feedback object is currently active.");
   bool active = false;
   DOCUMENT("``True`` if the transform feedback object is currently paused.");
@@ -459,6 +540,7 @@ struct RasterizerState
   DOCUMENT("");
   RasterizerState() = default;
   RasterizerState(const RasterizerState &) = default;
+  RasterizerState &operator=(const RasterizerState &) = default;
 
   DOCUMENT("The polygon :class:`FillMode`.");
   FillMode fillMode = FillMode::Solid;
@@ -524,14 +606,24 @@ struct Rasterizer
   DOCUMENT("");
   Rasterizer() = default;
   Rasterizer(const Rasterizer &) = default;
+  Rasterizer &operator=(const Rasterizer &) = default;
 
-  DOCUMENT("A list of :class:`Viewport` with the bound viewports.");
+  DOCUMENT(R"(The bound viewports.
+
+:type: List[Viewport]
+)");
   rdcarray<Viewport> viewports;
 
-  DOCUMENT("A list of :class:`Scissor` with the bound scissor regions.");
+  DOCUMENT(R"(The bound scissor regions.
+
+:type: List[Scissor]
+)");
   rdcarray<Scissor> scissors;
 
-  DOCUMENT("A :class:`GLRasterizerState` with the details of the rasterization state.");
+  DOCUMENT(R"(The details of the rasterization state.
+
+:type: GLRasterizerState
+)");
   RasterizerState state;
 };
 
@@ -541,6 +633,7 @@ struct DepthState
   DOCUMENT("");
   DepthState() = default;
   DepthState(const DepthState &) = default;
+  DepthState &operator=(const DepthState &) = default;
 
   DOCUMENT("``True`` if depth testing should be performed.");
   bool depthEnable = false;
@@ -562,13 +655,21 @@ struct StencilState
   DOCUMENT("");
   StencilState() = default;
   StencilState(const StencilState &) = default;
+  StencilState &operator=(const StencilState &) = default;
 
   DOCUMENT("``True`` if stencil operations should be performed.");
   bool stencilEnable = false;
 
-  DOCUMENT("A :class:`StencilFace` describing what happens for front-facing polygons.");
+  DOCUMENT(R"(The stencil state for front-facing polygons.
+
+:type: StencilFace
+)");
   StencilFace frontFace;
-  DOCUMENT("A :class:`StencilFace` describing what happens for back-facing polygons.");
+
+  DOCUMENT(R"(The stencil state for back-facing polygons.
+
+:type: StencilFace
+)");
   StencilFace backFace;
 };
 
@@ -578,12 +679,12 @@ struct Attachment
   DOCUMENT("");
   Attachment() = default;
   Attachment(const Attachment &) = default;
+  Attachment &operator=(const Attachment &) = default;
 
   bool operator==(const Attachment &o) const
   {
-    return resourceId == o.resourceId && slice == o.slice && mipLevel == o.mipLevel &&
-           swizzle[0] == o.swizzle[0] && swizzle[1] == o.swizzle[1] && swizzle[2] == o.swizzle[2] &&
-           swizzle[3] == o.swizzle[3];
+    return resourceId == o.resourceId && slice == o.slice && numSlices == o.numSlices &&
+           mipLevel == o.mipLevel && swizzle == o.swizzle;
   }
   bool operator<(const Attachment &o) const
   {
@@ -593,25 +694,23 @@ struct Attachment
       return slice < o.slice;
     if(!(mipLevel == o.mipLevel))
       return mipLevel < o.mipLevel;
-    if(!(swizzle[0] == o.swizzle[0]))
-      return swizzle[0] < o.swizzle[0];
-    if(!(swizzle[1] == o.swizzle[1]))
-      return swizzle[1] < o.swizzle[1];
-    if(!(swizzle[2] == o.swizzle[2]))
-      return swizzle[2] < o.swizzle[2];
-    if(!(swizzle[3] == o.swizzle[3]))
-      return swizzle[3] < o.swizzle[3];
+    if(!(swizzle == o.swizzle))
+      return swizzle < o.swizzle;
     return false;
   }
   DOCUMENT("The :class:`ResourceId` of the texture bound to this attachment.");
   ResourceId resourceId;
   DOCUMENT("The slice of the texture that's used in the attachment.");
   uint32_t slice = 0;
+  DOCUMENT("The number of slices of the texture that are used in the attachment.");
+  uint32_t numSlices = 1;
   DOCUMENT("The mip of the texture that's used in the attachment.");
   uint32_t mipLevel = 0;
-  DOCUMENT("Four :class:`TextureSwizzle` elements indicating the swizzle applied to this texture.");
-  TextureSwizzle swizzle[4] = {TextureSwizzle::Red, TextureSwizzle::Green, TextureSwizzle::Blue,
-                               TextureSwizzle::Alpha};
+  DOCUMENT(R"(The swizzle applied to the texture.
+
+:type: TextureSwizzle4
+)");
+  TextureSwizzle4 swizzle;
 };
 
 DOCUMENT("Describes the contents of a framebuffer object.");
@@ -620,17 +719,30 @@ struct FBO
   DOCUMENT("");
   FBO() = default;
   FBO(const FBO &) = default;
+  FBO &operator=(const FBO &) = default;
 
   DOCUMENT("The :class:`ResourceId` of the framebuffer.");
   ResourceId resourceId;
-  DOCUMENT("The list of :class:`GLAttachment` with the framebuffer color attachments.");
+  DOCUMENT(R"(The framebuffer color attachments.
+
+:type: List[GLAttachment]
+)");
   rdcarray<Attachment> colorAttachments;
-  DOCUMENT("The :class:`GLAttachment` with the framebuffer depth attachment.");
+  DOCUMENT(R"(The framebuffer depth attachment.
+
+:type: GLAttachment
+)");
   Attachment depthAttachment;
-  DOCUMENT("The :class:`GLAttachment` with the framebuffer stencil attachment.");
+  DOCUMENT(R"(The framebuffer stencil attachment.
+
+:type: GLAttachment
+)");
   Attachment stencilAttachment;
 
-  DOCUMENT("The list of draw buffer indices into the :data:`colorAttachments` attachment list.");
+  DOCUMENT(R"(The draw buffer indices into the :data:`colorAttachments` attachment list.
+
+:type: List[int]
+)");
   rdcarray<int32_t> drawBuffers;
   DOCUMENT("The read buffer index in the :data:`colorAttachments` attachment list.");
   int32_t readBuffer = 0;
@@ -642,12 +754,19 @@ struct BlendState
   DOCUMENT("");
   BlendState() = default;
   BlendState(const BlendState &) = default;
+  BlendState &operator=(const BlendState &) = default;
 
-  DOCUMENT("A list of :class:`ColorBlend` describing the blend operations for each target.");
+  DOCUMENT(R"(The blend operations for each target.
+
+:type: List[ColorBlend]
+)");
   rdcarray<ColorBlend> blends;
 
-  DOCUMENT("The constant blend factor to use in blend equations.");
-  float blendFactor[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+  DOCUMENT(R"(The constant blend factor to use in blend equations.
+  
+:type: Tuple[float,float,float,float]
+)");
+  rdcfixedarray<float, 4> blendFactor = {1.0f, 1.0f, 1.0f, 1.0f};
 };
 
 DOCUMENT("Describes the current state of the framebuffer stage of the pipeline.");
@@ -656,6 +775,7 @@ struct FrameBuffer
   DOCUMENT("");
   FrameBuffer() = default;
   FrameBuffer(const FrameBuffer &) = default;
+  FrameBuffer &operator=(const FrameBuffer &) = default;
 
   DOCUMENT(
       "``True`` if sRGB correction should be applied when writing to an sRGB-formatted texture.");
@@ -663,12 +783,21 @@ struct FrameBuffer
   DOCUMENT("``True`` if dithering should be used when writing to color buffers.");
   bool dither = false;
 
-  DOCUMENT("A :class:`GLFBO` with the information about a draw framebuffer.");
+  DOCUMENT(R"(The draw framebuffer.
+
+:type: GLFBO
+)");
   FBO drawFBO;
-  DOCUMENT("A :class:`GLFBO` with the information about a read framebuffer.");
+  DOCUMENT(R"(The read framebuffer.
+
+:type: GLFBO
+)");
   FBO readFBO;
 
-  DOCUMENT("A :class:`GLBlendState` with the details of the blending state.");
+  DOCUMENT(R"(The details of the blending state.
+
+:type: GLBlendState
+)");
   BlendState blendState;
 };
 
@@ -678,6 +807,7 @@ struct Hints
   DOCUMENT("");
   Hints() = default;
   Hints(const Hints &) = default;
+  Hints &operator=(const Hints &) = default;
 
   DOCUMENT("A :class:`QualityHint` with the derivatives hint.");
   QualityHint derivatives = QualityHint::DontCare;
@@ -702,60 +832,121 @@ struct State
   State(const State &) = delete;
 #endif
 
-  DOCUMENT("A :class:`GLVertexInput` describing the vertex input stage.");
+  DOCUMENT(R"(The vertex input stage.
+
+:type: GLVertexInput
+)");
   VertexInput vertexInput;
 
-  DOCUMENT("A :class:`GLShader` describing the vertex shader stage.");
+  DOCUMENT(R"(The vertex shader stage.
+
+:type: GLShader
+)")
   Shader vertexShader;
-  DOCUMENT("A :class:`GLShader` describing the tessellation control shader stage.");
+
+  DOCUMENT(R"(The tessellation control shader stage.
+
+:type: GLShader
+)");
   Shader tessControlShader;
-  DOCUMENT("A :class:`GLShader` describing the tessellation evaluation shader stage.");
+  DOCUMENT(R"(The tessellation evaluation shader stage.
+
+:type: GLShader
+)");
   Shader tessEvalShader;
-  DOCUMENT("A :class:`GLShader` describing the geometry shader stage.");
+  DOCUMENT(R"(The geometry shader stage.
+   
+:type: GLShader
+)");
   Shader geometryShader;
-  DOCUMENT("A :class:`GLShader` describing the fragment shader stage.");
+  DOCUMENT(R"(The fragment shader stage.
+   
+:type: GLShader
+)");
   Shader fragmentShader;
-  DOCUMENT("A :class:`GLShader` describing the compute shader stage.");
+  DOCUMENT(R"(The compute shader stage.
+   
+:type: GLShader
+)");
   Shader computeShader;
 
   DOCUMENT("The :class:`ResourceId` of the program pipeline (if active).");
   ResourceId pipelineResourceId;
 
-  DOCUMENT(
-      "A :class:`GLFixedVertexProcessing` describing the fixed-function vertex processing stage.");
+  DOCUMENT(R"(The fixed-function vertex processing stage.
+
+:type: GLFixedVertexProcessing
+)");
   FixedVertexProcessing vertexProcessing;
 
-  DOCUMENT("A list of :class:`GLTexture` with the currently bound textures.");
+  DOCUMENT(R"(The currently bound textures.
+
+:type: List[GLTexture]
+)");
   rdcarray<Texture> textures;
-  DOCUMENT("A list of :class:`GLSampler` with the currently bound samplers.");
+  DOCUMENT(R"(The currently bound samplers.
+
+ :type: List[GLSampler]
+)");
   rdcarray<Sampler> samplers;
 
-  DOCUMENT("A list of :class:`GLBuffer` with the currently bound atomic buffers.");
+  DOCUMENT(R"(The currently bound atomic buffers.
+
+:type: List[GLBuffer]
+)");
   rdcarray<Buffer> atomicBuffers;
-  DOCUMENT("A list of :class:`GLBuffer` with the currently bound uniform buffers.");
+  DOCUMENT(R"(The currently bound uniform buffers.
+ 
+:type: List[GLBuffer]
+)");
   rdcarray<Buffer> uniformBuffers;
-  DOCUMENT("A list of :class:`GLBuffer` with the currently bound shader storage buffers.");
+
+  DOCUMENT(R"(The currently bound shader storage buffers.
+
+:type: List[GLBuffer]
+)");
   rdcarray<Buffer> shaderStorageBuffers;
 
-  DOCUMENT("A list of :class:`GLImageLoadStore` with the currently bound load/store images.");
+  DOCUMENT(R"(The currently bound load/store images.
+
+:type: List[GLImageLoadStore]
+)");
   rdcarray<ImageLoadStore> images;
 
-  DOCUMENT("A :class:`GLFeedback` describing the transform feedback stage.");
+  DOCUMENT(R"(The transform feedback stage.
+
+:type: GLFeedback
+)");
   Feedback transformFeedback;
 
-  DOCUMENT("A :class:`GLRasterizer` describing rasterization.");
+  DOCUMENT(R"(The rasterization configuration.
+
+:type: GLRasterizer
+)");
   Rasterizer rasterizer;
 
-  DOCUMENT("A :class:`GLDepthState` describing depth processing.");
+  DOCUMENT(R"(The depth state.
+
+:type: GLDepthState
+)");
   DepthState depthState;
 
-  DOCUMENT("A :class:`GLStencilState` describing stencil processing.");
+  DOCUMENT(R"(The stencil state.
+
+:type: GLStencilState
+)");
   StencilState stencilState;
 
-  DOCUMENT("A :class:`GLFrameBuffer` describing the framebuffer.");
+  DOCUMENT(R"(The bound framebuffer.
+
+:type: GLFrameBuffer
+)");
   FrameBuffer framebuffer;
 
-  DOCUMENT("A :class:`GLHints` describing the hint state.");
+  DOCUMENT(R"(The hint state.
+
+:type: GLHints
+)");
   Hints hints;
 };
 

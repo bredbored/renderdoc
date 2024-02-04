@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -24,8 +24,8 @@
 
 #pragma once
 
-#include <string>
-#include <vector>
+#include "api/replay/rdcarray.h"
+#include "api/replay/rdcstr.h"
 #include "spirv_compile.h"
 
 namespace glslang
@@ -34,12 +34,9 @@ class TShader;
 class TProgram;
 };
 
-glslang::TShader *CompileShaderForReflection(SPIRVShaderStage stage,
-                                             const std::vector<std::string> &sources);
-glslang::TProgram *LinkProgramForReflection(const std::vector<glslang::TShader *> &shaders);
-
-struct TBuiltInResource;
-extern TBuiltInResource *GetDefaultResources();
+glslang::TShader *CompileShaderForReflection(rdcspv::ShaderStage stage,
+                                             const rdcarray<rdcstr> &sources);
+glslang::TProgram *LinkProgramForReflection(const rdcarray<glslang::TShader *> &shaders);
 
 enum class ReflectionInterface
 {
@@ -83,9 +80,10 @@ void glslangGetProgramInterfaceiv(glslang::TProgram *program, ReflectionInterfac
                                   ReflectionProperty pname, int32_t *params);
 
 void glslangGetProgramResourceiv(glslang::TProgram *program, ReflectionInterface programInterface,
-                                 uint32_t index, const std::vector<ReflectionProperty> &props,
+                                 uint32_t index, const rdcarray<ReflectionProperty> &props,
                                  int32_t bufSize, int32_t *length, int32_t *params);
-uint32_t glslangGetProgramResourceIndex(glslang::TProgram *program, const char *name);
+uint32_t glslangGetProgramResourceIndex(glslang::TProgram *program,
+                                        ReflectionInterface programInterface, const char *name);
 
 const char *glslangGetProgramResourceName(glslang::TProgram *program,
                                           ReflectionInterface programInterface, uint32_t index);

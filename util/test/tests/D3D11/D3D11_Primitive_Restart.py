@@ -6,20 +6,20 @@ class D3D11_Primitive_Restart(rdtest.TestCase):
     demos_test_name = 'D3D11_Primitive_Restart'
 
     def check_capture(self):
-        self.check_final_backbuffer()
+        action = self.find_action("Draw")
 
-        draw = self.find_draw("Draw")
+        self.check(action is not None)
 
-        self.check(draw is not None)
-
-        self.controller.SetFrameEvent(draw.eventId, False)
+        self.controller.SetFrameEvent(action.eventId, False)
 
         pipe: rd.PipeState = self.controller.GetPipelineState()
 
-        postvs_data = self.get_postvs(rd.MeshDataStage.VSOut, 0, draw.numIndices)
+        postvs_data = self.get_postvs(action, rd.MeshDataStage.VSOut, 0, action.numIndices)
+
+        ib = pipe.GetIBuffer()
 
         # Calculate the strip restart index for this index width
-        striprestart_index = pipe.GetStripRestartIndex() & ((1 << (draw.indexByteWidth*8)) - 1)
+        striprestart_index = pipe.GetRestartIndex() & ((1 << (ib.byteStride*8)) - 1)
 
         # We don't check all of the output, we check a few key vertices to ensure they match up
         postvs_ref = {
@@ -27,7 +27,7 @@ class D3D11_Primitive_Restart(rdtest.TestCase):
                 'vtx': 0,
                 'idx': 0,
                 'SV_POSITION': [-0.8, 0.2, 0.0, 1.0],
-                'COLOR': [1.0, 0.0, 0.0, 1.0],
+                'COLOR': [0.0, 1.0, 0.0, 1.0],
                 'TEXCOORD': [0.0, 0.0],
             },
             4: {
@@ -44,22 +44,36 @@ class D3D11_Primitive_Restart(rdtest.TestCase):
                 'vtx': 9,
                 'idx': 8,
                 'SV_POSITION': [-0.8, -0.7, 0.0, 1.0],
-                'COLOR': [1.0, 0.0, 0.0, 1.0],
+                'COLOR': [0.0, 0.0, 1.0, 1.0],
                 'TEXCOORD': [0.0, 0.0],
             },
         }
 
         self.check_mesh_data(postvs_ref, postvs_data)
 
-        # Now check the draw with a vertex offset
-        draw = self.find_draw("Draw", draw.eventId+1)
+        # Now check the action with a vertex offset
+        action = self.find_action("Draw", action.eventId+1)
 
-        self.check(draw is not None)
+        self.check(action is not None)
 
-        self.controller.SetFrameEvent(draw.eventId, False)
+        self.controller.SetFrameEvent(action.eventId, False)
 
-        postvs_data = self.get_postvs(rd.MeshDataStage.VSOut, 0, draw.numIndices)
+        postvs_data = self.get_postvs(action, rd.MeshDataStage.VSOut, 0, action.numIndices)
 
         # Data should be identical
 
         self.check_mesh_data(postvs_ref, postvs_data)
+
+        # Check that the rendered mesh is as expected
+        out = pipe.GetOutputTargets()[0].resourceId
+        for x in [x*0.01 for x in range(1, 100)]:
+            self.check_pixel_value(out, x, 0.1, [0.2, 0.2, 0.2, 1.0])
+            self.check_pixel_value(out, x, 0.5, [0.2, 0.2, 0.2, 1.0])
+
+        self.check_pixel_value(out, 0.3, 0.25, [0.0, 1.0, 0.0, 1.0])
+        self.check_pixel_value(out, 0.5, 0.25, [0.0, 1.0, 0.0, 1.0])
+        self.check_pixel_value(out, 0.7, 0.25, [0.0, 1.0, 0.0, 1.0])
+        self.check_pixel_value(out, 0.3, 0.75, [0.0, 0.0, 1.0, 1.0])
+        self.check_pixel_value(out, 0.5, 0.75, [0.0, 0.0, 1.0, 1.0])
+        self.check_pixel_value(out, 0.7, 0.75, [0.0, 0.0, 1.0, 1.0])
+

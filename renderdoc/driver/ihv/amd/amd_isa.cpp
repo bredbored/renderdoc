@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2017-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -23,34 +23,43 @@
  ******************************************************************************/
 
 #include "amd_isa.h"
+#include <ctype.h>
+#include "api/replay/renderdoc_replay.h"
 #include "common/common.h"
+#include "common/formatting.h"
 #include "core/plugins.h"
+#include "core/settings.h"
+#include "os/os_specific.h"
 #include "strings/string_utils.h"
 #include "amd_isa_devices.h"
+
+RDOC_CONFIG(bool, AMD_ISA_ShowLegacyASICs, false,
+            "Show legacy ASICs for AMD shader disassembly targets. Note that depending on the "
+            "environment if driver support is required, these may not be available.");
 
 namespace GCNISA
 {
 #if ENABLED(RDOC_WIN32)
-static const std::string amdspv_name = "amdspv.exe";
-static const std::string virtualcontext_name = "VirtualContext.exe";
+static const rdcstr amdspv_name = "amdspv.exe";
+static const rdcstr virtualcontext_name = "VirtualContext.exe";
 #else
-static const std::string amdspv_name = "amdspv.sh";
-static const std::string virtualcontext_name = "VirtualContext";
+static const rdcstr amdspv_name = "amdspv";
+static const rdcstr virtualcontext_name = "VirtualContext";
 #endif
 
-std::string pluginPath = "amd/isa";
+rdcstr pluginPath = "amd/isa";
 
 // in amd_isa_<plat>.cpp
-std::string DisassembleDXBC(const bytebuf &shaderBytes, const std::string &target);
+rdcstr DisassembleDXBC(const bytebuf &shaderBytes, const rdcstr &target);
 
-static bool IsSupported(ShaderEncoding encoding)
+static bool CheckForSupport(ShaderEncoding encoding)
 {
   if(encoding == ShaderEncoding::GLSL)
   {
-    std::string vc = LocatePluginFile(pluginPath, virtualcontext_name);
+    rdcstr vc = LocatePluginFile(pluginPath, virtualcontext_name);
 
     Process::ProcessResult result = {};
-    Process::LaunchProcess(vc.c_str(), get_dirname(vc).c_str(), "", true, &result);
+    Process::LaunchProcess(vc, get_dirname(vc), "", true, &result);
 
     // running with no parameters produces an error, so if there's no output something went wrong.
     if(result.strStdout.empty())
@@ -59,13 +68,13 @@ static bool IsSupported(ShaderEncoding encoding)
     return true;
   }
 
-  if(encoding == ShaderEncoding::SPIRV)
+  if(encoding == ShaderEncoding::SPIRV || encoding == ShaderEncoding::OpenGLSPIRV)
   {
     // TODO need to check if an AMD context is running
-    std::string amdspv = LocatePluginFile(pluginPath, amdspv_name);
+    rdcstr amdspv = LocatePluginFile(pluginPath, amdspv_name);
 
     Process::ProcessResult result = {};
-    Process::LaunchProcess(amdspv.c_str(), get_dirname(amdspv).c_str(), "", true, &result);
+    Process::LaunchProcess(amdspv, get_dirname(amdspv), "", true, &result);
 
     // running with no parameters produces help text, so if there's no output something went wrong.
     if(result.strStdout.empty())
@@ -77,7 +86,7 @@ static bool IsSupported(ShaderEncoding encoding)
   // we only need to check if we can get atidxx64.dll
   if(encoding == ShaderEncoding::DXBC)
   {
-    std::string test = DisassembleDXBC(bytebuf(), "");
+    rdcstr test = DisassembleDXBC(bytebuf(), "");
 
     return test.empty();
   }
@@ -85,51 +94,158 @@ static bool IsSupported(ShaderEncoding encoding)
   return false;
 }
 
-void GetTargets(GraphicsAPI api, std::vector<std::string> &targets)
+static void GetEncodings(GraphicsAPI api, ShaderEncoding &primary, ShaderEncoding &secondary)
 {
-  targets.reserve(asicCount + 1);
-
-  ShaderEncoding primary = ShaderEncoding::SPIRV, secondary = ShaderEncoding::SPIRV;
-
   if(IsD3D(api))
   {
     primary = ShaderEncoding::DXBC;
-    secondary = ShaderEncoding::DXBC;
+    secondary = ShaderEncoding::DXIL;
   }
   else if(api == GraphicsAPI::OpenGL)
   {
     primary = ShaderEncoding::GLSL;
-    secondary = ShaderEncoding::SPIRV;
+    secondary = ShaderEncoding::OpenGLSPIRV;
   }
   else if(api == GraphicsAPI::Vulkan)
   {
     primary = ShaderEncoding::SPIRV;
     secondary = ShaderEncoding::SPIRV;
   }
+}
 
-  if(IsSupported(primary) || IsSupported(secondary))
+bool encodingCached[arraydim<ShaderEncoding>()] = {};
+bool encodingSupported[arraydim<ShaderEncoding>()] = {};
+
+static const rdcstr unsupportedTargetName = "AMD GCN ISA";
+
+Threading::ThreadHandle supportCheckThread = 0;
+
+static void CacheSupport(ShaderEncoding primary, ShaderEncoding secondary = ShaderEncoding::Unknown)
+{
+  // if there's a thread running, sync it now.
+  if(supportCheckThread)
   {
-    // OpenGL doesn't support AMDIL
-    if(api != GraphicsAPI::OpenGL)
-      targets.push_back("AMDIL");
+    Threading::JoinThread(supportCheckThread);
+    Threading::CloseThread(supportCheckThread);
+    supportCheckThread = 0;
+  }
 
-    int apiBitmask = 1 << (int)api;
+  // if we have these encodings cached now, return
+  if(encodingCached[(size_t)primary] &&
+     (secondary == ShaderEncoding::Unknown || encodingCached[(size_t)secondary]))
+    return;
 
-    for(int i = 0; i < asicCount; i++)
+  // kick off a thread to cache these encodings' support
+  supportCheckThread = Threading::CreateThread([primary, secondary]() {
+    encodingSupported[(size_t)primary] = CheckForSupport(primary);
+    encodingSupported[(size_t)secondary] = CheckForSupport(secondary);
+
+    encodingCached[(size_t)primary] = true;
+    encodingCached[(size_t)secondary] = true;
+  });
+}
+
+static bool IsSupported(ShaderEncoding encoding)
+{
+  CacheSupport(encoding);
+
+  return encodingSupported[(size_t)encoding];
+}
+
+void CacheSupport(GraphicsAPI api)
+{
+  ShaderEncoding primary = ShaderEncoding::SPIRV, secondary = ShaderEncoding::SPIRV;
+  GetEncodings(api, primary, secondary);
+
+  CacheSupport(primary, secondary);
+}
+
+void GetTargets(GraphicsAPI api, const DriverInformation &driver, rdcarray<rdcstr> &targets)
+{
+  targets.reserve(asicCount + 1);
+
+  ShaderEncoding primary = ShaderEncoding::SPIRV, secondary = ShaderEncoding::SPIRV;
+  GetEncodings(api, primary, secondary);
+
+  bool validAMDGLDriver = true;
+
+  if(api == GraphicsAPI::OpenGL)
+  {
+    if(driver.vendor == GPUVendor::AMD)
     {
-      if(asicInfo[i].apiBitmask & apiBitmask)
-        targets.push_back(asicInfo[i].name);
+      // try to see if we're on 22.7.1 or newer. This is a bit of guesswork but we assume the
+      // version string won't change *too* much over time. If it does, it's impossible to predict
+      // how so this code will just need to be changed.
+      // We match any /[0-9.]+/ substrings by hand, discard if one looks like an OpenGL version
+      // (4.x.y) and assume the next is the driver version
+      const char *num = driver.version;
+      const char *end = num + sizeof(driver.version);
+      while(*num && num < end)
+      {
+        // skip any non-matching digits
+        if(!isdigit(*num) && *num != '.')
+        {
+          num++;
+          continue;
+        }
+
+        // consume all matching digits
+        rdcstr versionStr;
+        while(isdigit(*num) || *num == '.')
+        {
+          versionStr.push_back(*num);
+          num++;
+        }
+
+        // ignore OpenGL-looking versions
+        if(versionStr.beginsWith("4."))
+          continue;
+
+        int versionNum[3] = {};
+        int idx = 0;
+        for(char c : versionStr)
+        {
+          if(isdigit(c))
+          {
+            versionNum[idx] *= 10;
+            versionNum[idx] += int(c - '0');
+          }
+          else if(c == '.')
+          {
+            idx++;
+
+            if(idx > 2)
+              break;
+          }
+        }
+
+        RDCLOG("Running on AMD driver version %d.%d.%d", versionNum[0], versionNum[1], versionNum[2]);
+
+        if(versionNum[0] > 22 || versionNum[1] >= 7)
+          validAMDGLDriver = false;
+
+        // we found a match, stop regardless
+        break;
+      }
     }
+  }
+
+  if(validAMDGLDriver && (IsSupported(primary) || IsSupported(secondary)))
+  {
+    targets.push_back("AMDIL");
+
+    for(int i = AMD_ISA_ShowLegacyASICs() ? 0 : legacyAsicCount; i < asicCount; i++)
+      targets.push_back(asicInfo[i].name);
   }
   else
   {
     // if unsupported, push a 'dummy' target, so that when the user selects it they'll see the error
     // message
-    targets.push_back("AMD GCN ISA");
+    targets.push_back(unsupportedTargetName);
   }
 }
 
-std::string DisassembleSPIRV(ShaderStage stage, const bytebuf &shaderBytes, const std::string &target)
+rdcstr DisassembleSPIRV(ShaderStage stage, const bytebuf &shaderBytes, const rdcstr &target)
 {
   if(!IsSupported(ShaderEncoding::SPIRV))
   {
@@ -141,7 +257,7 @@ std::string DisassembleSPIRV(ShaderStage stage, const bytebuf &shaderBytes, cons
 ; https://github.com/baldurk/renderdoc/wiki/GCN-ISA)";
   }
 
-  std::string cmdLine = "-Dall -l";
+  rdcstr cmdLine = "-Dall -l";
 
   bool found = false;
 
@@ -180,11 +296,13 @@ std::string DisassembleSPIRV(ShaderStage stage, const bytebuf &shaderBytes, cons
     case ShaderStage::Geometry: stageName = "geom"; break;
     case ShaderStage::Fragment: stageName = "frag"; break;
     case ShaderStage::Compute: stageName = "comp"; break;
+    case ShaderStage::Task: stageName = "task"; break;
+    case ShaderStage::Mesh: stageName = "mesh"; break;
     case ShaderStage::Count: return "; Cannot identify shader type";
   }
 
-  std::string tempPath = FileIO::GetTempFolderFilename() + "rdoc_isa__";
-  std::string inPath = StringFormat::Fmt("%sin.spv", tempPath.c_str());
+  rdcstr tempPath = FileIO::GetTempFolderFilename() + "rdoc_isa__";
+  rdcstr inPath = StringFormat::Fmt("%sin.spv", tempPath.c_str());
 
   cmdLine += StringFormat::Fmt(
       " -set in.spv=\"%sin.spv\" out.%s.palIlText=\"%sout.il\" out.%s.isa=\"%sout.bin\" "
@@ -193,67 +311,63 @@ std::string DisassembleSPIRV(ShaderStage stage, const bytebuf &shaderBytes, cons
       tempPath.c_str(), stageName, tempPath.c_str(), stageName, tempPath.c_str(), stageName,
       tempPath.c_str(), stageName, tempPath.c_str(), tempPath.c_str());
 
-  FileIO::dump(inPath.c_str(), shaderBytes.data(), shaderBytes.size());
+  FileIO::WriteAll(inPath, shaderBytes);
 
   // try to locate the amdspv relative to our running program
-  std::string amdspv = LocatePluginFile(pluginPath, amdspv_name);
+  rdcstr amdspv = LocatePluginFile(pluginPath, amdspv_name);
 
   Process::ProcessResult result = {};
-  Process::LaunchProcess(amdspv.c_str(), get_dirname(amdspv).c_str(), cmdLine.c_str(), true, &result);
+  Process::LaunchProcess(amdspv, get_dirname(amdspv), cmdLine, true, &result);
 
-  if(result.strStdout.find("SUCCESS") == std::string::npos)
+  if(result.strStdout.find("SUCCESS") < 0)
   {
     return "; Failed to Disassemble - " + result.strStdout;
   }
 
   // remove artifacts we don't need
-  FileIO::Delete(StringFormat::Fmt("%sin.spv", tempPath.c_str()).c_str());
-  FileIO::Delete(StringFormat::Fmt("%sout.log", tempPath.c_str()).c_str());
-  FileIO::Delete(StringFormat::Fmt("%sout.bin", tempPath.c_str()).c_str());
+  FileIO::Delete(StringFormat::Fmt("%sin.spv", tempPath.c_str()));
+  FileIO::Delete(StringFormat::Fmt("%sout.log", tempPath.c_str()));
+  FileIO::Delete(StringFormat::Fmt("%sout.bin", tempPath.c_str()));
 
-  std::string ret;
+  rdcstr ret;
 
   if(amdil)
   {
-    std::vector<byte> data;
-    FileIO::slurp(StringFormat::Fmt("%sout.il", tempPath.c_str()).c_str(), data);
-
-    ret = std::string(data.data(), data.data() + data.size());
+    FileIO::ReadAll(StringFormat::Fmt("%sout.il", tempPath.c_str()), ret);
   }
   else
   {
-    std::vector<byte> data;
-    FileIO::slurp(StringFormat::Fmt("%sout.txt", tempPath.c_str()).c_str(), data);
+    FileIO::ReadAll(StringFormat::Fmt("%sout.txt", tempPath.c_str()), ret);
 
-    ret = std::string(data.data(), data.data() + data.size());
+    rdcstr statsfile = StringFormat::Fmt("%sstats.txt", tempPath.c_str());
 
-    std::string statsfile = StringFormat::Fmt("%sstats.txt", tempPath.c_str());
-
-    if(FileIO::exists(statsfile.c_str()))
+    if(FileIO::exists(statsfile))
     {
-      FileIO::slurp(statsfile.c_str(), data);
+      rdcstr stats;
+      FileIO::ReadAll(statsfile, stats);
 
-      ret += std::string(data.data(), data.data() + data.size());
+      ret += "\n\n" + stats;
     }
   }
 
-  FileIO::Delete(StringFormat::Fmt("%sout.il", tempPath.c_str()).c_str());
-  FileIO::Delete(StringFormat::Fmt("%sout.txt", tempPath.c_str()).c_str());
-  FileIO::Delete(StringFormat::Fmt("%sstats.txt", tempPath.c_str()).c_str());
+  FileIO::Delete(StringFormat::Fmt("%sout.il", tempPath.c_str()));
+  FileIO::Delete(StringFormat::Fmt("%sout.txt", tempPath.c_str()));
+  FileIO::Delete(StringFormat::Fmt("%sstats.txt", tempPath.c_str()));
 
-  std::string header = StringFormat::Fmt("; Disassembly for %s\n\n", target.c_str());
+  rdcstr header = StringFormat::Fmt("; Disassembly for %s\n\n", target.c_str());
 
-  ret.insert(ret.begin(), header.begin(), header.end());
+  ret.insert(0, header.begin(), header.size());
 
   return ret;
 }
 
-std::string DisassembleGLSL(ShaderStage stage, const bytebuf &shaderBytes, const std::string &target)
+rdcstr DisassembleGLSL(ShaderStage stage, const bytebuf &shaderBytes, const rdcstr &target)
 {
-  if(!IsSupported(ShaderEncoding::GLSL))
+  if(!IsSupported(ShaderEncoding::GLSL) || target == unsupportedTargetName)
   {
     return R"(; GLSL disassembly not supported, couldn't locate VirtualContext.exe or it failed to run.
-; It only works when the AMD driver is currently being used for graphics.
+; It only works when the AMD driver is currently being used for graphics, and only on drivers older
+; *older* than 22.7.1, where support for this method of disassembly stopped.
 ;
 ; To see instructions on how to download and configure the plugins on your system, go to:
 ; https://github.com/baldurk/renderdoc/wiki/GCN-ISA)";
@@ -288,16 +402,25 @@ std::string DisassembleGLSL(ShaderStage stage, const bytebuf &shaderBytes, const
       stageIndex = 5;
       stageName = "comp";
       break;
+    case ShaderStage::Task:
+      stageIndex = 6;
+      stageName = "task";
+      break;
+    case ShaderStage::Mesh:
+      stageIndex = 7;
+      stageName = "mesh";
+      break;
     case ShaderStage::Count: return "; Cannot identify shader type";
   }
 
-  std::string tempPath = FileIO::GetTempFolderFilename() + "rdoc_isa__";
-  std::string inPath = StringFormat::Fmt("%sin.%s", tempPath.c_str(), stageName);
-  std::string outPath = StringFormat::Fmt("%sout.txt", tempPath.c_str());
-  std::string binPath = StringFormat::Fmt("%sout.bin", tempPath.c_str());
-  std::string statsPath = StringFormat::Fmt("%sstats.txt", tempPath.c_str());
+  rdcstr tempPath = FileIO::GetTempFolderFilename() + "rdoc_isa__";
+  rdcstr inPath = StringFormat::Fmt("%sin.%s", tempPath.c_str(), stageName);
+  rdcstr outPath = StringFormat::Fmt("%sout.txt", tempPath.c_str());
+  rdcstr binPath = StringFormat::Fmt("%sout.bin", tempPath.c_str());
+  rdcstr statsPath = StringFormat::Fmt("%sstats.txt", tempPath.c_str());
+  rdcstr ilPath = StringFormat::Fmt("%sil.txt", tempPath.c_str());
 
-  std::string cmdLine = "\"";
+  rdcstr cmdLine = "\"";
 
   // ISA disassembly
   for(int i = 0; i < 6; i++)
@@ -332,6 +455,13 @@ std::string DisassembleGLSL(ShaderStage stage, const bytebuf &shaderBytes, const
     }
   }
 
+  // dummy values
+  if(!found)
+  {
+    const asic &a = asicInfo[legacyAsicCount];
+    cmdLine += StringFormat::Fmt("%d;%d;", a.chipFamily, a.chipRevision);
+  }
+
   // input files
   for(int i = 0; i < 6; i++)
   {
@@ -341,61 +471,77 @@ std::string DisassembleGLSL(ShaderStage stage, const bytebuf &shaderBytes, const
     cmdLine += ';';
   }
 
+  cmdLine += ";\"";
+
+  // amdil files
+  for(int i = 0; i < 6; i++)
+  {
+    if(i == stageIndex)
+      cmdLine += ilPath;
+
+    cmdLine += ';';
+  }
+
+  if(!found && target == "AMDIL")
+  {
+    outPath = ilPath;
+    found = true;
+  }
+
   if(!found)
     return "; Invalid ISA Target specified";
 
-  cmdLine += ";\"";
-
-  FileIO::dump(inPath.c_str(), shaderBytes.data(), shaderBytes.size());
+  FileIO::WriteAll(inPath, shaderBytes);
 
   // try to locate the amdspv relative to our running program
-  std::string vc = LocatePluginFile(pluginPath, virtualcontext_name);
+  rdcstr vc = LocatePluginFile(pluginPath, virtualcontext_name);
 
   Process::ProcessResult result = {};
-  Process::LaunchProcess(vc.c_str(), get_dirname(vc).c_str(), cmdLine.c_str(), true, &result);
+  Process::LaunchProcess(vc, get_dirname(vc), cmdLine, true, &result);
 
-  if(result.retCode != 0 || result.strStdout.find("Error") != std::string::npos ||
-     result.strStdout.empty() || !FileIO::exists(outPath.c_str()))
+  if(result.retCode != 0 || result.strStdout.find("Error") >= 0 || result.strStdout.empty() ||
+     !FileIO::exists(outPath))
   {
     return "; Failed to Disassemble - check AMD driver is currently running\n\n; " + result.strStdout;
   }
 
   // remove artifacts we don't need
-  FileIO::Delete(inPath.c_str());
-  FileIO::Delete(binPath.c_str());
+  FileIO::Delete(inPath);
+  FileIO::Delete(binPath);
 
-  std::string ret;
+  rdcstr ret;
 
   {
-    std::vector<byte> data;
-    FileIO::slurp(outPath.c_str(), data);
-    ret = std::string(data.data(), data.data() + data.size());
+    FileIO::ReadAll(outPath, ret);
 
-    if(FileIO::exists(statsPath.c_str()))
+    while(ret.back() == '\0')
+      ret.pop_back();
+
+    if(FileIO::exists(statsPath))
     {
-      FileIO::slurp(statsPath.c_str(), data);
-      ret += "\n\n";
-      ret += std::string(data.data(), data.data() + data.size());
+      rdcstr stats;
+      FileIO::ReadAll(statsPath, stats);
+      ret += "\n\n" + stats;
     }
   }
 
-  FileIO::Delete(outPath.c_str());
-  FileIO::Delete(statsPath.c_str());
+  FileIO::Delete(outPath);
+  FileIO::Delete(statsPath);
 
-  std::string header = StringFormat::Fmt("; Disassembly for %s\n\n", target.c_str());
+  rdcstr header = StringFormat::Fmt("; Disassembly for %s\n\n", target.c_str());
 
-  ret.insert(ret.begin(), header.begin(), header.end());
+  ret.insert(0, header.begin(), header.size());
 
   return ret;
 }
 
-std::string Disassemble(ShaderEncoding encoding, ShaderStage stage, const bytebuf &shaderBytes,
-                        const std::string &target)
+rdcstr Disassemble(ShaderEncoding encoding, ShaderStage stage, const bytebuf &shaderBytes,
+                   const rdcstr &target)
 {
   if(encoding == ShaderEncoding::DXBC)
     return DisassembleDXBC(shaderBytes, target);
 
-  if(encoding == ShaderEncoding::SPIRV)
+  if(encoding == ShaderEncoding::SPIRV || encoding == ShaderEncoding::OpenGLSPIRV)
     return DisassembleSPIRV(stage, shaderBytes, target);
 
   if(encoding == ShaderEncoding::GLSL)

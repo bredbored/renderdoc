@@ -348,17 +348,6 @@ bool ToolWindowManagerWrapper::eventFilter(QObject *object, QEvent *event)
         showMaximized();
       }
     }
-    else if(event->type() == QEvent::NonClientAreaMouseButtonDblClick)
-    {
-      if(isMaximized())
-      {
-        showNormal();
-      }
-      else
-      {
-        showMaximized();
-      }
-    }
   }
   return QWidget::eventFilter(object, event);
 }
@@ -456,7 +445,7 @@ QVariantMap ToolWindowManagerWrapper::saveState()
     return QVariantMap();
   }
   QVariantMap result;
-  result[QStringLiteral("geometry")] = saveGeometry().toBase64();
+  result[QStringLiteral("geometry")] = QString::fromLatin1(saveGeometry().toBase64());
   QSplitter *splitter = findChild<QSplitter *>(QString(), Qt::FindDirectChildrenOnly);
   if(splitter)
   {

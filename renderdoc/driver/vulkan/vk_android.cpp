@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2016-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -43,12 +43,31 @@ VkResult WrappedVulkan::vkCreateAndroidSurfaceKHR(VkInstance instance,
 
     WrappedVkSurfaceKHR *wrapped = GetWrapped(*pSurface);
 
-    // since there's no point in allocating a full resource record and storing the window
-    // handle under there somewhere, we just cast. We won't use the resource record for anything
-    wrapped->record = (VkResourceRecord *)(uintptr_t)pCreateInfo->window;
+    wrapped->record =
+        RegisterSurface(WindowingSystem::Android, (void *)(uintptr_t)pCreateInfo->window);
   }
 
   return ret;
+}
+
+// VK_ANDROID_external_memory_android_hardware_buffer
+VkResult WrappedVulkan::vkGetAndroidHardwareBufferPropertiesANDROID(
+    VkDevice device, const struct AHardwareBuffer *buffer,
+    VkAndroidHardwareBufferPropertiesANDROID *pProperties)
+{
+  return ObjDisp(device)->GetAndroidHardwareBufferPropertiesANDROID(Unwrap(device), buffer,
+                                                                    pProperties);
+}
+
+// VK_ANDROID_external_memory_android_hardware_buffer
+VkResult WrappedVulkan::vkGetMemoryAndroidHardwareBufferANDROID(
+    VkDevice device, const VkMemoryGetAndroidHardwareBufferInfoANDROID *pInfo,
+    struct AHardwareBuffer **pBuffer)
+{
+  VkMemoryGetAndroidHardwareBufferInfoANDROID unwrappedInfo = *pInfo;
+  unwrappedInfo.memory = Unwrap(unwrappedInfo.memory);
+  return ObjDisp(device)->GetMemoryAndroidHardwareBufferANDROID(Unwrap(device), &unwrappedInfo,
+                                                                pBuffer);
 }
 
 void VulkanReplay::OutputWindow::SetWindowHandle(WindowingData window)
@@ -57,7 +76,7 @@ void VulkanReplay::OutputWindow::SetWindowHandle(WindowingData window)
   wnd = window.android.window;
 }
 
-void VulkanReplay::OutputWindow::CreateSurface(VkInstance inst)
+void VulkanReplay::OutputWindow::CreateSurface(WrappedVulkan *driver, VkInstance inst)
 {
   VkAndroidSurfaceCreateInfoKHR createInfo;
 
@@ -67,7 +86,7 @@ void VulkanReplay::OutputWindow::CreateSurface(VkInstance inst)
   createInfo.window = wnd;
 
   VkResult vkr = ObjDisp(inst)->CreateAndroidSurfaceKHR(Unwrap(inst), &createInfo, NULL, &surface);
-  RDCASSERTEQUAL(vkr, VK_SUCCESS);
+  driver->CheckVkResult(vkr);
 }
 
 void VulkanReplay::GetOutputWindowDimensions(uint64_t id, int32_t &w, int32_t &h)

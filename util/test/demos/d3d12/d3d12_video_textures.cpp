@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -37,7 +37,7 @@
 ///////////////////////////////////////////////////////////////////////////////////
 ///////////////////////////////////////////////////////////////////////////////////
 
-TEST(D3D12_Video_Textures, D3D12GraphicsTest)
+RD_TEST(D3D12_Video_Textures, D3D12GraphicsTest)
 {
   static constexpr const char *Description = "Tests of YUV textures";
 
@@ -294,7 +294,8 @@ float4 main(v2f IN) : SV_Target0
                                     .Mips(1)
                                     .InitialState(D3D12_RESOURCE_STATE_COPY_DEST);
         Vec4i cbdata[2] = {
-            Vec4i(rgba8.width, rgba8.height, horizDownsampleFactor, vertDownsampleFactor), config,
+            Vec4i(rgba8.width, rgba8.height, horizDownsampleFactor, vertDownsampleFactor),
+            config,
         };
         ID3D12ResourcePtr cb = MakeBuffer().Data(cbdata);
 
@@ -648,7 +649,7 @@ float4 main(v2f IN) : SV_Target0
 
       OMSetRenderTargets(cmd, {rtv}, {});
 
-      ClearRenderTargetView(cmd, rtv, {0.4f, 0.5f, 0.6f, 1.0f});
+      ClearRenderTargetView(cmd, rtv, {0.2f, 0.2f, 0.2f, 1.0f});
 
       cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
 

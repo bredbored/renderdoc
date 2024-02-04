@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -22,9 +22,9 @@
  * THE SOFTWARE.
  ******************************************************************************/
 
+#include "api/replay/capture_options.h"
 #include <float.h>
 #include "api/app/renderdoc_app.h"
-#include "api/replay/renderdoc_replay.h"
 #include "common/common.h"
 #include "core/core.h"
 
@@ -39,7 +39,7 @@ int RENDERDOC_CC SetCaptureOptionU32(RENDERDOC_CaptureOption opt, uint32_t val)
     case eRENDERDOC_Option_APIValidation: opts.apiValidation = (val != 0); break;
     case eRENDERDOC_Option_CaptureCallstacks: opts.captureCallstacks = (val != 0); break;
     case eRENDERDOC_Option_CaptureCallstacksOnlyDraws:
-      opts.captureCallstacksOnlyDraws = (val != 0);
+      opts.captureCallstacksOnlyActions = (val != 0);
       break;
     case eRENDERDOC_Option_DelayForDebugger: opts.delayForDebugger = val; break;
     case eRENDERDOC_Option_VerifyBufferAccess: opts.verifyBufferAccess = (val != 0); break;
@@ -56,6 +56,7 @@ int RENDERDOC_CC SetCaptureOptionU32(RENDERDOC_CaptureOption opt, uint32_t val)
       else
         RDCWARN("AllowUnsupportedVendorExtensions unexpected parameter %x", val);
       break;
+    case eRENDERDOC_Option_SoftMemoryLimit: opts.softMemoryLimit = val; break;
     default: RDCLOG("Unrecognised capture option '%d'", opt); return 0;
   }
 
@@ -74,7 +75,7 @@ int RENDERDOC_CC SetCaptureOptionF32(RENDERDOC_CaptureOption opt, float val)
     case eRENDERDOC_Option_APIValidation: opts.apiValidation = (val != 0.0f); break;
     case eRENDERDOC_Option_CaptureCallstacks: opts.captureCallstacks = (val != 0.0f); break;
     case eRENDERDOC_Option_CaptureCallstacksOnlyDraws:
-      opts.captureCallstacksOnlyDraws = (val != 0.0f);
+      opts.captureCallstacksOnlyActions = (val != 0.0f);
       break;
     case eRENDERDOC_Option_DelayForDebugger: opts.delayForDebugger = (uint32_t)val; break;
     case eRENDERDOC_Option_VerifyBufferAccess: opts.verifyBufferAccess = (val != 0.0f); break;
@@ -88,6 +89,7 @@ int RENDERDOC_CC SetCaptureOptionF32(RENDERDOC_CaptureOption opt, float val)
     case eRENDERDOC_Option_AllowUnsupportedVendorExtensions:
       RDCWARN("AllowUnsupportedVendorExtensions unexpected parameter %f", val);
       break;
+    case eRENDERDOC_Option_SoftMemoryLimit: opts.softMemoryLimit = (uint32_t)val; break;
     default: RDCLOG("Unrecognised capture option '%d'", opt); return 0;
   }
 
@@ -108,7 +110,7 @@ uint32_t RENDERDOC_CC GetCaptureOptionU32(RENDERDOC_CaptureOption opt)
     case eRENDERDOC_Option_CaptureCallstacks:
       return (RenderDoc::Inst().GetCaptureOptions().captureCallstacks ? 1 : 0);
     case eRENDERDOC_Option_CaptureCallstacksOnlyDraws:
-      return (RenderDoc::Inst().GetCaptureOptions().captureCallstacksOnlyDraws ? 1 : 0);
+      return (RenderDoc::Inst().GetCaptureOptions().captureCallstacksOnlyActions ? 1 : 0);
     case eRENDERDOC_Option_DelayForDebugger:
       return (RenderDoc::Inst().GetCaptureOptions().delayForDebugger);
     case eRENDERDOC_Option_VerifyBufferAccess:
@@ -125,6 +127,8 @@ uint32_t RENDERDOC_CC GetCaptureOptionU32(RENDERDOC_CaptureOption opt)
     case eRENDERDOC_Option_DebugOutputMute:
       return (RenderDoc::Inst().GetCaptureOptions().debugOutputMute ? 1 : 0);
     case eRENDERDOC_Option_AllowUnsupportedVendorExtensions: return 0;
+    case eRENDERDOC_Option_SoftMemoryLimit:
+      return (RenderDoc::Inst().GetCaptureOptions().softMemoryLimit);
     default: break;
   }
 
@@ -145,7 +149,7 @@ float RENDERDOC_CC GetCaptureOptionF32(RENDERDOC_CaptureOption opt)
     case eRENDERDOC_Option_CaptureCallstacks:
       return (RenderDoc::Inst().GetCaptureOptions().captureCallstacks ? 1.0f : 0.0f);
     case eRENDERDOC_Option_CaptureCallstacksOnlyDraws:
-      return (RenderDoc::Inst().GetCaptureOptions().captureCallstacksOnlyDraws ? 1.0f : 0.0f);
+      return (RenderDoc::Inst().GetCaptureOptions().captureCallstacksOnlyActions ? 1.0f : 0.0f);
     case eRENDERDOC_Option_DelayForDebugger:
       return (RenderDoc::Inst().GetCaptureOptions().delayForDebugger * 1.0f);
     case eRENDERDOC_Option_VerifyBufferAccess:
@@ -162,6 +166,8 @@ float RENDERDOC_CC GetCaptureOptionF32(RENDERDOC_CaptureOption opt)
     case eRENDERDOC_Option_DebugOutputMute:
       return (RenderDoc::Inst().GetCaptureOptions().debugOutputMute ? 1.0f : 0.0f);
     case eRENDERDOC_Option_AllowUnsupportedVendorExtensions: return 0.0f;
+    case eRENDERDOC_Option_SoftMemoryLimit:
+      return (RenderDoc::Inst().GetCaptureOptions().softMemoryLimit * 1.0f);
     default: break;
   }
 
@@ -171,15 +177,67 @@ float RENDERDOC_CC GetCaptureOptionF32(RENDERDOC_CaptureOption opt)
 
 CaptureOptions::CaptureOptions()
 {
+  // since we're reading from all bytes even padding etc, memset to 0
+  RDCEraseEl(*this);
   allowVSync = true;
   allowFullscreen = true;
   apiValidation = false;
   captureCallstacks = false;
-  captureCallstacksOnlyDraws = false;
+  captureCallstacksOnlyActions = false;
   delayForDebugger = 0;
   verifyBufferAccess = false;
   hookIntoChildren = false;
   refAllResources = false;
   captureAllCmdLists = false;
   debugOutputMute = true;
+  softMemoryLimit = 0;
 }
+
+#if ENABLED(ENABLE_UNIT_TESTS)
+
+#undef None
+#undef Always
+
+#include "catch/catch.hpp"
+
+TEST_CASE("Check CaptureOptions de/serialise to string", "[serialise]")
+{
+  CaptureOptions opts;
+
+  bool *boolOpts[] = {
+      &opts.allowVSync,
+      &opts.allowFullscreen,
+      &opts.apiValidation,
+      &opts.captureCallstacks,
+      &opts.captureCallstacksOnlyActions,
+      &opts.verifyBufferAccess,
+      &opts.hookIntoChildren,
+      &opts.refAllResources,
+      &opts.captureAllCmdLists,
+      &opts.debugOutputMute,
+  };
+
+  for(uint32_t delay = 0; delay < 1000; delay++)
+  {
+    for(uint32_t variant = 0; variant < (1 << ARRAY_COUNT(boolOpts)); variant++)
+    {
+      opts.delayForDebugger = delay;
+      for(size_t o = 0; o < ARRAY_COUNT(boolOpts); o++)
+      {
+        *boolOpts[o] = (variant & (1 << o)) != 0;
+      }
+
+      rdcstr s = opts.EncodeAsString();
+      CaptureOptions decoded;
+      decoded.DecodeFromString(s);
+
+      CHECK(memcmp(&opts, &decoded, sizeof(decoded)) == 0);
+    }
+  }
+
+  // check that nothing explodes here
+  CaptureOptions a;
+  a.DecodeFromString("");
+}
+
+#endif

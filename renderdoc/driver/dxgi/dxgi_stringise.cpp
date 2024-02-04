@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2016-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -179,6 +179,7 @@ rdcstr DoStringise(const D3D_FEATURE_LEVEL &el)
     STRINGISE_ENUM(D3D_FEATURE_LEVEL_11_1)
     STRINGISE_ENUM(D3D_FEATURE_LEVEL_12_0)
     STRINGISE_ENUM(D3D_FEATURE_LEVEL_12_1)
+    STRINGISE_ENUM(D3D_FEATURE_LEVEL_12_2)
   }
   END_ENUM_STRINGISE();
 }
@@ -188,6 +189,7 @@ rdcstr DoStringise(const D3D_DRIVER_TYPE &el)
 {
   BEGIN_ENUM_STRINGISE(D3D_DRIVER_TYPE);
   {
+    STRINGISE_ENUM(D3D_DRIVER_TYPE_UNKNOWN)
     STRINGISE_ENUM(D3D_DRIVER_TYPE_HARDWARE)
     STRINGISE_ENUM(D3D_DRIVER_TYPE_REFERENCE)
     STRINGISE_ENUM(D3D_DRIVER_TYPE_NULL)
@@ -206,6 +208,7 @@ rdcstr DoStringise(const long &el)
   switch(hr)
   {
     STRINGISE_ENUM(S_OK)
+    STRINGISE_ENUM(S_FALSE)
     STRINGISE_ENUM(DXGI_ERROR_INVALID_CALL)
     STRINGISE_ENUM(DXGI_ERROR_NOT_FOUND)
     STRINGISE_ENUM(DXGI_ERROR_DEVICE_REMOVED)
@@ -213,6 +216,8 @@ rdcstr DoStringise(const long &el)
     STRINGISE_ENUM(DXGI_ERROR_DEVICE_RESET)
     STRINGISE_ENUM(DXGI_ERROR_WAS_STILL_DRAWING)
     STRINGISE_ENUM(DXGI_ERROR_UNSUPPORTED)
+    STRINGISE_ENUM(DXGI_ERROR_ACCESS_DENIED)
+    STRINGISE_ENUM(DXGI_ERROR_DRIVER_INTERNAL_ERROR)
     STRINGISE_ENUM(E_OUTOFMEMORY)
     STRINGISE_ENUM(E_INVALIDARG)
     STRINGISE_ENUM(E_NOINTERFACE)
@@ -224,7 +229,7 @@ rdcstr DoStringise(const long &el)
 }
 
 #if ENABLED(ENABLE_UNIT_TESTS)
-#include "3rdparty/catch/catch.hpp"
+#include "catch/catch.hpp"
 
 TEST_CASE("DXGI ToStr", "[tostr][d3d]")
 {

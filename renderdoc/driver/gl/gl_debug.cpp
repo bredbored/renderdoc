@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  * Copyright (c) 2014 Crytek
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -39,7 +39,28 @@
 #define OPENGL 1
 #include "data/glsl/glsl_ubos_cpp.h"
 
-GLuint GLReplay::CreateShader(GLenum shaderType, const std::string &src)
+void GetGLSLVersions(ShaderType &shaderType, int &glslVersion, int &glslBaseVer, int &glslCSVer)
+{
+  if(IsGLES)
+  {
+    shaderType = ShaderType::GLSLES;
+    glslVersion = glslBaseVer = glslCSVer = 300;
+
+    if(GLCoreVersion >= 31)
+      glslVersion = glslBaseVer = glslCSVer = 310;
+
+    if(GLCoreVersion >= 32)
+      glslVersion = glslBaseVer = glslCSVer = 320;
+  }
+  else
+  {
+    shaderType = ShaderType::GLSL;
+    glslVersion = glslBaseVer = 150;
+    glslCSVer = 420;
+  }
+}
+
+GLuint CreateShader(GLenum shaderType, const rdcstr &src)
 {
   GLuint ret = GL.glCreateShader(shaderType);
 
@@ -61,7 +82,7 @@ GLuint GLReplay::CreateShader(GLenum shaderType, const std::string &src)
   return ret;
 }
 
-GLuint GLReplay::CreateSPIRVShader(GLenum shaderType, const std::string &src)
+GLuint CreateSPIRVShader(GLenum shaderType, const rdcstr &src)
 {
   if(!HasExt[ARB_gl_spirv])
   {
@@ -69,11 +90,11 @@ GLuint GLReplay::CreateSPIRVShader(GLenum shaderType, const std::string &src)
     return 0;
   }
 
-  SPIRVCompilationSettings settings(SPIRVSourceLanguage::OpenGLGLSL,
-                                    SPIRVShaderStage(ShaderIdx(shaderType)));
+  rdcspv::CompilationSettings settings(rdcspv::InputLanguage::OpenGLGLSL,
+                                       rdcspv::ShaderStage(ShaderIdx(shaderType)));
 
-  std::vector<uint32_t> spirv;
-  std::string s = CompileSPIRV(settings, {src}, spirv);
+  rdcarray<uint32_t> spirv;
+  rdcstr s = rdcspv::Compile(settings, {src}, spirv);
 
   if(spirv.empty())
   {
@@ -101,13 +122,8 @@ GLuint GLReplay::CreateSPIRVShader(GLenum shaderType, const std::string &src)
   return ret;
 }
 
-GLuint GLReplay::CreateCShaderProgram(const std::string &src)
+GLuint CreateCShaderProgram(const rdcstr &src)
 {
-  if(m_pDriver == NULL)
-    return 0;
-
-  MakeCurrentReplayContext(m_DebugCtx);
-
   GLuint cs = CreateShader(eGL_COMPUTE_SHADER, src);
   if(cs == 0)
     return 0;
@@ -134,7 +150,7 @@ GLuint GLReplay::CreateCShaderProgram(const std::string &src)
   return ret;
 }
 
-GLuint GLReplay::CreateShaderProgram(GLuint vs, GLuint fs, GLuint gs)
+GLuint CreateShaderProgram(GLuint vs, GLuint fs, GLuint gs)
 {
   GLuint ret = GL.glCreateProgram();
 
@@ -157,14 +173,8 @@ GLuint GLReplay::CreateShaderProgram(GLuint vs, GLuint fs, GLuint gs)
   return ret;
 }
 
-GLuint GLReplay::CreateShaderProgram(const std::string &vsSrc, const std::string &fsSrc,
-                                     const std::string &gsSrc)
+GLuint CreateShaderProgram(const rdcstr &vsSrc, const rdcstr &fsSrc, const rdcstr &gsSrc)
 {
-  if(m_pDriver == NULL)
-    return 0;
-
-  MakeCurrentReplayContext(m_DebugCtx);
-
   GLuint vs = 0;
   GLuint fs = 0;
   GLuint gs = 0;
@@ -340,8 +350,13 @@ void GLReplay::InitDebugData()
   RenderDoc::Inst().SetProgress(LoadProgress::DebugManagerInit, 0.0f);
 
   {
-    WindowingData window = {WindowingSystem::Unknown};
+    WindowingData window = {WindowingSystem::Headless};
     uint64_t id = MakeOutputWindow(window, true);
+
+    m_DebugCtx = NULL;
+
+    if(id == 0)
+      return;
 
     m_DebugID = id;
     m_DebugCtx = &m_OutputWindows[id];
@@ -356,26 +371,22 @@ void GLReplay::InitDebugData()
   DebugData.outWidth = 0.0f;
   DebugData.outHeight = 0.0f;
 
-  std::string vs;
-  std::string fs;
-  std::string gs;
-  std::string cs;
+  rdcstr vs;
+  rdcstr fs;
+  rdcstr gs;
+  rdcstr cs;
 
+  ShaderType shaderType;
   int glslVersion;
   int glslBaseVer;
   int glslCSVer;    // compute shader
-  ShaderType shaderType;
 
-  std::string texSampleDefines;
+  GetGLSLVersions(shaderType, glslVersion, glslBaseVer, glslCSVer);
+
+  rdcstr texSampleDefines;
 
   if(IsGLES)
   {
-    glslVersion = glslBaseVer = glslCSVer = 310;
-    shaderType = eShaderGLSLES;
-
-    if(GLCoreVersion >= 32)
-      glslVersion = glslBaseVer = glslCSVer = 320;
-
     if(HasExt[OES_texture_cube_map_array] || HasExt[EXT_texture_cube_map_array] || GLCoreVersion >= 32)
       texSampleDefines += "#define TEXSAMPLE_CUBE_ARRAY 1\n";
 
@@ -389,13 +400,11 @@ void GLReplay::InitDebugData()
       texSampleDefines +=
           "#define TEXSAMPLE_BUFFER 1\n"
           "#extension GL_EXT_texture_buffer : require\n";
+
+    texSampleDefines += "#define HAS_BIT_CONVERSION 1\n";
   }
   else
   {
-    glslVersion = glslBaseVer = 150;
-    glslCSVer = 420;
-    shaderType = eShaderGLSL;
-
     if(HasExt[ARB_texture_cube_map_array])
       texSampleDefines +=
           "#define TEXSAMPLE_CUBE_ARRAY 1\n"
@@ -405,21 +414,58 @@ void GLReplay::InitDebugData()
       texSampleDefines +=
           "#define TEXSAMPLE_MULTISAMPLE 1\n"
           "#extension GL_ARB_texture_multisample : require\n";
+
+    if(HasExt[ARB_gpu_shader5])
+      texSampleDefines +=
+          "#define HAS_BIT_CONVERSION 1\n"
+          "#extension GL_ARB_gpu_shader5 : require\n";
+    else if(HasExt[ARB_shader_bit_encoding])
+      texSampleDefines +=
+          "#define HAS_BIT_CONVERSION 1\n"
+          "#extension GL_ARB_shader_bit_encoding : require\n";
   }
 
+  rdcstr vsDefines = "#define FORCE_IO_LOCATION 1";
+
+  if(!IsGLES)
+  {
+    vsDefines =
+        "#extension GL_ARB_separate_shader_objects : require\n"
+        "#extension GL_ARB_explicit_attrib_location : require\n" +
+        vsDefines;
+  }
+
+  vs = GenerateGLSLShader(GetEmbeddedResource(glsl_blit_vert), shaderType, glslBaseVer, vsDefines);
+
+  // used to combine with custom shaders.
+  // this has to have explicit locations on the output even though we don't normally use that,
+  // because GL doesn't have a fallback to match by name, and custom shaders are expected to have an
+  // explicit location on the input
+  DebugData.texDisplayVertexShader = CreateShader(eGL_VERTEX_SHADER, vs);
+
   vs = GenerateGLSLShader(GetEmbeddedResource(glsl_blit_vert), shaderType, glslBaseVer);
+  fs = GenerateGLSLShader(GetEmbeddedResource(glsl_fixedcol_frag), shaderType, glslBaseVer);
+  DebugData.fullScreenFixedColProg = CreateShaderProgram(vs, fs);
+
+  fs = GenerateGLSLShader(GetEmbeddedResource(glsl_depth_copy_frag), shaderType, glslBaseVer);
+  DebugData.fullScreenCopyDepth = CreateShaderProgram(vs, fs);
+
+  fs = GenerateGLSLShader(GetEmbeddedResource(glsl_depth_copyms_frag), shaderType, glslBaseVer);
+  DebugData.fullScreenCopyDepthMS = CreateShaderProgram(vs, fs);
+
+  DebugData.fixedcolFragShaderSPIRV = DebugData.quadoverdrawFragShaderSPIRV = 0;
 
   // pre-compile SPIR-V shaders up front since this is more expensive
   if(HasExt[ARB_gl_spirv])
   {
     // SPIR-V shaders are always generated as desktop GL 430, for ease
-    std::string source =
-        GenerateGLSLShader(GetEmbeddedResource(glsl_fixedcol_frag), eShaderGLSPIRV, 430);
+    rdcstr source =
+        GenerateGLSLShader(GetEmbeddedResource(glsl_fixedcol_frag), ShaderType::GLSPIRV, 430);
     DebugData.fixedcolFragShaderSPIRV = CreateSPIRVShader(eGL_FRAGMENT_SHADER, source);
 
     if(HasExt[ARB_gpu_shader5] && HasExt[ARB_shader_image_load_store])
     {
-      std::string defines = "";
+      rdcstr defines = "";
 
       if(!HasExt[ARB_derivative_control])
       {
@@ -427,19 +473,15 @@ void GLReplay::InitDebugData()
         defines += "#define dFdyFine dFdy\n\n";
       }
 
-      source =
-          GenerateGLSLShader(GetEmbeddedResource(glsl_quadwrite_frag), eShaderGLSPIRV, 430, defines);
+      source = GenerateGLSLShader(GetEmbeddedResource(glsl_quadwrite_frag), ShaderType::GLSPIRV,
+                                  430, defines);
       DebugData.quadoverdrawFragShaderSPIRV = CreateSPIRVShader(eGL_FRAGMENT_SHADER, source);
     }
   }
 
-  // used to combine with custom shaders.
-  DebugData.texDisplayVertexShader = CreateShader(eGL_VERTEX_SHADER, vs);
-
   for(int i = 0; i < 3; i++)
   {
-    std::string defines = std::string("#define UINT_TEX ") + (i == 1 ? "1" : "0") + "\n";
-    defines += std::string("#define SINT_TEX ") + (i == 2 ? "1" : "0") + "\n";
+    rdcstr defines = rdcstr("#define SHADER_BASETYPE ") + ToStr(i) + "\n";
 
     fs = GenerateGLSLShader(GetEmbeddedResource(glsl_texdisplay_frag), shaderType, glslBaseVer,
                             defines + texSampleDefines);
@@ -449,6 +491,14 @@ void GLReplay::InitDebugData()
     BindUBO(DebugData.texDisplayProg[i], "TexDisplayUBOData", 0);
     BindUBO(DebugData.texDisplayProg[i], "HeatmapData", 1);
     ConfigureTexDisplayProgramBindings(DebugData.texDisplayProg[i]);
+
+    fs = GenerateGLSLShader(GetEmbeddedResource(glsl_texremap_frag), shaderType, glslBaseVer,
+                            defines + texSampleDefines);
+
+    DebugData.texRemapProg[i] = CreateShaderProgram(vs, fs);
+
+    BindUBO(DebugData.texRemapProg[i], "TexDisplayUBOData", 0);
+    ConfigureTexDisplayProgramBindings(DebugData.texRemapProg[i]);
   }
 
   RenderDoc::Inst().SetProgress(LoadProgress::DebugManagerInit, 0.2f);
@@ -518,6 +568,53 @@ void GLReplay::InitDebugData()
 
   BindUBO(DebugData.checkerProg, "CheckerboardUBOData", 0);
 
+  for(size_t intIdx = 0; intIdx < 3; intIdx++)
+  {
+    for(size_t numViews = 0; numViews < ARRAY_COUNT(DebugData.discardProg[intIdx]); numViews++)
+    {
+      rdcstr defines;
+
+      defines += rdcstr("#define SHADER_BASETYPE ") + ToStr(intIdx) + "\n";
+
+      if(numViews > 0 && IsGLES && HasExt[OVR_multiview])
+        defines = StringFormat::Fmt("#define NUM_VIEWS %zu\n", numViews + 1);
+
+      rdcstr blitvs =
+          GenerateGLSLShader(GetEmbeddedResource(glsl_blit_vert), shaderType, glslBaseVer, defines);
+
+      fs = GenerateGLSLShader(GetEmbeddedResource(glsl_discard_frag), shaderType, glslBaseVer,
+                              defines);
+      DebugData.discardProg[intIdx][numViews] = CreateShaderProgram(blitvs, fs);
+
+      BindUBO(DebugData.discardProg[intIdx][numViews], "DiscardUBOData", 0);
+
+      if(!IsGLES)
+      {
+        rdcstr name = "col0";
+        for(GLuint i = 0; i < 8; i++)
+        {
+          name[3] = char('0' + i);
+          GL.glBindFragDataLocation(DebugData.discardProg[intIdx][numViews], i, name.c_str());
+        }
+      }
+    }
+  }
+
+  {
+    ResourceFormat fmt;
+    fmt.type = ResourceFormatType::Regular;
+    fmt.compType = CompType::Float;
+    fmt.compByteWidth = 4;
+    fmt.compCount = 1;
+    bytebuf pattern = GetDiscardPattern(DiscardType::InvalidateCall, fmt, 1, true);
+    fmt.compType = CompType::UInt;
+    pattern.append(GetDiscardPattern(DiscardType::InvalidateCall, fmt, 1, true));
+    drv.glGenBuffers(1, &DebugData.discardPatternBuffer);
+    drv.glBindBuffer(eGL_UNIFORM_BUFFER, DebugData.discardPatternBuffer);
+    drv.glNamedBufferDataEXT(DebugData.discardPatternBuffer, pattern.size(), pattern.data(),
+                             eGL_STATIC_DRAW);
+  }
+
   if(HasExt[ARB_geometry_shader4])
   {
     vs = GenerateGLSLShader(GetEmbeddedResource(glsl_mesh_vert), shaderType, glslBaseVer);
@@ -539,14 +636,12 @@ void GLReplay::InitDebugData()
 
     // we have two fragment shaders, one that reads from the vs outputs and one that reads from the
     // gs outputs
-    std::string vsfs =
-        GenerateGLSLShader(GetEmbeddedResource(glsl_mesh_frag), shaderType, glslBaseVer,
-                           "#define SECONDARY_NAME vsout_secondary\n"
-                           "#define NORM_NAME vsout_norm\n");
-    std::string gsfs =
-        GenerateGLSLShader(GetEmbeddedResource(glsl_mesh_frag), shaderType, glslBaseVer,
-                           "#define SECONDARY_NAME gsout_secondary\n"
-                           "#define NORM_NAME gsout_norm\n");
+    rdcstr vsfs = GenerateGLSLShader(GetEmbeddedResource(glsl_mesh_frag), shaderType, glslBaseVer,
+                                     "#define SECONDARY_NAME vsout_secondary\n"
+                                     "#define NORM_NAME vsout_norm\n");
+    rdcstr gsfs = GenerateGLSLShader(GetEmbeddedResource(glsl_mesh_frag), shaderType, glslBaseVer,
+                                     "#define SECONDARY_NAME gsout_secondary\n"
+                                     "#define NORM_NAME gsout_norm\n");
     gs = GenerateGLSLShader(GetEmbeddedResource(glsl_mesh_geom), shaderType, glslBaseVer);
 
     // recreate the shaders
@@ -559,7 +654,7 @@ void GLReplay::InitDebugData()
 
     if(HasExt[ARB_gpu_shader_fp64] && HasExt[ARB_vertex_attrib_64bit])
     {
-      std::string extensions =
+      rdcstr extensions =
           "#extension GL_ARB_gpu_shader_fp64 : require\n"
           "#extension GL_ARB_vertex_attrib_64bit : require\n";
 
@@ -637,7 +732,7 @@ void GLReplay::InitDebugData()
 
     if(HasExt[ARB_gpu_shader_fp64] && HasExt[ARB_vertex_attrib_64bit])
     {
-      std::string extensions =
+      rdcstr extensions =
           "#extension GL_ARB_gpu_shader_fp64 : require\n"
           "#extension GL_ARB_vertex_attrib_64bit : require\n";
 
@@ -708,27 +803,38 @@ void GLReplay::InitDebugData()
   drv.glGenFramebuffers(1, &DebugData.pickPixelFBO);
   drv.glBindFramebuffer(eGL_FRAMEBUFFER, DebugData.pickPixelFBO);
 
-  drv.glGenBuffers(1, &DebugData.dummyTexBufferStore);
-  drv.glBindBuffer(eGL_TEXTURE_BUFFER, DebugData.dummyTexBufferStore);
-  drv.glNamedBufferDataEXT(DebugData.dummyTexBufferStore, 32, NULL, eGL_STATIC_DRAW);
-  drv.glBindBuffer(eGL_TEXTURE_BUFFER, 0);
+  if(HasExt[ARB_texture_buffer_object])
+  {
+    drv.glGenBuffers(1, &DebugData.dummyTexBufferStore);
+    drv.glBindBuffer(eGL_TEXTURE_BUFFER, DebugData.dummyTexBufferStore);
+    drv.glNamedBufferDataEXT(DebugData.dummyTexBufferStore, 32, NULL, eGL_STATIC_DRAW);
+    drv.glBindBuffer(eGL_TEXTURE_BUFFER, 0);
 
-  drv.glGenTextures(1, &DebugData.dummyTexBuffer);
-  drv.glBindTexture(eGL_TEXTURE_BUFFER, DebugData.dummyTexBuffer);
-  drv.glTextureBufferEXT(DebugData.dummyTexBuffer, eGL_TEXTURE_BUFFER, eGL_RGBA32F,
-                         DebugData.dummyTexBufferStore);
-  drv.glBindTexture(eGL_TEXTURE_BUFFER, 0);
+    drv.glGenTextures(1, &DebugData.dummyTexBuffer);
+    drv.glBindTexture(eGL_TEXTURE_BUFFER, DebugData.dummyTexBuffer);
+    drv.glTextureBufferEXT(DebugData.dummyTexBuffer, eGL_TEXTURE_BUFFER, eGL_RGBA32F,
+                           DebugData.dummyTexBufferStore);
+    drv.glBindTexture(eGL_TEXTURE_BUFFER, 0);
+  }
+  else
+  {
+    DebugData.dummyTexBuffer = DebugData.dummyTexBufferStore = 0;
+  }
 
   drv.glGenTextures(1, &DebugData.pickPixelTex);
   drv.glBindTexture(eGL_TEXTURE_2D, DebugData.pickPixelTex);
 
   drv.glTextureImage2DEXT(DebugData.pickPixelTex, eGL_TEXTURE_2D, 0, eGL_RGBA32F, 1, 1, 0, eGL_RGBA,
                           eGL_FLOAT, NULL);
-  drv.glTexParameteri(eGL_TEXTURE_2D, eGL_TEXTURE_MAX_LEVEL, 0);
-  drv.glTexParameteri(eGL_TEXTURE_2D, eGL_TEXTURE_MIN_FILTER, eGL_NEAREST);
-  drv.glTexParameteri(eGL_TEXTURE_2D, eGL_TEXTURE_MAG_FILTER, eGL_NEAREST);
-  drv.glTexParameteri(eGL_TEXTURE_2D, eGL_TEXTURE_WRAP_S, eGL_CLAMP_TO_EDGE);
-  drv.glTexParameteri(eGL_TEXTURE_2D, eGL_TEXTURE_WRAP_T, eGL_CLAMP_TO_EDGE);
+  drv.glTextureParameteriEXT(DebugData.pickPixelTex, eGL_TEXTURE_2D, eGL_TEXTURE_MAX_LEVEL, 0);
+  drv.glTextureParameteriEXT(DebugData.pickPixelTex, eGL_TEXTURE_2D, eGL_TEXTURE_MIN_FILTER,
+                             eGL_NEAREST);
+  drv.glTextureParameteriEXT(DebugData.pickPixelTex, eGL_TEXTURE_2D, eGL_TEXTURE_MAG_FILTER,
+                             eGL_NEAREST);
+  drv.glTextureParameteriEXT(DebugData.pickPixelTex, eGL_TEXTURE_2D, eGL_TEXTURE_WRAP_S,
+                             eGL_CLAMP_TO_EDGE);
+  drv.glTextureParameteriEXT(DebugData.pickPixelTex, eGL_TEXTURE_2D, eGL_TEXTURE_WRAP_T,
+                             eGL_CLAMP_TO_EDGE);
   drv.glFramebufferTexture2D(eGL_FRAMEBUFFER, eGL_COLOR_ATTACHMENT0, eGL_TEXTURE_2D,
                              DebugData.pickPixelTex, 0);
 
@@ -736,13 +842,6 @@ void GLReplay::InitDebugData()
   drv.glBindVertexArray(DebugData.emptyVAO);
 
   RenderDoc::Inst().SetProgress(LoadProgress::DebugManagerInit, 0.6f);
-
-  if(HasExt[ARB_compute_shader] && !HasExt[ARB_shading_language_420pack])
-  {
-    RDCERR(
-        "GL implementation has ARB_compute_shader but not ARB_shading_language_420pack! "
-        "Compute shaders won't compile successfully.");
-  }
 
   // histogram/minmax data
   {
@@ -754,7 +853,8 @@ void GLReplay::InitDebugData()
         ARRAY_COUNT(DebugData.minmaxTileProgram) >= (TEXDISPLAY_SINT_TEX | TEXDISPLAY_TYPEMASK) + 1,
         "not enough programs");
 
-    if(HasExt[ARB_compute_shader] && HasExt[ARB_shader_storage_buffer_object])
+    if(HasExt[ARB_compute_shader] && HasExt[ARB_shader_storage_buffer_object] &&
+       HasExt[ARB_shading_language_420pack])
     {
       for(int t = 1; t <= RESTYPE_TEXTYPEMAX; t++)
       {
@@ -768,10 +868,9 @@ void GLReplay::InitDebugData()
             idx |= TEXDISPLAY_SINT_TEX;
 
           {
-            std::string defines;
-            defines += std::string("#define SHADER_RESTYPE ") + ToStr(t) + "\n";
-            defines += std::string("#define UINT_TEX ") + (i == 1 ? "1" : "0") + "\n";
-            defines += std::string("#define SINT_TEX ") + (i == 2 ? "1" : "0") + "\n";
+            rdcstr defines;
+            defines += rdcstr("#define SHADER_RESTYPE ") + ToStr(t) + "\n";
+            defines += rdcstr("#define SHADER_BASETYPE ") + ToStr(i) + "\n";
             defines += texSampleDefines;
 
             cs = GenerateGLSLShader(GetEmbeddedResource(glsl_minmaxtile_comp), shaderType,
@@ -784,10 +883,9 @@ void GLReplay::InitDebugData()
           }
 
           {
-            std::string defines;
-            defines += std::string("#define SHADER_RESTYPE ") + ToStr(t) + "\n";
-            defines += std::string("#define UINT_TEX ") + (i == 1 ? "1" : "0") + "\n";
-            defines += std::string("#define SINT_TEX ") + (i == 2 ? "1" : "0") + "\n";
+            rdcstr defines;
+            defines += rdcstr("#define SHADER_RESTYPE ") + ToStr(t) + "\n";
+            defines += rdcstr("#define SHADER_BASETYPE ") + ToStr(i) + "\n";
             defines += texSampleDefines;
 
             cs = GenerateGLSLShader(GetEmbeddedResource(glsl_histogram_comp), shaderType, glslCSVer,
@@ -801,10 +899,9 @@ void GLReplay::InitDebugData()
 
           if(t == 1)
           {
-            std::string defines;
-            defines += std::string("#define SHADER_RESTYPE ") + ToStr(t) + "\n";
-            defines += std::string("#define UINT_TEX ") + (i == 1 ? "1" : "0") + "\n";
-            defines += std::string("#define SINT_TEX ") + (i == 2 ? "1" : "0") + "\n";
+            rdcstr defines;
+            defines += rdcstr("#define SHADER_RESTYPE ") + ToStr(t) + "\n";
+            defines += rdcstr("#define SHADER_BASETYPE ") + ToStr(i) + "\n";
 
             cs = GenerateGLSLShader(GetEmbeddedResource(glsl_minmaxresult_comp), shaderType,
                                     glslCSVer, defines);
@@ -845,66 +942,7 @@ void GLReplay::InitDebugData()
                              eGL_DYNAMIC_READ);
   }
 
-  if(HasExt[ARB_compute_shader] && HasExt[ARB_shader_image_load_store] &&
-     HasExt[ARB_texture_multisample])
-  {
-    cs = GenerateGLSLShader(GetEmbeddedResource(glsl_ms2array_comp), shaderType, glslCSVer);
-    DebugData.MS2Array = CreateCShaderProgram(cs);
-
-    // GLES doesn't have multisampled image load/store even with any extension
-    DebugData.Array2MS = 0;
-    if(!IsGLES)
-    {
-      cs = GenerateGLSLShader(GetEmbeddedResource(glsl_array2ms_comp), shaderType, glslCSVer);
-      DebugData.Array2MS = CreateCShaderProgram(cs);
-    }
-  }
-  else
-  {
-    DebugData.MS2Array = 0;
-    DebugData.Array2MS = 0;
-    RDCWARN(
-        "GL_ARB_compute_shader or ARB_shader_image_load_store or ARB_texture_multisample not "
-        "supported, disabling 2DMS save/load.");
-    m_pDriver->AddDebugMessage(MessageCategory::Portability, MessageSeverity::Medium,
-                               MessageSource::RuntimeWarning,
-                               "GL_ARB_compute_shader or ARB_shader_image_load_store not "
-                               "supported, disabling 2DMS save/load.");
-  }
-
-  DebugData.DepthArray2MS = DebugData.DepthMS2Array = 0;
-
-  if(HasExt[ARB_texture_multisample])
-  {
-    vs = GenerateGLSLShader(GetEmbeddedResource(glsl_blit_vert), shaderType, glslBaseVer);
-
-    fs = GenerateGLSLShader(GetEmbeddedResource(glsl_depthms2arr_frag), shaderType, glslBaseVer);
-    DebugData.DepthMS2Array = CreateShaderProgram(vs, fs);
-
-    GL.glUseProgram(DebugData.DepthMS2Array);
-
-    GL.glUniform1i(GL.glGetUniformLocation(DebugData.DepthMS2Array, "srcDepthMS"), 0);
-    GL.glUniform1i(GL.glGetUniformLocation(DebugData.DepthMS2Array, "srcStencilMS"), 1);
-
-    fs = GenerateGLSLShader(GetEmbeddedResource(glsl_deptharr2ms_frag), shaderType, glslBaseVer);
-    DebugData.DepthArray2MS = CreateShaderProgram(vs, fs);
-
-    GL.glUseProgram(DebugData.DepthArray2MS);
-
-    GL.glUniform1i(GL.glGetUniformLocation(DebugData.DepthArray2MS, "srcDepthArray"), 0);
-    GL.glUniform1i(GL.glGetUniformLocation(DebugData.DepthArray2MS, "srcStencilArray"), 1);
-  }
-  else
-  {
-    DebugData.MS2Array = 0;
-    DebugData.Array2MS = 0;
-    RDCWARN("GL_ARB_texture_multisample not supported, disabling 2DMS depth-stencil save/load.");
-    m_pDriver->AddDebugMessage(
-        MessageCategory::Portability, MessageSeverity::Medium, MessageSource::RuntimeWarning,
-        "GL_ARB_texture_multisample not supported, disabling 2DMS depth-stencil save/load.");
-  }
-
-  if(HasExt[ARB_compute_shader])
+  if(HasExt[ARB_compute_shader] && HasExt[ARB_shading_language_420pack])
   {
     cs = GenerateGLSLShader(GetEmbeddedResource(glsl_mesh_comp), shaderType, glslCSVer);
     DebugData.meshPickProgram = CreateCShaderProgram(cs);
@@ -955,15 +993,40 @@ void GLReplay::InitDebugData()
 
   Vec3f axisFrustum[] = {
       // axis marker vertices
-      Vec3f(0.0f, 0.0f, 0.0f), Vec3f(1.0f, 0.0f, 0.0f), Vec3f(0.0f, 0.0f, 0.0f),
-      Vec3f(0.0f, 1.0f, 0.0f), Vec3f(0.0f, 0.0f, 0.0f), Vec3f(0.0f, 0.0f, 1.0f),
+      Vec3f(0.0f, 0.0f, 0.0f),
+      Vec3f(1.0f, 0.0f, 0.0f),
+      Vec3f(0.0f, 0.0f, 0.0f),
+      Vec3f(0.0f, 1.0f, 0.0f),
+      Vec3f(0.0f, 0.0f, 0.0f),
+      Vec3f(0.0f, 0.0f, 1.0f),
 
       // frustum vertices
-      TLN, TRN, TRN, BRN, BRN, BLN, BLN, TLN,
+      TLN,
+      TRN,
+      TRN,
+      BRN,
+      BRN,
+      BLN,
+      BLN,
+      TLN,
 
-      TLN, TLF, TRN, TRF, BLN, BLF, BRN, BRF,
+      TLN,
+      TLF,
+      TRN,
+      TRF,
+      BLN,
+      BLF,
+      BRN,
+      BRF,
 
-      TLF, TRF, TRF, BRF, BRF, BLF, BLF, TLF,
+      TLF,
+      TRF,
+      TRF,
+      BRF,
+      BRF,
+      BLF,
+      BLF,
+      TLF,
   };
 
   drv.glNamedBufferDataEXT(DebugData.axisFrustumBuffer, sizeof(axisFrustum), axisFrustum,
@@ -1002,7 +1065,7 @@ void GLReplay::InitDebugData()
     const char *version = (const char *)drv.glGetString(eGL_VERSION);
 
     // we're just doing substring searches, so combine both for ease.
-    std::string combined = (vendor ? vendor : "");
+    rdcstr combined = (vendor ? vendor : "");
     combined += " ";
     combined += (renderer ? renderer : "");
 
@@ -1042,7 +1105,7 @@ void GLReplay::InitDebugData()
 
     for(const pattern &p : patterns)
     {
-      if(combined.find(p.search) != std::string::npos)
+      if(combined.contains(p.search))
       {
         if(m_DriverInfo.vendor == GPUVendor::Unknown)
         {
@@ -1063,12 +1126,12 @@ void GLReplay::InitDebugData()
 
     RDCDEBUG("Identified GPU vendor '%s'", ToStr(m_DriverInfo.vendor).c_str());
 
-    std::string versionString = version;
+    rdcstr versionString = version;
 
     versionString += " / ";
-    versionString += renderer;
+    versionString += renderer ? renderer : "";
     versionString += " / ";
-    versionString += vendor;
+    versionString += vendor ? vendor : "";
 
     versionString.resize(RDCMIN(versionString.size(), ARRAY_COUNT(m_DriverInfo.version) - 1));
     memcpy(m_DriverInfo.version, versionString.c_str(), versionString.size());
@@ -1077,17 +1140,20 @@ void GLReplay::InitDebugData()
   // these below need to be made on the replay context, as they are context-specific (not shared)
   // and will be used on the replay context.
 
-  drv.glGenTransformFeedbacks(1, &DebugData.feedbackObj);
+  if(HasExt[ARB_transform_feedback2])
+    drv.glGenTransformFeedbacks(1, &DebugData.feedbackObj);
   drv.glGenBuffers(1, &DebugData.feedbackBuffer);
   DebugData.feedbackQueries.push_back(0);
   drv.glGenQueries(1, &DebugData.feedbackQueries[0]);
 
-  drv.glBindTransformFeedback(eGL_TRANSFORM_FEEDBACK, DebugData.feedbackObj);
+  if(HasExt[ARB_transform_feedback2])
+    drv.glBindTransformFeedback(eGL_TRANSFORM_FEEDBACK, DebugData.feedbackObj);
   drv.glBindBuffer(eGL_TRANSFORM_FEEDBACK_BUFFER, DebugData.feedbackBuffer);
   drv.glNamedBufferDataEXT(DebugData.feedbackBuffer, (GLsizeiptr)DebugData.feedbackBufferSize, NULL,
                            eGL_DYNAMIC_READ);
   drv.glBindBufferBase(eGL_TRANSFORM_FEEDBACK_BUFFER, 0, DebugData.feedbackBuffer);
-  drv.glBindTransformFeedback(eGL_TRANSFORM_FEEDBACK, 0);
+  if(HasExt[ARB_transform_feedback2])
+    drv.glBindTransformFeedback(eGL_TRANSFORM_FEEDBACK, 0);
 
   RenderDoc::Inst().SetProgress(LoadProgress::DebugManagerInit, 1.0f);
 
@@ -1114,7 +1180,8 @@ void GLReplay::InitDebugData()
     m_Degraded = true;
   }
 
-  if(!HasExt[ARB_shader_image_load_store] || !HasExt[ARB_compute_shader])
+  if(!HasExt[ARB_shader_image_load_store] || !HasExt[ARB_compute_shader] ||
+     !HasExt[ARB_shading_language_420pack])
   {
     RDCWARN(
         "Don't have shader image load/store or compute shaders, functionality will be degraded.");
@@ -1136,19 +1203,42 @@ void GLReplay::DeleteDebugData()
 
   MakeCurrentReplayContext(&m_ReplayCtx);
 
+  if(HasExt[KHR_debug])
+  {
+    GL.glDebugMessageCallback(NULL, NULL);
+  }
+
   if(DebugData.overlayProg)
     drv.glDeleteProgram(DebugData.overlayProg);
 
-  drv.glDeleteTransformFeedbacks(1, &DebugData.feedbackObj);
+  for(size_t b = 0; b < 3; b++)
+    for(size_t i = 0; i < ARRAY_COUNT(DebugData.discardProg[b]); i++)
+      if(DebugData.discardProg[b][i])
+        drv.glDeleteProgram(DebugData.discardProg[b][i]);
+
+  if(HasExt[ARB_transform_feedback2])
+    drv.glDeleteTransformFeedbacks(1, &DebugData.feedbackObj);
   drv.glDeleteBuffers(1, &DebugData.feedbackBuffer);
   drv.glDeleteQueries((GLsizei)DebugData.feedbackQueries.size(), DebugData.feedbackQueries.data());
 
   MakeCurrentReplayContext(m_DebugCtx);
 
+  if(HasExt[KHR_debug])
+  {
+    GL.glDebugMessageCallback(NULL, NULL);
+  }
+
   ClearPostVSCache();
 
   drv.glDeleteFramebuffers(1, &DebugData.overlayFBO);
   drv.glDeleteTextures(1, &DebugData.overlayTex);
+
+  if(DebugData.fullScreenFixedColProg)
+    drv.glDeleteProgram(DebugData.fullScreenFixedColProg);
+  if(DebugData.fullScreenCopyDepth)
+    drv.glDeleteProgram(DebugData.fullScreenCopyDepth);
+  if(DebugData.fullScreenCopyDepthMS)
+    drv.glDeleteProgram(DebugData.fullScreenCopyDepthMS);
 
   if(DebugData.quadoverdrawFragShader)
     drv.glDeleteShader(DebugData.quadoverdrawFragShader);
@@ -1160,8 +1250,12 @@ void GLReplay::DeleteDebugData()
   if(DebugData.texDisplayVertexShader)
     drv.glDeleteShader(DebugData.texDisplayVertexShader);
   for(int i = 0; i < 3; i++)
+  {
     if(DebugData.texDisplayProg[i])
       drv.glDeleteProgram(DebugData.texDisplayProg[i]);
+    if(DebugData.texRemapProg[i])
+      drv.glDeleteProgram(DebugData.texRemapProg[i]);
+  }
 
   if(DebugData.checkerProg)
     drv.glDeleteProgram(DebugData.checkerProg);
@@ -1222,16 +1316,6 @@ void GLReplay::DeleteDebugData()
   drv.glDeleteBuffers(1, &DebugData.pickVBBuf);
   drv.glDeleteBuffers(1, &DebugData.pickResultBuf);
 
-  if(DebugData.Array2MS)
-    drv.glDeleteProgram(DebugData.Array2MS);
-  if(DebugData.MS2Array)
-    drv.glDeleteProgram(DebugData.MS2Array);
-
-  if(DebugData.DepthArray2MS)
-    drv.glDeleteProgram(DebugData.DepthArray2MS);
-  if(DebugData.DepthMS2Array)
-    drv.glDeleteProgram(DebugData.DepthMS2Array);
-
   drv.glDeleteBuffers(1, &DebugData.minmaxTileResult);
   drv.glDeleteBuffers(1, &DebugData.minmaxResult);
   drv.glDeleteBuffers(1, &DebugData.histogramBuf);
@@ -1259,6 +1343,7 @@ GLReplay::TextureSamplerState GLReplay::SetSamplerParams(GLenum target, GLuint t
   GL.glGetTextureParameterivEXT(texname, target, eGL_TEXTURE_MAG_FILTER, (GLint *)&ret.magFilter);
   GL.glGetTextureParameterivEXT(texname, target, eGL_TEXTURE_WRAP_S, (GLint *)&ret.wrapS);
   GL.glGetTextureParameterivEXT(texname, target, eGL_TEXTURE_WRAP_T, (GLint *)&ret.wrapT);
+  GL.glGetTextureParameterivEXT(texname, target, eGL_TEXTURE_WRAP_R, (GLint *)&ret.wrapR);
   GL.glGetTextureParameterivEXT(texname, target, eGL_TEXTURE_COMPARE_MODE, (GLint *)&ret.compareMode);
 
   // disable depth comparison
@@ -1269,6 +1354,7 @@ GLReplay::TextureSamplerState GLReplay::SetSamplerParams(GLenum target, GLuint t
   GLenum param = eGL_CLAMP_TO_EDGE;
   GL.glTextureParameterivEXT(texname, target, eGL_TEXTURE_WRAP_S, (GLint *)&param);
   GL.glTextureParameterivEXT(texname, target, eGL_TEXTURE_WRAP_T, (GLint *)&param);
+  GL.glTextureParameterivEXT(texname, target, eGL_TEXTURE_WRAP_R, (GLint *)&param);
 
   // depending on the mode, set min/mag filter
   GLenum minFilter = eGL_NEAREST;
@@ -1304,13 +1390,362 @@ void GLReplay::RestoreSamplerParams(GLenum target, GLuint texname, TextureSample
 
   GL.glTextureParameterivEXT(texname, target, eGL_TEXTURE_WRAP_S, (GLint *)&state.wrapS);
   GL.glTextureParameterivEXT(texname, target, eGL_TEXTURE_WRAP_T, (GLint *)&state.wrapT);
+  GL.glTextureParameterivEXT(texname, target, eGL_TEXTURE_WRAP_R, (GLint *)&state.wrapR);
   GL.glTextureParameterivEXT(texname, target, eGL_TEXTURE_MIN_FILTER, (GLint *)&state.minFilter);
   GL.glTextureParameterivEXT(texname, target, eGL_TEXTURE_MAG_FILTER, (GLint *)&state.magFilter);
   GL.glTextureParameterivEXT(texname, target, eGL_TEXTURE_COMPARE_MODE, (GLint *)&state.compareMode);
 }
 
-bool GLReplay::GetMinMax(ResourceId texid, uint32_t sliceFace, uint32_t mip, uint32_t sample,
-                         CompType typeHint, float *minval, float *maxval)
+void GLReplay::FillWithDiscardPattern(DiscardType type, GLuint framebuffer, GLsizei numAttachments,
+                                      const GLenum *attachments, GLint x, GLint y, GLsizei width,
+                                      GLsizei height)
+{
+  RDCASSERT(type == DiscardType::InvalidateCall);
+
+  WrappedOpenGL &drv = *m_pDriver;
+
+  GLMarkerRegion region("FillWithDiscardPattern FBO");
+
+  GLRenderState rs;
+  rs.FetchState(&drv);
+
+  // we use the original framebuffer, and mask off any attachments that shouldn't be discarded
+  drv.glBindFramebuffer(eGL_DRAW_FRAMEBUFFER, framebuffer);
+
+  int numviews = 1;
+
+  if(IsGLES && HasExt[OVR_multiview])
+  {
+    GL.glGetNamedFramebufferAttachmentParameterivEXT(
+        framebuffer, eGL_COLOR_ATTACHMENT0, eGL_FRAMEBUFFER_ATTACHMENT_TEXTURE_NUM_VIEWS_OVR,
+        &numviews);
+  }
+
+  drv.glBindBufferBase(eGL_UNIFORM_BUFFER, 0, DebugData.discardPatternBuffer);
+
+  drv.glDisable(eGL_BLEND);
+  drv.glDisable(eGL_CULL_FACE);
+  drv.glEnable(eGL_DEPTH_TEST);
+  drv.glEnable(eGL_STENCIL_TEST);
+  drv.glDepthFunc(eGL_ALWAYS);
+  drv.glStencilFunc(eGL_ALWAYS, 0, 0xff);
+  if(!IsGLES)
+    drv.glPolygonMode(eGL_FRONT_AND_BACK, eGL_FILL);
+
+  // scissor to the rect
+  drv.glEnable(eGL_SCISSOR_TEST);
+  drv.glScissor(x, y, width, height);
+
+  GLint maxview[2] = {2048, 2048};
+  drv.glGetIntegerv(eGL_MAX_VIEWPORT_DIMS, maxview);
+  drv.glViewport(0, 0, maxview[0], maxview[1]);
+
+  // disable all masks at first
+  drv.glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+  drv.glDepthMask(GL_FALSE);
+  drv.glStencilMask(0);
+
+  int intIdx = -1;
+
+  // enable masks specified by attachments
+  bool stencil = false;
+  for(GLsizei i = 0; i < numAttachments; i++)
+  {
+    if(attachments[i] == eGL_DEPTH_STENCIL_ATTACHMENT)
+    {
+      drv.glDepthMask(GL_TRUE);
+      drv.glStencilMask(0xff);
+      stencil = true;
+    }
+    else if(attachments[i] == eGL_DEPTH_ATTACHMENT)
+    {
+      drv.glDepthMask(GL_TRUE);
+    }
+    else if(attachments[i] == eGL_STENCIL_ATTACHMENT)
+    {
+      drv.glStencilMask(0xff);
+      stencil = true;
+    }
+    else
+    {
+      drv.glColorMaski(attachments[i] - eGL_COLOR_ATTACHMENT0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+
+      if(intIdx == -1)
+      {
+        GLuint att;
+        drv.glGetFramebufferAttachmentParameteriv(eGL_DRAW_FRAMEBUFFER, attachments[i],
+                                                  eGL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME,
+                                                  (GLint *)&att);
+        GLenum attType;
+        drv.glGetFramebufferAttachmentParameteriv(eGL_DRAW_FRAMEBUFFER, attachments[i],
+                                                  eGL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE,
+                                                  (GLint *)&attType);
+
+        ResourceId id = drv.GetResourceManager()->GetResID(attType == eGL_RENDERBUFFER
+                                                               ? RenderbufferRes(drv.GetCtx(), att)
+                                                               : TextureRes(drv.GetCtx(), att));
+
+        GLenum fmt = m_pDriver->m_Textures[id].internalFormat;
+
+        if(IsUIntFormat(fmt))
+          intIdx = 1;
+        else if(IsSIntFormat(fmt))
+          intIdx = 2;
+        else
+          intIdx = 0;
+      }
+    }
+  }
+
+  if(intIdx == -1)
+    intIdx = 0;
+
+  GLuint prog = DebugData.discardProg[intIdx][RDCCLAMP(numviews, 1, 4) - 1];
+
+  drv.glUseProgram(prog);
+
+  GLint loc = drv.glGetUniformLocation(prog, "flags");
+
+  uint32_t flags = 0U;
+
+  if(height == 1)
+    flags |= 0x10U;
+
+  if(stencil)
+  {
+    drv.glStencilOp(eGL_REPLACE, eGL_REPLACE, eGL_REPLACE);
+
+    drv.glStencilFunc(eGL_ALWAYS, 0, 0xff);
+    drv.glProgramUniform1ui(prog, loc, flags | 1U);
+    drv.glDrawArrays(eGL_TRIANGLE_STRIP, 0, 4);
+
+    drv.glStencilFunc(eGL_ALWAYS, 0xff, 0xff);
+    drv.glProgramUniform1ui(prog, loc, flags | 2U);
+    drv.glDrawArrays(eGL_TRIANGLE_STRIP, 0, 4);
+  }
+  else
+  {
+    drv.glProgramUniform1ui(prog, loc, flags);
+
+    // if we're not writing stencil we can just do one draw
+    drv.glDrawArrays(eGL_TRIANGLE_STRIP, 0, 4);
+  }
+
+  rs.ApplyState(&drv);
+}
+
+void GLReplay::FillWithDiscardPattern(DiscardType type, ResourceId id, GLuint mip, GLint xoffset,
+                                      GLint yoffset, GLint zoffset, GLsizei width, GLsizei height,
+                                      GLsizei depth)
+{
+  RDCASSERT(type == DiscardType::InvalidateCall);
+
+  WrappedOpenGL &drv = *m_pDriver;
+
+  GLMarkerRegion region("FillWithDiscardPattern Texture");
+
+  auto &texDetails = drv.m_Textures[id];
+
+  GLenum fmt = texDetails.internalFormat;
+
+  bytebuf &pattern = m_DiscardPatterns[fmt];
+
+  GLenum target = texDetails.curType;
+
+  if(pattern.empty())
+    pattern = GetDiscardPattern(type, MakeResourceFormat(target, fmt), 1, true);
+
+  bool compressed = IsCompressedFormat(fmt);
+
+  if(target == eGL_TEXTURE_CUBE_MAP)
+    depth = RDCMIN(depth, 6);
+  else
+    depth = RDCMIN(texDetails.depth, depth);
+  height = RDCMIN(texDetails.height, height);
+  width = RDCMIN(texDetails.width, width);
+
+  GLint dim = texDetails.dimension;
+
+  GLint oldRowLength = 0;
+  GL.glGetIntegerv(eGL_UNPACK_ROW_LENGTH, &oldRowLength);
+
+  // ensure even if we're uploading a sub-rect that the row length is the same.
+  GL.glPixelStorei(eGL_UNPACK_ROW_LENGTH, DiscardPatternWidth);
+
+  GLuint tex = texDetails.resource.name;
+
+  GLenum format = eGL_NONE;
+  GLenum datatype = eGL_NONE;
+
+  if(!compressed)
+  {
+    format = GetBaseFormat(fmt);
+    datatype = GetDataType(fmt);
+  }
+
+  for(GLsizei zc = 0; zc < depth; zc++)
+  {
+    GLsizei z = zoffset + zc;
+
+    if(texDetails.curType == eGL_TEXTURE_CUBE_MAP)
+    {
+      GLenum targets[] = {
+          eGL_TEXTURE_CUBE_MAP_POSITIVE_X, eGL_TEXTURE_CUBE_MAP_NEGATIVE_X,
+          eGL_TEXTURE_CUBE_MAP_POSITIVE_Y, eGL_TEXTURE_CUBE_MAP_NEGATIVE_Y,
+          eGL_TEXTURE_CUBE_MAP_POSITIVE_Z, eGL_TEXTURE_CUBE_MAP_NEGATIVE_Z,
+      };
+
+      target = targets[z % 6];
+    }
+
+    for(GLsizei yc = 0; yc < height; yc += DiscardPatternHeight)
+    {
+      GLsizei y = yoffset + yc;
+
+      for(GLsizei xc = 0; xc < width; xc += DiscardPatternWidth)
+      {
+        GLsizei x = xoffset + xc;
+
+        GLsizei subwidth = RDCMIN((GLsizei)DiscardPatternWidth, texDetails.width - x);
+        GLsizei subheight = RDCMIN((GLsizei)DiscardPatternHeight, texDetails.height - y);
+
+        if(compressed)
+        {
+          GLsizei dataSize = (GLsizei)GetCompressedByteSize(subwidth, subheight, 1, fmt);
+
+          if(dim == 1)
+            GL.glCompressedTextureSubImage1DEXT(tex, target, mip, x, subwidth, fmt, dataSize,
+                                                pattern.data());
+          else if(dim == 2)
+            GL.glCompressedTextureSubImage2DEXT(tex, target, mip, x, y, subwidth, subheight, fmt,
+                                                dataSize, pattern.data());
+          else if(dim == 3)
+            GL.glCompressedTextureSubImage3DEXT(tex, target, mip, x, y, z, subwidth, subheight, 1,
+                                                fmt, dataSize, pattern.data());
+        }
+        else
+        {
+          if(dim == 1)
+            GL.glTextureSubImage1DEXT(tex, target, mip, x, subwidth, format, datatype,
+                                      pattern.data());
+          else if(dim == 2)
+            GL.glTextureSubImage2DEXT(tex, target, mip, x, y, subwidth, subheight, format, datatype,
+                                      pattern.data());
+          else if(dim == 3)
+            GL.glTextureSubImage3DEXT(tex, target, mip, x, y, z, subwidth, subheight, 1, format,
+                                      datatype, pattern.data());
+        }
+      }
+    }
+  }
+
+  GL.glPixelStorei(eGL_UNPACK_ROW_LENGTH, oldRowLength);
+}
+
+void GLReplay::PickPixel(ResourceId texture, uint32_t x, uint32_t y, const Subresource &sub,
+                         CompType typeCast, float pixel[4])
+{
+  WrappedOpenGL &drv = *m_pDriver;
+
+  MakeCurrentReplayContext(m_DebugCtx);
+
+  drv.glBindFramebuffer(eGL_FRAMEBUFFER, DebugData.pickPixelFBO);
+  drv.glBindFramebuffer(eGL_READ_FRAMEBUFFER, DebugData.pickPixelFBO);
+
+  pixel[0] = pixel[1] = pixel[2] = pixel[3] = 0.0f;
+  drv.glClearBufferfv(eGL_COLOR, 0, pixel);
+
+  DebugData.outWidth = DebugData.outHeight = 1.0f;
+  drv.glViewport(0, 0, 1, 1);
+
+  TextureDisplay texDisplay;
+
+  texDisplay.red = texDisplay.green = texDisplay.blue = texDisplay.alpha = true;
+  texDisplay.flipY = false;
+  texDisplay.hdrMultiplier = -1.0f;
+  texDisplay.linearDisplayAsGamma = true;
+  texDisplay.subresource = sub;
+  texDisplay.customShaderId = ResourceId();
+  texDisplay.rangeMin = 0.0f;
+  texDisplay.rangeMax = 1.0f;
+  texDisplay.scale = 1.0f;
+  texDisplay.resourceId = texture;
+  texDisplay.typeCast = typeCast;
+  texDisplay.rawOutput = true;
+  texDisplay.xOffset = -float(x << sub.mip);
+  texDisplay.yOffset = -float(y << sub.mip);
+
+  auto &texDetails = m_pDriver->m_Textures[texDisplay.resourceId];
+
+  uint32_t mipWidth = RDCMAX(1U, (uint32_t)texDetails.width >> sub.mip);
+  uint32_t mipHeight = RDCMAX(1U, (uint32_t)texDetails.height >> sub.mip);
+
+  texDisplay.xOffset = -(float(x) / float(mipWidth)) * texDetails.width;
+  texDisplay.yOffset = -(float(y) / float(mipHeight)) * texDetails.height;
+
+  RenderTextureInternal(texDisplay, eTexDisplay_MipShift);
+
+  drv.glReadPixels(0, 0, 1, 1, eGL_RGBA, eGL_FLOAT, (void *)pixel);
+
+  if(!HasExt[ARB_gpu_shader5])
+  {
+    if(IsSIntFormat(texDetails.internalFormat))
+    {
+      int32_t casted[4] = {
+          (int32_t)pixel[0],
+          (int32_t)pixel[1],
+          (int32_t)pixel[2],
+          (int32_t)pixel[3],
+      };
+
+      memcpy(pixel, casted, sizeof(casted));
+    }
+    else if(IsUIntFormat(texDetails.internalFormat))
+    {
+      uint32_t casted[4] = {
+          (uint32_t)pixel[0],
+          (uint32_t)pixel[1],
+          (uint32_t)pixel[2],
+          (uint32_t)pixel[3],
+      };
+
+      memcpy(pixel, casted, sizeof(casted));
+    }
+  }
+
+  {
+    // need to read stencil separately as GL can't read both depth and stencil
+    // at the same time.
+    if(texDetails.internalFormat == eGL_DEPTH24_STENCIL8 ||
+       texDetails.internalFormat == eGL_DEPTH32F_STENCIL8 ||
+       texDetails.internalFormat == eGL_DEPTH_STENCIL)
+    {
+      texDisplay.red = texDisplay.blue = texDisplay.alpha = false;
+
+      RenderTextureInternal(texDisplay, eTexDisplay_MipShift);
+
+      uint32_t stencilpixel[4];
+      drv.glReadPixels(0, 0, 1, 1, eGL_RGBA, eGL_FLOAT, (void *)stencilpixel);
+
+      if(!HasExt[ARB_gpu_shader5])
+      {
+        // bits weren't aliased, so re-cast back to uint.
+        float fpix[4];
+        memcpy(fpix, stencilpixel, sizeof(fpix));
+
+        stencilpixel[0] = (uint32_t)fpix[0];
+        stencilpixel[1] = (uint32_t)fpix[1];
+      }
+
+      // not sure whether [0] or [1] will return stencil values, so use
+      // max of two because other channel should be 0
+      pixel[1] = float(RDCMAX(stencilpixel[0], stencilpixel[1])) / 255.0f;
+    }
+  }
+}
+
+bool GLReplay::GetMinMax(ResourceId texid, const Subresource &sub, CompType typeCast, float *minval,
+                         float *maxval)
 {
   auto &texDetails = m_pDriver->m_Textures[texid];
 
@@ -1320,18 +1755,17 @@ bool GLReplay::GetMinMax(ResourceId texid, uint32_t sliceFace, uint32_t mip, uin
     // for depth/stencil we need to run the code twice - once to fetch depth and once to fetch
     // stencil - since we can't process float depth and int stencil at the same time
     Vec4f depth[2] = {
-        {0.0f, 0.0f, 0.0f, 0.0f}, {1.0f, 1.0f, 1.0f, 1.0f},
+        {0.0f, 0.0f, 0.0f, 0.0f},
+        {1.0f, 1.0f, 1.0f, 1.0f},
     };
     Vec4u stencil[2] = {{0, 0, 0, 0}, {1, 1, 1, 1}};
 
-    bool success =
-        GetMinMax(texid, sliceFace, mip, sample, typeHint, false, &depth[0].x, &depth[1].x);
+    bool success = GetMinMax(texid, sub, typeCast, false, &depth[0].x, &depth[1].x);
 
     if(!success)
       return false;
 
-    success = GetMinMax(texid, sliceFace, mip, sample, typeHint, true, (float *)&stencil[0].x,
-                        (float *)&stencil[1].x);
+    success = GetMinMax(texid, sub, typeCast, true, (float *)&stencil[0].x, (float *)&stencil[1].x);
 
     if(!success)
       return false;
@@ -1342,9 +1776,7 @@ bool GLReplay::GetMinMax(ResourceId texid, uint32_t sliceFace, uint32_t mip, uin
     {
       case eGL_STENCIL_INDEX1: rangeScale = 1.0f; break;
       case eGL_STENCIL_INDEX4: rangeScale = 16.0f; break;
-      default:
-        RDCWARN("Unexpected raw format for stencil visualization");
-      // fall through
+      default: RDCWARN("Unexpected raw format for stencil visualization"); DELIBERATE_FALLTHROUGH();
       case eGL_DEPTH24_STENCIL8:
       case eGL_DEPTH32F_STENCIL8:
       case eGL_DEPTH_STENCIL:
@@ -1355,22 +1787,22 @@ bool GLReplay::GetMinMax(ResourceId texid, uint32_t sliceFace, uint32_t mip, uin
     depth[0].y = float(stencil[0].x) / rangeScale;
     depth[1].y = float(stencil[1].x) / rangeScale;
 
-    memcpy(minval, &depth[0].x, sizeof(depth[0]));
-    memcpy(maxval, &depth[1].x, sizeof(depth[1]));
+    memcpy(minval, &depth[0], sizeof(depth[0]));
+    memcpy(maxval, &depth[1], sizeof(depth[1]));
 
     return true;
   }
 
-  return GetMinMax(texid, sliceFace, mip, sample, typeHint, false, minval, maxval);
+  return GetMinMax(texid, sub, typeCast, false, minval, maxval);
 }
 
-bool GLReplay::GetMinMax(ResourceId texid, uint32_t sliceFace, uint32_t mip, uint32_t sample,
-                         CompType typeHint, bool stencil, float *minval, float *maxval)
+bool GLReplay::GetMinMax(ResourceId texid, const Subresource &sub, CompType typeCast, bool stencil,
+                         float *minval, float *maxval)
 {
   if(texid == ResourceId() || m_pDriver->m_Textures.find(texid) == m_pDriver->m_Textures.end())
     return false;
 
-  if(!HasExt[ARB_compute_shader])
+  if(!HasExt[ARB_compute_shader] || !HasExt[ARB_shading_language_420pack])
     return false;
 
   auto &texDetails = m_pDriver->m_Textures[texid];
@@ -1385,13 +1817,11 @@ bool GLReplay::GetMinMax(ResourceId texid, uint32_t sliceFace, uint32_t mip, uin
   switch(texDetails.curType)
   {
     case eGL_RENDERBUFFER:
-      texSlot = RESTYPE_TEX2D;
+      texSlot = texDetails.samples > 1 ? RESTYPE_TEX2DMS : RESTYPE_TEX2D;
       renderbuffer = true;
       break;
     case eGL_TEXTURE_1D: texSlot = RESTYPE_TEX1D; break;
-    default:
-      RDCWARN("Unexpected texture type");
-    // fall through
+    default: RDCWARN("Unexpected texture type"); DELIBERATE_FALLTHROUGH();
     case eGL_TEXTURE_2D: texSlot = RESTYPE_TEX2D; break;
     case eGL_TEXTURE_2D_MULTISAMPLE: texSlot = RESTYPE_TEX2DMS; break;
     case eGL_TEXTURE_2D_MULTISAMPLE_ARRAY: texSlot = RESTYPE_TEX2DMSARRAY; break;
@@ -1413,6 +1843,8 @@ bool GLReplay::GetMinMax(ResourceId texid, uint32_t sliceFace, uint32_t mip, uin
     // need replay context active to do blit (as FBOs aren't shared)
     MakeCurrentReplayContext(&m_ReplayCtx);
 
+    GLMarkerRegion blitRegion("Renderbuffer Blit");
+
     GLuint curDrawFBO = 0;
     GLuint curReadFBO = 0;
     GL.glGetIntegerv(eGL_DRAW_FRAMEBUFFER_BINDING, (GLint *)&curDrawFBO);
@@ -1429,10 +1861,12 @@ bool GLReplay::GetMinMax(ResourceId texid, uint32_t sliceFace, uint32_t mip, uin
     GL.glBindFramebuffer(eGL_READ_FRAMEBUFFER, curReadFBO);
 
     texname = texDetails.renderbufferReadTex;
-    target = eGL_TEXTURE_2D;
+    target = texDetails.samples > 1 ? eGL_TEXTURE_2D_MULTISAMPLE : eGL_TEXTURE_2D;
   }
 
   MakeCurrentReplayContext(m_DebugCtx);
+
+  GLMarkerRegion region("GetMinMax");
 
   RDCGLenum dsTexMode = eGL_NONE;
   if(IsDepthStencilFormat(texDetails.internalFormat))
@@ -1460,17 +1894,18 @@ bool GLReplay::GetMinMax(ResourceId texid, uint32_t sliceFace, uint32_t mip, uin
       (HistogramUBOData *)GL.glMapBufferRange(eGL_UNIFORM_BUFFER, 0, sizeof(HistogramUBOData),
                                               GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
 
-  cdata->HistogramTextureResolution.x = (float)RDCMAX(details.width >> mip, 1U);
-  cdata->HistogramTextureResolution.y = (float)RDCMAX(details.height >> mip, 1U);
-  cdata->HistogramTextureResolution.z = (float)RDCMAX(details.depth >> mip, 1U);
-  if(texDetails.curType != eGL_TEXTURE_3D)
-    cdata->HistogramSlice = (float)sliceFace + 0.001f;
+  cdata->HistogramTextureResolution.x = (float)RDCMAX(details.width >> sub.mip, 1U);
+  cdata->HistogramTextureResolution.y = (float)RDCMAX(details.height >> sub.mip, 1U);
+  cdata->HistogramTextureResolution.z = (float)RDCMAX(details.depth >> sub.mip, 1U);
+  if(texDetails.curType == eGL_TEXTURE_3D)
+    cdata->HistogramSlice =
+        (float)RDCCLAMP(sub.slice, 0U, uint32_t(details.depth >> sub.mip) - 1) + 0.001f;
   else
-    cdata->HistogramSlice = (float)(sliceFace >> mip);
-  cdata->HistogramMip = (int)mip;
+    cdata->HistogramSlice = (float)RDCCLAMP(sub.slice, 0U, details.arraysize - 1) + 0.001f;
+  cdata->HistogramMip = (int)sub.mip;
   cdata->HistogramNumSamples = texDetails.samples;
-  cdata->HistogramSample = (int)RDCCLAMP(sample, 0U, details.msSamp - 1);
-  if(sample == ~0U)
+  cdata->HistogramSample = (int)RDCCLAMP(sub.sample, 0U, details.msSamp - 1);
+  if(sub.sample == ~0U)
     cdata->HistogramSample = -int(details.msSamp);
   cdata->HistogramMin = 0.0f;
   cdata->HistogramMax = 1.0f;
@@ -1506,8 +1941,8 @@ bool GLReplay::GetMinMax(ResourceId texid, uint32_t sliceFace, uint32_t mip, uin
   GLint origDSTexMode = eGL_DEPTH_COMPONENT;
   if(dsTexMode != eGL_NONE && HasExt[ARB_stencil_texturing])
   {
-    GL.glGetTexParameteriv(target, eGL_DEPTH_STENCIL_TEXTURE_MODE, &origDSTexMode);
-    GL.glTexParameteri(target, eGL_DEPTH_STENCIL_TEXTURE_MODE, dsTexMode);
+    GL.glGetTextureParameterivEXT(texname, target, eGL_DEPTH_STENCIL_TEXTURE_MODE, &origDSTexMode);
+    GL.glTextureParameteriEXT(texname, target, eGL_DEPTH_STENCIL_TEXTURE_MODE, dsTexMode);
   }
 
   GLint baseLevel[4] = {-1};
@@ -1579,14 +2014,14 @@ bool GLReplay::GetMinMax(ResourceId texid, uint32_t sliceFace, uint32_t mip, uin
   maxval[3] = minmax[1].w;
 
   if(dsTexMode != eGL_NONE && HasExt[ARB_stencil_texturing])
-    GL.glTexParameteri(target, eGL_DEPTH_STENCIL_TEXTURE_MODE, origDSTexMode);
+    GL.glTextureParameteriEXT(texname, target, eGL_DEPTH_STENCIL_TEXTURE_MODE, origDSTexMode);
 
   return true;
 }
 
-bool GLReplay::GetHistogram(ResourceId texid, uint32_t sliceFace, uint32_t mip, uint32_t sample,
-                            CompType typeHint, float minval, float maxval, bool channels[4],
-                            std::vector<uint32_t> &histogram)
+bool GLReplay::GetHistogram(ResourceId texid, const Subresource &sub, CompType typeCast,
+                            float minval, float maxval, const rdcfixedarray<bool, 4> &channels_,
+                            rdcarray<uint32_t> &histogram)
 {
   if(minval >= maxval || texid == ResourceId())
     return false;
@@ -1594,8 +2029,11 @@ bool GLReplay::GetHistogram(ResourceId texid, uint32_t sliceFace, uint32_t mip, 
   if(m_pDriver->m_Textures.find(texid) == m_pDriver->m_Textures.end())
     return false;
 
-  if(!HasExt[ARB_compute_shader])
+  if(!HasExt[ARB_compute_shader] || !HasExt[ARB_shading_language_420pack])
     return false;
+
+  // take a local copy so we can modify it
+  rdcfixedarray<bool, 4> channels = channels_;
 
   auto &texDetails = m_pDriver->m_Textures[texid];
 
@@ -1609,13 +2047,11 @@ bool GLReplay::GetHistogram(ResourceId texid, uint32_t sliceFace, uint32_t mip, 
   switch(texDetails.curType)
   {
     case eGL_RENDERBUFFER:
-      texSlot = RESTYPE_TEX2D;
+      texSlot = texDetails.samples > 1 ? RESTYPE_TEX2DMS : RESTYPE_TEX2D;
       renderbuffer = true;
       break;
     case eGL_TEXTURE_1D: texSlot = RESTYPE_TEX1D; break;
-    default:
-      RDCWARN("Unexpected texture type");
-    // fall through
+    default: RDCWARN("Unexpected texture type"); DELIBERATE_FALLTHROUGH();
     case eGL_TEXTURE_2D: texSlot = RESTYPE_TEX2D; break;
     case eGL_TEXTURE_2D_MULTISAMPLE: texSlot = RESTYPE_TEX2DMS; break;
     case eGL_TEXTURE_2D_MULTISAMPLE_ARRAY: texSlot = RESTYPE_TEX2DMSARRAY; break;
@@ -1637,6 +2073,8 @@ bool GLReplay::GetHistogram(ResourceId texid, uint32_t sliceFace, uint32_t mip, 
     // need replay context active to do blit (as FBOs aren't shared)
     MakeCurrentReplayContext(&m_ReplayCtx);
 
+    GLMarkerRegion blitRegion("Renderbuffer Blit");
+
     GLuint curDrawFBO = 0;
     GLuint curReadFBO = 0;
     GL.glGetIntegerv(eGL_DRAW_FRAMEBUFFER_BINDING, (GLint *)&curDrawFBO);
@@ -1653,10 +2091,12 @@ bool GLReplay::GetHistogram(ResourceId texid, uint32_t sliceFace, uint32_t mip, 
     GL.glBindFramebuffer(eGL_READ_FRAMEBUFFER, curReadFBO);
 
     texname = texDetails.renderbufferReadTex;
-    target = eGL_TEXTURE_2D;
+    target = texDetails.samples > 1 ? eGL_TEXTURE_2D_MULTISAMPLE : eGL_TEXTURE_2D;
   }
 
   MakeCurrentReplayContext(m_DebugCtx);
+
+  GLMarkerRegion region("GetHistogram");
 
   RDCGLenum dsTexMode = eGL_NONE;
   if(IsDepthStencilFormat(texDetails.internalFormat))
@@ -1692,7 +2132,7 @@ bool GLReplay::GetHistogram(ResourceId texid, uint32_t sliceFace, uint32_t mip, 
         case eGL_STENCIL_INDEX4: rangeScale = 16.0f; break;
         default:
           RDCWARN("Unexpected raw format for stencil visualization");
-        // fall through
+          DELIBERATE_FALLTHROUGH();
         case eGL_DEPTH24_STENCIL8:
         case eGL_DEPTH32F_STENCIL8:
         case eGL_DEPTH_STENCIL:
@@ -1720,17 +2160,18 @@ bool GLReplay::GetHistogram(ResourceId texid, uint32_t sliceFace, uint32_t mip, 
       (HistogramUBOData *)GL.glMapBufferRange(eGL_UNIFORM_BUFFER, 0, sizeof(HistogramUBOData),
                                               GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
 
-  cdata->HistogramTextureResolution.x = (float)RDCMAX(details.width >> mip, 1U);
-  cdata->HistogramTextureResolution.y = (float)RDCMAX(details.height >> mip, 1U);
-  cdata->HistogramTextureResolution.z = (float)RDCMAX(details.depth >> mip, 1U);
-  if(texDetails.curType != eGL_TEXTURE_3D)
-    cdata->HistogramSlice = (float)sliceFace + 0.001f;
+  cdata->HistogramTextureResolution.x = (float)RDCMAX(details.width >> sub.mip, 1U);
+  cdata->HistogramTextureResolution.y = (float)RDCMAX(details.height >> sub.mip, 1U);
+  cdata->HistogramTextureResolution.z = (float)RDCMAX(details.depth >> sub.mip, 1U);
+  if(texDetails.curType == eGL_TEXTURE_3D)
+    cdata->HistogramSlice =
+        (float)RDCCLAMP(sub.slice, 0U, uint32_t(details.depth >> sub.mip) - 1) + 0.001f;
   else
-    cdata->HistogramSlice = (float)(sliceFace >> mip);
-  cdata->HistogramMip = mip;
+    cdata->HistogramSlice = (float)RDCCLAMP(sub.slice, 0U, details.arraysize - 1) + 0.001f;
+  cdata->HistogramMip = sub.mip;
   cdata->HistogramNumSamples = texDetails.samples;
-  cdata->HistogramSample = (int)RDCCLAMP(sample, 0U, details.msSamp - 1);
-  if(sample == ~0U)
+  cdata->HistogramSample = (int)RDCCLAMP(sub.sample, 0U, details.msSamp - 1);
+  if(sub.sample == ~0U)
     cdata->HistogramSample = -int(details.msSamp);
   cdata->HistogramMin = minval;
 
@@ -1788,8 +2229,8 @@ bool GLReplay::GetHistogram(ResourceId texid, uint32_t sliceFace, uint32_t mip, 
   GLint origDSTexMode = eGL_DEPTH_COMPONENT;
   if(dsTexMode != eGL_NONE && HasExt[ARB_stencil_texturing])
   {
-    GL.glGetTexParameteriv(target, eGL_DEPTH_STENCIL_TEXTURE_MODE, &origDSTexMode);
-    GL.glTexParameteri(target, eGL_DEPTH_STENCIL_TEXTURE_MODE, dsTexMode);
+    GL.glGetTextureParameterivEXT(texname, target, eGL_DEPTH_STENCIL_TEXTURE_MODE, &origDSTexMode);
+    GL.glTextureParameteriEXT(texname, target, eGL_DEPTH_STENCIL_TEXTURE_MODE, dsTexMode);
   }
 
   GLint baseLevel[4] = {-1};
@@ -1849,7 +2290,7 @@ bool GLReplay::GetHistogram(ResourceId texid, uint32_t sliceFace, uint32_t mip, 
   RestoreSamplerParams(target, texname, prevSampState);
 
   if(dsTexMode != eGL_NONE && HasExt[ARB_stencil_texturing])
-    GL.glTexParameteri(target, eGL_DEPTH_STENCIL_TEXTURE_MODE, origDSTexMode);
+    GL.glTextureParameteriEXT(texname, target, eGL_DEPTH_STENCIL_TEXTURE_MODE, origDSTexMode);
 
   return true;
 }
@@ -1859,7 +2300,7 @@ uint32_t GLReplay::PickVertex(uint32_t eventId, int32_t width, int32_t height,
 {
   WrappedOpenGL &drv = *m_pDriver;
 
-  if(!HasExt[ARB_compute_shader])
+  if(!HasExt[ARB_compute_shader] || !HasExt[ARB_shading_language_420pack])
     return ~0U;
 
   MakeCurrentReplayContext(m_DebugCtx);
@@ -1870,123 +2311,135 @@ uint32_t GLReplay::PickVertex(uint32_t eventId, int32_t width, int32_t height,
 
   Matrix4f camMat = cfg.cam ? ((Camera *)cfg.cam)->GetMatrix() : Matrix4f::Identity();
   Matrix4f pickMVP = projMat.Mul(camMat);
+  if(!cfg.position.unproject)
+  {
+    pickMVP = pickMVP.Mul(Matrix4f(cfg.axisMapping));
+  }
 
-  Matrix4f pickMVPProj;
+  bool reverseProjection = false;
+  Matrix4f guessProj;
+  Matrix4f guessProjInverse;
   if(cfg.position.unproject)
   {
     // the derivation of the projection matrix might not be right (hell, it could be an
     // orthographic projection). But it'll be close enough likely.
-    Matrix4f guessProj =
-        cfg.position.farPlane != FLT_MAX
-            ? Matrix4f::Perspective(cfg.fov, cfg.position.nearPlane, cfg.position.farPlane, cfg.aspect)
-            : Matrix4f::ReversePerspective(cfg.fov, cfg.position.nearPlane, cfg.aspect);
+    if(cfg.position.farPlane != FLT_MAX)
+    {
+      guessProj =
+          Matrix4f::Perspective(cfg.fov, cfg.position.nearPlane, cfg.position.farPlane, cfg.aspect);
+    }
+    else
+    {
+      reverseProjection = true;
+      guessProj = Matrix4f::ReversePerspective(cfg.fov, cfg.position.nearPlane, cfg.aspect);
+    }
 
     if(cfg.ortho)
       guessProj = Matrix4f::Orthographic(cfg.position.nearPlane, cfg.position.farPlane);
 
-    pickMVPProj = projMat.Mul(camMat.Mul(guessProj.Inverse()));
+    if(cfg.position.flipY)
+      guessProj[5] *= -1.0f;
+
+    guessProjInverse = guessProj.Inverse();
   }
 
-  vec3 rayPos;
-  vec3 rayDir;
+  Vec3f rayPos;
+  Vec3f rayDir;
   // convert mouse pos to world space ray
   {
-    Matrix4f inversePickMVP = pickMVP.Inverse();
-
     float pickX = ((float)x) / ((float)width);
     float pickXCanonical = RDCLERP(-1.0f, 1.0f, pickX);
 
     float pickY = ((float)y) / ((float)height);
-    // flip the Y axis
+    // flip the Y axis by default for Y-up
     float pickYCanonical = RDCLERP(1.0f, -1.0f, pickY);
 
-    vec3 cameraToWorldNearPosition =
-        inversePickMVP.Transform(Vec3f(pickXCanonical, pickYCanonical, -1), 1);
+    if(cfg.position.flipY && !cfg.ortho)
+      pickYCanonical = -pickYCanonical;
 
-    vec3 cameraToWorldFarPosition =
-        inversePickMVP.Transform(Vec3f(pickXCanonical, pickYCanonical, 1), 1);
+    // x/y is inside the window. Since we're not using the window projection we need to correct
+    // for the aspect ratio here.
+    if(cfg.position.unproject && !cfg.ortho)
+      pickXCanonical *= (float(width) / float(height)) / cfg.aspect;
 
-    vec3 testDir = (cameraToWorldFarPosition - cameraToWorldNearPosition);
-    testDir.Normalise();
+    // set up the NDC near/far pos
+    Vec3f nearPosNDC = Vec3f(pickXCanonical, pickYCanonical, 0);
+    Vec3f farPosNDC = Vec3f(pickXCanonical, pickYCanonical, 1);
 
-    // Calculate the ray direction first in the regular way (above), so we can use the
-    // the output for testing if the ray we are picking is negative or not. This is similar
-    // to checking against the forward direction of the camera, but more robust
-    if(cfg.position.unproject)
+    if(cfg.position.unproject && cfg.ortho)
     {
-      Matrix4f inversePickMVPGuess = pickMVPProj.Inverse();
+      // orthographic projections we raycast in NDC space
+      Matrix4f inversePickMVP = pickMVP.Inverse();
 
-      vec3 nearPosProj = inversePickMVPGuess.Transform(Vec3f(pickXCanonical, pickYCanonical, -1), 1);
+      // transform from the desired NDC co-ordinates into camera space
+      Vec3f nearPosCamera = inversePickMVP.Transform(nearPosNDC, 1);
+      Vec3f farPosCamera = inversePickMVP.Transform(farPosNDC, 1);
 
-      vec3 farPosProj = inversePickMVPGuess.Transform(Vec3f(pickXCanonical, pickYCanonical, 1), 1);
+      Vec3f testDir = (farPosCamera - nearPosCamera);
+      testDir.Normalise();
+
+      Matrix4f pickMVPguessProjInverse = guessProj.Mul(inversePickMVP);
+
+      Vec3f nearPosProj = pickMVPguessProjInverse.Transform(nearPosNDC, 1);
+      Vec3f farPosProj = pickMVPguessProjInverse.Transform(farPosNDC, 1);
 
       rayDir = (farPosProj - nearPosProj);
       rayDir.Normalise();
 
+      // Calculate the ray direction first in the regular way (above), so we can use the
+      // the output for testing if the ray we are picking is negative or not. This is similar
+      // to checking against the forward direction of the camera, but more robust
       if(testDir.z < 0)
       {
         rayDir = -rayDir;
       }
       rayPos = nearPosProj;
     }
+    else if(cfg.position.unproject)
+    {
+      // projected data we pick in world-space to avoid problems with handling unusual transforms
+
+      if(reverseProjection)
+      {
+        farPosNDC.z = 1e-6f;
+        nearPosNDC.z = 1e+6f;
+      }
+
+      // invert the guessed projection matrix to get the near/far pos in camera space
+      Vec3f nearPosCamera = guessProjInverse.Transform(nearPosNDC, 1.0f);
+      Vec3f farPosCamera = guessProjInverse.Transform(farPosNDC, 1.0f);
+
+      // normalise and generate the ray
+      rayDir = (farPosCamera - nearPosCamera);
+      rayDir.Normalise();
+
+      farPosCamera = nearPosCamera + rayDir;
+
+      // invert the camera transform to transform the ray as camera-relative into world space
+      Matrix4f inverseCamera = camMat.Inverse();
+
+      Vec3f nearPosWorld = inverseCamera.Transform(nearPosCamera, 1);
+      Vec3f farPosWorld = inverseCamera.Transform(farPosCamera, 1);
+
+      // again normalise our final ray
+      rayDir = (farPosWorld - nearPosWorld);
+      rayDir.Normalise();
+
+      rayPos = nearPosWorld;
+    }
     else
     {
-      rayDir = testDir;
-      rayPos = cameraToWorldNearPosition;
+      Matrix4f inversePickMVP = pickMVP.Inverse();
+
+      // transform from the desired NDC co-ordinates into model space
+      Vec3f nearPosCamera = inversePickMVP.Transform(nearPosNDC, 1);
+      Vec3f farPosCamera = inversePickMVP.Transform(farPosNDC, 1);
+
+      rayDir = (farPosCamera - nearPosCamera);
+      rayDir.Normalise();
+      rayPos = nearPosCamera;
     }
   }
-
-  drv.glBindBufferBase(eGL_UNIFORM_BUFFER, 0, DebugData.UBOs[0]);
-  MeshPickUBOData *cdata =
-      (MeshPickUBOData *)drv.glMapBufferRange(eGL_UNIFORM_BUFFER, 0, sizeof(MeshPickUBOData),
-                                              GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
-
-  cdata->rayPos = rayPos;
-  cdata->rayDir = rayDir;
-  cdata->use_indices = cfg.position.indexByteStride ? 1U : 0U;
-  cdata->numVerts = cfg.position.numIndices;
-  bool isTriangleMesh = true;
-  switch(cfg.position.topology)
-  {
-    case Topology::TriangleList:
-    {
-      cdata->meshMode = MESH_TRIANGLE_LIST;
-      break;
-    }
-    case Topology::TriangleStrip:
-    {
-      cdata->meshMode = MESH_TRIANGLE_STRIP;
-      break;
-    }
-    case Topology::TriangleFan:
-    {
-      cdata->meshMode = MESH_TRIANGLE_FAN;
-      break;
-    }
-    case Topology::TriangleList_Adj:
-    {
-      cdata->meshMode = MESH_TRIANGLE_LIST_ADJ;
-      break;
-    }
-    case Topology::TriangleStrip_Adj:
-    {
-      cdata->meshMode = MESH_TRIANGLE_STRIP_ADJ;
-      break;
-    }
-    default:    // points, lines, patchlists, unknown
-    {
-      cdata->meshMode = MESH_OTHER;
-      isTriangleMesh = false;
-    }
-  }
-
-  // line/point data
-  cdata->unproject = cfg.position.unproject;
-  cdata->mvp = cfg.position.unproject ? pickMVPProj : pickMVP;
-  cdata->coords = Vec2f((float)x, (float)y);
-  cdata->viewport = Vec2f((float)width, (float)height);
-
-  drv.glUnmapBuffer(eGL_UNIFORM_BUFFER);
 
   GLuint ib = 0;
 
@@ -2000,34 +2453,50 @@ uint32_t GLReplay::PickVertex(uint32_t eventId, int32_t width, int32_t height,
   if(cfg.position.indexByteStride && cfg.position.indexResourceId != ResourceId())
     ib = m_pDriver->GetResourceManager()->GetCurrentResource(cfg.position.indexResourceId).name;
 
+  const bool fandecode =
+      (cfg.position.topology == Topology::TriangleFan && cfg.position.allowRestart);
+  uint32_t numIndices = cfg.position.numIndices;
+
   // We copy into our own buffers to promote to the target type (uint32) that the shader expects.
   // Most IBs will be 16-bit indices, most VBs will not be float4. We also apply baseVertex here
 
   if(ib)
   {
+    rdcarray<uint32_t> idxtmp;
+
+    // if it's a triangle fan that allows restart, we'll have to unpack it.
+    // Allocate enough space for the list on the GPU, and enough temporary space to upcast into
+    // first
+    if(fandecode)
+    {
+      idxtmp.resize(numIndices);
+
+      numIndices *= 3;
+    }
+
     // resize up on demand
-    if(DebugData.pickIBBuf == 0 || DebugData.pickIBSize < cfg.position.numIndices * sizeof(uint32_t))
+    if(DebugData.pickIBBuf == 0 || DebugData.pickIBSize < numIndices * sizeof(uint32_t))
     {
       drv.glDeleteBuffers(1, &DebugData.pickIBBuf);
 
       drv.glGenBuffers(1, &DebugData.pickIBBuf);
       drv.glBindBuffer(eGL_SHADER_STORAGE_BUFFER, DebugData.pickIBBuf);
-      drv.glNamedBufferDataEXT(DebugData.pickIBBuf, cfg.position.numIndices * sizeof(uint32_t),
-                               NULL, eGL_STREAM_DRAW);
+      drv.glNamedBufferDataEXT(DebugData.pickIBBuf, numIndices * sizeof(uint32_t), NULL,
+                               eGL_STREAM_DRAW);
 
-      DebugData.pickIBSize = cfg.position.numIndices * sizeof(uint32_t);
+      DebugData.pickIBSize = numIndices * sizeof(uint32_t);
     }
 
-    byte *idxs = new byte[cfg.position.numIndices * cfg.position.indexByteStride];
-    memset(idxs, 0, cfg.position.numIndices * cfg.position.indexByteStride);
+    byte *idxs = new byte[numIndices * cfg.position.indexByteStride];
+    memset(idxs, 0, numIndices * cfg.position.indexByteStride);
 
-    std::vector<uint32_t> outidxs;
-    outidxs.resize(cfg.position.numIndices);
+    rdcarray<uint32_t> outidxs;
+    outidxs.resize(numIndices);
 
     drv.glBindBuffer(eGL_COPY_READ_BUFFER, ib);
 
-    GLint bufsize = 0;
-    drv.glGetBufferParameteriv(eGL_COPY_READ_BUFFER, eGL_BUFFER_SIZE, &bufsize);
+    GLuint bufsize = 0;
+    drv.glGetBufferParameteriv(eGL_COPY_READ_BUFFER, eGL_BUFFER_SIZE, (GLint *)&bufsize);
 
     drv.glGetBufferSubData(eGL_COPY_READ_BUFFER, (GLintptr)cfg.position.indexByteOffset,
                            RDCMIN(uint32_t(bufsize) - uint32_t(cfg.position.indexByteOffset),
@@ -2037,6 +2506,8 @@ uint32_t GLReplay::PickVertex(uint32_t eventId, int32_t width, int32_t height,
     uint8_t *idxs8 = (uint8_t *)idxs;
     uint16_t *idxs16 = (uint16_t *)idxs;
     uint32_t *idxs32 = (uint32_t *)idxs;
+
+    size_t idxcount = 0;
 
     if(cfg.position.indexByteStride == 1)
     {
@@ -2062,11 +2533,8 @@ uint32_t GLReplay::PickVertex(uint32_t eventId, int32_t width, int32_t height,
         }
 
         outidxs[i] = idx;
+        idxcount++;
       }
-
-      drv.glBindBuffer(eGL_SHADER_STORAGE_BUFFER, DebugData.pickIBBuf);
-      drv.glBufferSubData(eGL_SHADER_STORAGE_BUFFER, 0, cfg.position.numIndices * sizeof(uint32_t),
-                          outidxs.data());
     }
     else if(cfg.position.indexByteStride == 2)
     {
@@ -2092,11 +2560,8 @@ uint32_t GLReplay::PickVertex(uint32_t eventId, int32_t width, int32_t height,
         }
 
         outidxs[i] = idx;
+        idxcount++;
       }
-
-      drv.glBindBuffer(eGL_SHADER_STORAGE_BUFFER, DebugData.pickIBBuf);
-      drv.glBufferSubData(eGL_SHADER_STORAGE_BUFFER, 0, cfg.position.numIndices * sizeof(uint32_t),
-                          outidxs.data());
     }
     else
     {
@@ -2122,12 +2587,30 @@ uint32_t GLReplay::PickVertex(uint32_t eventId, int32_t width, int32_t height,
         }
 
         outidxs[i] = idx;
+        idxcount++;
+      }
+    }
+
+    // if it's a triangle fan that allows restart, unpack it
+    if(cfg.position.topology == Topology::TriangleFan && cfg.position.allowRestart)
+    {
+      // resize to how many indices were actually read
+      outidxs.resize(idxcount);
+
+      // patch the index buffer
+      PatchTriangleFanRestartIndexBufer(outidxs, cfg.position.restartIndex);
+
+      for(uint32_t &idx : idxtmp)
+      {
+        if(idx == cfg.position.restartIndex)
+          idx = 0;
       }
 
-      drv.glBindBuffer(eGL_SHADER_STORAGE_BUFFER, DebugData.pickIBBuf);
-      drv.glBufferSubData(eGL_SHADER_STORAGE_BUFFER, 0, cfg.position.numIndices * sizeof(uint32_t),
-                          outidxs.data());
+      numIndices = (uint32_t)outidxs.size();
     }
+
+    drv.glBindBuffer(eGL_SHADER_STORAGE_BUFFER, DebugData.pickIBBuf);
+    drv.glBufferSubData(eGL_SHADER_STORAGE_BUFFER, 0, numIndices * sizeof(uint32_t), outidxs.data());
   }
 
   // unpack and linearise the data
@@ -2136,7 +2619,7 @@ uint32_t GLReplay::PickVertex(uint32_t eventId, int32_t width, int32_t height,
     GetBufferData(cfg.position.vertexResourceId, cfg.position.vertexByteOffset, 0, oldData);
 
     // clamp maxIndex to upper bound in case we got invalid indices or primitive restart indices
-    maxIndex = RDCMIN(maxIndex, uint32_t(oldData.size() / cfg.position.vertexByteStride));
+    maxIndex = RDCMIN(maxIndex, uint32_t(oldData.size() / RDCMAX(1U, cfg.position.vertexByteStride)));
 
     if(DebugData.pickVBBuf == 0 || DebugData.pickVBSize < (maxIndex + 1) * sizeof(Vec4f))
     {
@@ -2150,7 +2633,7 @@ uint32_t GLReplay::PickVertex(uint32_t eventId, int32_t width, int32_t height,
       DebugData.pickVBSize = (maxIndex + 1) * sizeof(Vec4f);
     }
 
-    std::vector<FloatVector> vbData;
+    rdcarray<FloatVector> vbData;
     vbData.resize(maxIndex + 1);
 
     byte *data = &oldData[0];
@@ -2170,6 +2653,93 @@ uint32_t GLReplay::PickVertex(uint32_t eventId, int32_t width, int32_t height,
     drv.glBufferSubData(eGL_SHADER_STORAGE_BUFFER, 0, (maxIndex + 1) * sizeof(Vec4f), vbData.data());
   }
 
+  drv.glBindBufferBase(eGL_UNIFORM_BUFFER, 0, DebugData.UBOs[0]);
+  MeshPickUBOData *cdata =
+      (MeshPickUBOData *)drv.glMapBufferRange(eGL_UNIFORM_BUFFER, 0, sizeof(MeshPickUBOData),
+                                              GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
+
+  if(!cdata)
+  {
+    RDCERR("Map buffer failed %d", drv.glGetError());
+    return ~0U;
+  }
+
+  cdata->rayPos = rayPos;
+  cdata->rayDir = rayDir;
+  cdata->use_indices = cfg.position.indexByteStride ? 1U : 0U;
+  cdata->numVerts = numIndices;
+  bool isTriangleMesh = true;
+  switch(cfg.position.topology)
+  {
+    case Topology::TriangleList:
+    {
+      cdata->meshMode = MESH_TRIANGLE_LIST;
+      break;
+    }
+    case Topology::TriangleStrip:
+    {
+      cdata->meshMode = MESH_TRIANGLE_STRIP;
+      break;
+    }
+    case Topology::TriangleFan:
+    {
+      if(fandecode)
+        cdata->meshMode = MESH_TRIANGLE_LIST;
+      else
+        cdata->meshMode = MESH_TRIANGLE_FAN;
+      break;
+    }
+    case Topology::TriangleList_Adj:
+    {
+      cdata->meshMode = MESH_TRIANGLE_LIST_ADJ;
+      break;
+    }
+    case Topology::TriangleStrip_Adj:
+    {
+      cdata->meshMode = MESH_TRIANGLE_STRIP_ADJ;
+      break;
+    }
+    default:    // points, lines, patchlists, unknown
+    {
+      cdata->meshMode = MESH_OTHER;
+      isTriangleMesh = false;
+    }
+  }
+
+  // line/point data
+  cdata->unproject = cfg.position.unproject;
+  cdata->flipY = cfg.position.flipY;
+  cdata->ortho = cfg.ortho;
+  cdata->coords = Vec2f((float)x, (float)y);
+  cdata->viewport = Vec2f((float)width, (float)height);
+
+  if(cfg.position.unproject && isTriangleMesh)
+  {
+    // projected triangle meshes we transform the vertices into world space, and ray-cast against
+    // that
+    //
+    // NOTE: for ortho, this matrix is not used and we just do the perspective W division on model
+    // vertices. The ray is cast in NDC
+    if(cfg.ortho)
+      cdata->transformMat = Matrix4f::Identity();
+    else
+      cdata->transformMat = guessProjInverse;
+  }
+  else if(cfg.position.unproject)
+  {
+    // projected non-triangles are just point clouds, so we transform the vertices into world space
+    // then project them back onto the output and compare that against the picking 2D co-ordinates
+    cdata->transformMat = pickMVP.Mul(guessProjInverse);
+  }
+  else
+  {
+    // plain meshes of either type, we just transform from model space to the output, and raycast or
+    // co-ordinate check
+    cdata->transformMat = pickMVP;
+  }
+
+  drv.glUnmapBuffer(eGL_UNIFORM_BUFFER);
+
   uint32_t reset[4] = {};
   drv.glBindBufferBase(eGL_SHADER_STORAGE_BUFFER, 0, DebugData.pickResultBuf);
   drv.glBufferSubData(eGL_SHADER_STORAGE_BUFFER, 0, sizeof(uint32_t) * 4, &reset);
@@ -2186,6 +2756,8 @@ uint32_t GLReplay::PickVertex(uint32_t eventId, int32_t width, int32_t height,
 
   drv.glBindBuffer(eGL_COPY_READ_BUFFER, DebugData.pickResultBuf);
   drv.glGetBufferSubData(eGL_COPY_READ_BUFFER, 0, sizeof(uint32_t), &numResults);
+
+  uint32_t ret = ~0U;
 
   if(numResults > 0)
   {
@@ -2219,7 +2791,7 @@ uint32_t GLReplay::PickVertex(uint32_t eventId, int32_t width, int32_t height,
 
       drv.glUnmapNamedBufferEXT(DebugData.pickResultBuf);
 
-      return closest->vertid;
+      ret = closest->vertid;
     }
     else
     {
@@ -2258,117 +2830,21 @@ uint32_t GLReplay::PickVertex(uint32_t eventId, int32_t width, int32_t height,
 
       drv.glUnmapNamedBufferEXT(DebugData.pickResultBuf);
 
-      return closest->vertid;
+      ret = closest->vertid;
     }
   }
 
-  return ~0U;
+  if(fandecode)
+  {
+    // undo the triangle list expansion
+    if(ret > 2)
+      ret = (ret + 3) / 3 + 1;
+  }
+
+  return ret;
 }
 
-void GLReplay::PickPixel(ResourceId texture, uint32_t x, uint32_t y, uint32_t sliceFace,
-                         uint32_t mip, uint32_t sample, CompType typeHint, float pixel[4])
-{
-  WrappedOpenGL &drv = *m_pDriver;
-
-  MakeCurrentReplayContext(m_DebugCtx);
-
-  drv.glBindFramebuffer(eGL_FRAMEBUFFER, DebugData.pickPixelFBO);
-  drv.glBindFramebuffer(eGL_READ_FRAMEBUFFER, DebugData.pickPixelFBO);
-
-  pixel[0] = pixel[1] = pixel[2] = pixel[3] = 0.0f;
-  drv.glClearBufferfv(eGL_COLOR, 0, pixel);
-
-  DebugData.outWidth = DebugData.outHeight = 1.0f;
-  drv.glViewport(0, 0, 1, 1);
-
-  TextureDisplay texDisplay;
-
-  texDisplay.red = texDisplay.green = texDisplay.blue = texDisplay.alpha = true;
-  texDisplay.flipY = false;
-  texDisplay.hdrMultiplier = -1.0f;
-  texDisplay.linearDisplayAsGamma = true;
-  texDisplay.mip = mip;
-  texDisplay.sampleIdx = sample;
-  texDisplay.customShaderId = ResourceId();
-  texDisplay.sliceFace = sliceFace;
-  texDisplay.rangeMin = 0.0f;
-  texDisplay.rangeMax = 1.0f;
-  texDisplay.scale = 1.0f;
-  texDisplay.resourceId = texture;
-  texDisplay.typeHint = typeHint;
-  texDisplay.rawOutput = true;
-  texDisplay.xOffset = -float(x);
-  texDisplay.yOffset = -float(y);
-
-  RenderTextureInternal(texDisplay, eTexDisplay_MipShift);
-
-  drv.glReadPixels(0, 0, 1, 1, eGL_RGBA, eGL_FLOAT, (void *)pixel);
-
-  if(!HasExt[ARB_gpu_shader5])
-  {
-    auto &texDetails = m_pDriver->m_Textures[texDisplay.resourceId];
-
-    if(IsSIntFormat(texDetails.internalFormat))
-    {
-      int32_t casted[4] = {
-          (int32_t)pixel[0], (int32_t)pixel[1], (int32_t)pixel[2], (int32_t)pixel[3],
-      };
-
-      memcpy(pixel, casted, sizeof(casted));
-    }
-    else if(IsUIntFormat(texDetails.internalFormat))
-    {
-      uint32_t casted[4] = {
-          (uint32_t)pixel[0], (uint32_t)pixel[1], (uint32_t)pixel[2], (uint32_t)pixel[3],
-      };
-
-      memcpy(pixel, casted, sizeof(casted));
-    }
-  }
-
-  {
-    auto &texDetails = m_pDriver->m_Textures[texture];
-
-    // need to read stencil separately as GL can't read both depth and stencil
-    // at the same time.
-    if(texDetails.internalFormat == eGL_DEPTH24_STENCIL8 ||
-       texDetails.internalFormat == eGL_DEPTH32F_STENCIL8 ||
-       texDetails.internalFormat == eGL_DEPTH_STENCIL ||
-       texDetails.internalFormat == eGL_STENCIL_INDEX8)
-    {
-      texDisplay.red = texDisplay.blue = texDisplay.alpha = false;
-
-      RenderTextureInternal(texDisplay, eTexDisplay_MipShift);
-
-      uint32_t stencilpixel[4];
-      drv.glReadPixels(0, 0, 1, 1, eGL_RGBA, eGL_FLOAT, (void *)stencilpixel);
-
-      if(!HasExt[ARB_gpu_shader5])
-      {
-        // bits weren't aliased, so re-cast back to uint.
-        float fpix[4];
-        memcpy(fpix, stencilpixel, sizeof(fpix));
-
-        stencilpixel[0] = (uint32_t)fpix[0];
-        stencilpixel[1] = (uint32_t)fpix[1];
-      }
-
-      // not sure whether [0] or [1] will return stencil values, so use
-      // max of two because other channel should be 0
-      pixel[1] = float(RDCMAX(stencilpixel[0], stencilpixel[1])) / 255.0f;
-
-      // the first depth read will have read stencil instead.
-      // NULL it out so the UI sees only stencil
-      if(texDetails.internalFormat == eGL_STENCIL_INDEX8)
-      {
-        pixel[1] = float(RDCMAX(stencilpixel[0], stencilpixel[1])) / 255.0f;
-        pixel[0] = 0.0f;
-      }
-    }
-  }
-}
-
-void GLReplay::RenderCheckerboard()
+void GLReplay::RenderCheckerboard(FloatVector dark, FloatVector light)
 {
   MakeCurrentReplayContext(m_DebugCtx);
 
@@ -2387,14 +2863,20 @@ void GLReplay::RenderCheckerboard()
       (CheckerboardUBOData *)drv.glMapBufferRange(eGL_UNIFORM_BUFFER, 0, sizeof(CheckerboardUBOData),
                                                   GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
 
+  if(!ubo)
+  {
+    RDCERR("Map buffer failed %d", drv.glGetError());
+    return;
+  }
+
   ubo->BorderWidth = 0.0f;
   ubo->RectPosition = Vec2f();
   ubo->RectSize = Vec2f();
   ubo->CheckerSquareDimension = 64.0f;
   ubo->InnerColor = Vec4f();
 
-  ubo->PrimaryColor = ConvertSRGBToLinear(RenderDoc::Inst().DarkCheckerboardColor());
-  ubo->SecondaryColor = ConvertSRGBToLinear(RenderDoc::Inst().LightCheckerboardColor());
+  ubo->PrimaryColor = ConvertSRGBToLinear(dark);
+  ubo->SecondaryColor = ConvertSRGBToLinear(light);
 
   drv.glUnmapBuffer(eGL_UNIFORM_BUFFER);
 

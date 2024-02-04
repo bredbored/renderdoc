@@ -4,7 +4,7 @@
     "name": "VK_LAYER_RENDERDOC_Capture",
     "type": "GLOBAL",
     "library_path": "@VULKAN_LAYER_MODULE_PATH@",
-    "api_version": "1.1.73",
+    "api_version": "1.3.131",
     "implementation_version": "@RENDERDOC_VERSION_MINOR@",
     "description": "Debugging capture layer for RenderDoc",
     "functions": {
@@ -31,10 +31,15 @@
                         "vkCmdDebugMarkerEndEXT",
                         "vkCmdDebugMarkerInsertEXT"
                        ]
+      },
+      {
+        "name": "VK_EXT_tooling_info",
+        "spec_version": "1",
+        "entrypoints": ["vkGetPhysicalDeviceToolPropertiesEXT"]
       }
     ],
     "enable_environment": {
-      "ENABLE_VULKAN_RENDERDOC_CAPTURE": "1"
+      "@VULKAN_ENABLE_VAR@": "1"
     },
     "disable_environment": {
       "DISABLE_VULKAN_RENDERDOC_CAPTURE_@RENDERDOC_VERSION_MAJOR@_@RENDERDOC_VERSION_MINOR@": "1"

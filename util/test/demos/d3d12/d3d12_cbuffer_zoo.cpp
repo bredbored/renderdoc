@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2018-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -24,7 +24,7 @@
 
 #include "d3d12_test.h"
 
-TEST(D3D12_CBuffer_Zoo, D3D12GraphicsTest)
+RD_TEST(D3D12_CBuffer_Zoo, D3D12GraphicsTest)
 {
   static constexpr const char *Description =
       "Tests every kind of constant that can be in a cbuffer to make sure it's decoded "
@@ -36,7 +36,37 @@ struct float3_1 { float3 a; float b; };
 
 struct nested { float3_1 a; float4 b[4]; float3_1 c[4]; };
 
-cbuffer consts : register(b0)
+struct float2_struct { float x; float y; };
+
+struct nested_with_padding
+{
+  float a;                              // 0, <1, 2, 3>
+  float4 b;                             // {4, 5, 6, 7}
+  float c;                              // 8, <9, 10, 11>
+  float3 d[4];                          // [0]: {12, 13, 14}, <15>
+                                        // [1]: {16, 17, 18}, <19>
+                                        // [2]: {20, 21, 22}, <23>
+                                        // [3]: {24, 25, 26}, <27>
+};
+
+struct empty_struct
+{
+};
+
+struct nested_with_empty
+{
+  float3 a;                              // 0, 1, 2, 3
+  empty_struct b;                        // <omitted>
+  float2 c;                              // 4, 5, <6, 7>
+};
+
+struct misaligned_struct
+{
+  float4 a;
+  float2 b;
+};
+
+cbuffer consts : register(b7)
 {
   // dummy* entries are just to 'reset' packing to avoid pollution between tests
 
@@ -225,8 +255,35 @@ cbuffer consts : register(b0)
                                           //         <434, 438>
                                           //         <435, 439>
                                           // }
+                                          
+  nested_with_padding ak[2];              // 440 - 467, 468 - 495
 
-  float4 test;                            // {440, 441, 442, 443}
+  float4 dummy13;                         // forces no trailing overlap with ak
+
+  float al;                               // {500}, <501, 502, 503>
+
+  // struct is always float4 aligned, can't be packed with al
+  float2_struct am;                       // {504, 505}, <506, 507>
+
+  // struct allows trailing things into padding
+  float an;                               // {506}
+
+  float4 gldummy4;                        // account for an not overlapping in GL/VK
+
+  empty_struct empty;                     // completely omitted
+
+  nested_with_empty nested_empty;         // empty struct will take up a float4
+
+  misaligned_struct ao[2];                // [0] = {
+                                          //   .a = { 520, 521, 522, 523 }
+                                          //   .b = { 524, 525 } <526, 527>
+                                          // }
+                                          // [1] = {
+                                          //   .a = { 528, 529, 530, 531 }
+                                          //   .b = { 532, 533 } <534, 535>
+                                          // }
+
+  float4 test;                            // {536, 537, 538, 539}
 };
 
 // this comes from root signature constants
@@ -238,9 +295,14 @@ cbuffer rootconsts : register(b1)
   float3_1 root_d;
 };
 
+cbuffer hugespace : register(b0, space999999999)
+{
+  float4 huge_val;
+};
+
 float4 main() : SV_Target0
 {
-	return test + root_zero + float4(0.1f, 0.0f, 0.0f, 0.0f);
+	return test + root_zero + huge_val * 1e-30f + float4(0.1f, 0.0f, 0.0f, 0.0f);
 }
 
 )EOSHADER";
@@ -265,13 +327,22 @@ float4 main() : SV_Target0
     if(!Init())
       return 3;
 
-    ID3DBlobPtr vsblob = Compile(D3DDefaultVertex, "main", "vs_5_0");
-    ID3DBlobPtr psblob = Compile(pixel, "main", "ps_5_0");
+    ID3DBlobPtr vs5blob = Compile(D3DDefaultVertex, "main", "vs_5_0");
+    ID3DBlobPtr ps5blob = Compile(pixel, "main", "ps_5_1");
 
-    Vec4f cbufferdata[512];
+    ID3DBlobPtr vs6blob = m_DXILSupport ? Compile(D3DDefaultVertex, "main", "vs_6_0") : NULL;
+    ID3DBlobPtr ps6blob = m_DXILSupport ? Compile(pixel, "main", "ps_6_0") : NULL;
+
+    const size_t bindOffset = 16;
+
+    Vec4f cbufferdata[bindOffset + 512];
+
+    for(int i = 0; i < bindOffset; i++)
+      cbufferdata[i] = Vec4f(-99.9f, -88.8f, -77.7f, -66.6f);
 
     for(int i = 0; i < 512; i++)
-      cbufferdata[i] = Vec4f(float(i * 4 + 0), float(i * 4 + 1), float(i * 4 + 2), float(i * 4 + 3));
+      cbufferdata[bindOffset + i] =
+          Vec4f(float(i * 4 + 0), float(i * 4 + 1), float(i * 4 + 2), float(i * 4 + 3));
 
     RootData rootData = {};
 
@@ -291,18 +362,30 @@ float4 main() : SV_Target0
     rootData.root_d.a[2] = 110.0f;
     rootData.root_d.b = 120.0f;
 
+    RootData emptyRoot = {};
+
     static_assert(sizeof(rootData) == 64, "Root data is mis-sized");
 
     ID3D12ResourcePtr vb = MakeBuffer().Data(DefaultTri);
     ID3D12ResourcePtr cb = MakeBuffer().Data(cbufferdata);
 
     ID3D12RootSignaturePtr sig = MakeSig({
-        cbvParam(D3D12_SHADER_VISIBILITY_PIXEL, 0, 0),
+        cbvParam(D3D12_SHADER_VISIBILITY_PIXEL, 0, 7),
+        constParam(D3D12_SHADER_VISIBILITY_VERTEX, 0, 1, sizeof(rootData) / sizeof(uint32_t)),
         constParam(D3D12_SHADER_VISIBILITY_PIXEL, 0, 1, sizeof(rootData) / sizeof(uint32_t)),
+        constParam(D3D12_SHADER_VISIBILITY_GEOMETRY, 0, 1, sizeof(rootData) / sizeof(uint32_t)),
+        cbvParam(D3D12_SHADER_VISIBILITY_PIXEL, 999999999, 0),
     });
 
-    ID3D12PipelineStatePtr pso = MakePSO().RootSig(sig).InputLayout().VS(vsblob).PS(psblob).RTVs(
-        {DXGI_FORMAT_R32G32B32A32_FLOAT});
+    ID3D12PipelineStatePtr dxbcpso =
+        MakePSO().RootSig(sig).InputLayout().VS(vs5blob).PS(ps5blob).RTVs(
+            {DXGI_FORMAT_R32G32B32A32_FLOAT});
+
+    ID3D12PipelineStatePtr dxilpso = NULL;
+
+    if(vs6blob && ps6blob)
+      dxilpso = MakePSO().RootSig(sig).InputLayout().VS(vs6blob).PS(ps6blob).RTVs(
+          {DXGI_FORMAT_R32G32B32A32_FLOAT});
 
     ResourceBarrier(vb, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
     ResourceBarrier(cb, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
@@ -322,26 +405,48 @@ float4 main() : SV_Target0
       D3D12_CPU_DESCRIPTOR_HANDLE bbrtv =
           MakeRTV(bb).Format(DXGI_FORMAT_R8G8B8A8_UNORM_SRGB).CreateCPU(0);
 
-      ClearRenderTargetView(cmd, bbrtv, {0.4f, 0.5f, 0.6f, 1.0f});
+      ClearRenderTargetView(cmd, bbrtv, {0.2f, 0.2f, 0.2f, 1.0f});
 
       D3D12_CPU_DESCRIPTOR_HANDLE offrtv = MakeRTV(rtvtex).CreateCPU(0);
 
-      ClearRenderTargetView(cmd, offrtv, {0.4f, 0.5f, 0.6f, 1.0f});
+      ClearRenderTargetView(cmd, offrtv, {0.2f, 0.2f, 0.2f, 1.0f});
 
       cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
       IASetVertexBuffer(cmd, vb, sizeof(DefaultA2V), 0);
-      cmd->SetPipelineState(pso);
+      cmd->SetPipelineState(dxbcpso);
       cmd->SetGraphicsRootSignature(sig);
-      cmd->SetGraphicsRootConstantBufferView(0, cb->GetGPUVirtualAddress());
-      cmd->SetGraphicsRoot32BitConstants(1, sizeof(rootData) / sizeof(uint32_t), &rootData, 0);
+      cmd->SetGraphicsRootConstantBufferView(
+          0, cb->GetGPUVirtualAddress() + bindOffset * sizeof(Vec4f));
+      cmd->SetGraphicsRoot32BitConstants(1, sizeof(emptyRoot) / sizeof(uint32_t), &emptyRoot, 0);
+      cmd->SetGraphicsRoot32BitConstants(2, sizeof(rootData) / sizeof(uint32_t), &rootData, 0);
+      cmd->SetGraphicsRoot32BitConstants(3, sizeof(emptyRoot) / sizeof(uint32_t), &emptyRoot, 0);
+      cmd->SetGraphicsRootConstantBufferView(
+          4, cb->GetGPUVirtualAddress() + bindOffset * sizeof(Vec4f) + 256);
 
       RSSetViewport(cmd, {0.0f, 0.0f, (float)screenWidth, (float)screenHeight, 0.0f, 1.0f});
       RSSetScissorRect(cmd, {0, 0, screenWidth, screenHeight});
 
       OMSetRenderTargets(cmd, {offrtv}, {});
 
+      setMarker(cmd, "DXBC Draw");
       cmd->DrawInstanced(3, 1, 0, 0);
+
+      if(dxilpso)
+      {
+        cmd->SetPipelineState(dxilpso);
+
+        setMarker(cmd, "DXIL Draw");
+        cmd->DrawInstanced(3, 1, 0, 0);
+      }
+
+      ResourceBarrier(cmd, rtvtex, D3D12_RESOURCE_STATE_RENDER_TARGET,
+                      D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+
+      blitToSwap(cmd, rtvtex, bb);
+
+      ResourceBarrier(cmd, rtvtex, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                      D3D12_RESOURCE_STATE_RENDER_TARGET);
 
       FinishUsingBackbuffer(cmd, D3D12_RESOURCE_STATE_RENDER_TARGET);
 

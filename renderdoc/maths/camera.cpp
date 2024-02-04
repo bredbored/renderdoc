@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  * Copyright (c) 2014 Crytek
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -53,7 +53,7 @@ void Camera::RotateArcball(float ax, float ay, float bx, float by)
 
   if(az < 1.0f)
   {
-    a = Vec3f(from.x, from.y, sqrt(1.0f - az));
+    a = Vec3f(from.x, from.y, sqrtf(1.0f - az));
   }
   else
   {
@@ -63,7 +63,7 @@ void Camera::RotateArcball(float ax, float ay, float bx, float by)
 
   if(bz < 1.0f)
   {
-    b = Vec3f(to.x, to.y, sqrt(1.0f - bz));
+    b = Vec3f(to.x, to.y, sqrtf(1.0f - bz));
   }
   else
   {
@@ -102,6 +102,7 @@ void Camera::Update()
     Matrix4f d = Matrix4f::Translation(Vec3f(0.0f, 0.0f, dist));
 
     mat = d.Mul(r.Mul(p));
+    basis = mat.Transpose();
   }
 }
 

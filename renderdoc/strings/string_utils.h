@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  * Copyright (c) 2014 Crytek
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -25,22 +25,22 @@
 
 #pragma once
 
-#include <stdint.h>
-#include <string>
-#include <vector>
+#include "api/replay/rdcarray.h"
+#include "api/replay/rdcstr.h"
 
-std::string strlower(const std::string &str);
-std::string strupper(const std::string &str);
-
-std::string trim(const std::string &str);
-std::string removeFromEnd(const std::string &value, const std::string &ending);
+rdcstr strlower(const rdcstr &str);
+rdcstr strupper(const rdcstr &str);
 
 uint32_t strhash(const char *str, uint32_t existingHash = 5381);
 
-bool endswith(const std::string &value, const std::string &ending);
+rdcstr get_basename(const rdcstr &path);
+rdcstr get_dirname(const rdcstr &path);
+rdcstr strip_extension(const rdcstr &path);
 
-std::string get_basename(const std::string &path);
-std::string get_dirname(const std::string &path);
+// remove everything but alphanumeric ' ' and '.'
+// It replaces everything else with _
+// for logging strings where they might contain garbage characters
+void strip_nonbasic(rdcstr &str);
 
-void split(const std::string &in, std::vector<std::string> &out, const char sep);
-void merge(const std::vector<std::string> &in, std::string &out, const char sep);
+void split(const rdcstr &in, rdcarray<rdcstr> &out, const char sep);
+void merge(const rdcarray<rdcstr> &in, rdcstr &out, const char sep);

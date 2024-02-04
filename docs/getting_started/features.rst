@@ -1,9 +1,9 @@
 Features
 ========
 
-This page documents the current feature set of RenderDoc. This gives an overview of what RenderDoc is capable of, and where it is in its development. You might also be interested in the :doc:`../behind_scenes/planned_features`.
+This page documents the current feature set of RenderDoc. This gives an overview of what RenderDoc is capable of, and where it is in its development.
 
-Currently RenderDoc supports Vulkan, D3D11, D3D12, OpenGL, and OpenGL ES on Windows, Linux, Android, Stadia, and Nintendo Switch :sup:`TM`. The UI runs in Qt and will work on any desktop platform.
+Currently RenderDoc supports Vulkan, D3D11, D3D12, OpenGL, and OpenGL ES on Windows, Linux, Android, and Nintendo Switch :sup:`TM`. The UI runs in Qt and will work on any desktop platform.
 
 RenderDoc can also double as an image viewer in a simplistic fashion, separate to its functionality as a debugger. Drag in or open any of a variety of image file formats and RenderDoc will display them as if they were the only texture in a capture. This way it can be used as a simple e.g. dds viewer, with support for all sorts of formats, encodings and things typical image viewers don't tend to handle like mips, cubemaps and arrays.
 
@@ -13,7 +13,7 @@ Current Common Feature set
 * Trimming capture - capture file only contains data necessary for replaying the frame in question, not all textures & buffers ever created in the lifetime of the app.
 * Optional network support. The main way RenderDoc is used is capture & replay on the same machine, but you can also attach over the network, and replay on a remote host.
 * Multiple frame capture with ability to open side-by-side to compare.
-* Event browsing, with standard perfmarker style tree.
+* Event browsing, with API standard tree of markers.
 * Full graphics pipeline state display.
 
     * Resources bound to the pipeline are trimmed to what is actually in use, e.g. if a shader only references a texture in the first binding slot, textures in other binding slots will not be displayed by default.
@@ -24,9 +24,9 @@ Current Common Feature set
 * Timeline bar of the scene hierarchy.
 
     * Displays scene left-to-right in time, event hierarchy top-to-bottom.
-    * *Not* scaled based on time of each drawcall
-    * Individual draw events are shown as dots when the tree is full expanded.
-    * The currently selected resource in the texture viewer is highlighted below individual drawcalls visible that use it - e.g. red for 'used for read', green for 'used for write'
+    * *Not* scaled based on time of each action
+    * Individual actions are shown as dots when the tree is full expanded.
+    * The currently selected resource in the texture viewer is highlighted below individual actions visible that use it - e.g. orange for 'used for read', pale blue for 'used for write'
 
 * Flexible resource inspector.
 
@@ -36,7 +36,7 @@ Current Common Feature set
     * The API calls used to create the object before its use in the frame are displayed.
     * Any object can be renamed, and its name automatically updates everywhere in the UI.
 
-* For each drawcall, a list of all API calls (state/resource setting) is available, with each call optionally having a complete callstack to locate where it came from in-app.
+* For each action, a list of all API calls (state/resource setting) is available, with each call optionally having a complete callstack to locate where it came from in-app.
 * Mesh buffer inspection and visualisation before/after vertex shader and at the end of the geometry pipeline (after GS or DS, whichever is later). All views have arcball and flycam controls, Projected data is not limited to the 2D viewport, RenderDoc attempts to unproject to allow viewing in world-space.
 * More advanced mesh visualisation such as viewing other components as position (e.g. to render a mesh in UV space), and visual mesh picking from both input and output panes.
 * 'Raw' buffer inspection for buffers. Custom format can be set with HLSL-lite or GLSL-lite syntax.
@@ -56,7 +56,7 @@ Current Common Feature set
 * Custom visualisation shader support - e.g. decode custom packed formats or gbuffers.
 * Hot shader editing and replacement.
 * Auto-range fitting to min/max values in texture data, and histogram display.
-* Simple per-drawcall timings and tabular view of GPU counter data.
+* Simple per-action timings and tabular view of GPU counter data.
 * Python scripting console with full documented API, giving complete access to RenderDoc internals, core data structures, and the Qt UI itself.
 * Import and Export of captures
 
@@ -79,14 +79,17 @@ D3D11
 D3D12
 -----
 
-* Support for D3D12 up to D3D12.3, Windows 10 only.
-* Debug marker uses the PIXSetMarker macros that go through SetMarker/BeginEvent/EndEvent on the command list
+* Support for D3D12 up to D3D12.9, Windows 10 and above, and D3D12On7 on Windows 7.
+* Debug marker uses the SetMarker/BeginEvent/EndEvent functions on the command list or queue.
+* Vertex, Pixel and Compute shader debugging for DXBC/fxc shaders.
 
 Vulkan
 ------
 
-* Support for Vulkan 1.1 on Windows, Linux, Android, and Stadia.
-* Event markers and object naming both come from ``VK_EXT_debug_marker``.
+* Support for Vulkan 1.3 on Windows, Linux, and Android.
+* Event markers and object naming both come from ``VK_EXT_debug_utils`` or deprecated ``VK_EXT_debug_marker``.
+
+Captures have a very limited amount of portability between machines. Many hardware-specific feature uses are baked into captures, and portability depends on how similar the capture and replay hardware are, whether these feature uses can map the same in both cases. Captures are however completely portable between different OSes with sufficiently comparable hardware.
 
 OpenGL & OpenGL ES
 ------------------
@@ -95,9 +98,3 @@ OpenGL & OpenGL ES
 * Support for OpenGL ES 2.0 - 3.2 on Linux, Windows, and Android.
 * Tree hierarchy of events defined by any of the standard or vendor-specific extensions, and ``KHR_debug`` object labels used for object naming.
 
-Captures have a very limited amount of portability between machines. Many hardware-specific feature uses are baked into captures, and portability depends on how similar the capture and replay hardware are, whether these feature uses can map the same in both cases. Captures are however completely portable between different OSes with sufficiently comparable hardware.
-
-See Also
---------
-
-* :doc:`../behind_scenes/planned_features`

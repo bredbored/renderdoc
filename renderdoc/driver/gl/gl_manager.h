@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  * Copyright (c) 2014 Crytek
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -65,18 +65,19 @@ public:
     // records
     // that have already freed their parents.
     {
-      auto it = m_GLResourceRecords.begin();
+      auto it = m_CurrentResources.begin();
 
-      for(size_t i = 0; it != m_GLResourceRecords.end();)
+      for(size_t i = 0; it != m_CurrentResources.end();)
       {
-        size_t prevSize = m_GLResourceRecords.size();
-        it->second->FreeParents(this);
+        size_t prevSize = m_CurrentResources.size();
+        if(it->second.second)
+          it->second.second->FreeParents(this);
 
         // collection modified, restart loop
-        if(prevSize != m_GLResourceRecords.size())
+        if(prevSize != m_CurrentResources.size())
         {
           i = 0;
-          it = m_GLResourceRecords.begin();
+          it = m_CurrentResources.begin();
           continue;
         }
 
@@ -86,17 +87,24 @@ public:
       }
     }
 
-    while(!m_GLResourceRecords.empty())
+    while(!m_CurrentResources.empty())
     {
-      auto it = m_GLResourceRecords.begin();
-      ResourceId id = it->second->GetResourceID();
-      it->second->Delete(this);
+      auto it = m_CurrentResources.end();
+      --it;
+      ResourceId id = it->second.first;
+      if(it->second.second)
+        it->second.second->Delete(this);
 
-      if(!m_GLResourceRecords.empty() && m_GLResourceRecords.begin()->second->GetResourceID() == id)
-        m_GLResourceRecords.erase(m_GLResourceRecords.begin());
+      if(!m_CurrentResources.empty())
+      {
+        auto last = m_CurrentResources.end();
+        last--;
+        if(last->second.first == id)
+          m_CurrentResources.erase(last);
+      }
     }
 
-    m_CurrentResourceIds.clear();
+    m_CurrentResources.clear();
 
     ResourceManager::Shutdown();
   }
@@ -104,16 +112,15 @@ public:
   void DeleteContext(void *context)
   {
     size_t count = 0;
-    for(auto it = m_CurrentResourceIds.begin(); it != m_CurrentResourceIds.end();)
+    for(auto it = m_CurrentResources.begin(); it != m_CurrentResources.end();)
     {
       if(it->first.ContextShareGroup == context && it->first.Namespace != eResSpecial)
       {
         ++count;
-        ResourceId res = it->second;
-        if(HasResourceRecord(res))
-          GetResourceRecord(res)->Delete(this);
-        ReleaseCurrentResource(it->second);
-        it = m_CurrentResourceIds.erase(it);
+        if(it->second.second)
+          it->second.second->Delete(this);
+        ReleaseCurrentResource(it->second.first);
+        m_CurrentResources.erase(it);
       }
       else
       {
@@ -121,27 +128,28 @@ public:
       }
     }
     RDCDEBUG("Removed %zu/%zu resources belonging to context/sharegroup %p", count,
-             m_CurrentResourceIds.size(), context);
+             m_CurrentResources.size(), context);
   }
 
   inline void RemoveResourceRecord(ResourceId id)
   {
-    for(auto it = m_GLResourceRecords.begin(); it != m_GLResourceRecords.end(); it++)
+    GLResourceRecord *record = ResourceManager::GetResourceRecord(id);
+
+    if(record)
     {
-      if(it->second->GetResourceID() == id)
-      {
-        m_GLResourceRecords.erase(it);
-        break;
-      }
+      auto it = m_CurrentResources.find(record->Resource);
+      if(it != m_CurrentResources.end() && it->second.first == id)
+        it->second.second = NULL;
     }
 
     ResourceManager::RemoveResourceRecord(id);
   }
 
-  ResourceId RegisterResource(GLResource res)
+  ResourceId RegisterResource(GLResource res, ResourceId id = ResourceId())
   {
-    ResourceId id = ResourceIDGen::GetNewUniqueID();
-    m_CurrentResourceIds[res] = id;
+    if(id == ResourceId())
+      id = ResourceIDGen::GetNewUniqueID();
+    m_CurrentResources[res].first = id;
     AddCurrentResource(id, res);
     return id;
   }
@@ -150,8 +158,8 @@ public:
 
   bool HasCurrentResource(GLResource res)
   {
-    auto it = m_CurrentResourceIds.find(res);
-    if(it != m_CurrentResourceIds.end())
+    auto it = m_CurrentResources.find(res);
+    if(it != m_CurrentResources.end())
       return true;
 
     return false;
@@ -159,21 +167,31 @@ public:
 
   void UnregisterResource(GLResource res)
   {
-    auto it = m_CurrentResourceIds.find(res);
-    if(it != m_CurrentResourceIds.end())
+    auto it = m_CurrentResources.find(res);
+    if(it != m_CurrentResources.end())
     {
-      m_Names.erase(it->second);
+      ResourceId id = it->second.first;
+      m_Names.erase(id);
 
-      ReleaseCurrentResource(it->second);
-      m_CurrentResourceIds.erase(res);
+      if(IsReplayMode(m_State) && HasLiveResource(id))
+        EraseLiveResource(id);
+      ReleaseCurrentResource(id);
+      m_CurrentResources.erase(res);
+
+      auto fboit = m_FBOAttachmentsCache.find(id);
+      if(fboit != m_FBOAttachmentsCache.end())
+      {
+        delete fboit->second;
+        m_FBOAttachmentsCache.erase(fboit);
+      }
     }
   }
 
-  ResourceId GetID(GLResource res)
+  ResourceId GetResID(GLResource res)
   {
-    auto it = m_CurrentResourceIds.find(res);
-    if(it != m_CurrentResourceIds.end())
-      return it->second;
+    auto it = m_CurrentResources.find(res);
+    if(it != m_CurrentResources.end())
+      return it->second.first;
     return ResourceId();
   }
 
@@ -182,7 +200,7 @@ public:
     GLResourceRecord *ret = ResourceManager::AddResourceRecord(id);
     GLResource res = GetCurrentResource(id);
 
-    m_GLResourceRecords[res] = ret;
+    m_CurrentResources[res].second = ret;
     ret->Resource = res;
 
     return ret;
@@ -195,32 +213,77 @@ public:
 
   GLResourceRecord *GetResourceRecord(GLResource res)
   {
-    auto it = m_GLResourceRecords.find(res);
-    if(it != m_GLResourceRecords.end())
-      return it->second;
+    auto it = m_CurrentResources.find(res);
+    if(it != m_CurrentResources.end())
+      return it->second.second;
 
     return ResourceManager::GetResourceRecord(GetID(res));
   }
 
   using ResourceManager::MarkResourceFrameReferenced;
 
+  void MarkResourceFrameReferenced(ResourceId id, FrameRefType refType)
+  {
+    GLResourceRecord *record = GetResourceRecord(id);
+    if(record && record->viewSource != ResourceId())
+      ResourceManager::MarkResourceFrameReferenced(record->viewSource, refType);
+
+    ResourceManager::MarkResourceFrameReferenced(id, refType);
+  }
+
+  void MarkResourceFrameReferenced(GLResourceRecord *record, FrameRefType refType)
+  {
+    if(record && record->viewSource != ResourceId())
+      ResourceManager::MarkResourceFrameReferenced(record->viewSource, refType);
+
+    ResourceManager::MarkResourceFrameReferenced(record->GetResourceID(), refType);
+  }
+
   void MarkResourceFrameReferenced(GLResource res, FrameRefType refType)
   {
     // we allow VAO 0 as a special case
     if(res.name == 0 && res.Namespace != eResVertexArray)
       return;
-    ResourceManager::MarkResourceFrameReferenced(GetID(res), refType);
+
+    rdcpair<ResourceId, GLResourceRecord *> &it = m_CurrentResources[res];
+
+    if(it.second && it.second->viewSource != ResourceId())
+      ResourceManager::MarkResourceFrameReferenced(it.second->viewSource, refType);
+
+    ResourceManager::MarkResourceFrameReferenced(it.first, refType);
   }
 
-  using ResourceManager::MarkDirtyResource;
+  void MarkDirtyResource(ResourceId id)
+  {
+    GLResourceRecord *record = GetResourceRecord(id);
+    if(record && record->viewSource != ResourceId())
+      ResourceManager::MarkDirtyResource(record->viewSource);
 
-  void MarkDirtyResource(GLResource res) { return ResourceManager::MarkDirtyResource(GetID(res)); }
+    return ResourceManager::MarkDirtyResource(id);
+  }
+  void MarkDirtyResource(GLResource res)
+  {
+    rdcpair<ResourceId, GLResourceRecord *> &it = m_CurrentResources[res];
+
+    if(it.second && it.second->viewSource != ResourceId())
+      ResourceManager::MarkDirtyResource(it.second->viewSource);
+
+    return ResourceManager::MarkDirtyResource(it.first);
+  }
   // Mark resource as dirty and write-referenced.
   // Write-referenced resources are used to track resource "age".
   void MarkDirtyWithWriteReference(GLResource res)
   {
-    MarkResourceFrameReferenced(res, eFrameRef_ReadBeforeWrite);
-    MarkDirtyResource(res);
+    rdcpair<ResourceId, GLResourceRecord *> &it = m_CurrentResources[res];
+
+    if(it.second && it.second->viewSource != ResourceId())
+    {
+      ResourceManager::MarkResourceFrameReferenced(it.second->viewSource, eFrameRef_ReadBeforeWrite);
+      ResourceManager::MarkDirtyResource(it.second->viewSource);
+    }
+
+    ResourceManager::MarkResourceFrameReferenced(it.first, eFrameRef_ReadBeforeWrite);
+    ResourceManager::MarkDirtyResource(it.first);
   }
 
   void RegisterSync(ContextPair &ctx, GLsync sync, GLuint &name, ResourceId &id)
@@ -235,10 +298,10 @@ public:
   GLsync GetSync(GLuint name) { return m_CurrentSyncs[name]; }
   ResourceId GetSyncID(GLsync sync) { return m_SyncIDs[sync]; }
   // KHR_debug storage
-  const std::string &GetName(ResourceId id) { return m_Names[id]; }
-  void SetName(ResourceId id, const std::string &name) { m_Names[id] = name; }
-  void SetName(GLResource res, const std::string &name) { SetName(GetID(res), name); }
-  std::string GetName(GLResource res) { return GetName(GetID(res)); }
+  const rdcstr &GetName(ResourceId id) { return m_Names[id]; }
+  void SetName(ResourceId id, const rdcstr &name) { m_Names[id] = name; }
+  void SetName(GLResource res, const rdcstr &name) { SetName(GetID(res), name); }
+  rdcstr GetName(GLResource res) { return GetName(GetID(res)); }
   // we need to find all the children bound to VAOs/FBOs and mark them referenced. The reason for
   // this is that say a VAO became high traffic and we stopped serialising buffer binds, but then it
   // is never modified in a frame and none of the buffers are ever referenced. They would be
@@ -246,47 +309,53 @@ public:
   // this would be handled by record parenting, but that would be a nightmare to track.
   void MarkVAOReferenced(GLResource res, FrameRefType ref, bool allowFake0 = false);
   void MarkFBOReferenced(GLResource res, FrameRefType ref);
+  void MarkFBODirtyWithWriteReference(GLResourceRecord *record);
 
   bool IsResourceTrackedForPersistency(const GLResource &res);
-
-  void Force_ReferenceViews();
 
   template <typename SerialiserType>
   bool Serialise_InitialState(SerialiserType &ser, ResourceId id, GLResourceRecord *record,
                               const GLInitialContents *initial);
+  bool Serialise_InitialState(WriteSerialiser &ser, ResourceId id, GLResourceRecord *record,
+                              const GLInitialContents *initial);
 
   void ContextPrepare_InitialState(GLResource res);
-  bool Serialise_InitialState(WriteSerialiser &ser, ResourceId id, GLResourceRecord *record,
-                              const GLInitialContents *initial)
-  {
-    return Serialise_InitialState<WriteSerialiser>(ser, id, record, initial);
-  }
 
   void SetInternalResource(GLResource res);
 
 private:
+  // forward this on. We de-alias it so that uses of GetID() within the GL driver aren't virtual
+  ResourceId GetID(GLResource res) { return GetResID(res); }
   bool ResourceTypeRelease(GLResource res);
   bool Prepare_InitialState(GLResource res);
   uint64_t GetSize_InitialState(ResourceId resid, const GLInitialContents &initial);
 
-  void CreateTextureImage(GLuint tex, GLenum internalFormat, GLenum internalFormatHint,
-                          GLenum textype, GLint dim, GLint width, GLint height, GLint depth,
-                          GLint samples, int mips);
   void PrepareTextureInitialContents(ResourceId liveid, ResourceId origid, GLResource res);
 
   void Create_InitialState(ResourceId id, GLResource live, bool hasData);
   void Apply_InitialState(GLResource live, const GLInitialContents &initial);
 
-  std::map<GLResource, GLResourceRecord *> m_GLResourceRecords;
+  void MarkFBOAttachmentsReferenced(ResourceId id, GLResourceRecord *record, FrameRefType ref,
+                                    bool markDirty);
 
-  std::map<GLResource, ResourceId> m_CurrentResourceIds;
+  // unfortunately not all resources have a record even at capture time (certain special resources
+  // do not) so we store a pair to ensure we can always lookup the resource ID
+  rdcflatmap<GLResource, rdcpair<ResourceId, GLResourceRecord *>> m_CurrentResources;
 
   // sync objects must be treated differently as they're not GLuint names, but pointer sized.
   // We manually give them GLuint names so they're otherwise namespaced as (eResSync, GLuint)
   std::map<GLsync, ResourceId> m_SyncIDs;
   std::map<GLuint, GLsync> m_CurrentSyncs;
-  std::map<ResourceId, std::string> m_Names;
-  volatile int64_t m_SyncName;
+  std::map<ResourceId, rdcstr> m_Names;
+  int64_t m_SyncName;
+
+  struct FBOCache
+  {
+    uint32_t age = 0;
+    rdcarray<ResourceId> attachments;
+  };
+
+  rdcflatmap<ResourceId, FBOCache *> m_FBOAttachmentsCache;
 
   WrappedOpenGL *m_Driver;
 };

@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  * Copyright (c) 2014 Crytek
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -36,13 +36,13 @@ static BOOL add_hooks()
   wchar_t curFile[512];
   GetModuleFileNameW(NULL, curFile, 512);
 
-  std::string f = get_basename(strlower(StringFormat::Wide2UTF8(curFile)));
+  rdcstr f = get_basename(strlower(StringFormat::Wide2UTF8(curFile)));
 
   // bail immediately if we're in a system process. We don't want to hook, log, anything -
   // this instance is being used for a shell extension.
   if(f == "dllhost.exe" || f == "explorer.exe")
   {
-#ifndef _RELEASE
+#if ENABLED(RDOC_RELEASE)
     OutputDebugStringA(
         "Detecting shell process! Disabling hooking in dllhost.exe or explorer.exe\n");
 #endif
@@ -50,13 +50,15 @@ static BOOL add_hooks()
   }
 
   // search for an exported symbol with this name, typically renderdoc__replay__marker
-  if(LibraryHooks::Detect(STRINGIZE(RDOC_DLL_FILE) "__replay__marker"))
+  if(LibraryHooks::Detect(STRINGIZE(RDOC_BASE_NAME) "__replay__marker"))
   {
     RDCDEBUG("Not creating hooks - in replay app");
 
     RenderDoc::Inst().SetReplayApp(true);
 
     RenderDoc::Inst().Initialise();
+
+    LibraryHooks::ReplayInitialise();
 
     return true;
   }

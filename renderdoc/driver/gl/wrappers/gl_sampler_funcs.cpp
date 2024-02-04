@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  * Copyright (c) 2014 Crytek
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -36,7 +36,7 @@ template <typename SerialiserType>
 bool WrappedOpenGL::Serialise_glGenSamplers(SerialiserType &ser, GLsizei n, GLuint *samplers)
 {
   SERIALISE_ELEMENT(n);
-  SERIALISE_ELEMENT_LOCAL(sampler, GetResourceManager()->GetID(SamplerRes(GetCtx(), *samplers)))
+  SERIALISE_ELEMENT_LOCAL(sampler, GetResourceManager()->GetResID(SamplerRes(GetCtx(), *samplers)))
       .TypedAs("GLResource"_lit);
 
   SERIALISE_CHECK_READ_ERRORS();
@@ -96,7 +96,7 @@ template <typename SerialiserType>
 bool WrappedOpenGL::Serialise_glCreateSamplers(SerialiserType &ser, GLsizei n, GLuint *samplers)
 {
   SERIALISE_ELEMENT(n);
-  SERIALISE_ELEMENT_LOCAL(sampler, GetResourceManager()->GetID(SamplerRes(GetCtx(), *samplers)))
+  SERIALISE_ELEMENT_LOCAL(sampler, GetResourceManager()->GetResID(SamplerRes(GetCtx(), *samplers)))
       .TypedAs("GLResource"_lit);
 
   SERIALISE_CHECK_READ_ERRORS();
@@ -184,7 +184,7 @@ bool WrappedOpenGL::Serialise_glBindSamplers(SerialiserType &ser, GLuint first, 
                                              const GLuint *samplerHandles)
 {
   // can't serialise arrays of GL handles since they're not wrapped or typed :(.
-  std::vector<GLResource> samplers;
+  rdcarray<GLResource> samplers;
 
   if(ser.IsWriting())
   {
@@ -193,15 +193,15 @@ bool WrappedOpenGL::Serialise_glBindSamplers(SerialiserType &ser, GLuint first, 
       samplers.push_back(SamplerRes(GetCtx(), samplerHandles ? samplerHandles[i] : 0));
   }
 
-  SERIALISE_ELEMENT(first);
+  SERIALISE_ELEMENT(first).Important();
   SERIALISE_ELEMENT(count);
-  SERIALISE_ELEMENT(samplers);
+  SERIALISE_ELEMENT(samplers).Important();
 
   SERIALISE_CHECK_READ_ERRORS();
 
   if(IsReplayingAndReading())
   {
-    std::vector<GLuint> samps;
+    rdcarray<GLuint> samps;
     samps.reserve(count);
     for(int32_t i = 0; i < count; i++)
       samps.push_back(samplers[i].name);

@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2016-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -60,6 +60,9 @@ public:
   void QueueCapture(int frameNumber, int numFrames);
   const QString &hostname() { return m_Hostname; }
   void cleanItems();
+  void fileSaved(QString from, QString to);
+  int unsavedCaptureCount();
+  bool checkAllowClose(int totalUnsavedCaptures, bool &noToAll);
 
 public slots:
   bool checkAllowClose();
@@ -103,6 +106,8 @@ private:
     QString api;
     QDateTime timestamp;
     uint32_t frameNumber;
+    uint64_t byteSize;
+    QString title;
 
     QImage thumb;
 
@@ -123,9 +128,10 @@ private:
   struct APIStatus
   {
     APIStatus() = default;
-    APIStatus(bool p, bool s) : presenting(p), supported(s) {}
+    APIStatus(bool p, bool s, rdcstr m) : presenting(p), supported(s), supportMessage(m) {}
     bool presenting = false;
     bool supported = false;
+    rdcstr supportMessage;
   };
 
   Capture *GetCapture(QListWidgetItem *item);
@@ -138,7 +144,7 @@ private:
 
   void connectionThreadEntry();
   void captureCopied(uint32_t ID, const QString &localPath);
-  void captureAdded(const NewCaptureData &newCapture);
+  void captureAdded(const QString &name, const NewCaptureData &newCapture);
   void connectionClosed();
 
   void selfClose();
@@ -163,10 +169,11 @@ private:
   QSemaphore m_QueueCapture;
   QSemaphore m_CopyCapture;
   QSemaphore m_Disconnect;
+  QSemaphore m_CycleWindow;
   int m_CaptureNumFrames = 1;
   int m_QueueCaptureFrameNum = 0;
   int m_CaptureCounter = 0;
-  ITargetControl *m_Connection = NULL;
+  QSemaphore m_Connected;
 
   uint32_t m_CopyCaptureID = ~0U;
   QString m_CopyCaptureLocalPath;

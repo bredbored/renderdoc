@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2016-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -26,6 +26,7 @@
 #include <QDesktopServices>
 #include <QFileDialog>
 #include <QFileInfo>
+#include <QKeyEvent>
 #include <QMimeData>
 #include <QMouseEvent>
 #include <QNetworkAccessManager>
@@ -39,6 +40,8 @@
 #include "Code/QRDUtils.h"
 #include "Code/Resources.h"
 #include "Widgets/Extended/RDLabel.h"
+#include "Widgets/Extended/RDMenu.h"
+#include "Widgets/ReplayOptionsSelector.h"
 #include "Windows/Dialogs/AboutDialog.h"
 #include "Windows/Dialogs/CaptureDialog.h"
 #include "Windows/Dialogs/CrashDialog.h"
@@ -59,13 +62,64 @@
 extern "C" void *__stdcall GetModuleHandleA(const char *);
 #endif
 
+NetworkWorker::NetworkWorker() : QObject(NULL)
+{
+}
+
+NetworkWorker::~NetworkWorker()
+{
+}
+
+void NetworkWorker::get(QUrl url)
+{
+  if(manager == NULL)
+    manager = new QNetworkAccessManager(this);
+
+  // create the request
+  QNetworkReply *req = manager->get(QNetworkRequest(url));
+
+  // connect up error and finished slots on *this* thread, and in the lambda emit signals to
+  // cross-thread back onto the UI thread.
+  QObject::connect(req, OverloadedSlot<QNetworkReply::NetworkError>::of(&QNetworkReply::error),
+                   [this, req](QNetworkReply::NetworkError) {
+                     emit requestFailed(req->url(), req->errorString());
+                   });
+
+  QObject::connect(req, &QNetworkReply::finished, [this, req]() {
+    if(req->error() != QNetworkReply::NoError)
+    {
+      emit requestFailed(req->url(), req->errorString());
+      return;
+    }
+
+    QByteArray replyData = req->readAll();
+
+    emit requestCompleted(req->url(), replyData);
+  });
+}
+
+void MainWindow::MakeNetworkRequest(QUrl url, std::function<void(QByteArray)> success,
+                                    std::function<void(QString)> failure)
+{
+  m_NetworkCompleteCallbacks[url] = success;
+  if(failure)
+    m_NetworkFailCallbacks[url] = failure;
+
+  // fire over onto the network thread
+  emit networkRequestGet(url);
+}
+
 MainWindow::MainWindow(ICaptureContext &ctx) : QMainWindow(NULL), ui(new Ui::MainWindow), m_Ctx(ctx)
 {
   ui->setupUi(this);
 
   setProperty("ICaptureContext", QVariant::fromValue((void *)&ctx));
 
-#if !defined(Q_OS_WIN32)
+#if defined(Q_OS_WIN32)
+  // remove inject menu item when it's not enabled in the settings
+  if(!ctx.Config().AllowProcessInject)
+    ui->menu_File->removeAction(ui->action_Inject_into_Process);
+#else
   // process injection is not supported on non-Windows, so remove the menu item rather than disable
   // it without a clear way to communicate that it is never supported
   ui->menu_File->removeAction(ui->action_Inject_into_Process);
@@ -115,7 +169,7 @@ MainWindow::MainWindow(ICaptureContext &ctx) : QMainWindow(NULL), ui(new Ui::Mai
   QObject::connect(ui->action_Clear_Capture_Settings_History, &QAction::triggered, this,
                    &MainWindow::ClearRecentCaptureSettings);
 
-  contextChooserMenu = new QMenu(this);
+  contextChooserMenu = new RDMenu(this);
 
   FillRemotesMenu(contextChooserMenu, true);
 
@@ -129,6 +183,21 @@ MainWindow::MainWindow(ICaptureContext &ctx) : QMainWindow(NULL), ui(new Ui::Mai
   contextChooser->setContextMenuPolicy(Qt::DefaultContextMenu);
   QObject::connect(contextChooserMenu, &QMenu::aboutToShow, this,
                    &MainWindow::contextChooser_menuShowing);
+  QObject::connect(contextChooserMenu, &RDMenu::keyPress, [this](QKeyEvent *ev) {
+    QList<QAction *> actions = contextChooserMenu->actions();
+    if(ev->key() == Qt::Key_L)
+    {
+      actions.last()->trigger();
+      contextChooserMenu->close();
+    }
+    else if(ev->key() >= Qt::Key_1 && ev->key() <= Qt::Key_9)
+    {
+      int idx = ev->key() - Qt::Key_1;
+      if(idx < actions.size())
+        actions[idx]->trigger();
+      contextChooserMenu->close();
+    }
+  });
 
   ui->statusBar->addWidget(contextChooser);
 
@@ -160,11 +229,15 @@ MainWindow::MainWindow(ICaptureContext &ctx) : QMainWindow(NULL), ui(new Ui::Mai
 
   m_RemoteProbeSemaphore.release();
   m_RemoteProbe = new LambdaThread([this]() {
-    RENDERDOC_AndroidInitialise();
+    // fetch all device protocols to start them processing
+    rdcarray<rdcstr> protocols;
+    RENDERDOC_GetSupportedDeviceProtocols(&protocols);
+    for(const rdcstr &p : protocols)
+      RENDERDOC_GetDeviceProtocolController(p);
 
     while(m_RemoteProbeSemaphore.available())
     {
-      // do a remoteProbe immediately to populate the android hosts list on startup.
+      // do a remoteProbe immediately to populate the device list on startup.
       remoteProbe();
 
       // do several small sleeps so we can respond quicker when we need to shut down
@@ -176,6 +249,7 @@ MainWindow::MainWindow(ICaptureContext &ctx) : QMainWindow(NULL), ui(new Ui::Mai
       }
     }
   });
+  m_RemoteProbe->setName(lit("Remote Probe"));
   m_RemoteProbe->start();
 
   SetTitle();
@@ -186,7 +260,31 @@ MainWindow::MainWindow(ICaptureContext &ctx) : QMainWindow(NULL), ui(new Ui::Mai
   ui->action_Send_Error_Report->setEnabled(false);
 #endif
 
-  m_NetManager = new QNetworkAccessManager(this);
+  // only allow sending error reports if we have a valid git commit hash
+  rdcstr hash = RENDERDOC_GetCommitHash();
+  if(hash.length() != 40 || hash.find_first_not_of("0123456789abcdef") >= 0)
+  {
+    qInfo() << "Disabling error reports due to invalid commit hash";
+    ui->action_Send_Error_Report->setEnabled(false);
+  }
+
+  m_NetWorker = new NetworkWorker;
+  m_NetManagerThread = new LambdaThread([this]() {
+    QEventLoop loop;
+    loop.exec();
+    delete m_NetWorker;
+  });
+  m_NetManagerThread->moveObjectToThread(m_NetWorker);
+  m_NetManagerThread->start();
+  m_NetManagerThread->thread()->setPriority(QThread::LowPriority);
+
+  // set up cross-thread signal/slot connections
+  QObject::connect(this, &MainWindow::networkRequestGet, m_NetWorker, &NetworkWorker::get,
+                   Qt::QueuedConnection);
+  QObject::connect(m_NetWorker, &NetworkWorker::requestFailed, this,
+                   &MainWindow::networkRequestFailed, Qt::QueuedConnection);
+  QObject::connect(m_NetWorker, &NetworkWorker::requestCompleted, this,
+                   &MainWindow::networkRequestCompleted, Qt::QueuedConnection);
 
   updateAction = new QAction(this);
   updateAction->setText(tr("Update Available!"));
@@ -247,11 +345,8 @@ MainWindow::MainWindow(ICaptureContext &ctx) : QMainWindow(NULL), ui(new Ui::Mai
           m_Ctx.Config().Save();
 
           // call out to the status-check to see when the bug report was last updated
-          QNetworkReply *reply =
-              m_NetManager->get(QNetworkRequest(QUrl(QString(b.URL()) + lit("/check"))));
-
-          QObject::connect(reply, &QNetworkReply::finished, [this, reply, b]() {
-            QString response = QString::fromUtf8(reply->readAll());
+          MakeNetworkRequest(QUrl(QString(b.URL()) + lit("/check")), [this, b](QByteArray replyData) {
+            QString response = QString::fromUtf8(replyData);
 
             if(response.isEmpty())
               return;
@@ -299,7 +394,12 @@ MainWindow::MainWindow(ICaptureContext &ctx) : QMainWindow(NULL), ui(new Ui::Mai
   ui->action_Recompress_Capture->setEnabled(false);
 
 #if defined(Q_OS_WIN32)
-  if(GetModuleHandleA("rdocself.dll"))
+#define SELF_HOST_NAME "rdocself.dll"
+#else
+#define SELF_HOST_NAME "librdocself.so"
+#endif
+
+  if(RENDERDOC_CanSelfHostedCapture(SELF_HOST_NAME))
   {
     QAction *begin = new QAction(tr("Start Self-hosted Capture"), this);
     QAction *end = new QAction(tr("End Self-hosted Capture"), this);
@@ -309,21 +409,20 @@ MainWindow::MainWindow(ICaptureContext &ctx) : QMainWindow(NULL), ui(new Ui::Mai
       begin->setEnabled(false);
       end->setEnabled(true);
 
-      RENDERDOC_StartSelfHostCapture("rdocself.dll");
+      RENDERDOC_StartSelfHostCapture(SELF_HOST_NAME);
     });
 
     QObject::connect(end, &QAction::triggered, [begin, end]() {
       begin->setEnabled(true);
       end->setEnabled(false);
 
-      RENDERDOC_EndSelfHostCapture("rdocself.dll");
+      RENDERDOC_EndSelfHostCapture(SELF_HOST_NAME);
     });
 
     ui->menu_Tools->addSeparator();
     ui->menu_Tools->addAction(begin);
     ui->menu_Tools->addAction(end);
   }
-#endif
 
   m_Ctx.AddCaptureViewer(this);
 
@@ -396,10 +495,18 @@ MainWindow::MainWindow(ICaptureContext &ctx) : QMainWindow(NULL), ui(new Ui::Mai
   ui->extension_dummy_Window->setVisible(false);
   ui->extension_dummy_Tools->setVisible(false);
   ui->extension_dummy_Help->setVisible(false);
+
+  RegisterShortcut("ALT+R", this, [this](QWidget *) { contextChooser->click(); });
 }
 
 MainWindow::~MainWindow()
 {
+  // close the network manager thread
+  m_NetManagerThread->thread()->quit();
+  m_NetManagerThread->deleteLater();
+
+  m_Ctx.Replay().DisconnectFromRemoteServer();
+
   // explicitly delete our children here, so that the MainWindow is still alive while they are
   // closing.
 
@@ -419,7 +526,7 @@ QString MainWindow::GetLayoutPath(int layout)
   if(layout > 0)
     filename = lit("Layout%1.config").arg(layout);
 
-  return configFilePath(filename);
+  return ConfigFilePath(filename);
 }
 
 void MainWindow::on_action_Exit_triggered()
@@ -439,6 +546,47 @@ void MainWindow::on_action_Open_Capture_triggered()
 
   if(!filename.isEmpty())
     LoadFromFilename(filename, false);
+}
+
+void MainWindow::on_action_Open_Capture_with_Options_triggered()
+{
+  if(!PromptCloseCapture())
+    return;
+
+  ReplayOptionsSelector *replayOptions = new ReplayOptionsSelector(m_Ctx, true, this);
+
+  QDialog *openWithOptions = new QDialog(this);
+  openWithOptions->setWindowFlags(openWithOptions->windowFlags() & ~Qt::WindowContextHelpButtonHint);
+  openWithOptions->setWindowIcon(windowIcon());
+  openWithOptions->setWindowTitle(tr("Open Capture with Options"));
+  openWithOptions->setSizeGripEnabled(false);
+  openWithOptions->setModal(true);
+
+  QVBoxLayout l;
+  l.addWidget(replayOptions);
+  l.setMargin(3);
+  l.setSizeConstraint(QLayout::SetFixedSize);
+
+  openWithOptions->setLayout(&l);
+
+  QObject::connect(replayOptions, &ReplayOptionsSelector::canceled, openWithOptions,
+                   &QDialog::reject);
+  QObject::connect(replayOptions, &ReplayOptionsSelector::opened, openWithOptions, &QDialog::accept);
+
+  if(RDDialog::show(openWithOptions) != QDialog::Accepted)
+  {
+    openWithOptions->deleteLater();
+    return;
+  }
+
+  QString filename = replayOptions->filename();
+
+  openWithOptions->deleteLater();
+
+  if(filename.isEmpty())
+    return;
+
+  LoadCapture(filename, replayOptions->options(), false, true);
 }
 
 void MainWindow::importCapture(const CaptureFileFormat &fmt)
@@ -483,7 +631,7 @@ void MainWindow::LoadFromFilename(const QString &filename, bool temporary)
 
   if(ext == lit("rdc"))
   {
-    LoadCapture(filename, temporary, true);
+    LoadCapture(filename, m_Ctx.Config().DefaultReplayOptions, temporary, true);
   }
   else if(ext == lit("cap"))
   {
@@ -496,7 +644,7 @@ void MainWindow::LoadFromFilename(const QString &filename, bool temporary)
   else
   {
     // not a recognised filetype, see if we can load it anyway
-    LoadCapture(filename, temporary, true);
+    LoadCapture(filename, m_Ctx.Config().DefaultReplayOptions, temporary, true);
   }
 }
 
@@ -509,8 +657,7 @@ void MainWindow::OnCaptureTrigger(const QString &exe, const QString &workingDir,
     return;
 
   LambdaThread *th = new LambdaThread([this, exe, workingDir, cmdLine, env, opts, callback]() {
-
-    if(isCapturableAppRunningOnAndroid())
+    if(isUnshareableDeviceInUse())
     {
       RDDialog::warning(this, tr("RenderDoc is already capturing an app on this device"),
                         tr("A running app on this device is already being captured with RenderDoc. "
@@ -525,40 +672,40 @@ void MainWindow::OnCaptureTrigger(const QString &exe, const QString &workingDir,
         m_Ctx.Replay().ExecuteAndInject(exe, workingDir, cmdLine, env, capturefile, opts);
 
     GUIInvoke::call(this, [this, exe, ret, callback]() {
-
-      if(ret.status == ReplayStatus::JDWPFailure)
+      if(ret.result.code == ResultCode::JDWPFailure)
       {
         RDDialog::critical(
             this, tr("Error connecting to debugger"),
             tr("<html>Error launching %1 for capture.\n\n"
                "Something went wrong connecting to the debugger on the Android device.\n\n"
-               "This can happen if the package is not "
-               "marked as debuggable, or if another android tool such as Android Studio "
-               "is interfering with the debug connection.\n\n"
+               "This can happen if the package is not marked as debuggable, the device is not "
+               "configured to allow app debugging, if the intent arguments are badly specified, or "
+               "if another android tool such as Android Studio is interfering with the debug "
+               "connection.\n\n"
                "Close <b>all</b> instances of Android Studio or other Android programs "
                "and try again.</html>")
                 .arg(exe));
         return;
       }
 
-      if(ret.status != ReplayStatus::Succeeded)
+      if(ret.result.code != ResultCode::Succeeded)
       {
-        RDDialog::critical(this, tr("Error kicking capture"),
-                           tr("Error launching %1 for capture.\n\n%2. Check the diagnostic log in "
-                              "the help menu for more details")
-                               .arg(exe)
-                               .arg(ToQStr(ret.status)));
+        RDDialog::critical(
+            this, tr("Error launching capture"),
+            tr("Error launching %1 for capture.\n\n%2.").arg(exe).arg(ret.result.Message()));
         return;
       }
 
       LiveCapture *live = new LiveCapture(
-          m_Ctx, m_Ctx.Replay().CurrentRemote() ? m_Ctx.Replay().CurrentRemote()->hostname : "",
-          m_Ctx.Replay().CurrentRemote() ? m_Ctx.Replay().CurrentRemote()->Name() : "", ret.ident,
-          this, this);
+          m_Ctx,
+          m_Ctx.Replay().CurrentRemote().IsValid() ? m_Ctx.Replay().CurrentRemote().Hostname() : "",
+          m_Ctx.Replay().CurrentRemote().IsValid() ? m_Ctx.Replay().CurrentRemote().Name() : "",
+          ret.ident, this, this);
       ShowLiveCapture(live);
       callback(live);
     });
   });
+  th->setName(lit("ExecuteAndInject"));
   th->start();
   // wait a few ms before popping up a progress bar
   th->wait(500);
@@ -581,34 +728,14 @@ void MainWindow::OnInjectTrigger(uint32_t PID, const rdcarray<EnvironmentModific
   LambdaThread *th = new LambdaThread([this, PID, env, name, opts, callback]() {
     QString capturefile = m_Ctx.TempCaptureFilename(name);
 
-    ExecuteResult ret =
-        RENDERDOC_InjectIntoProcess(PID, env, capturefile.toUtf8().data(), opts, false);
+    ExecuteResult ret = RENDERDOC_InjectIntoProcess(PID, env, capturefile, opts, false);
 
     GUIInvoke::call(this, [this, PID, ret, callback]() {
-
-      if(ret.status == ReplayStatus::JDWPFailure)
+      if(ret.result.code != ResultCode::Succeeded)
       {
         RDDialog::critical(
-            this, tr("Error connecting to debugger"),
-            tr("<html>Error injecting into process %1 for capture.\n\n"
-               "Something went wrong connecting to the debugger on the Android device.\n\n"
-               "This can happen if the package is not "
-               "marked as debuggable, or if another android tool such as Android Studio "
-               "is interfering with the debug connection.\n\n"
-               "Close <b>all</b> instances of Android Studio or other Android programs "
-               "and try again.</html>")
-                .arg(PID));
-        return;
-      }
-
-      if(ret.status != ReplayStatus::Succeeded)
-      {
-        RDDialog::critical(
-            this, tr("Error kicking capture"),
-            tr("Error injecting into process %1 for capture.\n\n%2. Check the diagnostic log in "
-               "the help menu for more details")
-                .arg(PID)
-                .arg(ToQStr(ret.status)));
+            this, tr("Error injecting into process"),
+            tr("Error injecting into process %1 for capture.\n\n%2").arg(PID).arg(ret.result.Message()));
         return;
       }
 
@@ -628,7 +755,8 @@ void MainWindow::OnInjectTrigger(uint32_t PID, const rdcarray<EnvironmentModific
   th->deleteLater();
 }
 
-void MainWindow::LoadCapture(const QString &filename, bool temporary, bool local)
+void MainWindow::LoadCapture(const QString &filename, const ReplayOptions &opts, bool temporary,
+                             bool local)
 {
   if(PromptCloseCapture())
   {
@@ -639,32 +767,25 @@ void MainWindow::LoadCapture(const QString &filename, bool temporary, bool local
     QString machineIdent;
     ReplaySupport support = ReplaySupport::Unsupported;
 
-    bool remoteReplay =
-        !local || (m_Ctx.Replay().CurrentRemote() && m_Ctx.Replay().CurrentRemote()->connected);
+    bool remoteReplay = !local || m_Ctx.Replay().CurrentRemote().IsConnected();
 
     if(local)
     {
       ICaptureFile *file = RENDERDOC_OpenCaptureFile();
 
-      ReplayStatus status = file->OpenFile(filename.toUtf8().data(), "rdc", NULL);
+      ResultDetails result = file->OpenFile(filename, "rdc", NULL);
 
-      if(status != ReplayStatus::Succeeded)
+      if(!result.OK())
       {
-        QString text = tr("Couldn't open file '%1'\n").arg(filename);
-        QString message = file->ErrorString();
-        if(message.isEmpty())
-          text += tr("%1").arg(ToQStr(status));
-        else
-          text += tr("%1: %2").arg(ToQStr(status)).arg(message);
-
-        RDDialog::critical(this, tr("Error opening capture"), text);
+        RDDialog::critical(this, tr("Error opening capture"),
+                           tr("Couldn't open file '%1'\n%2").arg(filename).arg(result.Message()));
 
         file->Shutdown();
         return;
       }
 
       driver = file->DriverName();
-      machineIdent = QString::fromUtf8(file->RecordedMachineIdent());
+      machineIdent = file->RecordedMachineIdent();
       support = file->LocalReplaySupport();
 
       file->Shutdown();
@@ -701,8 +822,7 @@ void MainWindow::LoadCapture(const QString &filename, bool temporary, bool local
                                [this]() { return contextChooser->isEnabled(); });
           }
 
-          remoteReplay =
-              (m_Ctx.Replay().CurrentRemote() && m_Ctx.Replay().CurrentRemote()->connected);
+          remoteReplay = m_Ctx.Replay().CurrentRemote().IsConnected();
 
           if(!remoteReplay)
           {
@@ -753,7 +873,7 @@ void MainWindow::LoadCapture(const QString &filename, bool temporary, bool local
         QString remoteMessage =
             tr("This capture was captured with %1 and cannot be replayed on %2.\n\n")
                 .arg(driver)
-                .arg(m_Ctx.Replay().CurrentRemote()->Name());
+                .arg(m_Ctx.Replay().CurrentRemote().Name());
 
         remoteMessage += tr("Try selecting a different remote context in the status bar.");
 
@@ -797,10 +917,10 @@ void MainWindow::LoadCapture(const QString &filename, bool temporary, bool local
         ANALYTIC_SET(UIFeatures.ImageViewer, true);
       }
 
-      m_Ctx.LoadCapture(fileToLoad, origFilename, temporary, local);
+      m_Ctx.LoadCapture(fileToLoad, opts, origFilename, temporary, local);
     }
 
-    if(!remoteReplay)
+    if(local && !temporary)
     {
       m_Ctx.Config().LastCaptureFilePath = QFileInfo(filename).absolutePath();
     }
@@ -859,20 +979,30 @@ bool MainWindow::PromptSaveCaptureAs()
   QString saveFilename = GetSavePath();
 
   if(!saveFilename.isEmpty())
-  {
-    bool success = m_Ctx.SaveCaptureTo(saveFilename);
-
-    if(!success)
-      return false;
-
-    AddRecentFile(m_Ctx.Config().RecentCaptureFiles, saveFilename, 10);
-    PopulateRecentCaptureFiles();
-    SetTitle(saveFilename);
-
-    return true;
-  }
+    return SaveCurrentCapture(saveFilename);
 
   return false;
+}
+
+bool MainWindow::SaveCurrentCapture(QString saveFilename)
+{
+  QString origFilename = m_Ctx.GetCaptureFilename();
+
+  bool success = m_Ctx.SaveCaptureTo(saveFilename);
+
+  if(!success)
+    return false;
+
+  AddRecentFile(m_Ctx.Config().RecentCaptureFiles, saveFilename);
+  PopulateRecentCaptureFiles();
+  SetTitle(saveFilename);
+
+  for(LiveCapture *live : m_LiveCaptures)
+    live->fileSaved(origFilename, saveFilename);
+
+  ui->action_Save_Capture_Inplace->setEnabled(false);
+
+  return true;
 }
 
 void MainWindow::exportCapture(const CaptureFileFormat &fmt)
@@ -930,8 +1060,6 @@ bool MainWindow::PromptCloseCapture()
   }
   else if(m_Ctx.GetCaptureModifications() != CaptureModifications::NoModifications)
   {
-    QMessageBox::StandardButton res = QMessageBox::No;
-
     QString text = tr("This capture has the following modifications:\n\n");
 
     CaptureModifications mods = m_Ctx.GetCaptureModifications();
@@ -942,6 +1070,8 @@ bool MainWindow::PromptCloseCapture()
       text += tr("Bookmarks have been changed.\n");
     if(mods & CaptureModifications::Notes)
       text += tr("Capture notes have been changed.\n");
+    if(mods & CaptureModifications::EditedShaders)
+      text += tr("Edited shaders have been changed.\n");
 
     bool saveas = false;
 
@@ -956,8 +1086,9 @@ bool MainWindow::PromptCloseCapture()
           tr("\nThe capture is on a remote host, would you like to save these changes locally?");
     }
 
-    res = RDDialog::question(this, tr("Save changes to capture?"), text,
-                             QMessageBox::Yes | QMessageBox::No | QMessageBox::Cancel);
+    QMessageBox::StandardButton res =
+        RDDialog::question(this, tr("Save changes to capture?"), text,
+                           QMessageBox::Yes | QMessageBox::No | QMessageBox::Cancel);
 
     if(res == QMessageBox::Cancel)
       return false;
@@ -979,14 +1110,28 @@ bool MainWindow::PromptCloseCapture()
   CloseCapture();
 
   if(!deletepath.isEmpty())
+  {
     m_Ctx.Replay().DeleteCapture(deletepath, caplocal);
+    RemoveRecentCapture(deletepath);
+  }
 
   return true;
 }
 
 void MainWindow::CloseCapture()
 {
+  QString path = m_Ctx.GetCaptureFilename();
+  bool local = m_Ctx.IsCaptureLocal();
+  bool temp = m_Ctx.IsCaptureTemporary();
+
   m_Ctx.CloseCapture();
+
+  if(m_OwnTempCapture && temp)
+  {
+    m_Ctx.Replay().DeleteCapture(path, local);
+    RemoveRecentCapture(path);
+    m_OwnTempCapture = false;
+  }
 
   ui->action_Save_Capture_Inplace->setEnabled(false);
   ui->action_Save_Capture_As->setEnabled(false);
@@ -1005,15 +1150,16 @@ void MainWindow::SetTitle(const QString &filename)
     prefix += lit(" - ");
   }
 
-  if(m_Ctx.Replay().CurrentRemote())
-    prefix += tr("Remote: %1 - ").arg(m_Ctx.Replay().CurrentRemote()->Name());
+  if(m_Ctx.Replay().CurrentRemote().IsValid())
+    prefix += tr("Remote: %1 - ").arg(m_Ctx.Replay().CurrentRemote().Name());
 
   QString text = prefix + lit("RenderDoc ");
 
   if(RENDERDOC_STABLE_BUILD)
     text += lit(FULL_VERSION_STRING);
   else
-    text += tr("Unstable release (%1 - %2)")
+    text += tr("Unstable %1 Build (%2 - %3)")
+                .arg(RENDERDOC_IsReleaseBuild() ? lit("Release") : lit("Development"))
                 .arg(lit(FULL_VERSION_STRING))
                 .arg(QString::fromLatin1(RENDERDOC_GetCommitHash()));
 
@@ -1095,6 +1241,10 @@ void MainWindow::PopulateRecentCaptureFiles()
     idx++;
 
     ui->menu_Recent_Capture_Files->setEnabled(true);
+
+    // only populate the 9 most recent, even if more exist in memory
+    if(idx == 10)
+      break;
   }
 
   ui->menu_Recent_Capture_Files->addSeparator();
@@ -1105,6 +1255,24 @@ void MainWindow::ClearRecentCaptureSettings()
 {
   m_Ctx.Config().RecentCaptureSettings.clear();
   PopulateRecentCaptureSettings();
+}
+
+void MainWindow::networkRequestFailed(QUrl url, QString error)
+{
+  if(m_NetworkFailCallbacks.contains(url))
+  {
+    m_NetworkFailCallbacks[url](error);
+    m_NetworkFailCallbacks.remove(url);
+  }
+}
+
+void MainWindow::networkRequestCompleted(QUrl url, QByteArray replyData)
+{
+  if(m_NetworkCompleteCallbacks.contains(url))
+  {
+    m_NetworkCompleteCallbacks[url](replyData);
+    m_NetworkCompleteCallbacks.remove(url);
+  }
 }
 
 void MainWindow::PopulateRecentCaptureSettings()
@@ -1124,6 +1292,10 @@ void MainWindow::PopulateRecentCaptureSettings()
     idx++;
 
     ui->menu_Recent_Capture_Settings->setEnabled(true);
+
+    // only populate the 9 most recent, even if more exist in memory
+    if(idx == 10)
+      break;
   }
 
   ui->menu_Recent_Capture_Settings->addSeparator();
@@ -1275,44 +1447,44 @@ void MainWindow::CheckUpdates(bool forceCheck, UpdateResultMethod callback)
   statusProgress->setMaximum(0);
 
   // call out to the status-check to see when the bug report was last updated
-  QNetworkReply *req = m_NetManager->get(QNetworkRequest(QUrl(
-      lit("https://renderdoc.org/getupdateurl/%1/%2?htmlnotes=1").arg(bitness).arg(versionCheck))));
+  MakeNetworkRequest(
+      QUrl(lit("https://renderdoc.org/getupdateurl/%1/%2?htmlnotes=1").arg(bitness).arg(versionCheck)),
 
-  QObject::connect(req, OverloadedSlot<QNetworkReply::NetworkError>::of(&QNetworkReply::error),
-                   [this, req](QNetworkReply::NetworkError) {
-                     qCritical() << "Network error:" << req->errorString();
-                   });
+      // on success
+      [this, callback](QByteArray replyData) {
+        statusText->setText(QString());
+        statusProgress->setVisible(false);
 
-  QObject::connect(req, &QNetworkReply::finished, [this, req, callback]() {
-    if(req->error() != QNetworkReply::NoError)
-      return;
+        QString response = QString::fromUtf8(replyData);
 
-    QString response = QString::fromUtf8(req->readAll());
+        if(response.isEmpty())
+        {
+          m_Ctx.Config().CheckUpdate_UpdateAvailable = false;
+          m_Ctx.Config().CheckUpdate_UpdateResponse = "";
+          m_Ctx.Config().CheckUpdate_CurrentVersion = lit(MAJOR_MINOR_VERSION_STRING);
+          m_Ctx.Config().Save();
+          SetNoUpdate();
 
-    statusText->setText(QString());
-    statusProgress->setVisible(false);
+          if(callback)
+            callback(UpdateResult::Latest);
 
-    if(response.isEmpty())
-    {
-      m_Ctx.Config().CheckUpdate_UpdateAvailable = false;
-      m_Ctx.Config().CheckUpdate_UpdateResponse = "";
-      m_Ctx.Config().CheckUpdate_CurrentVersion = lit(MAJOR_MINOR_VERSION_STRING);
-      m_Ctx.Config().Save();
-      SetNoUpdate();
+          return;
+        }
 
-      if(callback)
-        callback(UpdateResult::Latest);
+        m_Ctx.Config().CheckUpdate_UpdateAvailable = true;
+        m_Ctx.Config().CheckUpdate_UpdateResponse = response;
+        m_Ctx.Config().CheckUpdate_CurrentVersion = lit(MAJOR_MINOR_VERSION_STRING);
+        m_Ctx.Config().Save();
+        SetUpdateAvailable();
+        UpdatePopup();
+      },
 
-      return;
-    }
-
-    m_Ctx.Config().CheckUpdate_UpdateAvailable = true;
-    m_Ctx.Config().CheckUpdate_UpdateResponse = response;
-    m_Ctx.Config().CheckUpdate_CurrentVersion = lit(MAJOR_MINOR_VERSION_STRING);
-    m_Ctx.Config().Save();
-    SetUpdateAvailable();
-    UpdatePopup();
-  });
+      // on error
+      [this](QString error) {
+        statusText->setText(QString());
+        statusProgress->setVisible(false);
+        qCritical() << "Network error checking for updates:" << error;
+      });
 #else    //! RENDERDOC_OFFICIAL_BUILD
   {
     if(callback)
@@ -1445,7 +1617,16 @@ ToolWindowManager::AreaReference MainWindow::leftToolArea()
   return ToolWindowManager::AreaReference(ToolWindowManager::LastUsedArea);
 }
 
-void MainWindow::show()
+void MainWindow::BringToFront()
+{
+  // un-minimise if necessary
+  setWindowState(windowState() & ~Qt::WindowMinimized);
+  show();
+  raise();
+  activateWindow();
+}
+
+void MainWindow::LoadInitialLayout()
 {
   bool loaded = LoadLayout(0);
 
@@ -1495,15 +1676,20 @@ void MainWindow::show()
         ToolWindowManager::AreaReference(ToolWindowManager::TopWindowSide,
                                          ui->toolWindowManager->areaOf(textureViewer), 0.2f));
   }
+}
 
-  QMainWindow::show();
+void MainWindow::RemoveRecentCapture(const QString &filename)
+{
+  RemoveRecentFile(m_Ctx.Config().RecentCaptureFiles, filename);
+
+  PopulateRecentCaptureFiles();
 }
 
 void MainWindow::recentCaptureFile(const QString &filename)
 {
   if(QFileInfo::exists(filename))
   {
-    LoadCapture(filename, false, true);
+    LoadCapture(filename, m_Ctx.Config().DefaultReplayOptions, false, true);
   }
   else
   {
@@ -1513,9 +1699,7 @@ void MainWindow::recentCaptureFile(const QString &filename)
 
     if(res == QMessageBox::Yes)
     {
-      m_Ctx.Config().RecentCaptureFiles.removeOne(filename);
-
-      PopulateRecentCaptureFiles();
+      RemoveRecentCapture(filename);
     }
   }
 }
@@ -1584,61 +1768,25 @@ void MainWindow::remoteProbe()
 {
   if(!m_Ctx.IsCaptureLoaded() && !m_Ctx.IsCaptureLoading())
   {
-    GUIInvoke::call(this, [this] {
-      m_Ctx.Config().AddAndroidHosts();
-
-      // update the latest list by copy. Note this lock only protects m_ProbeRemoteHosts, not the
-      // actual RemoteHosts list itself - that is only accessed on the UI thread so is not locked.
-      {
-        QMutexLocker lock(&m_ProbeRemoteHostsLock);
-        m_ProbeRemoteHosts.clear();
-        for(RemoteHost *host : m_Ctx.Config().RemoteHosts)
-          m_ProbeRemoteHosts.push_back(*host);
-      }
-    });
+    m_Ctx.Config().UpdateEnumeratedProtocolDevices();
 
     // fetch the latest list
-    rdcarray<RemoteHost> hosts;
-    {
-      QMutexLocker lock(&m_ProbeRemoteHostsLock);
-      hosts = m_ProbeRemoteHosts;
-    }
-
-    QList<QPair<RemoteHost, RemoteHost>> updates;
+    rdcarray<RemoteHost> hosts = m_Ctx.Config().GetRemoteHosts();
 
     for(RemoteHost &host : hosts)
     {
       // don't mess with a host we're connected to - this is handled anyway
-      if(host.connected)
+      if(host.IsConnected())
         continue;
 
-      RemoteHost updated = host;
-
-      updated.CheckStatus();
+      // this will do the bulk of the status checking on this thread without holding any lock, then
+      // grab the remote host lock and update the config's host (if it's still there)
+      host.CheckStatus();
 
       // bail as soon as we notice that we're done
       if(!m_RemoteProbeSemaphore.available())
         return;
-
-      if(updated != host)
-        updates.push_back(qMakePair(host, updated));
     }
-
-    GUIInvoke::call(this, [this, updates] {
-      // this is a bit naive - it suffers from the A-B-A problem where the host could be updated
-      // then restored to its original state before we notice. In this case though we don't care
-      // about that, we just don't want to trash some important changes like the connected status
-      // changing or something.
-
-      for(const QPair<RemoteHost, RemoteHost> &u : updates)
-      {
-        for(RemoteHost *host : m_Ctx.Config().RemoteHosts)
-        {
-          if(*host == u.first)
-            *host = u.second;
-        }
-      }
-    });
   }
 }
 
@@ -1661,13 +1809,13 @@ void MainWindow::messageCheck()
 
       bool disconnected = false;
 
-      if(m_Ctx.Replay().CurrentRemote())
+      if(m_Ctx.Replay().CurrentRemote().IsValid())
       {
-        bool wasRunning = m_Ctx.Replay().CurrentRemote()->serverRunning;
+        bool wasRunning = m_Ctx.Replay().CurrentRemote().IsServerRunning();
 
         m_Ctx.Replay().PingRemote();
 
-        if(wasRunning != m_Ctx.Replay().CurrentRemote()->serverRunning)
+        if(wasRunning != m_Ctx.Replay().CurrentRemote().IsServerRunning())
         {
           qCritical() << "Remote server disconnected";
           disconnected = true;
@@ -1681,18 +1829,9 @@ void MainWindow::messageCheck()
         msgs = r->GetDebugMessages();
       }
 
-      GUIInvoke::call(this, [this, disconnected, msgs] {
-        // if we just got disconnected while replaying a capture, alert the user.
-        if(disconnected)
-        {
-          RDDialog::critical(this, tr("Remote server disconnected"),
-                             tr("Remote server disconnected during replaying of this capture.\n"
-                                "The replay will now be non-functional. To restore you will have "
-                                "to close the capture, allow "
-                                "RenderDoc to reconnect and load the capture again"));
-        }
-
-        if(m_Ctx.Replay().CurrentRemote() && !m_Ctx.Replay().CurrentRemote()->serverRunning)
+      GUIInvoke::call(this, [this, msgs] {
+        if(m_Ctx.Replay().CurrentRemote().IsValid() &&
+           !m_Ctx.Replay().CurrentRemote().IsServerRunning())
           contextChooser->setIcon(Icons::cross());
 
         if(!msgs.empty())
@@ -1711,11 +1850,11 @@ void MainWindow::messageCheck()
   }
   else if(!m_Ctx.IsCaptureLoaded() && !m_Ctx.IsCaptureLoading())
   {
-    if(m_Ctx.Replay().CurrentRemote())
+    if(m_Ctx.Replay().CurrentRemote().IsValid())
       m_Ctx.Replay().PingRemote();
 
     GUIInvoke::call(this, [this]() {
-      if(m_Ctx.Replay().CurrentRemote() && !m_Ctx.Replay().CurrentRemote()->serverRunning)
+      if(m_Ctx.Replay().CurrentRemote().IsValid() && !m_Ctx.Replay().CurrentRemote().IsServerRunning())
       {
         contextChooser->setIcon(Icons::cross());
         contextChooser->setText(tr("Replay Context: %1").arg(tr("Local")));
@@ -1735,32 +1874,40 @@ void MainWindow::FillRemotesMenu(QMenu *menu, bool includeLocalhost)
 {
   menu->clear();
 
-  for(int i = 0; i < m_Ctx.Config().RemoteHosts.count(); i++)
-  {
-    RemoteHost *host = m_Ctx.Config().RemoteHosts[i];
+  rdcarray<RemoteHost> hosts = m_Ctx.Config().GetRemoteHosts();
 
-    // add localhost at the end
-    if(host->IsLocalhost())
+  int idx = 1;
+
+  for(int i = 0; i < hosts.count(); i++)
+  {
+    RemoteHost host = hosts[i];
+
+    // add localhost at the end, skip invalid hosts
+    if(host.IsLocalhost() || !host.IsValid())
       continue;
 
     QAction *action = new QAction(menu);
 
-    action->setIcon(host->serverRunning && !host->versionMismatch ? Icons::tick() : Icons::cross());
-    if(host->connected)
-      action->setText(tr("%1 (Connected)").arg(host->Name()));
-    else if(host->serverRunning && host->versionMismatch)
-      action->setText(tr("%1 (Bad Version)").arg(host->Name()));
-    else if(host->serverRunning && host->busy)
-      action->setText(tr("%1 (Busy)").arg(host->Name()));
-    else if(host->serverRunning)
-      action->setText(tr("%1 (Online)").arg(host->Name()));
+    action->setIcon(host.IsServerRunning() && !host.IsVersionMismatch() ? Icons::tick()
+                                                                        : Icons::cross());
+    if(host.IsConnected())
+      action->setText(tr("%1 (Connected)").arg(host.Name()));
+    else if(host.IsServerRunning() && host.IsVersionMismatch())
+      action->setText(tr("%1 (%2)").arg(host.Name(), host.VersionMismatchError()));
+    else if(host.IsServerRunning() && host.IsBusy())
+      action->setText(tr("%1 (Busy)").arg(host.Name()));
+    else if(host.IsServerRunning())
+      action->setText(tr("%1 (Online)").arg(host.Name()));
     else
-      action->setText(tr("%1 (Offline)").arg(host->Name()));
+      action->setText(tr("%1 (Offline)").arg(host.Name()));
+
+    action->setText(lit("%1: %2").arg(idx++).arg(action->text()));
+
     QObject::connect(action, &QAction::triggered, this, &MainWindow::switchContext);
     action->setData(i);
 
     // don't allow switching to the connected host
-    if(host->connected)
+    if(host.IsConnected())
       action->setEnabled(false);
 
     menu->addAction(action);
@@ -1782,34 +1929,38 @@ void MainWindow::FillRemotesMenu(QMenu *menu, bool includeLocalhost)
 
 void MainWindow::setRemoteHost(int hostIdx)
 {
-  RemoteHost *host = NULL;
-  if(hostIdx >= 0 && hostIdx < m_Ctx.Config().RemoteHosts.count())
-  {
-    host = m_Ctx.Config().RemoteHosts[hostIdx];
-  }
-
-  for(LiveCapture *live : m_LiveCaptures)
-  {
-    // allow live captures to this host to stay open, that way
-    // we can connect to a live capture, then switch into that
-    // context
-    if(host && live->hostname() == host->hostname)
-      continue;
-
-    if(!live->checkAllowClose())
-      return;
-  }
-
   if(!PromptCloseCapture())
     return;
 
-  for(LiveCapture *live : m_LiveCaptures)
+  rdcarray<RemoteHost> hosts = m_Ctx.Config().GetRemoteHosts();
+
+  RemoteHost host;
+  if(hostIdx >= 0 && hostIdx < hosts.count())
+    host = hosts[hostIdx];
+
+  bool noToAll = false;
+
+  QList<LiveCapture *> liveCaptures = m_LiveCaptures;
+
+  int unsavedCaps = 0;
+  for(LiveCapture *live : liveCaptures)
+    unsavedCaps += live->unsavedCaptureCount();
+
+  for(LiveCapture *live : liveCaptures)
   {
     // allow live captures to this host to stay open, that way
     // we can connect to a live capture, then switch into that
     // context
-    if(host && live->hostname() == host->hostname)
+    if(host.IsValid() && live->hostname() == host.Hostname())
       continue;
+
+    // if the user previously selected 'no to all' in the save prompts below, apply that to all
+    // subsequent live captures by skipping the check and unconditionally cleaning all captures
+    if(!noToAll)
+    {
+      if(!live->checkAllowClose(unsavedCaps, noToAll))
+        return;
+    }
 
     live->cleanItems();
     live->close();
@@ -1817,7 +1968,7 @@ void MainWindow::setRemoteHost(int hostIdx)
 
   m_Ctx.Replay().DisconnectFromRemoteServer();
 
-  if(!host)
+  if(!host.IsValid())
   {
     contextChooser->setIcon(Icons::house());
     contextChooser->setText(tr("Replay Context: %1").arg(tr("Local")));
@@ -1833,8 +1984,8 @@ void MainWindow::setRemoteHost(int hostIdx)
   }
   else
   {
-    contextChooser->setText(tr("Replay Context: %1").arg(host->Name()));
-    contextChooser->setIcon(host->serverRunning ? Icons::connect() : Icons::disconnect());
+    contextChooser->setText(tr("Replay Context: %1").arg(host.Name()));
+    contextChooser->setIcon(host.IsServerRunning() ? Icons::connect() : Icons::disconnect());
 
     // disable until checking is done
     contextChooser->setEnabled(false);
@@ -1845,31 +1996,73 @@ void MainWindow::setRemoteHost(int hostIdx)
 
     statusText->setText(tr("Checking remote server status..."));
 
-    LambdaThread *th = new LambdaThread([this, host]() {
-      // see if the server is up
-      host->CheckStatus();
+    LambdaThread *th = new LambdaThread([this, h = host]() {
+      // make a mutable copy and see if the server is up
+      RemoteHost host = h;
+      host.CheckStatus();
 
-      if(host->IsADB() && !RENDERDOC_IsAndroidSupported(host->hostname.c_str()))
+      if(host.Protocol() && !host.Protocol()->IsSupported(host.Hostname()))
       {
         // check to see if we should warn the user about this unsupported android version.
-        GUIInvoke::call(this, [this]() {
+        GUIInvoke::call(this, [this, host]() {
           QDateTime today = QDateTime::currentDateTimeUtc();
           QDateTime compare = today.addDays(-21);
 
-          if(compare > m_Ctx.Config().UnsupportedAndroid_LastUpdate)
+          if(host.Protocol()->GetProtocolName() == "adb")
+          {
+            if(compare > m_Ctx.Config().UnsupportedAndroid_LastUpdate)
+            {
+              RDDialog::critical(
+                  this, tr("Unsupported Device Android Version"),
+                  tr("This device is older than Android 6.0, the minimum required version for "
+                     "RenderDoc.\n\nThis may break or cause unknown problems - use at your own "
+                     "risk."));
+            }
+
+            m_Ctx.Config().UnsupportedAndroid_LastUpdate = today;
+          }
+          else
           {
             RDDialog::critical(
-                this, tr("Unsupported Device Android Version"),
-                tr("This device is older than Android 6.0, the minimum required version for "
-                   "RenderDoc.\n\nThis may break or cause unknown problems - use at your own "
-                   "risk."));
+                this, tr("Unsupported Device"),
+                tr("This device is not able to support RenderDoc. Please consult the documentation "
+                   "for this type of device to see what the problem may be."));
           }
-
-          m_Ctx.Config().UnsupportedAndroid_LastUpdate = today;
         });
       }
 
-      if(!host->serverRunning && !host->runCommand.isEmpty())
+      if(host.Protocol() && host.IsVersionMismatch())
+      {
+        GUIInvoke::blockcall(this, [this, &host]() {
+          QMessageBox::StandardButton res =
+              RDDialog::question(this, tr("Unsupported version"),
+                                 tr("Remote server on %1 has an incompatible version.\n"
+                                    "Would you like to try to reinstall the version %2?")
+                                     .arg(host.Name())
+                                     .arg(lit(FULL_VERSION_STRING)),
+                                 QMessageBox::Yes | QMessageBox::No | QMessageBox::Cancel);
+
+          if(res == QMessageBox::Yes)
+          {
+            LambdaThread *launchthread = new LambdaThread([&host]() {
+              // since we have a protocol, try to force-launch which should attempt to reinstall.
+              host.Launch();
+
+              // update status
+              host.CheckStatus();
+            });
+            launchthread->setName(lit("Remote host launch"));
+            launchthread->start();
+
+            ShowProgressDialog(this, tr("Attempting to update remote server, please wait..."),
+                               [launchthread]() { return !launchthread->isRunning(); });
+
+            launchthread->deleteLater();
+          }
+        });
+      }
+
+      if(!host.IsServerRunning() && !host.RunCommand().isEmpty())
       {
         GUIInvoke::call(this, [this]() {
           statusText->setText(tr("Running remote server command..."));
@@ -1877,51 +2070,50 @@ void MainWindow::setRemoteHost(int hostIdx)
           statusProgress->setMaximum(0);
         });
 
-        ReplayStatus launchStatus = host->Launch();
-        if(launchStatus != ReplayStatus::Succeeded)
+        ResultDetails launchResult = host.Launch();
+        if(!launchResult.OK())
         {
-          showLaunchError(launchStatus);
+          showLaunchError(launchResult);
         }
 
         // check if it's running now
-        host->CheckStatus();
+        host.CheckStatus();
 
         GUIInvoke::call(this, [this]() { statusProgress->setVisible(false); });
       }
 
-      ReplayStatus status = ReplayStatus::Succeeded;
+      ResultDetails result = {ResultCode::Succeeded};
 
-      if(host->serverRunning && !host->busy)
+      if(host.IsServerRunning() && !host.IsBusy())
       {
-        status = m_Ctx.Replay().ConnectToRemoteServer(host);
+        result = m_Ctx.Replay().ConnectToRemoteServer(host);
       }
 
-      GUIInvoke::call(this, [this, host, status]() {
-        contextChooser->setIcon(host->serverRunning && !host->busy ? Icons::connect()
-                                                                   : Icons::disconnect());
+      GUIInvoke::call(this, [this, host, result]() {
+        contextChooser->setIcon(host.IsServerRunning() && !host.IsBusy() ? Icons::connect()
+                                                                         : Icons::disconnect());
 
-        if(status != ReplayStatus::Succeeded)
+        if(!result.OK())
         {
           contextChooser->setIcon(Icons::cross());
           contextChooser->setText(tr("Replay Context: %1").arg(tr("Local")));
-          statusText->setText(tr("Connection failed: %1").arg(ToQStr(status)));
+          statusText->setText(tr("Connection failed: %1").arg(result.Message()));
         }
-        else if(host->versionMismatch)
+        else if(host.IsVersionMismatch())
         {
-          statusText->setText(
-              tr("Remote server is not running RenderDoc %1").arg(lit(FULL_VERSION_STRING)));
+          statusText->setText(host.VersionMismatchError());
         }
-        else if(host->busy)
+        else if(host.IsBusy())
         {
           statusText->setText(tr("Remote server in use elsewhere"));
         }
-        else if(host->serverRunning)
+        else if(host.IsServerRunning())
         {
           statusText->setText(tr("Remote server ready"));
         }
         else
         {
-          if(!host->runCommand.isEmpty())
+          if(!host.RunCommand().isEmpty())
             statusText->setText(tr("Remote server not running or failed to start"));
           else
             statusText->setText(tr("Remote server not running - no start command configured"));
@@ -1933,6 +2125,7 @@ void MainWindow::setRemoteHost(int hostIdx)
           m_Ctx.GetCaptureDialog()->UpdateRemoteHost();
       });
     });
+    th->setName(lit("Remote host check"));
     th->selfDelete(true);
     th->start();
   }
@@ -2002,7 +2195,8 @@ void MainWindow::OnCaptureLoaded()
 
   PopulateRecentCaptureFiles();
 
-  ToolWindowManager::raiseToolWindow(m_Ctx.GetEventBrowser()->Widget());
+  if(m_Ctx.HasEventBrowser())
+    ToolWindowManager::raiseToolWindow(m_Ctx.GetEventBrowser()->Widget());
 }
 
 void MainWindow::OnCaptureClosed()
@@ -2030,7 +2224,7 @@ void MainWindow::OnCaptureClosed()
   SetTitle();
 
   // if the remote sever disconnected during capture replay, resort back to a 'disconnected' state
-  if(m_Ctx.Replay().CurrentRemote() && !m_Ctx.Replay().CurrentRemote()->serverRunning)
+  if(m_Ctx.Replay().CurrentRemote().IsValid() && !m_Ctx.Replay().CurrentRemote().IsServerRunning())
   {
     statusText->setText(
         tr("Remote server disconnected. To attempt to reconnect please select it again."));
@@ -2352,22 +2546,22 @@ void MainWindow::on_action_Resolve_Symbols_triggered()
   bool finished = false;
 
   m_Ctx.Replay().AsyncInvoke([this, &progress, &finished](IReplayController *) {
-    bool success =
-        m_Ctx.Replay().GetCaptureAccess()->InitResolver([&progress](float p) { progress = p; });
+    ResultDetails success = m_Ctx.Replay().GetCaptureAccess()->InitResolver(
+        true, [&progress](float p) { progress = p; });
 
-    if(!success)
+    if(!success.OK())
     {
       RDDialog::critical(
           this, tr("Error loading symbols"),
-          tr("Couldn't load symbols for callstack resolution.\n\nCheck diagnostic log in "
-             "Help menu for more details."));
+          tr("Couldn't load symbols for callstack resolution.\n\n%1").arg(success.Message()));
     }
 
     finished = true;
   });
 
-  ShowProgressDialog(this, tr("Resolving symbols, please wait..."),
-                     [&finished]() { return finished; }, [&progress]() { return progress; });
+  ShowProgressDialog(
+      this, tr("Resolving symbols, please wait..."), [&finished]() { return finished; },
+      [&progress]() { return progress; }, []() {});
 
   if(m_Ctx.HasAPIInspector())
     m_Ctx.GetAPIInspector()->Refresh();
@@ -2389,11 +2583,11 @@ void MainWindow::on_action_Start_Replay_Loop_triggered()
 
   const TextureDescription *displayTex = NULL;
 
-  const DrawcallDescription *lastDraw = m_Ctx.GetLastDrawcall();
+  const ActionDescription *lastAction = m_Ctx.GetLastAction();
 
-  displayTex = m_Ctx.GetTexture(lastDraw->copyDestination);
+  displayTex = m_Ctx.GetTexture(lastAction->copyDestination);
   if(!displayTex)
-    displayTex = m_Ctx.GetTexture(lastDraw->outputs[0]);
+    displayTex = m_Ctx.GetTexture(lastAction->outputs[0]);
 
   if(!displayTex)
   {
@@ -2438,9 +2632,8 @@ void MainWindow::on_action_Start_Replay_Loop_triggered()
   else
   {
     popup.resize(100, 100);
-    popup.setWindowTitle(tr("Looping replay of %1 Displaying %2")
-                             .arg(m_Ctx.GetCaptureFilename())
-                             .arg(tr("nothing")));
+    popup.setWindowTitle(
+        tr("Looping replay of %1 Displaying %2").arg(m_Ctx.GetCaptureFilename()).arg(tr("nothing")));
   }
 
   WindowingData winData = m_Ctx.CreateWindowingData(&popup);
@@ -2556,11 +2749,25 @@ void MainWindow::on_action_Manage_Extensions_triggered()
 
 void MainWindow::on_action_Manage_Remote_Servers_triggered()
 {
-  RemoteManager *rm = new RemoteManager(m_Ctx, this);
-  RDDialog::show(rm);
-  // now that we're done with it, the manager deletes itself when all lookups terminate (or
-  // immediately if there are no lookups ongoing).
-  rm->closeWhenFinished();
+  LambdaThread *th = new LambdaThread([this]() {
+    m_Ctx.Config().UpdateEnumeratedProtocolDevices();
+
+    GUIInvoke::call(this, [this]() {
+      RemoteManager *rm = new RemoteManager(m_Ctx, this);
+      RDDialog::show(rm);
+      // now that we're done with it, the manager deletes itself when all lookups terminate (or
+      // immediately if there are no lookups ongoing).
+      rm->closeWhenFinished();
+    });
+  });
+  th->start();
+  th->wait(500);
+  if(th->isRunning())
+  {
+    ShowProgressDialog(this, tr("Updating available devices, please wait..."),
+                       [th]() { return !th->isRunning(); });
+  }
+  th->deleteLater();
 }
 
 void MainWindow::on_action_Settings_triggered()
@@ -2596,16 +2803,6 @@ void MainWindow::on_action_Show_Tips_triggered()
   RDDialog::show(&tipsDialog);
 }
 
-void MainWindow::on_action_View_Diagnostic_Log_File_triggered()
-{
-  QWidget *logView = m_Ctx.GetDiagnosticLogView()->Widget();
-
-  if(ui->toolWindowManager->toolWindows().contains(logView))
-    ToolWindowManager::raiseToolWindow(logView);
-  else
-    ui->toolWindowManager->addToolWindow(logView, mainToolArea());
-}
-
 void MainWindow::on_action_Counter_Viewer_triggered()
 {
   QWidget *performanceCounterViewer = m_Ctx.GetPerformanceCounterViewer()->Widget();
@@ -2628,6 +2825,11 @@ void MainWindow::on_action_Resource_Inspector_triggered()
 
 void MainWindow::on_action_Send_Error_Report_triggered()
 {
+  sendErrorReport(false);
+}
+
+void MainWindow::sendErrorReport(bool forceCaptureInclusion)
+{
   rdcstr report;
   RENDERDOC_CreateBugReport(RENDERDOC_GetLogFile(), "", report);
 
@@ -2636,6 +2838,8 @@ void MainWindow::on_action_Send_Error_Report_triggered()
   json[lit("version")] = lit(FULL_VERSION_STRING);
   json[lit("gitcommit")] = QString::fromLatin1(RENDERDOC_GetCommitHash());
   json[lit("replaycrash")] = 1;
+  json[lit("manual")] = 1;
+  json[lit("forcecapture")] = forceCaptureInclusion ? 1 : 0;
   json[lit("report")] = (QString)report;
 
   CrashDialog crash(m_Ctx.Config(), json, this);
@@ -2673,8 +2877,7 @@ void MainWindow::on_action_Check_for_Updates_triggered()
       }
       case UpdateResult::Latest:
       {
-        RDDialog::information(this, tr("Latest version"),
-                              tr("You are running the latest version."));
+        RDDialog::information(this, tr("Latest version"), tr("You are running the latest version."));
         break;
       }
       case UpdateResult::Upgrade:
@@ -2684,6 +2887,16 @@ void MainWindow::on_action_Check_for_Updates_triggered()
       }
     }
   });
+}
+
+void MainWindow::showDiagnosticLogView()
+{
+  QWidget *logView = m_Ctx.GetDiagnosticLogView()->Widget();
+
+  if(ui->toolWindowManager->toolWindows().contains(logView))
+    ToolWindowManager::raiseToolWindow(logView);
+  else
+    ui->toolWindowManager->addToolWindow(logView, mainToolArea());
 }
 
 void MainWindow::updateAvailable_triggered()
@@ -2708,15 +2921,6 @@ void MainWindow::loadLayout_triggered()
 
 void MainWindow::closeEvent(QCloseEvent *event)
 {
-  for(LiveCapture *live : m_LiveCaptures)
-  {
-    if(!live->checkAllowClose())
-    {
-      event->ignore();
-      return;
-    }
-  }
-
   if(RENDERDOC_IsGlobalHookActive())
   {
     RDDialog::critical(this, tr("Global hook active"),
@@ -2731,8 +2935,35 @@ void MainWindow::closeEvent(QCloseEvent *event)
     return;
   }
 
-  for(LiveCapture *live : m_LiveCaptures)
+  bool noToAll = false;
+
+  QList<QPointer<LiveCapture>> liveCaptures;
+
+  int unsavedCaps = 0;
+  for(QPointer<LiveCapture> live : m_LiveCaptures)
   {
+    unsavedCaps += live->unsavedCaptureCount();
+    liveCaptures.append(live);
+  }
+
+  for(QPointer<LiveCapture> live : liveCaptures)
+  {
+    // The live capture could be deleted during this loop via the save capture modal message box
+    // message pump of an earlier live capture
+    if(live.isNull())
+      continue;
+
+    // if the user previously selected 'no to all' in the save prompts below, apply that to all
+    // subsequent live captures by skipping the check and unconditionally cleaning all captures
+    if(!noToAll)
+    {
+      if(!live->checkAllowClose(unsavedCaps, noToAll))
+      {
+        event->ignore();
+        return;
+      }
+    }
+
     live->cleanItems();
     delete live;
   }
@@ -2825,7 +3056,7 @@ QVariantMap MainWindow::saveState()
 {
   QVariantMap state = ui->toolWindowManager->saveState();
 
-  state[lit("mainWindowGeometry")] = saveGeometry().toBase64();
+  state[lit("mainWindowGeometry")] = QString::fromLatin1(saveGeometry().toBase64());
 
   return state;
 }
@@ -2841,6 +3072,7 @@ bool MainWindow::restoreState(QVariantMap &state)
 
 bool MainWindow::SaveLayout(int layout)
 {
+  qInfo() << "SaveLayout " << layout;
   QString path = GetLayoutPath(layout);
 
   QVariantMap state = saveState();
@@ -2856,6 +3088,7 @@ bool MainWindow::SaveLayout(int layout)
 
 bool MainWindow::LoadLayout(int layout)
 {
+  qInfo() << "LoadLayout " << layout;
   QString path = GetLayoutPath(layout);
 
   QFile f(path);
@@ -2868,7 +3101,20 @@ bool MainWindow::LoadLayout(int layout)
     if(!success)
       return false;
 
-    return restoreState(state);
+    if(restoreState(state))
+    {
+      // Close any windows which have now become orphaned
+      foreach(QWidget *toolWindow, ui->toolWindowManager->toolWindows())
+      {
+        if(ui->toolWindowManager->areaOf(toolWindow) == NULL)
+        {
+          qInfo() << "Manually closing orphaned window " << toolWindow->objectName();
+          ui->toolWindowManager->forceCloseToolWindow(toolWindow);
+        }
+      }
+      return true;
+    }
+    return false;
   }
 
   qInfo() << "Couldn't load layout from " << path << " " << f.errorString();
@@ -2876,48 +3122,56 @@ bool MainWindow::LoadLayout(int layout)
   return false;
 }
 
-void MainWindow::showLaunchError(ReplayStatus status)
+void MainWindow::showLaunchError(ResultDetails result)
 {
   QString message;
-  switch(status)
+  switch(result.code)
   {
-    case ReplayStatus::AndroidGrantPermissionsFailed:
+    case ResultCode::AndroidGrantPermissionsFailed:
       message =
-          tr("Failed to automatically grant Android permissions to installed server.\n\n"
+          tr("%1.\n\n"
              "Please manually allow the RenderDocCmd program storage permissions on your device "
-             "to ensure correct functionality.");
+             "to ensure correct functionality.")
+              .arg(result.Message());
       break;
-    case ReplayStatus::AndroidABINotFound:
-      message =
-          tr("Couldn't determine supported ABIs for your device, please check device connection "
-             "and status.");
+    case ResultCode::AndroidABINotFound:
+      message = tr("%1.\n\nPlease check device connection and result.").arg(result.Message());
       break;
-    case ReplayStatus::AndroidAPKFolderNotFound:
-      message = tr("Couldn't find APK folder, please check that your installation is complete.");
+    case ResultCode::AndroidAPKFolderNotFound: message = result.Message(); break;
+    case ResultCode::AndroidAPKInstallFailed:
+      message = tr("%1.\n\nlease check that your device is connected and accessible to "
+                   "adb, and that installing APKs over USB is allowed.")
+                    .arg(result.Message());
       break;
-    case ReplayStatus::AndroidAPKInstallFailed:
-      message =
-          tr("Couldn't install APK, please check that your device is connected and accessible to "
-             "adb.");
-    case ReplayStatus::AndroidAPKVerifyFailed:
+    case ResultCode::AndroidAPKVerifyFailed:
       message =
           tr("Couldn't correctly verify installed APK version.\n\n"
-             "Please check your installation is not corrupted, or if this is a custom build check "
-             "that all ABIs are built at the same version as this program.");
+             "Please check your installation is not corrupted."
+#if !RENDERDOC_OFFICIAL_BUILD
+             " Or if this is a custom build check that all ABIs are built at the same version as "
+             "this program."
+#endif
+          );
       break;
-    default: message = tr("Unexpected error: %1.").arg(ToQStr(status)); break;
+    default:
+      message = tr("Error encountered launching RenderDoc remote server: %1.").arg(result.Message());
+      break;
   }
   GUIInvoke::call(this, [this, message]() {
-    RDDialog::warning(this, tr("Problems installing RenderDoc server"), message);
+    RDDialog::warning(this, tr("Problems launching RenderDoc remote server"), message);
   });
 }
 
-bool MainWindow::isCapturableAppRunningOnAndroid()
+bool MainWindow::isUnshareableDeviceInUse()
 {
-  if(!m_Ctx.Replay().CurrentRemote() || !m_Ctx.Replay().CurrentRemote()->IsADB())
+  if(!m_Ctx.Replay().CurrentRemote().Protocol())
     return false;
 
-  rdcstr host = m_Ctx.Replay().CurrentRemote()->hostname;
-  uint32_t ident = RENDERDOC_EnumerateRemoteTargets(host.c_str(), 0);
+  rdcstr host = m_Ctx.Replay().CurrentRemote().Hostname();
+
+  if(m_Ctx.Replay().CurrentRemote().Protocol()->SupportsMultiplePrograms(host))
+    return false;
+
+  uint32_t ident = RENDERDOC_EnumerateRemoteTargets(host, 0);
   return ident != 0;
 }

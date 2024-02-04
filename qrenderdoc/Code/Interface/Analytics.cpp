@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2017-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -258,7 +258,7 @@ static struct AnalyticsDocumentation
     DOCUMENT_ANALYTIC(ShaderEditing, "Did the user edit a shader (any API)?");
     DOCUMENT_ANALYTIC(CallstackResolve, "Did the user capture and resolve CPU callstacks?");
     DOCUMENT_ANALYTIC(PixelHistory, "Did the user run a pixel history?");
-    DOCUMENT_ANALYTIC(DrawcallTimes, "Did the user fetch drawcall timings/durations?");
+    DOCUMENT_ANALYTIC(DrawcallTimes, "Did the user fetch action timings/durations?");
     DOCUMENT_ANALYTIC(PerformanceCounters, "Did the user fetch advanced performance counters?");
     DOCUMENT_ANALYTIC(PythonInterop, "Did the user run any python scripts or commands?");
     DOCUMENT_ANALYTIC(CustomTextureVisualise,
@@ -273,7 +273,7 @@ static struct AnalyticsDocumentation
 
   struct
   {
-    DOCUMENT_ANALYTIC(EventBrowser, "Did the user ever export drawcalls from the event browser?");
+    DOCUMENT_ANALYTIC(EventBrowser, "Did the user ever export actions from the event browser?");
     DOCUMENT_ANALYTIC(PipelineState, "Did the user ever export the pipeline state (any API)?");
     DOCUMENT_ANALYTIC(MeshOutput, "Did the user ever export mesh data (inputs or outputs)?");
     DOCUMENT_ANALYTIC(RawBuffer, "Did the user ever export raw buffer data?");
@@ -313,6 +313,7 @@ static struct AnalyticsDocumentation
     DOCUMENT_ANALYTIC(SparseResources, "Did any capture use sparse aka tiled resources?");
     DOCUMENT_ANALYTIC(MultiGPU, "Did any capture make use of multiple GPUs?");
     DOCUMENT_ANALYTIC(D3D12Bundle, "Did any D3D12 capture use bundles?");
+    DOCUMENT_ANALYTIC(DXILShaders, "Did any D3D12 capture use DXIL shaders?");
   } DOCUMENT_ANALYTIC_SECTION(CaptureFeatures, "Capture API Usage");
 } docs;
 
@@ -322,7 +323,7 @@ void AnalyticsSerialise(Analytics &serdb, QVariantMap &values, AnalyticsSerialis
 
 // only check this on 64-bit as it is different on 32-bit
 #if QT_POINTER_SIZE == 8 && defined(Q_OS_WIN32)
-  static_assert(sizeof(Analytics) == 147, "Sizeof Analytics has changed - update serialisation.");
+  static_assert(sizeof(Analytics) == 148, "Sizeof Analytics has changed - update serialisation.");
 #endif
 
   QString doc;
@@ -430,6 +431,7 @@ void AnalyticsSerialise(Analytics &serdb, QVariantMap &values, AnalyticsSerialis
     ANALYTIC_SERIALISE(CaptureFeatures.SparseResources);
     ANALYTIC_SERIALISE(CaptureFeatures.MultiGPU);
     ANALYTIC_SERIALISE(CaptureFeatures.D3D12Bundle);
+    ANALYTIC_SERIALISE(CaptureFeatures.DXILShaders);
   }
 
   if(type == AnalyticsSerialiseType::Documenting)
@@ -475,7 +477,7 @@ void Analytics::Load()
   Analytics::db = &actualDB;
 
   // find the filename where the analytics will be saved
-  analyticsSaveLocation = configFilePath(lit("analytics.json"));
+  analyticsSaveLocation = ConfigFilePath(lit("analytics.json"));
 
   QFile f(analyticsSaveLocation);
 
@@ -521,6 +523,7 @@ void Analytics::DocumentReport()
   {
     QDialog dialog;
     dialog.setWindowTitle(lit("Sample Analytics Report"));
+    dialog.setWindowFlags(dialog.windowFlags() & ~Qt::WindowContextHelpButtonHint);
     dialog.setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
     dialog.setFixedSize(600, 500);
 

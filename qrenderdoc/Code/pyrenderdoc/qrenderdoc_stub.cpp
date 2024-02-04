@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2017-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -43,14 +43,9 @@ CaptureSettings::CaptureSettings()
   RENDERDOC_GetDefaultCaptureOptions(&options);
 }
 
-rdcstr configFilePath(const rdcstr &filename)
+rdcstr ConfigFilePath(const rdcstr &filename)
 {
   return "";
-}
-
-ICaptureContext *getCaptureContext(const QWidget *widget)
-{
-  return NULL;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -79,6 +74,11 @@ rdcstr ShaderProcessingTool::DefaultArguments() const
   return "";
 }
 
+rdcstr ShaderProcessingTool::IOArguments() const
+{
+  return "";
+}
+
 ShaderToolOutput ShaderProcessingTool::DisassembleShader(QWidget *window,
                                                          const ShaderReflection *shaderDetails,
                                                          rdcstr arguments) const
@@ -88,7 +88,7 @@ ShaderToolOutput ShaderProcessingTool::DisassembleShader(QWidget *window,
 
 ShaderToolOutput ShaderProcessingTool::CompileShader(QWidget *window, rdcstr source,
                                                      rdcstr entryPoint, ShaderStage stage,
-                                                     rdcstr arguments) const
+                                                     rdcstr spirvVer, rdcstr arguments) const
 {
   return {};
 }
@@ -105,6 +105,10 @@ rdcstr BugReport::URL() const
 bool PersistantConfig::SetStyle()
 {
   return false;
+}
+
+PersistantConfig::PersistantConfig()
+{
 }
 
 PersistantConfig::~PersistantConfig()
@@ -125,21 +129,25 @@ void PersistantConfig::Close()
 {
 }
 
-int PersistantConfig::RemoteHostCount()
+rdcarray<RemoteHost> PersistantConfig::GetRemoteHosts()
 {
-  return 0;
+  return {};
 }
 
-RemoteHost *PersistantConfig::GetRemoteHost(int index)
+RemoteHost PersistantConfig::GetRemoteHost(const rdcstr &)
 {
-  return NULL;
+  return RemoteHost();
 }
 
 void PersistantConfig::AddRemoteHost(RemoteHost host)
 {
 }
 
-void PersistantConfig::AddAndroidHosts()
+void PersistantConfig::RemoveRemoteHost(RemoteHost host)
+{
+}
+
+void PersistantConfig::UpdateEnumeratedProtocolDevices()
 {
 }
 
@@ -147,17 +155,12 @@ void PersistantConfig::SetupFormatting()
 {
 }
 
-void AddRecentFile(rdcarray<rdcstr> &recentList, const rdcstr &file, int maxItems)
+void AddRecentFile(rdcarray<rdcstr> &recentList, const rdcstr &file)
 {
 }
 
-void PersistantConfig::SetConfigSetting(const rdcstr &name, const rdcstr &value)
+void RemoveRecentFile(rdcarray<rdcstr> &recentList, const rdcstr &file)
 {
-}
-
-rdcstr PersistantConfig::GetConfigSetting(const rdcstr &name)
-{
-  return "";
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -166,14 +169,95 @@ rdcstr PersistantConfig::GetConfigSetting(const rdcstr &name)
 
 RemoteHost::RemoteHost()
 {
-  serverRunning = connected = busy = versionMismatch = false;
+}
+
+RemoteHost::RemoteHost(const rdcstr &host)
+{
+}
+
+RemoteHost::RemoteHost(const RemoteHost &o)
+{
+}
+
+RemoteHost &RemoteHost::operator=(const RemoteHost &o)
+{
+  return *this;
+}
+
+RemoteHost::~RemoteHost()
+{
 }
 
 void RemoteHost::CheckStatus()
 {
 }
 
-ReplayStatus RemoteHost::Launch()
+ResultDetails RemoteHost::Connect(IRemoteServer **server)
 {
-  return ReplayStatus::Succeeded;
+  return {ResultCode::Succeeded};
+}
+
+ResultDetails RemoteHost::Launch()
+{
+  return {ResultCode::Succeeded};
+}
+
+bool RemoteHost::IsServerRunning() const
+{
+  return false;
+}
+
+bool RemoteHost::IsConnected() const
+{
+  return false;
+}
+
+bool RemoteHost::IsBusy() const
+{
+  return false;
+}
+
+bool RemoteHost::IsVersionMismatch() const
+{
+  return false;
+}
+
+rdcstr RemoteHost::VersionMismatchError() const
+{
+  return rdcstr();
+}
+
+rdcstr RemoteHost::FriendlyName() const
+{
+  return rdcstr();
+}
+
+void RemoteHost::SetFriendlyName(const rdcstr &name)
+{
+}
+
+rdcstr RemoteHost::RunCommand() const
+{
+  return rdcstr();
+}
+
+void RemoteHost::SetRunCommand(const rdcstr &cmd)
+{
+}
+
+rdcstr RemoteHost::LastCapturePath() const
+{
+  return rdcstr();
+}
+
+void RemoteHost::SetLastCapturePath(const rdcstr &path)
+{
+}
+
+void RemoteHost::SetConnected(bool connected)
+{
+}
+
+void RemoteHost::SetShutdown()
+{
 }

@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  * Copyright (c) 2014 Crytek
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -99,6 +99,12 @@ enum ReplayProxyPacket
   eReplayProxy_GetTargetShaderEncodings,
 
   eReplayProxy_GetDriverInfo,
+  eReplayProxy_GetAvailableGPUs,
+
+  eReplayProxy_ContinueDebug,
+  eReplayProxy_FreeDebugger,
+
+  eReplayProxy_FatalErrorCheck,
 };
 
 DECLARE_REFLECTION_ENUM(ReplayProxyPacket);
@@ -118,35 +124,10 @@ DECLARE_REFLECTION_ENUM(ReplayProxyPacket);
 class ReplayProxy : public IReplayDriver
 {
 public:
-  ReplayProxy(ReadSerialiser &reader, WriteSerialiser &writer, IReplayDriver *proxy)
-      : m_Reader(reader),
-        m_Writer(writer),
-        m_Proxy(proxy),
-        m_Remote(NULL),
-        m_Replay(NULL),
-        m_RemoteServer(false)
-  {
-    GetAPIProperties();
-    FetchStructuredFile();
-  }
+  ReplayProxy(ReadSerialiser &reader, WriteSerialiser &writer, IReplayDriver *proxy);
 
   ReplayProxy(ReadSerialiser &reader, WriteSerialiser &writer, IRemoteDriver *remoteDriver,
-              IReplayDriver *replayDriver, RENDERDOC_PreviewWindowCallback previewWindow)
-      : m_Reader(reader),
-        m_Writer(writer),
-        m_Proxy(NULL),
-        m_Remote(remoteDriver),
-        m_Replay(replayDriver),
-        m_PreviewWindow(previewWindow),
-        m_RemoteServer(true)
-  {
-    RDCEraseEl(m_APIProps);
-
-    InitRemoteExecutionThread();
-
-    if(m_Replay)
-      InitPreviewWindow();
-  }
+              IReplayDriver *replayDriver, RENDERDOC_PreviewWindowCallback previewWindow);
 
   virtual ~ReplayProxy();
 
@@ -161,17 +142,19 @@ public:
   void RemoteExecutionThreadEntry();
 
   bool IsRemoteProxy() { return !m_RemoteServer; }
+  RDResult FatalErrorCheck();
+  IReplayDriver *MakeDummyDriver();
   void Shutdown() { delete this; }
-  ReplayStatus ReadLogInitialisation(RDCFile *rdc, bool storeStructuredBuffers)
+  RDResult ReadLogInitialisation(RDCFile *rdc, bool storeStructuredBuffers)
   {
-    return ReplayStatus::Succeeded;
+    return ResultCode::Succeeded;
   }
   AMDRGPControl *GetRGPControl() { return NULL; }
-  std::vector<WindowingSystem> GetSupportedWindowSystems()
+  rdcarray<WindowingSystem> GetSupportedWindowSystems()
   {
     if(m_Proxy)
       return m_Proxy->GetSupportedWindowSystems();
-    return std::vector<WindowingSystem>();
+    return rdcarray<WindowingSystem>();
   }
   uint64_t MakeOutputWindow(WindowingData window, bool depth)
   {
@@ -232,10 +215,10 @@ public:
       return m_Proxy->FlipOutputWindow(id);
   }
 
-  void RenderCheckerboard()
+  void RenderCheckerboard(FloatVector dark, FloatVector light)
   {
     if(m_Proxy)
-      return m_Proxy->RenderCheckerboard();
+      return m_Proxy->RenderCheckerboard(dark, light);
   }
 
   void RenderHighlightBox(float w, float h, float scale)
@@ -244,45 +227,14 @@ public:
       return m_Proxy->RenderHighlightBox(w, h, scale);
   }
 
-  bool GetMinMax(ResourceId texid, uint32_t sliceFace, uint32_t mip, uint32_t sample,
-                 CompType typeHint, float *minval, float *maxval)
-  {
-    if(m_Proxy)
-    {
-      EnsureTexCached(texid, sliceFace, mip);
-      if(texid == ResourceId() || m_ProxyTextures[texid] == ResourceId())
-        return false;
-      return m_Proxy->GetMinMax(m_ProxyTextures[texid], sliceFace, mip, sample, typeHint, minval,
-                                maxval);
-    }
-
-    return false;
-  }
-
-  bool GetHistogram(ResourceId texid, uint32_t sliceFace, uint32_t mip, uint32_t sample,
-                    CompType typeHint, float minval, float maxval, bool channels[4],
-                    std::vector<uint32_t> &histogram)
-  {
-    if(m_Proxy)
-    {
-      EnsureTexCached(texid, sliceFace, mip);
-      if(texid == ResourceId() || m_ProxyTextures[texid] == ResourceId())
-        return false;
-      return m_Proxy->GetHistogram(m_ProxyTextures[texid], sliceFace, mip, sample, typeHint, minval,
-                                   maxval, channels, histogram);
-    }
-
-    return false;
-  }
-
   bool RenderTexture(TextureDisplay cfg)
   {
     if(m_Proxy)
     {
-      EnsureTexCached(cfg.resourceId, cfg.sliceFace, cfg.mip);
-      if(cfg.resourceId == ResourceId() || m_ProxyTextures[cfg.resourceId] == ResourceId())
+      EnsureTexCached(cfg.resourceId, cfg.typeCast, cfg.subresource);
+
+      if(cfg.resourceId == ResourceId())
         return false;
-      cfg.resourceId = m_ProxyTextures[cfg.resourceId];
 
       // due to OpenGL having origin bottom-left compared to the rest of the world,
       // we need to flip going in or out of GL.
@@ -298,16 +250,15 @@ public:
     return false;
   }
 
-  void PickPixel(ResourceId texture, uint32_t x, uint32_t y, uint32_t sliceFace, uint32_t mip,
-                 uint32_t sample, CompType typeHint, float pixel[4])
+  void PickPixel(ResourceId texture, uint32_t x, uint32_t y, const Subresource &sub,
+                 CompType typeCast, float pixel[4])
   {
     if(m_Proxy)
     {
-      EnsureTexCached(texture, sliceFace, mip);
-      if(texture == ResourceId() || m_ProxyTextures[texture] == ResourceId())
-        return;
+      EnsureTexCached(texture, typeCast, sub);
 
-      texture = m_ProxyTextures[texture];
+      if(texture == ResourceId())
+        return;
 
       // due to OpenGL having origin bottom-left compared to the rest of the world,
       // we need to flip going in or out of GL.
@@ -317,16 +268,48 @@ public:
          (m_APIProps.localRenderer == GraphicsAPI::OpenGL))
       {
         TextureDescription tex = m_Proxy->GetTexture(texture);
-        uint32_t mipHeight = RDCMAX(1U, tex.height >> mip);
+        uint32_t mipHeight = RDCMAX(1U, tex.height >> sub.mip);
         y = (mipHeight - 1) - y;
       }
 
-      m_Proxy->PickPixel(texture, x, y, sliceFace, mip, sample, typeHint, pixel);
+      m_Proxy->PickPixel(texture, x, y, sub, typeCast, pixel);
     }
   }
 
-  void RenderMesh(uint32_t eventId, const std::vector<MeshFormat> &secondaryDraws,
-                  const MeshDisplay &cfg)
+  bool GetMinMax(ResourceId texid, const Subresource &sub, CompType typeCast, float *minval,
+                 float *maxval)
+  {
+    if(m_Proxy)
+    {
+      EnsureTexCached(texid, typeCast, sub);
+
+      if(texid == ResourceId())
+        return false;
+
+      return m_Proxy->GetMinMax(texid, sub, typeCast, minval, maxval);
+    }
+
+    return false;
+  }
+
+  bool GetHistogram(ResourceId texid, const Subresource &sub, CompType typeCast, float minval,
+                    float maxval, const rdcfixedarray<bool, 4> &channels,
+                    rdcarray<uint32_t> &histogram)
+  {
+    if(m_Proxy)
+    {
+      EnsureTexCached(texid, typeCast, sub);
+
+      if(texid == ResourceId())
+        return false;
+
+      return m_Proxy->GetHistogram(texid, sub, typeCast, minval, maxval, channels, histogram);
+    }
+
+    return false;
+  }
+
+  void RenderMesh(uint32_t eventId, const rdcarray<MeshFormat> &secondaryDraws, const MeshDisplay &cfg)
   {
     if(m_Proxy && cfg.position.vertexResourceId != ResourceId())
     {
@@ -350,7 +333,7 @@ public:
         proxiedCfg.position.indexResourceId = m_ProxyBufferIds[proxiedCfg.position.indexResourceId];
       }
 
-      std::vector<MeshFormat> secDraws = secondaryDraws;
+      rdcarray<MeshFormat> secDraws = secondaryDraws;
 
       for(size_t i = 0; i < secDraws.size(); i++)
       {
@@ -401,9 +384,14 @@ public:
     return ~0U;
   }
 
-  void BuildCustomShader(ShaderEncoding sourceEncoding, bytebuf source, const std::string &entry,
-                         const ShaderCompileFlags &compileFlags, ShaderStage type, ResourceId *id,
-                         std::string *errors)
+  void SetCustomShaderIncludes(const rdcarray<rdcstr> &directories)
+  {
+    if(m_Proxy)
+      m_Proxy->SetCustomShaderIncludes(directories);
+  }
+  void BuildCustomShader(ShaderEncoding sourceEncoding, const bytebuf &source, const rdcstr &entry,
+                         const ShaderCompileFlags &compileFlags, ShaderStage type, ResourceId &id,
+                         rdcstr &errors)
   {
     if(m_Proxy)
     {
@@ -411,10 +399,8 @@ public:
     }
     else
     {
-      if(id)
-        *id = ResourceId();
-      if(errors)
-        *errors = "Unsupported BuildShader call on proxy without local renderer";
+      id = ResourceId();
+      errors = "Unsupported BuildShader call on proxy without local renderer";
     }
   }
 
@@ -426,23 +412,35 @@ public:
     return {};
   }
 
+  rdcarray<ShaderSourcePrefix> GetCustomShaderSourcePrefixes()
+  {
+    if(m_Proxy)
+      return m_Proxy->GetCustomShaderSourcePrefixes();
+
+    return {};
+  }
+
   void FreeCustomShader(ResourceId id)
   {
     if(m_Proxy)
       m_Proxy->FreeTargetResource(id);
   }
 
-  ResourceId ApplyCustomShader(ResourceId shader, ResourceId texid, uint32_t mip, uint32_t arrayIdx,
-                               uint32_t sampleIdx, CompType typeHint)
+  ResourceId ApplyCustomShader(TextureDisplay &display)
   {
     if(m_Proxy)
     {
-      EnsureTexCached(texid, 0, mip);
-      if(texid == ResourceId() || m_ProxyTextures[texid] == ResourceId())
+      Subresource customShaderSubresource = display.subresource;
+      // fetch all subsamples in case the custom shader wants to fetch more than simply the active
+      // subsample
+      customShaderSubresource.sample = ~0U;
+
+      EnsureTexCached(display.resourceId, display.typeCast, customShaderSubresource);
+
+      if(display.resourceId == ResourceId())
         return ResourceId();
-      texid = m_ProxyTextures[texid];
-      ResourceId customResourceId =
-          m_Proxy->ApplyCustomShader(shader, texid, mip, arrayIdx, sampleIdx, typeHint);
+
+      ResourceId customResourceId = m_Proxy->ApplyCustomShader(display);
       m_LocalTextures.insert(customResourceId);
       m_ProxyTextures[customResourceId] = customResourceId;
       return customResourceId;
@@ -453,87 +451,95 @@ public:
 
   bool Tick(int type);
 
-  const D3D11Pipe::State *GetD3D11PipelineState() { return &m_D3D11PipelineState; }
-  const D3D12Pipe::State *GetD3D12PipelineState() { return &m_D3D12PipelineState; }
-  const GLPipe::State *GetGLPipelineState() { return &m_GLPipelineState; }
-  const VKPipe::State *GetVulkanPipelineState() { return &m_VulkanPipelineState; }
-  const SDFile &GetStructuredFile() { return m_StructuredFile; }
+  void SetPipelineStates(D3D11Pipe::State *d3d11, D3D12Pipe::State *d3d12, GLPipe::State *gl,
+                         VKPipe::State *vk)
+  {
+    m_D3D11PipelineState = d3d11;
+    m_D3D12PipelineState = d3d12;
+    m_GLPipelineState = gl;
+    m_VulkanPipelineState = vk;
+  }
+  SDFile *GetStructuredFile() { return m_StructuredFile; }
   IMPLEMENT_FUNCTION_PROXIED(void, FetchStructuredFile);
 
-  IMPLEMENT_FUNCTION_PROXIED(const std::vector<ResourceDescription> &, GetResources);
+  IMPLEMENT_FUNCTION_PROXIED(rdcarray<ResourceDescription>, GetResources);
 
-  IMPLEMENT_FUNCTION_PROXIED(std::vector<ResourceId>, GetBuffers);
+  IMPLEMENT_FUNCTION_PROXIED(rdcarray<BufferDescription>, GetBuffers);
   IMPLEMENT_FUNCTION_PROXIED(BufferDescription, GetBuffer, ResourceId id);
 
-  IMPLEMENT_FUNCTION_PROXIED(std::vector<ResourceId>, GetTextures);
+  IMPLEMENT_FUNCTION_PROXIED(rdcarray<TextureDescription>, GetTextures);
   IMPLEMENT_FUNCTION_PROXIED(TextureDescription, GetTexture, ResourceId id);
 
   IMPLEMENT_FUNCTION_PROXIED(APIProperties, GetAPIProperties);
   IMPLEMENT_FUNCTION_PROXIED(DriverInformation, GetDriverInfo);
+  IMPLEMENT_FUNCTION_PROXIED(rdcarray<GPUDevice>, GetAvailableGPUs);
 
-  IMPLEMENT_FUNCTION_PROXIED(std::vector<DebugMessage>, GetDebugMessages);
+  IMPLEMENT_FUNCTION_PROXIED(rdcarray<DebugMessage>, GetDebugMessages);
 
   IMPLEMENT_FUNCTION_PROXIED(void, SavePipelineState, uint32_t eventId);
   IMPLEMENT_FUNCTION_PROXIED(void, ReplayLog, uint32_t endEventID, ReplayLogType replayType);
 
-  IMPLEMENT_FUNCTION_PROXIED(std::vector<uint32_t>, GetPassEvents, uint32_t eventId);
+  IMPLEMENT_FUNCTION_PROXIED(rdcarray<uint32_t>, GetPassEvents, uint32_t eventId);
 
-  IMPLEMENT_FUNCTION_PROXIED(std::vector<EventUsage>, GetUsage, ResourceId id);
+  IMPLEMENT_FUNCTION_PROXIED(rdcarray<EventUsage>, GetUsage, ResourceId id);
   IMPLEMENT_FUNCTION_PROXIED(FrameRecord, GetFrameRecord);
 
   IMPLEMENT_FUNCTION_PROXIED(bool, IsRenderOutput, ResourceId id);
 
   IMPLEMENT_FUNCTION_PROXIED(ResourceId, GetLiveID, ResourceId id);
 
-  IMPLEMENT_FUNCTION_PROXIED(std::vector<GPUCounter>, EnumerateCounters);
+  IMPLEMENT_FUNCTION_PROXIED(rdcarray<GPUCounter>, EnumerateCounters);
   IMPLEMENT_FUNCTION_PROXIED(CounterDescription, DescribeCounter, GPUCounter counterID);
-  IMPLEMENT_FUNCTION_PROXIED(std::vector<CounterResult>, FetchCounters,
-                             const std::vector<GPUCounter> &counterID);
+  IMPLEMENT_FUNCTION_PROXIED(rdcarray<CounterResult>, FetchCounters,
+                             const rdcarray<GPUCounter> &counterID);
 
-  IMPLEMENT_FUNCTION_PROXIED(void, FillCBufferVariables, ResourceId shader, std::string entryPoint,
-                             uint32_t cbufSlot, rdcarray<ShaderVariable> &outvars,
-                             const bytebuf &data);
+  IMPLEMENT_FUNCTION_PROXIED(void, FillCBufferVariables, ResourceId pipeline, ResourceId shader,
+                             ShaderStage stage, rdcstr entryPoint, uint32_t cbufSlot,
+                             rdcarray<ShaderVariable> &outvars, const bytebuf &data);
 
   IMPLEMENT_FUNCTION_PROXIED(void, GetBufferData, ResourceId buff, uint64_t offset, uint64_t len,
                              bytebuf &retData);
-  IMPLEMENT_FUNCTION_PROXIED(void, GetTextureData, ResourceId tex, uint32_t arrayIdx, uint32_t mip,
+  IMPLEMENT_FUNCTION_PROXIED(void, GetTextureData, ResourceId tex, const Subresource &sub,
                              const GetTextureDataParams &params, bytebuf &data);
 
   IMPLEMENT_FUNCTION_PROXIED(void, InitPostVSBuffers, uint32_t eventId);
-  IMPLEMENT_FUNCTION_PROXIED(void, InitPostVSBuffers, const std::vector<uint32_t> &passEvents);
+  IMPLEMENT_FUNCTION_PROXIED(void, InitPostVSBuffers, const rdcarray<uint32_t> &passEvents);
   IMPLEMENT_FUNCTION_PROXIED(MeshFormat, GetPostVSBuffers, uint32_t eventId, uint32_t instID,
                              uint32_t viewID, MeshDataStage stage);
 
-  IMPLEMENT_FUNCTION_PROXIED(ResourceId, RenderOverlay, ResourceId texid, CompType typeHint,
-                             FloatVector clearCol, DebugOverlay overlay, uint32_t eventId,
-                             const std::vector<uint32_t> &passEvents);
+  IMPLEMENT_FUNCTION_PROXIED(ResourceId, RenderOverlay, ResourceId texid, FloatVector clearCol,
+                             DebugOverlay overlay, uint32_t eventId,
+                             const rdcarray<uint32_t> &passEvents);
 
   IMPLEMENT_FUNCTION_PROXIED(rdcarray<ShaderEntryPoint>, GetShaderEntryPoints, ResourceId shader);
-  IMPLEMENT_FUNCTION_PROXIED(ShaderReflection *, GetShader, ResourceId shader,
+  IMPLEMENT_FUNCTION_PROXIED(ShaderReflection *, GetShader, ResourceId pipeline, ResourceId,
                              ShaderEntryPoint entry);
 
-  IMPLEMENT_FUNCTION_PROXIED(std::vector<std::string>, GetDisassemblyTargets);
-  IMPLEMENT_FUNCTION_PROXIED(std::string, DisassembleShader, ResourceId pipeline,
-                             const ShaderReflection *refl, const std::string &target);
+  IMPLEMENT_FUNCTION_PROXIED(rdcarray<rdcstr>, GetDisassemblyTargets, bool withPipeline);
+  IMPLEMENT_FUNCTION_PROXIED(rdcstr, DisassembleShader, ResourceId pipeline,
+                             const ShaderReflection *refl, const rdcstr &target);
 
   IMPLEMENT_FUNCTION_PROXIED(void, FreeTargetResource, ResourceId id);
 
-  IMPLEMENT_FUNCTION_PROXIED(std::vector<PixelModification>, PixelHistory,
-                             std::vector<EventUsage> events, ResourceId target, uint32_t x,
-                             uint32_t y, uint32_t slice, uint32_t mip, uint32_t sampleIdx,
-                             CompType typeHint);
-  IMPLEMENT_FUNCTION_PROXIED(ShaderDebugTrace, DebugVertex, uint32_t eventId, uint32_t vertid,
-                             uint32_t instid, uint32_t idx, uint32_t instOffset, uint32_t vertOffset);
-  IMPLEMENT_FUNCTION_PROXIED(ShaderDebugTrace, DebugPixel, uint32_t eventId, uint32_t x, uint32_t y,
-                             uint32_t sample, uint32_t primitive);
-  IMPLEMENT_FUNCTION_PROXIED(ShaderDebugTrace, DebugThread, uint32_t eventId,
-                             const uint32_t groupid[3], const uint32_t threadid[3],
+  IMPLEMENT_FUNCTION_PROXIED(rdcarray<PixelModification>, PixelHistory, rdcarray<EventUsage> events,
+                             ResourceId target, uint32_t x, uint32_t y, const Subresource &sub,
+                             CompType typeCast);
+  IMPLEMENT_FUNCTION_PROXIED(ShaderDebugTrace *, DebugVertex, uint32_t eventId, uint32_t vertid,
+                             uint32_t instid, uint32_t idx, uint32_t view);
+  IMPLEMENT_FUNCTION_PROXIED(ShaderDebugTrace *, DebugPixel, uint32_t eventId, uint32_t x,
+                             uint32_t y, uint32_t sample, uint32_t primitive);
+  IMPLEMENT_FUNCTION_PROXIED(ShaderDebugTrace *, DebugThread, uint32_t eventId,
+                             const rdcfixedarray<uint32_t, 3> &groupid,
+                             const rdcfixedarray<uint32_t, 3> &threadid,
                              std::function<bool()> cancelled);
+  IMPLEMENT_FUNCTION_PROXIED(rdcarray<ShaderDebugState>, ContinueDebug, ShaderDebugger *debugger);
+  IMPLEMENT_FUNCTION_PROXIED(void, FreeDebugger, ShaderDebugger *debugger);
 
   IMPLEMENT_FUNCTION_PROXIED(rdcarray<ShaderEncoding>, GetTargetShaderEncodings);
-  IMPLEMENT_FUNCTION_PROXIED(void, BuildTargetShader, ShaderEncoding sourceEncoding, bytebuf source,
-                             const std::string &entry, const ShaderCompileFlags &compileFlags,
-                             ShaderStage type, ResourceId *id, std::string *errors);
+  IMPLEMENT_FUNCTION_PROXIED(void, BuildTargetShader, ShaderEncoding sourceEncoding,
+                             const bytebuf &source, const rdcstr &entry,
+                             const ShaderCompileFlags &compileFlags, ShaderStage type,
+                             ResourceId &id, rdcstr &errors);
   IMPLEMENT_FUNCTION_PROXIED(void, ReplaceResource, ResourceId from, ResourceId to);
   IMPLEMENT_FUNCTION_PROXIED(void, RemoveReplacement, ResourceId id);
 
@@ -541,8 +547,8 @@ public:
   // and GetTextureData, but they do extra work to try and optimise transfer by delta-encoding the
   // difference in the returned data to the last time the resource was cached
   IMPLEMENT_FUNCTION_PROXIED(void, CacheBufferData, ResourceId buff);
-  IMPLEMENT_FUNCTION_PROXIED(void, CacheTextureData, ResourceId tex, uint32_t arrayIdx,
-                             uint32_t mip, const GetTextureDataParams &params);
+  IMPLEMENT_FUNCTION_PROXIED(void, CacheTextureData, ResourceId tex, const Subresource &sub,
+                             const GetTextureDataParams &params);
 
   // utility function to serialise the contents of a byte array given the previous contents that's
   // available on both sides of the communication.
@@ -557,13 +563,12 @@ public:
     return ResourceId();
   }
 
-  void SetProxyTextureData(ResourceId texid, uint32_t arrayIdx, uint32_t mip, byte *data,
-                           size_t dataSize)
+  void SetProxyTextureData(ResourceId texid, const Subresource &sub, byte *data, size_t dataSize)
   {
     RDCERR("Calling proxy-render functions on a proxy serialiser");
   }
 
-  bool IsTextureSupported(const ResourceFormat &format) { return true; }
+  bool IsTextureSupported(const TextureDescription &tex) { return true; }
   ResourceId CreateProxyBuffer(const BufferDescription &templateBuf)
   {
     RDCERR("Calling proxy-render functions on a proxy serialiser");
@@ -576,12 +581,12 @@ public:
   }
 
 private:
-  void EnsureTexCached(ResourceId texid, uint32_t arrayIdx, uint32_t mip);
+  void EnsureTexCached(ResourceId &texid, CompType &typeCast, const Subresource &sub);
   void RemapProxyTextureIfNeeded(TextureDescription &tex, GetTextureDataParams &params);
   void EnsureBufCached(ResourceId bufid);
   IMPLEMENT_FUNCTION_PROXIED(bool, NeedRemapForFetch, const ResourceFormat &format);
 
-  const DrawcallDescription *FindDraw(const rdcarray<DrawcallDescription> &drawcallList,
+  const ActionDescription *FindAction(const rdcarray<ActionDescription> &actionList,
                                       uint32_t eventId);
 
   bool CheckError(ReplayProxyPacket receivedPacket, ReplayProxyPacket expectedPacket);
@@ -589,16 +594,13 @@ private:
   struct TextureCacheEntry
   {
     ResourceId replayid;
-    uint32_t arrayIdx;
-    uint32_t mip;
+    Subresource sub;
 
     bool operator<(const TextureCacheEntry &o) const
     {
       if(replayid != o.replayid)
         return replayid < o.replayid;
-      if(arrayIdx != o.arrayIdx)
-        return arrayIdx < o.arrayIdx;
-      return mip < o.mip;
+      return sub < o.sub;
     }
   };
   // this cache only exists on the client side, with the proxy renderer. This denotes cases where we
@@ -616,7 +618,6 @@ private:
     ProxyTextureProperties() {}
     // Create a proxy Id with the default get-data parameters.
     ProxyTextureProperties(ResourceId proxyid) : id(proxyid) {}
-    operator ResourceId() const { return id; }
     bool operator==(const ResourceId &other) const { return id == other; }
   };
   // this cache only exists on the client side, with the proxy renderer. It contains the created
@@ -639,17 +640,23 @@ private:
   struct ShaderReflKey
   {
     ShaderReflKey() {}
-    ShaderReflKey(uint32_t eid, ResourceId i, ShaderEntryPoint e) : eventId(eid), id(i), entry(e) {}
+    ShaderReflKey(uint32_t eid, ResourceId p, ResourceId s, ShaderEntryPoint e)
+        : eventId(eid), pipeline(p), shader(s), entry(e)
+    {
+    }
     uint32_t eventId;
-    ResourceId id;
+    ResourceId pipeline, shader;
     ShaderEntryPoint entry;
     bool operator<(const ShaderReflKey &o) const
     {
       if(eventId != o.eventId)
         return eventId < o.eventId;
 
-      if(id != o.id)
-        return id < o.id;
+      if(pipeline != o.pipeline)
+        return pipeline < o.pipeline;
+
+      if(shader != o.shader)
+        return shader < o.shader;
 
       return entry < o.entry;
     }
@@ -692,8 +699,8 @@ private:
     RemoteExecution_ThreadActive = 2,
   };
 
-  volatile int32_t m_RemoteExecutionKill = 0;
-  volatile int32_t m_RemoteExecutionState = RemoteExecution_Inactive;
+  int32_t m_RemoteExecutionKill = 0;
+  int32_t m_RemoteExecutionState = RemoteExecution_Inactive;
 
   bool IsThreadIdle()
   {
@@ -704,19 +711,18 @@ private:
   Threading::ThreadHandle m_RemoteExecutionThread = 0;
 
   bool m_IsErrored = false;
+  RDResult m_FatalError = ResultCode::Succeeded;
 
   FrameRecord m_FrameRecord;
   APIProperties m_APIProps;
   std::map<ResourceId, TextureDescription> m_TextureInfo;
 
-  std::vector<DrawcallDescription *> m_Drawcalls;
+  rdcarray<ActionDescription *> m_Actions;
 
-  SDFile m_StructuredFile;
+  SDFile *m_StructuredFile;
 
-  std::vector<ResourceDescription> m_Resources;
-
-  D3D11Pipe::State m_D3D11PipelineState;
-  D3D12Pipe::State m_D3D12PipelineState;
-  GLPipe::State m_GLPipelineState;
-  VKPipe::State m_VulkanPipelineState;
+  D3D11Pipe::State *m_D3D11PipelineState = NULL;
+  D3D12Pipe::State *m_D3D12PipelineState = NULL;
+  GLPipe::State *m_GLPipelineState = NULL;
+  VKPipe::State *m_VulkanPipelineState = NULL;
 };

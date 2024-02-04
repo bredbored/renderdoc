@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2016-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -25,6 +25,7 @@
 #include <QApplication>
 #include <QDebug>
 #include <QDir>
+#include <QMutexLocker>
 #include <QStandardPaths>
 #include "Code/QRDUtils.h"
 #include "Styles/StyleData.h"
@@ -39,6 +40,18 @@ rdcstr DoStringise(const TimeUnit &el)
     STRINGISE_ENUM_CLASS(Milliseconds);
     STRINGISE_ENUM_CLASS(Microseconds);
     STRINGISE_ENUM_CLASS(Nanoseconds);
+  }
+  END_ENUM_STRINGISE();
+}
+
+template <>
+rdcstr DoStringise(const OffsetSizeDisplayMode &el)
+{
+  BEGIN_ENUM_STRINGISE(OffsetSizeDisplayMode)
+  {
+    STRINGISE_ENUM_CLASS(Auto);
+    STRINGISE_ENUM_CLASS(Decimal);
+    STRINGISE_ENUM_CLASS(Hexadecimal);
   }
   END_ENUM_STRINGISE();
 }
@@ -152,6 +165,28 @@ bool PersistantConfig::Serialize(const rdcstr &filename)
   return false;
 }
 
+struct LegacyData
+{
+  QString _Android_SDKPath;
+  QString _Android_JDKPath;
+  uint32_t _Android_MaxConnectTimeout = 30;
+  bool _ExternalTool_RGPIntegration = false;
+  bool _ShaderViewer_FriendlyNaming = true;
+  QVariantMap _ConfigSettings;
+};
+
+static rdcarray<rdcpair<rdcstr, CustomPersistentStorage *>> &GetCustomStorage()
+{
+  static rdcarray<rdcpair<rdcstr, CustomPersistentStorage *>> ret;
+  return ret;
+}
+
+CustomPersistentStorage::CustomPersistentStorage(rdcstr name)
+{
+  if(!name.empty())
+    GetCustomStorage().push_back({name, this});
+}
+
 QVariantMap PersistantConfig::storeValues() const
 {
   QVariantMap ret;
@@ -165,6 +200,20 @@ QVariantMap PersistantConfig::storeValues() const
   ret[lit(#name)] = convertToVariant<variantType>(name);
 
   CONFIG_SETTINGS()
+
+  // store any legacy values even though we don't need them
+
+  ret[lit("Android_SDKPath")] = m_Legacy->_Android_SDKPath;
+  ret[lit("Android_JDKPath")] = m_Legacy->_Android_JDKPath;
+  ret[lit("Android_MaxConnectTimeout")] = m_Legacy->_Android_MaxConnectTimeout;
+  ret[lit("ExternalTool_RGPIntegration")] = m_Legacy->_ExternalTool_RGPIntegration;
+  ret[lit("ShaderViewer_FriendlyNaming")] = m_Legacy->_ShaderViewer_FriendlyNaming;
+  ret[lit("ConfigSettings")] = m_Legacy->_ConfigSettings;
+
+  for(const rdcpair<rdcstr, CustomPersistentStorage *> &ps : GetCustomStorage())
+  {
+    ps.second->save(ret[QString(ps.first)]);
+  }
 
   return ret;
 }
@@ -192,78 +241,209 @@ void PersistantConfig::applyValues(const QVariantMap &values)
   RENAMED_SETTING(QVariantList, RecentLogFiles, RecentCaptureFiles);
   RENAMED_SETTING(QDateTime, DegradedLog_LastUpdate, DegradedCapture_LastUpdate);
   RENAMED_SETTING(QVariantList, SPIRVDisassemblers, ShaderProcessors);
+
+  // apply reasonable bounds to font scale to avoid invalid values
+  // 25% - 400%
+  Font_GlobalScale = qBound(0.25f, Font_GlobalScale, 4.0f);
+
+  // port old values that were saved here but are now saved in core.
+  // We only want to do this once, but we want to leave these values in the config to allow for
+  // people running old versions after running a new version - we don't want to remove all of their
+  // settings yet.
+  // So what we do is store an extra setting indicating that it's been ported - if that setting is
+  // present we just store/save them blindly. This does mean they can change but we won't re-port
+  // them.
+  // After the new config ships in a stable release we can remove this as we don't generally support
+  // forwards compatibility, only backwards compatibility, so it will be OK to drop the config
+  // settings.
+  bool processed = false;
+  if(values.contains(lit("ConfigSettings")) &&
+     values[lit("ConfigSettings")].toMap().contains(lit("modern.config.ported")))
+    processed = true;
+
+  bool saveConfig = false;
+
+#define CORE_SETTING(variantType, oldName, newName, data)              \
+  if(values.contains(lit(#oldName)))                                   \
+  {                                                                    \
+    m_Legacy->_##oldName = values[lit(#oldName)].value<variantType>(); \
+    if(!processed)                                                     \
+    {                                                                  \
+      SDObject *setting = RENDERDOC_SetConfigSetting(newName);         \
+      if(setting)                                                      \
+        setting->data = m_Legacy->_##oldName;                          \
+      saveConfig = true;                                               \
+    }                                                                  \
+  }
+
+  CORE_SETTING(QString, Android_SDKPath, "Android.SDKDirPath", data.str);
+  CORE_SETTING(QString, Android_JDKPath, "Android.JDKDirPath", data.str);
+  CORE_SETTING(uint32_t, Android_MaxConnectTimeout, "Android.MaxConnectTimeout", data.basic.u);
+  CORE_SETTING(bool, ExternalTool_RGPIntegration, "AMD.RGP.Enable", data.basic.b);
+  CORE_SETTING(bool, ShaderViewer_FriendlyNaming, "DXBC.Disassembly.FriendlyNaming", data.basic.b);
+
+  if(values.contains(lit("ConfigSettings")))
+  {
+    QVariantMap &settings = m_Legacy->_ConfigSettings;
+    settings = values[lit("ConfigSettings")].toMap();
+
+    if(!processed)
+    {
+      if(settings.contains(lit("shader.debug.searchPaths")))
+      {
+        QStringList searchPaths = settings[lit("shader.debug.searchPaths")].toString().split(
+            QLatin1Char(';'), QString::SkipEmptyParts);
+
+        SDObject *debug = RENDERDOC_SetConfigSetting("DXBC.Debug.SearchDirPaths");
+
+        debug->DeleteChildren();
+        debug->ReserveChildren(searchPaths.size());
+
+        for(int i = 0; i < searchPaths.size(); i++)
+          debug->AddAndOwnChild(makeSDString("$el"_lit, searchPaths[i]));
+      }
+
+      if(settings.contains(lit("d3d12ShaderDebugging")))
+      {
+        RENDERDOC_SetConfigSetting("D3D12_ShaderDebugging")->data.basic.b =
+            settings[lit("d3d12ShaderDebugging")].toBool();
+      }
+
+      if(settings.contains(lit("vulkanShaderDebugging")))
+      {
+        RENDERDOC_SetConfigSetting("Vulkan_ShaderDebugging")->data.basic.b =
+            settings[lit("vulkanShaderDebugging")].toBool();
+      }
+
+      saveConfig = true;
+    }
+
+    // mark the settings as ported so we don't do it again
+    settings[lit("modern.config.ported")] = true;
+  }
+
+  if(saveConfig)
+    RENDERDOC_SaveConfigSettings();
+
+  for(const rdcpair<rdcstr, CustomPersistentStorage *> &ps : GetCustomStorage())
+    ps.second->load(values[QString(ps.first)]);
 }
 
-int PersistantConfig::RemoteHostCount()
+static QMutex RemoteHostLock;
+
+rdcarray<RemoteHost> PersistantConfig::GetRemoteHosts()
 {
-  return RemoteHosts.count();
+  QMutexLocker autolock(&RemoteHostLock);
+  return RemoteHostList;
 }
 
-RemoteHost *PersistantConfig::GetRemoteHost(int index)
+RemoteHost PersistantConfig::GetRemoteHost(const rdcstr &hostname)
 {
-  if(index < 0 || index >= RemoteHostCount())
-    return NULL;
-  return RemoteHosts[index];
+  RemoteHost ret;
+
+  {
+    QMutexLocker autolock(&RemoteHostLock);
+    for(size_t i = 0; i < RemoteHostList.size(); i++)
+    {
+      if(RemoteHostList[i].Hostname() == hostname)
+      {
+        ret = RemoteHostList[i];
+        break;
+      }
+    }
+  }
+
+  return ret;
 }
 
 void PersistantConfig::AddRemoteHost(RemoteHost host)
 {
-  RemoteHosts.push_back(new RemoteHost(host));
-}
+  if(!host.IsValid())
+    return;
 
-void PersistantConfig::AddAndroidHosts()
-{
-  QMap<rdcstr, RemoteHost *> oldHosts;
-  for(int i = RemoteHosts.count() - 1; i >= 0; i--)
+  QMutexLocker autolock(&RemoteHostLock);
+
+  // don't add duplicates
+  for(size_t i = 0; i < RemoteHostList.size(); i++)
   {
-    if(RemoteHosts[i]->IsADB())
+    if(RemoteHostList[i] == host)
     {
-      RemoteHost *host = RemoteHosts.takeAt(i);
-      oldHosts[host->hostname] = host;
+      RemoteHostList[i] = host;
+      return;
     }
   }
 
-  QString androidSDKPath = (!Android_SDKPath.isEmpty() && QFile::exists(Android_SDKPath))
-                               ? QString(Android_SDKPath)
-                               : QString();
+  RemoteHostList.push_back(host);
+}
 
-  SetConfigSetting("androidSDKPath", androidSDKPath);
+void PersistantConfig::RemoveRemoteHost(RemoteHost host)
+{
+  if(!host.IsValid())
+    return;
 
-  QString androidJDKPath = (!Android_JDKPath.isEmpty() && QFile::exists(Android_JDKPath))
-                               ? QString(Android_JDKPath)
-                               : QString();
+  QMutexLocker autolock(&RemoteHostLock);
 
-  SetConfigSetting("androidJDKPath", androidJDKPath);
-
-  SetConfigSetting("MaxConnectTimeout", QString::number(Android_MaxConnectTimeout));
-
-  rdcstr androidHosts;
-  RENDERDOC_EnumerateAndroidDevices(androidHosts);
-  for(const QString &hostName :
-      QString(androidHosts).split(QLatin1Char(','), QString::SkipEmptyParts))
+  for(size_t i = 0; i < RemoteHostList.size(); i++)
   {
-    RemoteHost *host = NULL;
+    if(RemoteHostList[i] == host)
+    {
+      RemoteHostList.takeAt(i);
+      break;
+    }
+  }
+}
 
-    if(oldHosts.contains(hostName))
-      host = oldHosts.take(hostName);
-    else
-      host = new RemoteHost();
+void PersistantConfig::UpdateEnumeratedProtocolDevices()
+{
+  rdcarray<RemoteHost> enumeratedDevices;
 
-    host->hostname = hostName;
-    rdcstr friendly;
-    RENDERDOC_GetAndroidFriendlyName(hostName.toUtf8().data(), friendly);
-    host->friendlyName = friendly;
+  rdcarray<rdcstr> protocols;
+  RENDERDOC_GetSupportedDeviceProtocols(&protocols);
+
+  for(const rdcstr &p : protocols)
+  {
+    IDeviceProtocolController *protocol = RENDERDOC_GetDeviceProtocolController(p);
+
+    rdcarray<rdcstr> devices = protocol->GetDevices();
+
+    for(const rdcstr &d : devices)
+    {
+      RemoteHost newhost(protocol->GetProtocolName() + "://" + d);
+      enumeratedDevices.push_back(newhost);
+    }
+  }
+
+  QMutexLocker autolock(&RemoteHostLock);
+
+  QMap<rdcstr, RemoteHost> oldHosts;
+
+  for(int i = RemoteHostList.count() - 1; i >= 0; i--)
+  {
+    if(RemoteHostList[i].Protocol())
+    {
+      RemoteHost host = RemoteHostList.takeAt(i);
+      oldHosts[host.Hostname()] = host;
+    }
+  }
+
+  for(RemoteHost host : enumeratedDevices)
+  {
+    // if we already had this host, use that one.
+    if(oldHosts.contains(host.Hostname()))
+      host = oldHosts.take(host.Hostname());
+
+    host.SetFriendlyName(host.Protocol()->GetFriendlyName(host.Hostname()));
     // Just a command to display in the GUI and allow Launch() to be called.
-    host->runCommand = lit("Automatically handled");
-    RemoteHosts.push_back(host);
+    host.SetRunCommand("Automatically handled");
+    RemoteHostList.push_back(host);
   }
 
   // delete any leftovers
-  QMapIterator<rdcstr, RemoteHost *> i(oldHosts);
+  QMutableMapIterator<rdcstr, RemoteHost> i(oldHosts);
   while(i.hasNext())
   {
     i.next();
-    delete i.value();
+    i.value().SetShutdown();
   }
 }
 
@@ -286,47 +466,53 @@ bool PersistantConfig::SetStyle()
   return false;
 }
 
+PersistantConfig::PersistantConfig()
+{
+  m_Legacy = new LegacyData;
+}
+
 PersistantConfig::~PersistantConfig()
 {
-  for(RemoteHost *h : RemoteHosts)
-    delete h;
+  delete m_Legacy;
 }
 
 bool PersistantConfig::Load(const rdcstr &filename)
 {
   bool ret = Deserialize(filename);
 
-  // perform some sanitisation to make sure config is always in sensible state
-  for(const rdcstrpair &key : ConfigSettings)
-  {
-    // redundantly set each setting so it is flushed to the core dll
-    SetConfigSetting(key.first, key.second);
-  }
-
-  RENDERDOC_SetConfigSetting("Disassembly_FriendlyNaming", ShaderViewer_FriendlyNaming ? "1" : "0");
-  RENDERDOC_SetConfigSetting("ExternalTool_RGPIntegration", ExternalTool_RGPIntegration ? "1" : "0");
-
   RDDialog::DefaultBrowsePath = LastFileBrowsePath;
 
   // localhost should always be available as a remote host
-  bool foundLocalhost = false;
-
-  for(RemoteHost host : RemoteHostList)
   {
-    if(host.hostname.isEmpty())
-      continue;
+    QMutexLocker autolock(&RemoteHostLock);
 
-    RemoteHosts.push_back(new RemoteHost(host));
+    bool foundLocalhost = false;
 
-    if(host.IsLocalhost())
-      foundLocalhost = true;
-  }
+    rdcarray<RemoteHost> hosts;
+    hosts.swap(RemoteHostList);
 
-  if(!foundLocalhost)
-  {
-    RemoteHost *host = new RemoteHost();
-    host->hostname = "localhost";
-    RemoteHosts.insert(0, host);
+    for(RemoteHost host : hosts)
+    {
+      // skip invalid hosts
+      if(!host.IsValid())
+        continue;
+
+      // backwards compatibility - skip old adb hosts that were adb:
+      if(host.Hostname().find("adb:") >= 0 && host.Protocol() == NULL)
+        continue;
+
+      RemoteHostList.push_back(host);
+
+      if(host.IsLocalhost())
+        foundLocalhost = true;
+    }
+
+    if(!foundLocalhost)
+    {
+      RemoteHost host;
+      host.m_hostname = "localhost";
+      RemoteHostList.insert(0, host);
+    }
   }
 
   bool tools[arraydim<KnownShaderTool>()] = {};
@@ -337,12 +523,6 @@ bool PersistantConfig::Load(const rdcstr &filename)
     // if it's declared
     if(dis.tool != KnownShaderTool::Unknown)
       tools[(size_t)dis.tool] = true;
-
-    for(KnownShaderTool tool : values<KnownShaderTool>())
-    {
-      if(QString(dis.executable).contains(ToolExecutable(tool)))
-        tools[(size_t)tool] = true;
-    }
   }
 
   for(KnownShaderTool tool : values<KnownShaderTool>())
@@ -350,7 +530,7 @@ bool PersistantConfig::Load(const rdcstr &filename)
     if(tool == KnownShaderTool::Unknown || tools[(size_t)tool])
       continue;
 
-    QString exe = ToolExecutable(tool);
+    rdcstr exe = ToolExecutable(tool);
 
     if(exe.isEmpty())
       continue;
@@ -414,6 +594,7 @@ bool PersistantConfig::Load(const rdcstr &filename)
   {
     if(dis.tool != KnownShaderTool::Unknown)
     {
+      dis.name = ToQStr(dis.tool);
       dis.input = ToolInput(dis.tool);
       dis.output = ToolOutput(dis.tool);
     }
@@ -427,17 +608,25 @@ bool PersistantConfig::Save()
   if(m_Filename.isEmpty())
     return true;
 
-  // update serialize list
-  RemoteHostList.clear();
-  for(RemoteHost *host : RemoteHosts)
-    RemoteHostList.push_back(*host);
-
-  RENDERDOC_SetConfigSetting("Disassembly_FriendlyNaming", ShaderViewer_FriendlyNaming ? "1" : "0");
-  RENDERDOC_SetConfigSetting("ExternalTool_RGPIntegration", ExternalTool_RGPIntegration ? "1" : "0");
-
   LastFileBrowsePath = RDDialog::DefaultBrowsePath;
 
-  return Serialize(m_Filename);
+  // truncate the lists to a maximum of 9 items, allow more to exist in memory
+  rdcarray<rdcstr> capFiles = RecentCaptureFiles;
+  rdcarray<rdcstr> capSettings = RecentCaptureSettings;
+
+  // the oldest items are first, so remove from there
+  while(RecentCaptureFiles.count() >= 10)
+    RecentCaptureFiles.erase(0);
+  while(RecentCaptureSettings.count() >= 10)
+    RecentCaptureSettings.erase(0);
+
+  bool ret = Serialize(m_Filename);
+
+  // restore lists
+  RecentCaptureFiles = capFiles;
+  RecentCaptureSettings = capSettings;
+
+  return ret;
 }
 
 void PersistantConfig::Close()
@@ -450,7 +639,12 @@ void PersistantConfig::SetupFormatting()
   Formatter::setParams(*this);
 }
 
-void AddRecentFile(rdcarray<rdcstr> &recentList, const rdcstr &file, int maxItems)
+void RemoveRecentFile(rdcarray<rdcstr> &recentList, const rdcstr &file)
+{
+  recentList.removeOne(QDir::cleanPath(file));
+}
+
+void AddRecentFile(rdcarray<rdcstr> &recentList, const rdcstr &file)
 {
   QDir dir(file);
   QString path = dir.canonicalPath();
@@ -461,47 +655,10 @@ void AddRecentFile(rdcarray<rdcstr> &recentList, const rdcstr &file, int maxItem
     return;
   }
 
-  if(!recentList.contains(path))
-  {
-    recentList.push_back(path);
-    if(recentList.count() >= maxItems)
-      recentList.erase(0);
-  }
-  else
-  {
+  if(recentList.contains(path))
     recentList.removeOne(path);
-    recentList.push_back(path);
-  }
-}
 
-void PersistantConfig::SetConfigSetting(const rdcstr &name, const rdcstr &value)
-{
-  if(name.isEmpty())
-    return;
-
-  bool found = false;
-  for(rdcstrpair &kv : ConfigSettings)
-  {
-    if(kv.first == name)
-    {
-      kv.second = value;
-      found = true;
-      break;
-    }
-  }
-
-  if(!found)
-    ConfigSettings.push_back(make_rdcpair(name, value));
-  RENDERDOC_SetConfigSetting(name.data(), value.data());
-}
-
-rdcstr PersistantConfig::GetConfigSetting(const rdcstr &name)
-{
-  for(const rdcstrpair &kv : ConfigSettings)
-    if(kv.first == name)
-      return kv.second;
-
-  return "";
+  recentList.push_back(path);
 }
 
 ShaderProcessingTool::ShaderProcessingTool(const QVariant &var)
@@ -548,19 +705,50 @@ ShaderProcessingTool::ShaderProcessingTool(const QVariant &var)
 rdcstr ShaderProcessingTool::DefaultArguments() const
 {
   if(tool == KnownShaderTool::SPIRV_Cross)
-    return "--output {output_file} {input_file} --vulkan-semantics";
-  else if(tool == KnownShaderTool::spirv_dis)
-    return "--no-color -o {output_file} {input_file}";
+    return "--vulkan-semantics --entry {entry_point} --stage {glsl_stage4}";
+  else if(tool == KnownShaderTool::SPIRV_Cross_OpenGL)
+    return "--entry {entry_point} --stage {glsl_stage4}";
+  else if(tool == KnownShaderTool::spirv_dis || tool == KnownShaderTool::spirv_dis_OpenGL)
+    return "--no-color";
   else if(tool == KnownShaderTool::glslangValidatorGLSL)
-    return "-g -V -o {output_file} {input_file} -S {glsl_stage4}";
+    return "-g -V -S {glsl_stage4} --target-env {spirv_ver}";
+  else if(tool == KnownShaderTool::glslangValidatorGLSL_OpenGL)
+    return "-g -G -S {glsl_stage4} --target-env {spirv_ver}";
   else if(tool == KnownShaderTool::glslangValidatorHLSL)
-    return "-D -g -V -o {output_file} {input_file} -S {glsl_stage4} -e {entry_point}";
-  else if(tool == KnownShaderTool::spirv_as)
-    return "-o {output_file} {input_file}";
-  else if(tool == KnownShaderTool::dxc)
-    return "-T {hlsl_stage2}_6_0 -E {entry_point} -Fo {output_file} {input_file} -spirv";
+    return "-D -g -V -S {glsl_stage4} -e {entry_point} --target-env {spirv_ver}";
+  else if(tool == KnownShaderTool::spirv_as || tool == KnownShaderTool::spirv_as_OpenGL)
+    return "";
+  else if(tool == KnownShaderTool::dxcSPIRV)
+    return "-T {hlsl_stage2}_6_0 -E {entry_point} -spirv -fspv-target-env={vulkan_ver}";
+  else if(tool == KnownShaderTool::dxcDXIL)
+    return "-T {hlsl_stage2}_6_0 -E {entry_point}";
+  else if(tool == KnownShaderTool::fxc)
+    return "/T {hlsl_stage2}_5_0 /E {entry_point}";
 
   return args;
+}
+
+rdcstr ShaderProcessingTool::IOArguments() const
+{
+  if(tool == KnownShaderTool::SPIRV_Cross || tool == KnownShaderTool::SPIRV_Cross_OpenGL)
+    return "--output {output_file} {input_file}";
+  else if(tool == KnownShaderTool::spirv_dis || tool == KnownShaderTool::spirv_dis_OpenGL)
+    return "-o {output_file} {input_file}";
+  else if(tool == KnownShaderTool::glslangValidatorGLSL ||
+          tool == KnownShaderTool::glslangValidatorGLSL_OpenGL)
+    return "-o {output_file} {input_file}";
+  else if(tool == KnownShaderTool::glslangValidatorHLSL)
+    return "-o {output_file} {input_file}";
+  else if(tool == KnownShaderTool::spirv_as || tool == KnownShaderTool::spirv_as_OpenGL)
+    return "-o {output_file} {input_file}";
+  else if(tool == KnownShaderTool::dxcSPIRV)
+    return "-Fo {output_file} {input_file}";
+  else if(tool == KnownShaderTool::dxcDXIL)
+    return "-Fo {output_file} {input_file}";
+  else if(tool == KnownShaderTool::fxc)
+    return "/Fo {output_file} {input_file}";
+
+  return rdcstr();
 }
 
 ShaderProcessingTool::operator QVariant() const
@@ -603,6 +791,35 @@ BugReport::operator QVariant() const
   map[lit("submitDate")] = submitDate;
   map[lit("checkDate")] = checkDate;
   map[lit("unreadUpdates")] = unreadUpdates;
+
+  return map;
+}
+
+ReplayOptions::ReplayOptions(const QVariant &var)
+{
+  QVariantMap map = var.toMap();
+
+  if(map.contains(lit("apiValidation")))
+    apiValidation = map[lit("apiValidation")].toBool();
+  if(map.contains(lit("forceGPUVendor")))
+    forceGPUVendor = (GPUVendor)map[lit("forceGPUVendor")].toUInt();
+  if(map.contains(lit("forceGPUDeviceID")))
+    forceGPUDeviceID = map[lit("forceGPUDeviceID")].toUInt();
+  if(map.contains(lit("forceGPUDriverName")))
+    forceGPUDriverName = map[lit("forceGPUDriverName")].toString();
+  if(map.contains(lit("optimisation")))
+    optimisation = (ReplayOptimisationLevel)map[lit("optimisation")].toUInt();
+}
+
+ReplayOptions::operator QVariant() const
+{
+  QVariantMap map;
+
+  map[lit("apiValidation")] = apiValidation;
+  map[lit("forceGPUVendor")] = (uint32_t)forceGPUVendor;
+  map[lit("forceGPUDeviceID")] = forceGPUDeviceID;
+  map[lit("forceGPUDriverName")] = forceGPUDriverName;
+  map[lit("optimisation")] = (uint32_t)optimisation;
 
   return map;
 }

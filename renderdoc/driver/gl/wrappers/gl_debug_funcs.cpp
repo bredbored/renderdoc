@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  * Copyright (c) 2014 Crytek
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -24,16 +24,21 @@
  ******************************************************************************/
 
 #include "../gl_driver.h"
+#include "../gl_replay.h"
 #include "common/common.h"
 #include "strings/string_utils.h"
 
-static std::string DecodeObjectLabel(GLsizei length, const GLchar *label)
+static rdcstr DecodeLabel(GLsizei length, const GLchar *label)
 {
-  // we share implementations between KHR_debug and EXT_debug_label, however KHR_debug follows the
-  // pattern elsewhere (e.g. in glShaderSource) of a length of -1 meaning indeterminate
-  // NULL-terminated length, but EXT_debug_label takes length of 0 to mean that.
+  // we share implementations between KHR_debug and EXT_debug_label/EXT_debug_marker, however
+  // KHR_debug follows the pattern elsewhere (e.g. in glShaderSource) of a length of -1 meaning
+  // indeterminate NULL-terminated length, but EXT_debug_label/EXT_debug_marker takes length of 0 to
+  // mean that.
   GLsizei realLength = length;
-  if(gl_CurChunk == GLChunk::glLabelObjectEXT && length == 0)
+  if((gl_CurChunk == GLChunk::glLabelObjectEXT || gl_CurChunk == GLChunk::glPushGroupMarkerEXT ||
+      gl_CurChunk == GLChunk::glInsertEventMarkerEXT ||
+      gl_CurChunk == GLChunk::glStringMarkerGREMEDY) &&
+     length == 0)
     realLength = -1;
 
   // if length is negative (after above twiddling), it's taken from strlen and the label must be
@@ -44,10 +49,10 @@ static std::string DecodeObjectLabel(GLsizei length, const GLchar *label)
   if(realLength == 0 || label == NULL)
     return "";
 
-  return std::string(label, label + realLength);
+  return rdcstr(label, realLength);
 }
 
-static void ReturnObjectlabel(std::string name, GLsizei bufSize, GLsizei *length, GLchar *label)
+static void ReturnObjectlabel(rdcstr name, GLsizei bufSize, GLsizei *length, GLchar *label)
 {
   // If <label> is NULL and <length> is non-NULL then no string will be returned and the length
   // of the label will be returned in <length>.
@@ -114,11 +119,11 @@ bool WrappedOpenGL::Serialise_glObjectLabel(SerialiserType &ser, GLenum identifi
                                             GLsizei length, const GLchar *label)
 {
   GLResource Resource;
-  std::string Label;
+  rdcstr Label;
 
   if(ser.IsWriting())
   {
-    Label = DecodeObjectLabel(length, label);
+    Label = DecodeLabel(length, label);
 
     Resource = GetResource(identifier, name);
   }
@@ -131,12 +136,13 @@ bool WrappedOpenGL::Serialise_glObjectLabel(SerialiserType &ser, GLenum identifi
 
   if(IsReplayingAndReading() && Resource.name)
   {
-    ResourceId origId = GetResourceManager()->GetOriginalID(GetResourceManager()->GetID(Resource));
+    ResourceId origId = GetResourceManager()->GetOriginalID(GetResourceManager()->GetResID(Resource));
 
     GetResourceManager()->SetName(origId, Label);
 
     ResourceDescription &descr = GetReplay()->GetResourceDesc(origId);
-    descr.SetCustomName(Label);
+    if(!Label.empty())
+      descr.SetCustomName(Label);
     AddResourceCurChunk(descr);
   }
 
@@ -152,8 +158,7 @@ void WrappedOpenGL::glLabelObjectEXT(GLenum identifier, GLuint name, GLsizei len
   }
   else
   {
-    m_ScratchSerialiser.ChunkMetadata().timestampMicro = RenderDoc::Inst().GetMicrosecondTimestamp();
-    m_ScratchSerialiser.ChunkMetadata().durationMicro = 0;
+    SERIALISE_TIME_CALL();
   }
 
   if(IsCaptureMode(m_State))
@@ -169,7 +174,7 @@ void WrappedOpenGL::glLabelObjectEXT(GLenum identifier, GLuint name, GLsizei len
     if(GetResourceManager()->HasResourceRecord(res))
       record = GetResourceManager()->GetResourceRecord(res);
 
-    GetResourceManager()->SetName(res, DecodeObjectLabel(length, label));
+    GetResourceManager()->SetName(res, DecodeLabel(length, label));
 
     record->AddChunk(scope.Get());
   }
@@ -183,8 +188,7 @@ void WrappedOpenGL::glObjectLabel(GLenum identifier, GLuint name, GLsizei length
   }
   else
   {
-    m_ScratchSerialiser.ChunkMetadata().timestampMicro = RenderDoc::Inst().GetMicrosecondTimestamp();
-    m_ScratchSerialiser.ChunkMetadata().durationMicro = 0;
+    SERIALISE_TIME_CALL();
   }
 
   if(IsCaptureMode(m_State))
@@ -200,7 +204,7 @@ void WrappedOpenGL::glObjectLabel(GLenum identifier, GLuint name, GLsizei length
     if(GetResourceManager()->HasResourceRecord(res))
       record = GetResourceManager()->GetResourceRecord(res);
 
-    GetResourceManager()->SetName(res, DecodeObjectLabel(length, label));
+    GetResourceManager()->SetName(res, DecodeLabel(length, label));
 
     record->AddChunk(scope.Get());
   }
@@ -214,8 +218,7 @@ void WrappedOpenGL::glObjectPtrLabel(const void *ptr, GLsizei length, const GLch
   }
   else
   {
-    m_ScratchSerialiser.ChunkMetadata().timestampMicro = RenderDoc::Inst().GetMicrosecondTimestamp();
-    m_ScratchSerialiser.ChunkMetadata().durationMicro = 0;
+    SERIALISE_TIME_CALL();
   }
 
   if(IsCaptureMode(m_State))
@@ -226,7 +229,7 @@ void WrappedOpenGL::glObjectPtrLabel(const void *ptr, GLsizei length, const GLch
     Serialise_glObjectLabel(ser, eGL_SYNC_FENCE, GetResourceManager()->GetCurrentResource(id).name,
                             length, label);
 
-    GetResourceManager()->SetName(id, DecodeObjectLabel(length, label));
+    GetResourceManager()->SetName(id, DecodeLabel(length, label));
 
     GetContextRecord()->AddChunk(scope.Get());
   }
@@ -258,7 +261,7 @@ bool WrappedOpenGL::Serialise_glDebugMessageInsert(SerialiserType &ser, GLenum s
                                                    GLuint id, GLenum severity, GLsizei length,
                                                    const GLchar *buf)
 {
-  std::string name = buf ? std::string(buf, buf + (length > 0 ? length : strlen(buf))) : "";
+  rdcstr name = buf ? rdcstr(buf, length >= 0 ? length : strlen(buf)) : "";
 
   // unused, just for the user's benefit
   SERIALISE_ELEMENT(source);
@@ -277,12 +280,12 @@ bool WrappedOpenGL::Serialise_glDebugMessageInsert(SerialiserType &ser, GLenum s
 
     if(IsLoading(m_State))
     {
-      DrawcallDescription draw;
-      draw.name = name;
-      draw.flags |= DrawFlags::SetMarker;
+      ActionDescription action;
+      action.customName = name;
+      action.flags |= ActionFlags::SetMarker;
 
       AddEvent();
-      AddDrawcall(draw, false);
+      AddAction(action);
     }
   }
 
@@ -293,14 +296,20 @@ void WrappedOpenGL::HandleVRFrameMarkers(const GLchar *buf, GLsizei length)
 {
   if(strstr(buf, "vr-marker,frame_end,type,application") != NULL)
   {
-    SwapBuffers((void *)m_ActiveContexts[Threading::GetCurrentID()].wnd);
+    PUSH_CURRENT_CHUNK;
+
+    // don't serialise this present as a separate chunk
+    gl_CurChunk = GLChunk::Max;
+
+    SwapBuffers(WindowingSystem::Headless, (void *)m_ActiveContexts[Threading::GetCurrentID()].wnd);
     m_UsesVRMarkers = true;
 
     if(IsActiveCapturing(m_State))
     {
       m_AcceptedCtx.clear();
       m_AcceptedCtx.insert(GetCtx().ctx);
-      RDCDEBUG("Only resource ID accepted is %llu", GetCtxData().m_ContextDataResourceID);
+      RDCDEBUG("Only resource ID accepted is %s",
+               ToStr(GetCtxData().m_ContextDataResourceID).c_str());
     }
   }
 }
@@ -314,8 +323,7 @@ void WrappedOpenGL::glDebugMessageInsert(GLenum source, GLenum type, GLuint id, 
   }
   else
   {
-    m_ScratchSerialiser.ChunkMetadata().timestampMicro = RenderDoc::Inst().GetMicrosecondTimestamp();
-    m_ScratchSerialiser.ChunkMetadata().durationMicro = 0;
+    SERIALISE_TIME_CALL();
   }
 
   HandleVRFrameMarkers(buf, length);
@@ -323,7 +331,7 @@ void WrappedOpenGL::glDebugMessageInsert(GLenum source, GLenum type, GLuint id, 
   if(IsActiveCapturing(m_State) && type == eGL_DEBUG_TYPE_MARKER)
   {
     USE_SCRATCH_SERIALISER();
-    ser.SetDrawChunk();
+    ser.SetActionChunk();
     SCOPED_SERIALISE_CHUNK(gl_CurChunk);
     Serialise_glDebugMessageInsert(ser, source, type, id, severity, length, buf);
 
@@ -359,8 +367,7 @@ template <typename SerialiserType>
 bool WrappedOpenGL::Serialise_glInsertEventMarkerEXT(SerialiserType &ser, GLsizei length,
                                                      const GLchar *marker_)
 {
-  std::string marker =
-      marker_ ? std::string(marker_, marker_ + (length > 0 ? length : strlen(marker_))) : "";
+  rdcstr marker = DecodeLabel(length, marker_);
 
   SERIALISE_ELEMENT(length);
   SERIALISE_ELEMENT(marker);
@@ -374,12 +381,12 @@ bool WrappedOpenGL::Serialise_glInsertEventMarkerEXT(SerialiserType &ser, GLsize
 
     if(IsLoading(m_State))
     {
-      DrawcallDescription draw;
-      draw.name = marker;
-      draw.flags |= DrawFlags::SetMarker;
+      ActionDescription action;
+      action.customName = marker;
+      action.flags |= ActionFlags::SetMarker;
 
       AddEvent();
-      AddDrawcall(draw, false);
+      AddAction(action);
     }
   }
 
@@ -391,7 +398,7 @@ void WrappedOpenGL::glInsertEventMarkerEXT(GLsizei length, const GLchar *marker)
   if(IsActiveCapturing(m_State))
   {
     USE_SCRATCH_SERIALISER();
-    ser.SetDrawChunk();
+    ser.SetActionChunk();
     SCOPED_SERIALISE_CHUNK(gl_CurChunk);
     Serialise_glInsertEventMarkerEXT(ser, length, marker);
 
@@ -401,7 +408,12 @@ void WrappedOpenGL::glInsertEventMarkerEXT(GLsizei length, const GLchar *marker)
 
 void WrappedOpenGL::glFrameTerminatorGREMEDY()
 {
-  SwapBuffers((void *)m_ActiveContexts[Threading::GetCurrentID()].wnd);
+  PUSH_CURRENT_CHUNK;
+
+  // don't serialise this present as a separate chunk
+  gl_CurChunk = GLChunk::Max;
+
+  SwapBuffers(WindowingSystem::Headless, (void *)m_ActiveContexts[Threading::GetCurrentID()].wnd);
 }
 
 void WrappedOpenGL::glStringMarkerGREMEDY(GLsizei len, const void *string)
@@ -420,8 +432,7 @@ template <typename SerialiserType>
 bool WrappedOpenGL::Serialise_glPushDebugGroup(SerialiserType &ser, GLenum source, GLuint id,
                                                GLsizei length, const GLchar *message_)
 {
-  std::string message =
-      message_ ? std::string(message_, message_ + (length > 0 ? length : strlen(message_))) : "";
+  rdcstr message = DecodeLabel(length, message_);
 
   // unused, just for the user's benefit
   SERIALISE_ELEMENT(source);
@@ -441,12 +452,12 @@ bool WrappedOpenGL::Serialise_glPushDebugGroup(SerialiserType &ser, GLenum sourc
 
     if(IsLoading(m_State))
     {
-      DrawcallDescription draw;
-      draw.name = message;
-      draw.flags |= DrawFlags::PushMarker;
+      ActionDescription action;
+      action.customName = message;
+      action.flags |= ActionFlags::PushMarker;
 
       AddEvent();
-      AddDrawcall(draw, false);
+      AddAction(action);
     }
   }
 
@@ -461,14 +472,13 @@ void WrappedOpenGL::glPushDebugGroup(GLenum source, GLuint id, GLsizei length, c
   }
   else
   {
-    m_ScratchSerialiser.ChunkMetadata().timestampMicro = RenderDoc::Inst().GetMicrosecondTimestamp();
-    m_ScratchSerialiser.ChunkMetadata().durationMicro = 0;
+    SERIALISE_TIME_CALL();
   }
 
   if(IsActiveCapturing(m_State))
   {
     USE_SCRATCH_SERIALISER();
-    ser.SetDrawChunk();
+    ser.SetActionChunk();
     SCOPED_SERIALISE_CHUNK(gl_CurChunk);
     Serialise_glPushDebugGroup(ser, source, id, length, message);
 
@@ -485,18 +495,19 @@ bool WrappedOpenGL::Serialise_glPopDebugGroup(SerialiserType &ser)
       GLMarkerRegion::End();
     m_ReplayEventCount = RDCMAX(0, m_ReplayEventCount - 1);
 
-    if(IsLoading(m_State) && HasNonDebugMarkers())
+    if(IsLoading(m_State))
     {
-      DrawcallDescription draw;
-      draw.name = "API Calls";
-      draw.flags |= DrawFlags::APICalls;
+      ActionDescription action;
+      action.flags |= ActionFlags::PopMarker;
 
-      AddDrawcall(draw, true);
+      AddEvent();
+      AddAction(action);
     }
   }
 
   return true;
 }
+
 void WrappedOpenGL::glPopDebugGroup()
 {
   if(GL.glPopDebugGroup)
@@ -505,14 +516,13 @@ void WrappedOpenGL::glPopDebugGroup()
   }
   else
   {
-    m_ScratchSerialiser.ChunkMetadata().timestampMicro = RenderDoc::Inst().GetMicrosecondTimestamp();
-    m_ScratchSerialiser.ChunkMetadata().durationMicro = 0;
+    SERIALISE_TIME_CALL();
   }
 
   if(IsActiveCapturing(m_State))
   {
     USE_SCRATCH_SERIALISER();
-    ser.SetDrawChunk();
+    ser.SetActionChunk();
     SCOPED_SERIALISE_CHUNK(gl_CurChunk);
     Serialise_glPopDebugGroup(ser);
 

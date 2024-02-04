@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  * Copyright (c) 2014 Crytek
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -25,7 +25,12 @@
 
 #pragma once
 
+#include "apidefs.h"
+#include "rdcarray.h"
 #include "replay_enums.h"
+#include "resourceid.h"
+#include "stringise.h"
+#include "structured_data.h"
 
 DOCUMENT("A floating point four-component vector");
 struct FloatVector
@@ -34,6 +39,7 @@ struct FloatVector
   FloatVector() : x(0.0f), y(0.0f), z(0.0f), w(0.0f) {}
   FloatVector(const FloatVector &) = default;
   FloatVector(float X, float Y, float Z, float W) : x(X), y(Y), z(Z), w(W) {}
+  FloatVector &operator=(const FloatVector &) = default;
 #if defined(RENDERDOC_QT_COMPAT)
   FloatVector(const QColor &col) : x(col.redF()), y(col.greenF()), z(col.blueF()), w(col.alphaF())
   {
@@ -68,13 +74,48 @@ struct FloatVector
 
 DECLARE_REFLECTION_STRUCT(FloatVector);
 
+DOCUMENT("A transform to map the x, y, and z axes to new directions.");
+struct AxisMapping
+{
+  AxisMapping()
+      : xAxis(1.0f, 0.0f, 0.0f, 0.0f), yAxis(0.0f, 1.0f, 0.0f, 0.0f), zAxis(0.0f, 0.0f, 1.0f, 0.0f)
+  {
+  }
+  AxisMapping(const FloatVector &XAxis, const FloatVector &YAxis, const FloatVector &ZAxis)
+      : xAxis(XAxis), yAxis(YAxis), zAxis(ZAxis)
+  {
+  }
+  AxisMapping(const AxisMapping &) = default;
+  AxisMapping &operator=(const AxisMapping &) = default;
+  DOCUMENT(R"(The mapping of the x axis.
+
+:type: FloatVector
+)");
+  FloatVector xAxis;
+
+  DOCUMENT(R"(The mapping of the y axis.
+
+:type: FloatVector
+)");
+  FloatVector yAxis;
+
+  DOCUMENT(R"(The mapping of the z axis.
+
+:type: FloatVector
+)");
+  FloatVector zAxis;
+};
+
+DECLARE_REFLECTION_STRUCT(AxisMapping);
+
 DOCUMENT("Properties of a path on a remote filesystem.");
 struct PathEntry
 {
   DOCUMENT("");
   PathEntry() : flags(PathProperty::NoFlags), lastmod(0), size(0) {}
   PathEntry(const PathEntry &) = default;
-  PathEntry(const char *fn, PathProperty f) : filename(fn), flags(f), lastmod(0), size(0) {}
+  PathEntry(const rdcstr &fn, PathProperty f) : filename(fn), flags(f), lastmod(0), size(0) {}
+  PathEntry &operator=(const PathEntry &) = default;
   bool operator==(const PathEntry &o) const
   {
     return filename == o.filename && flags == o.flags && lastmod == o.lastmod && size == o.size;
@@ -112,6 +153,7 @@ struct SectionProperties
   DOCUMENT("");
   SectionProperties() = default;
   SectionProperties(const SectionProperties &) = default;
+  SectionProperties &operator=(const SectionProperties &) = default;
 
   DOCUMENT("The name of this section.");
   rdcstr name;
@@ -136,9 +178,10 @@ DECLARE_REFLECTION_STRUCT(SectionProperties);
 
 struct ResourceFormat;
 
-DOCUMENT("Internal function for getting the name for a resource format.");
+#if !defined(SWIG)
 extern "C" RENDERDOC_API void RENDERDOC_CC RENDERDOC_ResourceFormatName(const ResourceFormat &fmt,
                                                                         rdcstr &name);
+#endif
 
 DOCUMENT("Description of the format of a resource or element.");
 struct ResourceFormat
@@ -154,6 +197,7 @@ struct ResourceFormat
     flags = 0;
   }
   ResourceFormat(const ResourceFormat &) = default;
+  ResourceFormat &operator=(const ResourceFormat &) = default;
 
   bool operator==(const ResourceFormat &r) const
   {
@@ -177,7 +221,7 @@ struct ResourceFormat
 
   bool operator!=(const ResourceFormat &r) const { return !(*this == r); }
   DOCUMENT(R"(:return: The name of the format.
-:rtype: ``str``
+:rtype: str
 )");
   rdcstr Name() const
   {
@@ -187,21 +231,25 @@ struct ResourceFormat
   }
 
   DOCUMENT(R"(:return: ``True`` if the ``ResourceFormat`` is a 'special' non-regular type.
-:rtype: ``bool``
+:rtype: bool
 )");
   bool Special() const { return type != ResourceFormatType::Regular; }
-  DOCUMENT(R"(The :class:`ResourceFormatType` of this format. If the value is not
-:attr:`ResourceFormatType.Regular` then it's a non-uniform layout like block-compressed.
-)");
-
   DOCUMENT(R"(:return: ``True`` if the components are to be read in ``BGRA`` order.
-:rtype: ``bool``
+
+.. note::
+  The convention is that components are in RGBA order. Whether that means first byte to last byte,
+  or in bit-packed formats red in the lowest bits.
+
+  With BGRA order this means blue is in the first byte/lowest bits, but alpha is still always
+  expected in the last byte/uppermost bits.
+
+:rtype: bool
 )");
   bool BGRAOrder() const { return (flags & ResourceFormat_BGRA) != 0; }
   DOCUMENT(R"(Equivalent to checking if :data:`compType` is :data:`CompType.UNormSRGB`
 
 :return: ``True`` if the components are SRGB corrected on read and write.
-:rtype: ``bool``
+:rtype: bool
 )");
   bool SRGBCorrected() const { return compType == CompType::UNormSRGB; }
   DOCUMENT(R"(Get the subsampling rate for a YUV format. Only valid when :data:`type` is
@@ -210,7 +258,7 @@ a YUV format like :attr:`ResourceFormatType.YUV8`.
 For other formats, 0 is returned.
 
 :return: The subsampling rate, e.g. 444 for 4:4:4 or 420 for 4:2:0
-:rtype: ``int``
+:rtype: int
 )");
   uint32_t YUVSubsampling() const
   {
@@ -229,7 +277,7 @@ a YUV format like :attr:`ResourceFormatType.YUV8`.
 For other formats, 1 is returned.
 
 :return: The number of planes
-:rtype: ``int``
+:rtype: int
 )");
   uint32_t YUVPlaneCount() const
   {
@@ -256,7 +304,7 @@ For other formats, 1 is returned.
 
 The value should be e.g. 444 for 4:4:4 or 422 for 4:2:2. Invalid values will result in 0 being set.
 
-:param int subsample: The new subsampling rate.
+:param int subsampling: The new subsampling rate.
 )");
   void SetYUVSubsampling(uint32_t subsampling)
   {
@@ -284,9 +332,101 @@ Invalid values will result in 1 being set.
       flags |= ResourceFormat_3Planes;
   }
 
+  DOCUMENT(R"(:return: ``True`` if the ``ResourceFormat`` is a block-compressed type.
+:rtype: bool
+)");
+  bool BlockFormat() const
+  {
+    switch(type)
+    {
+      default: break;
+      case ResourceFormatType::BC1:
+      case ResourceFormatType::BC4:
+      case ResourceFormatType::BC2:
+      case ResourceFormatType::BC3:
+      case ResourceFormatType::BC5:
+      case ResourceFormatType::BC6:
+      case ResourceFormatType::BC7:
+      case ResourceFormatType::ETC2:
+      case ResourceFormatType::EAC:
+      case ResourceFormatType::ASTC:
+      case ResourceFormatType::PVRTC: return true;
+    }
+
+    return false;
+  }
+
+  DOCUMENT(R"(Return the size of a single element in this format, usually a pixel. For regular sized
+formats this is just :data:`compByteWidth` times :data:`compCount`, for special packed formats it's
+the tightly packed size of a single element, with no padding.
+
+Block-compressed formats define an 'element' as a whole block of texels.
+
+YUV formats where texel size varies depending on subsampling will return the size of a decompressed
+texel.
+
+:return: The size of an element
+:rtype: int
+)");
+  uint32_t ElementSize() const
+  {
+    switch(type)
+    {
+      case ResourceFormatType::Undefined: break;
+      case ResourceFormatType::Regular: return compByteWidth * compCount;
+      case ResourceFormatType::BC1:
+      case ResourceFormatType::BC4: return 8;    // 8 bytes for 4x4 block
+      case ResourceFormatType::BC2:
+      case ResourceFormatType::BC3:
+      case ResourceFormatType::BC5:
+      case ResourceFormatType::BC6:
+      case ResourceFormatType::BC7: return 16;    // 16 bytes for 4x4 block
+      case ResourceFormatType::ETC2: return 8;
+      case ResourceFormatType::EAC:
+        if(compCount == 1)
+          return 8;    // single channel R11 EAC
+        else if(compCount == 2)
+          return 16;    // two channel RG11 EAC
+        else
+          return 16;                               // RGBA8 EAC
+      case ResourceFormatType::ASTC: return 16;    // ASTC is always 128 bits per block
+      case ResourceFormatType::R10G10B10A2:
+      case ResourceFormatType::R11G11B10:
+      case ResourceFormatType::R9G9B9E5: return 4;
+      case ResourceFormatType::R5G6B5:
+      case ResourceFormatType::R5G5B5A1:
+      case ResourceFormatType::R4G4B4A4: return 2;
+      case ResourceFormatType::R4G4: return 1;
+      case ResourceFormatType::D16S8:
+        return 3;    // we define the size as tightly packed, so 3 bytes.
+      case ResourceFormatType::D24S8: return 4;
+      case ResourceFormatType::D32S8:
+        return 5;    // we define the size as tightly packed, so 5 bytes.
+      case ResourceFormatType::S8:
+      case ResourceFormatType::A8: return 1;
+      // can't give a sensible answer for YUV formats as the texel varies.
+      case ResourceFormatType::YUV8: return compCount;
+      case ResourceFormatType::YUV10:
+      case ResourceFormatType::YUV12:
+      case ResourceFormatType::YUV16: return compCount * 2;
+      case ResourceFormatType::PVRTC:
+        return 8;    // our representation can't differentiate 2bpp from 4bpp, so guess
+    }
+
+    return 0;
+  }
+
+  DOCUMENT(R"(The :class:`ResourceFormatType` of this format. If the value is not
+:attr:`ResourceFormatType.Regular` then it's a non-uniform layout like block-compressed.
+
+:type: ResourceFormatType
+)");
   ResourceFormatType type;
 
-  DOCUMENT("The :class:`type <CompType>` of each component.");
+  DOCUMENT(R"(The :class:`type <CompType>` of each component.
+
+:type: CompType
+)");
   CompType compType;
   DOCUMENT("The number of components in each element.");
   uint8_t compCount;
@@ -322,6 +462,7 @@ struct TextureFilter
   DOCUMENT("");
   TextureFilter() = default;
   TextureFilter(const TextureFilter &) = default;
+  TextureFilter &operator=(const TextureFilter &) = default;
 
   bool operator==(const TextureFilter &o) const
   {
@@ -351,12 +492,50 @@ struct TextureFilter
 
 DECLARE_REFLECTION_STRUCT(TextureFilter);
 
+DOCUMENT("The four components of a texture swizzle.");
+struct TextureSwizzle4
+{
+  DOCUMENT("");
+  TextureSwizzle4() = default;
+  TextureSwizzle4(const TextureSwizzle4 &) = default;
+  TextureSwizzle4 &operator=(const TextureSwizzle4 &) = default;
+
+  bool operator==(const TextureSwizzle4 &o) const
+  {
+    return red == o.red && green == o.green && blue == o.blue && alpha == o.alpha;
+  }
+  bool operator<(const TextureSwizzle4 &o) const
+  {
+    if(!(red == o.red))
+      return red < o.red;
+    if(!(green == o.green))
+      return green < o.green;
+    if(!(blue == o.blue))
+      return blue < o.blue;
+    if(!(alpha == o.alpha))
+      return alpha < o.alpha;
+    return false;
+  }
+
+  DOCUMENT("The red channel's :class:`TextureSwizzle`.");
+  TextureSwizzle red = TextureSwizzle::Red;
+  DOCUMENT("The green channel's :class:`TextureSwizzle`.");
+  TextureSwizzle green = TextureSwizzle::Green;
+  DOCUMENT("The blue channel's :class:`TextureSwizzle`.");
+  TextureSwizzle blue = TextureSwizzle::Blue;
+  DOCUMENT("The alpha channel's :class:`TextureSwizzle`.");
+  TextureSwizzle alpha = TextureSwizzle::Alpha;
+};
+
+DECLARE_REFLECTION_STRUCT(TextureSwizzle4);
+
 DOCUMENT("A description of any type of resource.");
 struct ResourceDescription
 {
   DOCUMENT("");
   ResourceDescription() = default;
   ResourceDescription(const ResourceDescription &) = default;
+  ResourceDescription &operator=(const ResourceDescription &) = default;
 
   bool operator==(const ResourceDescription &o) const { return resourceId == o.resourceId; }
   bool operator<(const ResourceDescription &o) const { return resourceId < o.resourceId; }
@@ -377,6 +556,8 @@ human-readable name by the application.
   DOCUMENT(R"(The chunk indices in the structured file that initialised this resource.
 
 This will at least contain the first call that created it, but may contain other auxilliary calls.
+
+:type: List[int]
 )");
   rdcarray<uint32_t> initialisationChunks;
 
@@ -386,6 +567,8 @@ Can be empty if there are no derived resources.
 
 This is the inverse of :data:`parentResources` in a potentially many:many relationship, but
 typically it is one parent to many derived.
+
+:type: List[ResourceId]
 )");
   rdcarray<ResourceId> derivedResources;
 
@@ -395,6 +578,8 @@ Can be empty if there are no parent resources.
 
 This is the inverse of :data:`derivedResources` in a potentially many:many relationship, but
 typically it is one parent to many derived.
+
+:type: List[ResourceId]
 )");
   rdcarray<ResourceId> parentResources;
 
@@ -405,7 +590,7 @@ typically it is one parent to many derived.
   inline void SetCustomName(const rdcstr &givenName)
   {
     autogeneratedName = false;
-    name = givenName.isEmpty() ? "<empty>" : givenName;
+    name = givenName.isEmpty() ? "<empty>"_lit : givenName;
   }
 };
 
@@ -417,10 +602,12 @@ struct BufferDescription
   DOCUMENT("");
   BufferDescription() = default;
   BufferDescription(const BufferDescription &) = default;
+  BufferDescription &operator=(const BufferDescription &) = default;
 
   bool operator==(const BufferDescription &o) const
   {
-    return resourceId == o.resourceId && creationFlags == o.creationFlags && length == o.length;
+    return resourceId == o.resourceId && creationFlags == o.creationFlags &&
+           gpuAddress == o.gpuAddress && length == o.length;
   }
   bool operator<(const BufferDescription &o) const
   {
@@ -428,6 +615,8 @@ struct BufferDescription
       return resourceId < o.resourceId;
     if(!(creationFlags == o.creationFlags))
       return creationFlags < o.creationFlags;
+    if(!(gpuAddress == o.gpuAddress))
+      return gpuAddress < o.gpuAddress;
     if(!(length == o.length))
       return length < o.length;
     return false;
@@ -436,10 +625,13 @@ struct BufferDescription
   ResourceId resourceId;
 
   DOCUMENT("The way this buffer will be used in the pipeline.");
-  BufferCategory creationFlags;
+  BufferCategory creationFlags = BufferCategory::NoFlags;
+
+  DOCUMENT("The known base GPU Address of this buffer. 0 if not applicable or available.");
+  uint64_t gpuAddress = 0;
 
   DOCUMENT("The byte length of the buffer.");
-  uint64_t length;
+  uint64_t length = 0;
 };
 
 DECLARE_REFLECTION_STRUCT(BufferDescription);
@@ -450,6 +642,7 @@ struct TextureDescription
   DOCUMENT("");
   TextureDescription() = default;
   TextureDescription(const TextureDescription &) = default;
+  TextureDescription &operator=(const TextureDescription &) = default;
 
   bool operator==(const TextureDescription &o) const
   {
@@ -491,7 +684,10 @@ struct TextureDescription
       return byteSize < o.byteSize;
     return false;
   }
-  DOCUMENT("The :class:`ResourceFormat` that describes the format of each pixel in the texture.");
+  DOCUMENT(R"(The format of each pixel in the texture.
+
+:type: ResourceFormat
+)");
   ResourceFormat format;
 
   DOCUMENT("The base dimension of the texture - either 1, 2, or 3.");
@@ -536,12 +732,18 @@ struct TextureDescription
 
 DECLARE_REFLECTION_STRUCT(TextureDescription);
 
-DOCUMENT("An individual API-level event, generally corresponds one-to-one with an API call.");
+DOCUMENT(R"(An individual API-level event, generally corresponds one-to-one with an API call.
+
+.. data:: NoChunk
+
+  No chunk is available.
+)");
 struct APIEvent
 {
   DOCUMENT("");
   APIEvent() = default;
   APIEvent(const APIEvent &) = default;
+  APIEvent &operator=(const APIEvent &) = default;
 
   bool operator==(const APIEvent &o) const { return eventId == o.eventId; }
   bool operator<(const APIEvent &o) const { return eventId < o.eventId; }
@@ -551,20 +753,21 @@ This is a 1-based count of API events in the capture. The eventId is used as a r
 many places in the API to represent where in the capture the 'current state' is, and to perform
 analysis in reference to the state at a particular point in the frame.
 
-eventIds are always increasing and positive, but they may not be contiguous - in some circumstances
-there may be gaps if some events are consumed entirely internally, such as debug marker pops which
-only modify the internal drawcall tree structures.
+eventIds are generally increasing, positive, and contiguous, with a few exceptions. These are when
+fake markers are added to a capture with :meth:`ReplayController.AddFakeMarkers`. Thus if strong
+eventId guarantees are desired, this function should be avoided.
 
 Also eventIds may not correspond directly to an actual function call - sometimes a function such as
-a multi draw indirect will be one function call that expands to multiple events to allow inspection
-of results part way through the multi draw.
+a multi action indirect will be one function call that expands to multiple events to allow inspection
+of results part way through the multi action.
 )");
   uint32_t eventId = 0;
 
-  DOCUMENT("A list of addresses in the CPU callstack where this function was called.");
-  rdcarray<uint64_t> callstack;
+  DOCUMENT(R"(The chunk index for this function call in the structured file.
 
-  DOCUMENT("The chunk index for this function call in the structured file.");
+If no chunk index is available this will be set to :data:`NoChunk`. This will only happen for fake
+markers added to the capture after load.
+)");
   uint32_t chunkIndex = 0;
 
   DOCUMENT(R"(A byte offset in the data stream where this event happens.
@@ -573,6 +776,8 @@ of results part way through the multi draw.
   the start of the file on disk.
 )");
   uint64_t fileOffset = 0;
+
+  static const uint32_t NoChunk = ~0U;
 };
 
 DECLARE_REFLECTION_STRUCT(APIEvent);
@@ -583,6 +788,7 @@ struct DebugMessage
   DOCUMENT("");
   DebugMessage() = default;
   DebugMessage(const DebugMessage &) = default;
+  DebugMessage &operator=(const DebugMessage &) = default;
 
   bool operator==(const DebugMessage &o) const
   {
@@ -660,6 +866,25 @@ struct ConstantBindStats
   DOCUMENT("");
   ConstantBindStats() = default;
   ConstantBindStats(const ConstantBindStats &) = default;
+  ConstantBindStats &operator=(const ConstantBindStats &) = default;
+  bool operator<(const ConstantBindStats &o) const
+  {
+    if(!(calls == o.calls))
+      return calls < o.calls;
+    if(!(sets == o.sets))
+      return sets < o.sets;
+    if(!(nulls == o.nulls))
+      return nulls < o.nulls;
+    if(!(bindslots == o.bindslots))
+      return bindslots < o.bindslots;
+    return sizes < o.sizes;
+  }
+
+  bool operator==(const ConstantBindStats &o) const
+  {
+    return calls == o.calls && sets == o.sets && nulls == o.nulls && bindslots == o.bindslots &&
+           sizes == o.sizes;
+  }
 
   static const BucketRecordType BucketType = BucketRecordType::Pow2;
   static const size_t BucketCount = 31;
@@ -673,10 +898,16 @@ struct ConstantBindStats
   DOCUMENT("How many objects were unbound.");
   uint32_t nulls;
 
-  DOCUMENT("A list where the Nth element contains the number of calls that bound N buffers.");
+  DOCUMENT(R"(A list where the Nth element contains the number of calls that bound N buffers.
+
+:type: List[int]
+)");
   rdcarray<uint32_t> bindslots;
 
-  DOCUMENT("A :class:`bucketed <BucketType>` list over the sizes of buffers bound.");
+  DOCUMENT(R"(A :class:`bucketed <BucketType>` list over the sizes of buffers bound.
+
+:type: List[int]
+)");
   rdcarray<uint32_t> sizes;
 };
 
@@ -688,6 +919,22 @@ struct SamplerBindStats
   DOCUMENT("");
   SamplerBindStats() = default;
   SamplerBindStats(const SamplerBindStats &) = default;
+  SamplerBindStats &operator=(const SamplerBindStats &) = default;
+  bool operator<(const SamplerBindStats &o) const
+  {
+    if(!(calls == o.calls))
+      return calls < o.calls;
+    if(!(sets == o.sets))
+      return sets < o.sets;
+    if(!(nulls == o.nulls))
+      return nulls < o.nulls;
+    return bindslots < o.bindslots;
+  }
+
+  bool operator==(const SamplerBindStats &o) const
+  {
+    return calls == o.calls && sets == o.sets && nulls == o.nulls && bindslots == o.bindslots;
+  }
 
   DOCUMENT("How many function calls were made.");
   uint32_t calls;
@@ -698,7 +945,10 @@ struct SamplerBindStats
   DOCUMENT("How many objects were unbound.");
   uint32_t nulls;
 
-  DOCUMENT("A list where the Nth element contains the number of calls that bound N samplers.");
+  DOCUMENT(R"(A list where the Nth element contains the number of calls that bound N samplers.
+
+:type: List[int]
+)");
   rdcarray<uint32_t> bindslots;
 };
 
@@ -710,6 +960,25 @@ struct ResourceBindStats
   DOCUMENT("");
   ResourceBindStats() = default;
   ResourceBindStats(const ResourceBindStats &) = default;
+  ResourceBindStats &operator=(const ResourceBindStats &) = default;
+  bool operator<(const ResourceBindStats &o) const
+  {
+    if(!(calls == o.calls))
+      return calls < o.calls;
+    if(!(sets == o.sets))
+      return sets < o.sets;
+    if(!(nulls == o.nulls))
+      return nulls < o.nulls;
+    if(!(types == o.types))
+      return types < o.types;
+    return bindslots < o.bindslots;
+  }
+
+  bool operator==(const ResourceBindStats &o) const
+  {
+    return calls == o.calls && sets == o.sets && nulls == o.nulls && types == o.types &&
+           bindslots == o.bindslots;
+  }
 
   DOCUMENT("How many function calls were made.");
   uint32_t calls;
@@ -723,10 +992,15 @@ struct ResourceBindStats
   DOCUMENT(R"(A list with one element for each type in :class:`TextureType`.
 
 The Nth element contains the number of times a resource of that type was bound.
+
+:type: List[int]
 )");
   rdcarray<uint32_t> types;
 
-  DOCUMENT("A list where the Nth element contains the number of calls that bound N resources.");
+  DOCUMENT(R"(A list where the Nth element contains the number of calls that bound N resources.
+
+:type: List[int]
+)");
   rdcarray<uint32_t> bindslots;
 };
 
@@ -747,6 +1021,7 @@ struct ResourceUpdateStats
   DOCUMENT("");
   ResourceUpdateStats() = default;
   ResourceUpdateStats(const ResourceUpdateStats &) = default;
+  ResourceUpdateStats &operator=(const ResourceUpdateStats &) = default;
 
   static const BucketRecordType BucketType = BucketRecordType::Pow2;
   static const size_t BucketCount = 31;
@@ -763,10 +1038,15 @@ struct ResourceUpdateStats
   DOCUMENT(R"(A list with one element for each type in :class:`TextureType`.
 
 The Nth element contains the number of times a resource of that type was updated.
+
+:type: List[int]
 )");
   rdcarray<uint32_t> types;
 
-  DOCUMENT("A :class:`bucketed <BucketType>` list over the number of bytes in the update.");
+  DOCUMENT(R"(A :class:`bucketed <BucketType>` list over the number of bytes in the update.
+
+:type: List[int]
+)");
   rdcarray<uint32_t> sizes;
 };
 
@@ -791,6 +1071,7 @@ struct DrawcallStats
   DOCUMENT("");
   DrawcallStats() = default;
   DrawcallStats(const DrawcallStats &) = default;
+  DrawcallStats &operator=(const DrawcallStats &) = default;
 
   static const BucketRecordType BucketType = BucketRecordType::Linear;
   static const size_t BucketSize = 1;
@@ -803,7 +1084,10 @@ struct DrawcallStats
   DOCUMENT("How many of :data:`calls` were indirect.");
   uint32_t indirect;
 
-  DOCUMENT("A :class:`bucketed <BucketType>` list over the number of instances in the draw.");
+  DOCUMENT(R"(A :class:`bucketed <BucketType>` list over the number of instances in the draw.
+      
+:type: List[int]
+)");
   rdcarray<uint32_t> counts;
 };
 
@@ -815,6 +1099,7 @@ struct DispatchStats
   DOCUMENT("");
   DispatchStats() = default;
   DispatchStats(const DispatchStats &) = default;
+  DispatchStats &operator=(const DispatchStats &) = default;
 
   DOCUMENT("How many dispatch calls were made.");
   uint32_t calls;
@@ -831,6 +1116,7 @@ struct IndexBindStats
   DOCUMENT("");
   IndexBindStats() = default;
   IndexBindStats(const IndexBindStats &) = default;
+  IndexBindStats &operator=(const IndexBindStats &) = default;
 
   DOCUMENT("How many function calls were made.");
   uint32_t calls;
@@ -850,6 +1136,7 @@ struct VertexBindStats
   DOCUMENT("");
   VertexBindStats() = default;
   VertexBindStats(const VertexBindStats &) = default;
+  VertexBindStats &operator=(const VertexBindStats &) = default;
 
   DOCUMENT("How many function calls were made.");
   uint32_t calls;
@@ -860,8 +1147,10 @@ struct VertexBindStats
   DOCUMENT("How many objects were unbound.");
   uint32_t nulls;
 
-  DOCUMENT(
-      "A list where the Nth element contains the number of calls that bound N vertex buffers.");
+  DOCUMENT(R"(A list where the Nth element contains the number of calls that bound N vertex buffers.
+
+:type: List[int]
+)");
   rdcarray<uint32_t> bindslots;
 };
 
@@ -873,6 +1162,7 @@ struct LayoutBindStats
   DOCUMENT("");
   LayoutBindStats() = default;
   LayoutBindStats(const LayoutBindStats &) = default;
+  LayoutBindStats &operator=(const LayoutBindStats &) = default;
 
   DOCUMENT("How many function calls were made.");
   uint32_t calls;
@@ -892,6 +1182,22 @@ struct ShaderChangeStats
   DOCUMENT("");
   ShaderChangeStats() = default;
   ShaderChangeStats(const ShaderChangeStats &) = default;
+  ShaderChangeStats &operator=(const ShaderChangeStats &) = default;
+  bool operator<(const ShaderChangeStats &o) const
+  {
+    if(!(calls == o.calls))
+      return calls < o.calls;
+    if(!(sets == o.sets))
+      return sets < o.sets;
+    if(!(nulls == o.nulls))
+      return nulls < o.nulls;
+    return redundants < o.redundants;
+  }
+
+  bool operator==(const ShaderChangeStats &o) const
+  {
+    return calls == o.calls && sets == o.sets && nulls == o.nulls && redundants == o.redundants;
+  }
 
   DOCUMENT("How many function calls were made.");
   uint32_t calls;
@@ -914,6 +1220,7 @@ struct BlendStats
   DOCUMENT("");
   BlendStats() = default;
   BlendStats(const BlendStats &) = default;
+  BlendStats &operator=(const BlendStats &) = default;
 
   DOCUMENT("How many function calls were made.");
   uint32_t calls;
@@ -936,6 +1243,7 @@ struct DepthStencilStats
   DOCUMENT("");
   DepthStencilStats() = default;
   DepthStencilStats(const DepthStencilStats &) = default;
+  DepthStencilStats &operator=(const DepthStencilStats &) = default;
 
   DOCUMENT("How many function calls were made.");
   uint32_t calls;
@@ -958,6 +1266,7 @@ struct RasterizationStats
   DOCUMENT("");
   RasterizationStats() = default;
   RasterizationStats(const RasterizationStats &) = default;
+  RasterizationStats &operator=(const RasterizationStats &) = default;
 
   DOCUMENT("How many function calls were made.");
   uint32_t calls;
@@ -971,10 +1280,16 @@ struct RasterizationStats
   DOCUMENT("How many calls made no change due to the existing bind being identical.");
   uint32_t redundants;
 
-  DOCUMENT("A list where the Nth element contains the number of calls that bound N viewports.");
+  DOCUMENT(R"(A list where the Nth element contains the number of calls that bound N viewports.
+    
+:type: List[int]
+)");
   rdcarray<uint32_t> viewports;
 
-  DOCUMENT("A list where the Nth element contains the number of calls that bound N scissor rects.");
+  DOCUMENT(R"(A list where the Nth element contains the number of calls that bound N scissor rects.
+    
+:type: List[int]
+)");
   rdcarray<uint32_t> rects;
 };
 
@@ -986,6 +1301,7 @@ struct OutputTargetStats
   DOCUMENT("");
   OutputTargetStats() = default;
   OutputTargetStats(const OutputTargetStats &) = default;
+  OutputTargetStats &operator=(const OutputTargetStats &) = default;
 
   DOCUMENT("How many function calls were made.");
   uint32_t calls;
@@ -996,7 +1312,10 @@ struct OutputTargetStats
   DOCUMENT("How many objects were unbound.");
   uint32_t nulls;
 
-  DOCUMENT("A list where the Nth element contains the number of calls that bound N targets.");
+  DOCUMENT(R"(A list where the Nth element contains the number of calls that bound N targets.
+
+:type: List[int]
+)");
   rdcarray<uint32_t> bindslots;
 };
 
@@ -1009,58 +1328,112 @@ Currently this information is only available on D3D11 and is fairly API-centric.
 struct FrameStatistics
 {
   DOCUMENT("");
-  FrameStatistics() = default;
+  FrameStatistics()
+  {
+    constants.resize(ENUM_ARRAY_SIZE(ShaderStage));
+    samplers.resize(ENUM_ARRAY_SIZE(ShaderStage));
+    resources.resize(ENUM_ARRAY_SIZE(ShaderStage));
+    shaders.resize(ENUM_ARRAY_SIZE(ShaderStage));
+  }
   FrameStatistics(const FrameStatistics &) = default;
+  FrameStatistics &operator=(const FrameStatistics &) = default;
 
   DOCUMENT("``True`` if the statistics in this structure are valid.");
-  bool recorded;
+  bool recorded = false;
 
-  DOCUMENT("A list of constant buffer bind statistics, one per each :class:`stage <ShaderStage>`.");
-  ConstantBindStats constants[ENUM_ARRAY_SIZE(ShaderStage)];
+  DOCUMENT(R"(A list of constant buffer bind statistics, one per each :class:`stage <ShaderStage>`.
+  
+:type: List[ConstantBindStats]
+)");
+  rdcarray<ConstantBindStats> constants;
 
-  DOCUMENT("A list of sampler bind statistics, one per each :class:`stage <ShaderStage>`.");
-  SamplerBindStats samplers[ENUM_ARRAY_SIZE(ShaderStage)];
+  DOCUMENT(R"(A list of sampler bind statistics, one per each :class:`stage <ShaderStage>`.
+  
+:type: List[SamplerBindStats]
+)");
+  rdcarray<SamplerBindStats> samplers;
 
-  DOCUMENT("A list of resource bind statistics, one per each :class:`stage <ShaderStage>`.");
-  ResourceBindStats resources[ENUM_ARRAY_SIZE(ShaderStage)];
+  DOCUMENT(R"(A list of resource bind statistics, one per each :class:`stage <ShaderStage>`.
+  
+:type: List[ResourceBindStats]
+)");
+  rdcarray<ResourceBindStats> resources;
 
-  DOCUMENT("Information about resource contents updates.");
-  ResourceUpdateStats updates;
+  DOCUMENT(R"(Information about resource contents updates.
+  
+:type: ResourceUpdateStats
+)");
+  ResourceUpdateStats updates = {};
 
-  DOCUMENT("Information about drawcalls.");
-  DrawcallStats draws;
+  DOCUMENT(R"(Information about drawcalls.
+  
+:type: DrawcallStats
+)");
+  DrawcallStats draws = {};
 
-  DOCUMENT("Information about compute dispatches.");
-  DispatchStats dispatches;
+  DOCUMENT(R"(Information about compute dispatches.
+  
+:type: DispatchStats
+)");
+  DispatchStats dispatches = {};
 
-  DOCUMENT("Information about index buffer binds.");
-  IndexBindStats indices;
+  DOCUMENT(R"(Information about index buffer binds.
+  
+:type: IndexBindStats
+)");
+  IndexBindStats indices = {};
 
-  DOCUMENT("Information about vertex buffer binds.");
-  VertexBindStats vertices;
+  DOCUMENT(R"(Information about vertex buffer binds.
+  
+:type: VertexBindStats
+)");
+  VertexBindStats vertices = {};
 
-  DOCUMENT("Information about vertex layout binds.");
-  LayoutBindStats layouts;
+  DOCUMENT(R"(Information about vertex layout binds.
+  
+:type: LayoutBindStats
+)");
+  LayoutBindStats layouts = {};
 
-  DOCUMENT("A list of shader bind statistics, one per each :class:`stage <ShaderStage>`.");
-  ShaderChangeStats shaders[ENUM_ARRAY_SIZE(ShaderStage)];
+  DOCUMENT(R"(A list of shader bind statistics, one per each :class:`stage <ShaderStage>`.
+  
+:type: List[ShaderChangeStats]
+)");
+  rdcarray<ShaderChangeStats> shaders;
 
-  DOCUMENT("Information about blend state binds.");
-  BlendStats blends;
+  DOCUMENT(R"(Information about blend state binds.
+  
+:type: BlendStats
+)");
+  BlendStats blends = {};
 
-  DOCUMENT("Information about depth-stencil state binds.");
-  DepthStencilStats depths;
+  DOCUMENT(R"(Information about depth-stencil state binds.
+  
+:type: DepthStencilStats
+)");
+  DepthStencilStats depths = {};
 
-  DOCUMENT("Information about rasterizer state binds.");
-  RasterizationStats rasters;
+  DOCUMENT(R"(Information about rasterizer state binds.
+  
+:type: RasterizationStats
+)");
+  RasterizationStats rasters = {};
 
-  DOCUMENT("Information about output merger and UAV binds.");
-  OutputTargetStats outputs;
+  DOCUMENT(R"(Information about output merger and UAV binds.
+  
+:type: OutputTargetStats
+)");
+  OutputTargetStats outputs = {};
 };
 
 DECLARE_REFLECTION_STRUCT(FrameStatistics);
 
-DOCUMENT("Contains frame-level global information");
+DOCUMENT(R"(Contains frame-level global information
+
+.. data:: NoFrameNumber
+
+  No frame number is available.
+)");
 struct FrameDescription
 {
   DOCUMENT("");
@@ -1075,12 +1448,14 @@ struct FrameDescription
   {
   }
   FrameDescription(const FrameDescription &) = default;
+  FrameDescription &operator=(const FrameDescription &) = default;
 
   DOCUMENT(R"(Starting from frame #1 defined as the time from application startup to first present,
 this counts the frame number when the capture was made.
 
 .. note:: This value is only accurate if the capture was triggered through the default mechanism, if
-  it was triggered from the application API it doesn't correspond to anything.
+  it was triggered from the application API it doesn't correspond to anything and will be set to
+  :data:`NoFrameNumber`.
 )");
   uint32_t frameNumber;
 
@@ -1106,11 +1481,19 @@ this counts the frame number when the capture was made.
   DOCUMENT("The time when the capture was created, as a unix timestamp in UTC.");
   uint64_t captureTime;
 
-  DOCUMENT("The :class:`frame statistics <FrameStatistics>`.");
+  DOCUMENT(R"(The frame statistics.
+
+:type: FrameStatistics
+)");
   FrameStatistics stats;
 
-  DOCUMENT("A list of debug messages that are not associated with any particular event.");
+  DOCUMENT(R"(The debug messages that are not associated with any particular event.
+
+:type: List[DebugMessage]
+)");
   rdcarray<DebugMessage> debugMessages;
+
+  static const uint32_t NoFrameNumber = ~0U;
 };
 
 DECLARE_REFLECTION_STRUCT(FrameDescription);
@@ -1124,6 +1507,7 @@ struct EventUsage
   EventUsage(const EventUsage &) = default;
   EventUsage(uint32_t e, ResourceUsage u) : eventId(e), usage(u) {}
   EventUsage(uint32_t e, ResourceUsage u, ResourceId v) : eventId(e), usage(u), view(v) {}
+  EventUsage &operator=(const EventUsage &) = default;
   bool operator<(const EventUsage &o) const
   {
     if(!(eventId == o.eventId))
@@ -1144,144 +1528,241 @@ struct EventUsage
 
 DECLARE_REFLECTION_STRUCT(EventUsage);
 
-DOCUMENT("Describes the properties of a drawcall, dispatch, debug marker, or similar event.");
-struct DrawcallDescription
+DOCUMENT("Specifies a subresource within a texture.");
+struct Subresource
 {
   DOCUMENT("");
-  DrawcallDescription() { Reset(); }
-  DrawcallDescription(const DrawcallDescription &) = default;
-
-  DOCUMENT("Resets the drawcall back to a default/empty state.");
-  void Reset()
+  Subresource(uint32_t mip = 0, uint32_t slice = 0, uint32_t sample = 0)
+      : mip(mip), slice(slice), sample(sample)
   {
-    eventId = 0;
-    drawcallId = 0;
-    flags = DrawFlags::NoFlags;
-    markerColor[0] = markerColor[1] = markerColor[2] = markerColor[3] = 0.0f;
-    numIndices = 0;
-    numInstances = 0;
-    indexOffset = 0;
-    baseVertex = 0;
-    vertexOffset = 0;
-    instanceOffset = 0;
-    drawIndex = 0;
-
-    dispatchDimension[0] = dispatchDimension[1] = dispatchDimension[2] = 0;
-    dispatchThreadsDimension[0] = dispatchThreadsDimension[1] = dispatchThreadsDimension[2] = 0;
-    dispatchBase[0] = dispatchBase[1] = dispatchBase[2] = 0;
-
-    indexByteWidth = 0;
-    topology = Topology::Unknown;
-
-    copySource = ResourceId();
-    copyDestination = ResourceId();
-
-    parent = previous = next = NULL;
-
-    for(int i = 0; i < 8; i++)
-      outputs[i] = ResourceId();
-    depthOut = ResourceId();
   }
-  DOCUMENT("");
-  bool operator==(const DrawcallDescription &o) const { return eventId == o.eventId; }
-  bool operator<(const DrawcallDescription &o) const { return eventId < o.eventId; }
-  DOCUMENT("The :data:`eventId <APIEvent.eventId>` that actually produced the drawcall.");
-  uint32_t eventId;
-  DOCUMENT("A 1-based index of this drawcall relative to other drawcalls.");
-  uint32_t drawcallId;
+  Subresource(const Subresource &) = default;
+  Subresource &operator=(const Subresource &) = default;
 
-  DOCUMENT(R"(The name of this drawcall. Typically a summarised/concise list of parameters.
+  bool operator==(const Subresource &o) const
+  {
+    return mip == o.mip && slice == o.slice && sample == o.sample;
+  }
+  bool operator!=(const Subresource &o) const { return !(*this == o); }
+  bool operator<(const Subresource &o) const
+  {
+    if(!(mip == o.mip))
+      return mip < o.mip;
+    if(!(slice == o.slice))
+      return slice < o.slice;
+    if(!(sample == o.sample))
+      return sample < o.sample;
+    return false;
+  }
 
-.. note:: For drawcalls, the convention is to list primary parameters (vertex/index count, instance
-  count) and omit secondary parameters (vertex offset, instance offset).
+  DOCUMENT("The mip level in the texture.");
+  uint32_t mip;
+  DOCUMENT(R"(The slice within the texture. For 3D textures this is a depth slice, for arrays it is
+an array slice.
+
+.. note::
+  Cubemaps are simply 2D array textures with a special meaning, so the faces of a cubemap are the 2D
+  array slices in the standard order: X+, X-, Y+, Y-, Z+, Z-. Cubemap arrays are 2D arrays with
+  ``6 * N`` faces, where each cubemap within the array takes up 6 slices in the above order.
 )");
-  rdcstr name;
+  uint32_t slice;
+  DOCUMENT("The sample in a multisampled texture.");
+  uint32_t sample;
+};
 
-  DOCUMENT("A set of :class:`DrawFlags` properties describing what kind of drawcall this is.");
-  DrawFlags flags;
+DECLARE_REFLECTION_STRUCT(Subresource);
 
-  DOCUMENT("A RGBA color specified by a debug marker call.");
-  float markerColor[4];
+DOCUMENT(R"(Describes the properties of an action.
 
-  DOCUMENT("The number of indices or vertices as appropriate for the drawcall. 0 if not used.");
-  uint32_t numIndices;
+An action is a call such as a draw, a compute dispatch, clears, copies, resolves, etc. Any GPU event
+which may have deliberate visible side-effects to application-visible memory, typically resources
+such as textures and buffers. It also includes markers, which provide a user-generated annotation of
+events and actions.
+)");
+struct ActionDescription
+{
+  DOCUMENT("");
+  ActionDescription() = default;
+  ActionDescription(const ActionDescription &) = default;
+  ActionDescription &operator=(const ActionDescription &) = default;
 
-  DOCUMENT("The number of instances for the drawcall. 0 if not used.");
-  uint32_t numInstances;
+  DOCUMENT(R"(Returns whether or not this action corresponds to a fake marker added by
+:meth:`ReplayController.AddFakeMarkers`.
+
+Such actions may break expectations of event IDs and action IDs, so it is recommended to avoid
+processing them wherever possible.
+
+:return: Returns whether or not this action is a fake marker.
+:rtype: bool
+)");
+  bool IsFakeMarker() const
+  {
+    return events.size() == 1 && events[0].chunkIndex == APIEvent::NoChunk;
+  }
+
+  DOCUMENT(R"(Returns the name for this action, either from its custom name (see :data:`customName`)
+or from the matching chunk in the structured data passed in.
+
+:param SDFile structuredFile: The structured data file for the capture this action is from.
+:return: Returns the best available name for this action.
+:rtype: str
+)");
+  rdcstr GetName(const SDFile &structuredFile) const
+  {
+    if(!customName.empty())
+      return customName;
+
+    // if we have events, the last one is the one for this action. Return the corresponding chunk
+    // name
+    if(events.size() >= 1)
+    {
+      const uint32_t chunkIndex = events.back().chunkIndex;
+
+      if(chunkIndex < structuredFile.chunks.size())
+      {
+        rdcstr ret = structuredFile.chunks[chunkIndex]->name;
+        ret += "()";
+        return ret;
+      }
+    }
+
+    return rdcstr();
+  }
+
+  DOCUMENT("");
+  bool operator==(const ActionDescription &o) const { return eventId == o.eventId; }
+  bool operator<(const ActionDescription &o) const { return eventId < o.eventId; }
+  DOCUMENT("The :data:`eventId <APIEvent.eventId>` that actually produced the action.");
+  uint32_t eventId = 0;
+  DOCUMENT("A 1-based index of this action relative to other actions.");
+  uint32_t actionId = 0;
+
+  DOCUMENT(R"(The custom name of this action.
+
+For markers this will be a user-provided string. In most other cases this will be empty, and the
+name can be generated using structured data. The last listed event in :data:`events` will correspond
+to the event for the overall action, and its chunk will contain a name and any parameters.
+
+Some actions will have a custom name generated for e.g. reading back and directly displaying
+indirect parameters or render pass parameters.
+)");
+  rdcstr customName;
+
+  DOCUMENT("A set of :class:`ActionFlags` properties describing what kind of action this is.");
+  ActionFlags flags = ActionFlags::NoFlags;
+
+  DOCUMENT(R"(A RGBA color specified by a debug marker call.
+
+:type: FloatVector
+)");
+  FloatVector markerColor;
+
+  DOCUMENT("The number of indices or vertices as appropriate for a draw action. 0 if not used.");
+  uint32_t numIndices = 0;
+
+  DOCUMENT("The number of instances for a draw action. 0 if not used.");
+  uint32_t numInstances = 0;
 
   DOCUMENT("For indexed drawcalls, the offset added to each index after fetching.");
-  int32_t baseVertex;
+  int32_t baseVertex = 0;
 
   DOCUMENT("For indexed drawcalls, the first index to fetch from the index buffer.");
-  uint32_t indexOffset;
+  uint32_t indexOffset = 0;
 
   DOCUMENT("For non-indexed drawcalls, the offset applied before looking up each vertex input.");
-  uint32_t vertexOffset;
+  uint32_t vertexOffset = 0;
 
   DOCUMENT(
       "For instanced drawcalls, the offset applied before looking up instanced vertex inputs.");
-  uint32_t instanceOffset;
+  uint32_t instanceOffset = 0;
 
-  DOCUMENT(R"(The index of this draw in an call with multiple draws, e.g. an indirect draw.
+  DOCUMENT(R"(The index of this action in an call with multiple draws, e.g. an indirect action.
 
-0 if not part of a multi-draw.
+0 if not part of a multi-action.
 )");
-  uint32_t drawIndex;
+  uint32_t drawIndex = 0;
 
-  DOCUMENT("The 3D number of workgroups to dispatch in a dispatch call.");
-  uint32_t dispatchDimension[3];
+  DOCUMENT(R"(The 3D number of workgroups to dispatch in a dispatch call.
 
-  DOCUMENT("The 3D size of each workgroup in threads if the call allows an override, or 0 if not.");
-  uint32_t dispatchThreadsDimension[3];
-
-  DOCUMENT("The 3D base offset of the workgroup ID if the call allows an override, or 0 if not.");
-  uint32_t dispatchBase[3];
-
-  DOCUMENT(R"(The width in bytes of each index.
-
-Valid values are 1 (depending on API), 2 or 4, or 0 if the drawcall is not an indexed draw.
+:type: Tuple[int,int,int]
 )");
-  uint32_t indexByteWidth;
+  rdcfixedarray<uint32_t, 3> dispatchDimension = {0, 0, 0};
 
-  DOCUMENT("The :class:`Topology` used in this drawcall.");
-  Topology topology;
+  DOCUMENT(R"(The 3D size of each workgroup in threads if the call allows an override, or 0 if not.
+
+:type: Tuple[int,int,int]
+)");
+  rdcfixedarray<uint32_t, 3> dispatchThreadsDimension = {0, 0, 0};
+
+  DOCUMENT(R"(The 3D base offset of the workgroup ID if the call allows an override, or 0 if not.
+
+:type: Tuple[int,int,int]
+)");
+  rdcfixedarray<uint32_t, 3> dispatchBase = {0, 0, 0};
 
   DOCUMENT(R"(The :class:`ResourceId` identifying the source object in a copy, resolve or blit
 operation.
 )");
   ResourceId copySource;
+
+  DOCUMENT(R"(Which part of :data:`copySource` is used.
+
+:type: Subresource
+)");
+  Subresource copySourceSubresource;
+
   DOCUMENT(R"(The :class:`ResourceId` identifying the destination object in a copy, resolve or blit
 operation.
 )");
   ResourceId copyDestination;
 
-  DOCUMENT(R"(The parent of this drawcall, or ``None`` if there is no parent for this drawcall.
-)");
-  const DrawcallDescription *parent;
+  DOCUMENT(R"(Which part of :data:`copyDestination` is used.
 
-  DOCUMENT(R"(The previous drawcall in the frame, or ``None`` if this is the first drawcall in the
+:type: Subresource
+)");
+  Subresource copyDestinationSubresource;
+
+  DOCUMENT(R"(The parent of this action, or ``None`` if there is no parent for this action.
+
+:type: ActionDescription
+)");
+  const ActionDescription *parent = NULL;
+
+  DOCUMENT(R"(The previous action in the frame, or ``None`` if this is the first action in the
 frame.
-)");
-  const DrawcallDescription *previous;
-  DOCUMENT(
-      "The next drawcall in the frame, or ``None`` if this is the last drawcall in the frame.");
-  const DrawcallDescription *next;
 
-  DOCUMENT(R"(A simple list of the :class:`ResourceId` ids for the color outputs, which can be used
-for very coarse bucketing of drawcalls into similar passes by their outputs.
+:type: ActionDescription
 )");
-  ResourceId outputs[8];
+  const ActionDescription *previous = NULL;
+  DOCUMENT(R"(The next action in the frame, or ``None`` if this is the last action in the frame.
+
+:type: ActionDescription
+)");
+  const ActionDescription *next = NULL;
+
+  DOCUMENT(R"(An 8-tuple of the :class:`ResourceId` ids for the color outputs, which can be used
+for very coarse bucketing of actions into similar passes by their outputs.
+
+:type: Tuple[ResourceId,...]
+)");
+  rdcfixedarray<ResourceId, 8> outputs;
   DOCUMENT("The resource used for depth output - see :data:`outputs`.");
   ResourceId depthOut;
 
-  DOCUMENT("A list of the :class:`APIEvent` events that happened since the previous drawcall.");
+  DOCUMENT(R"(The events that happened since the previous action.
+
+:type: List[APIEvent]
+)");
   rdcarray<APIEvent> events;
 
-  DOCUMENT("A list of :class:`DrawcallDescription` child drawcalls.");
-  rdcarray<DrawcallDescription> children;
+  DOCUMENT(R"(The child actions below this one, if it's a marker region or multi-action.
+
+:type: List[ActionDescription]
+)");
+  rdcarray<ActionDescription> children;
 };
 
-DECLARE_REFLECTION_STRUCT(DrawcallDescription);
+DECLARE_REFLECTION_STRUCT(ActionDescription);
 
 DOCUMENT("Gives some API-specific information about the capture.");
 struct APIProperties
@@ -1289,6 +1770,7 @@ struct APIProperties
   DOCUMENT("");
   APIProperties() = default;
   APIProperties(const APIProperties &) = default;
+  APIProperties &operator=(const APIProperties &) = default;
 
   DOCUMENT("The :class:`GraphicsAPI` of the actual log/capture.");
   GraphicsAPI pipelineType = GraphicsAPI::D3D11;
@@ -1301,6 +1783,10 @@ different to the above, and lets the UI make decisions e.g. to flip rendering of
   DOCUMENT("The :class:`GPUVendor` of the active GPU being used.");
   GPUVendor vendor = GPUVendor::Unknown;
 
+  DOCUMENT(R"(``True`` if the capture is being replayed over a remote connection.
+)");
+  bool remoteReplay = false;
+
   DOCUMENT(R"(``True`` if the capture was loaded successfully but running in a degraded mode - e.g.
 with software rendering, or with some functionality disabled due to lack of support.
 )");
@@ -1312,6 +1798,12 @@ worked around by re-sorting bindings.
 )");
   bool shadersMutable = false;
 
+  DOCUMENT("(``True`` if the API supports shader debugging.");
+  bool shaderDebugging = false;
+
+  DOCUMENT("(``True`` if the API supports viewing pixel history.");
+  bool pixelHistory = false;
+
   DOCUMENT("``True`` if the driver and system are configured to allow creating RGP captures.");
   bool rgpCapture = false;
 
@@ -1322,6 +1814,7 @@ worked around by re-sorting bindings.
   bool SparseResources = false;
   bool MultiGPU = false;
   bool D3D12Bundle = false;
+  bool DXILShaders = false;
 #endif
 };
 
@@ -1330,6 +1823,11 @@ DECLARE_REFLECTION_STRUCT(APIProperties);
 DOCUMENT("Gives information about the driver for this API.");
 struct DriverInformation
 {
+  DOCUMENT("");
+  DriverInformation() = default;
+  DriverInformation(const DriverInformation &) = default;
+  DriverInformation &operator=(const DriverInformation &) = default;
+
   DOCUMENT("The :class:`GPUVendor` that provides this driver");
   GPUVendor vendor;
 
@@ -1353,17 +1851,17 @@ struct Uuid
 
   Uuid() { words[0] = words[1] = words[2] = words[3] = 0; }
   Uuid(const Uuid &) = default;
+  Uuid &operator=(const Uuid &) = default;
 
   DOCUMENT("Compares two ``Uuid`` objects for less-than.");
-  bool operator<(const Uuid &rhs) const
-  {
-    return std::lexicographical_compare(words, words + 4, rhs.words, rhs.words + 4);
-  }
-
+  bool operator<(const Uuid &rhs) const { return words < rhs.words; }
   DOCUMENT("Compares two ``Uuid`` objects for equality.");
-  bool operator==(const Uuid &rhs) const { return ::memcmp(words, rhs.words, sizeof(words)) == 0; }
-  DOCUMENT("The Uuid bytes as an array of four 32-bit integers.")
-  uint32_t words[4];
+  bool operator==(const Uuid &rhs) const { return words == rhs.words; }
+  DOCUMENT(R"(The Uuid bytes as a tuple of four 32-bit integers.
+
+:type: Tuple[int,int,int,int]
+)")
+  rdcfixedarray<uint32_t, 4> words;
 };
 
 DECLARE_REFLECTION_STRUCT(Uuid);
@@ -1374,6 +1872,7 @@ struct CounterDescription
   DOCUMENT("");
   CounterDescription() = default;
   CounterDescription(const CounterDescription &) = default;
+  CounterDescription &operator=(const CounterDescription &) = default;
 
   DOCUMENT(R"(The :class:`GPUCounter` this counter represents.
 
@@ -1406,7 +1905,10 @@ struct CounterDescription
   DOCUMENT("The :class:`CounterUnit` for the result value.");
   CounterUnit unit;
 
-  DOCUMENT("The :class:`Uuid` of this counter, which uniquely identifies it.");
+  DOCUMENT(R"(The unique identifier for this counter that will not change across drivers or replays.
+
+:type: Uuid
+)");
   Uuid uuid;
 };
 
@@ -1465,6 +1967,7 @@ struct CounterResult
     value.u64 = data;
   }
 #endif
+  CounterResult &operator=(const CounterResult &) = default;
 
   DOCUMENT("Compares two ``CounterResult`` objects for less-than.");
   bool operator<(const CounterResult &o) const
@@ -1501,7 +2004,10 @@ struct CounterResult
   GPUCounter counter;
 #endif
 
-  DOCUMENT("The value itself.");
+  DOCUMENT(R"(The value itself.
+
+:type: CounterValue
+)");
   CounterValue value;
 };
 
@@ -1510,12 +2016,21 @@ DECLARE_REFLECTION_STRUCT(CounterResult);
 DOCUMENT("The contents of an RGBA pixel.");
 union PixelValue
 {
-  DOCUMENT("The RGBA value interpreted as ``float``.");
-  float floatValue[4];
-  DOCUMENT("The RGBA value interpreted as 32-bit unsigned integer.");
-  uint32_t uintValue[4];
-  DOCUMENT("The RGBA value interpreted as 32-bit signed integer.");
-  int32_t intValue[4];
+  DOCUMENT(R"(The RGBA value interpreted as ``float``.
+
+:type: Tuple[float, float, float, float]
+)");
+  rdcfixedarray<float, 4> floatValue;
+  DOCUMENT(R"(The RGBA value interpreted as 32-bit unsigned integer.
+
+:type: Tuple[int, int, int, int]
+)");
+  rdcfixedarray<uint32_t, 4> uintValue;
+  DOCUMENT(R"(The RGBA value interpreted as 32-bit signed integer.
+
+:type: Tuple[int, int, int, int]
+)");
+  rdcfixedarray<int32_t, 4> intValue;
 };
 
 DECLARE_REFLECTION_STRUCT(PixelValue);
@@ -1526,6 +2041,7 @@ struct ModificationValue
   DOCUMENT("");
   ModificationValue() = default;
   ModificationValue(const ModificationValue &) = default;
+  ModificationValue &operator=(const ModificationValue &) = default;
 
   bool operator==(const ModificationValue &o) const
   {
@@ -1541,7 +2057,10 @@ struct ModificationValue
       return stencil < o.stencil;
     return false;
   }
-  DOCUMENT("The color value.");
+  DOCUMENT(R"(The color value.
+
+:type: PixelValue
+)");
   PixelValue col;
 
   DOCUMENT("The depth output, as a ``float``.");
@@ -1549,6 +2068,18 @@ struct ModificationValue
 
   DOCUMENT("The stencil output, or ``-1`` if not available.");
   int32_t stencil;
+
+  DOCUMENT(R"(
+:return: Returns whether or not this modification value is valid.
+:rtype: bool
+)");
+  bool IsValid() const { return col.uintValue[0] != 0xdeadbeef || col.uintValue[1] != 0xdeadf00d; }
+  DOCUMENT("Sets this modification value to be invalid.");
+  void SetInvalid()
+  {
+    col.uintValue[0] = 0xdeadbeef;
+    col.uintValue[1] = 0xdeadf00d;
+  }
 };
 
 DECLARE_REFLECTION_STRUCT(ModificationValue);
@@ -1559,6 +2090,7 @@ struct PixelModification
   DOCUMENT("");
   PixelModification() = default;
   PixelModification(const PixelModification &) = default;
+  PixelModification &operator=(const PixelModification &) = default;
 
   bool operator==(const PixelModification &o) const
   {
@@ -1566,9 +2098,10 @@ struct PixelModification
            unboundPS == o.unboundPS && fragIndex == o.fragIndex && primitiveID == o.primitiveID &&
            preMod == o.preMod && shaderOut == o.shaderOut && postMod == o.postMod &&
            sampleMasked == o.sampleMasked && backfaceCulled == o.backfaceCulled &&
-           depthClipped == o.depthClipped && viewClipped == o.viewClipped &&
-           scissorClipped == o.scissorClipped && shaderDiscarded == o.shaderDiscarded &&
-           depthTestFailed == o.depthTestFailed && stencilTestFailed == o.stencilTestFailed;
+           depthClipped == o.depthClipped && depthBoundsFailed == o.depthBoundsFailed &&
+           viewClipped == o.viewClipped && scissorClipped == o.scissorClipped &&
+           shaderDiscarded == o.shaderDiscarded && depthTestFailed == o.depthTestFailed &&
+           stencilTestFailed == o.stencilTestFailed;
   }
   bool operator<(const PixelModification &o) const
   {
@@ -1594,6 +2127,8 @@ struct PixelModification
       return backfaceCulled < o.backfaceCulled;
     if(!(depthClipped == o.depthClipped))
       return depthClipped < o.depthClipped;
+    if(!(depthBoundsFailed == o.depthBoundsFailed))
+      return depthBoundsFailed < o.depthBoundsFailed;
     if(!(viewClipped == o.viewClipped))
       return viewClipped < o.viewClipped;
     if(!(scissorClipped == o.scissorClipped))
@@ -1616,22 +2151,30 @@ struct PixelModification
   bool unboundPS;
 
   DOCUMENT(R"(A 0-based index of which fragment this modification corresponds to, in the case that
-multiple fragments from a single draw wrote to a pixel.
+multiple fragments from a single action wrote to a pixel.
 )");
   uint32_t fragIndex;
 
   DOCUMENT("The primitive that generated this fragment.");
   uint32_t primitiveID;
 
-  DOCUMENT(R"(The :class:`ModificationValue` of the texture before this fragment ran.
+  DOCUMENT(R"(The value of the texture before this fragment ran.
 
 This is valid only for the first fragment if multiple fragments in the same event write to the same
 pixel.
+
+:type: ModificationValue
 )");
   ModificationValue preMod;
-  DOCUMENT("The :class:`ModificationValue` that this fragment wrote from the pixel shader.");
+  DOCUMENT(R"(The value that this fragment wrote from the pixel shader.
+
+:type: ModificationValue
+)");
   ModificationValue shaderOut;
-  DOCUMENT(R"(The :class:`ModificationValue` of the texture after this fragment ran.)");
+  DOCUMENT(R"(The value of the texture after this fragment ran.
+
+:type: ModificationValue
+)");
   ModificationValue postMod;
 
   DOCUMENT("``True`` if the sample mask eliminated this fragment.");
@@ -1640,6 +2183,8 @@ pixel.
   bool backfaceCulled;
   DOCUMENT("``True`` if depth near/far clipping eliminated this fragment.");
   bool depthClipped;
+  DOCUMENT("``True`` if depth bounds clipping eliminated this fragment.");
+  bool depthBoundsFailed;
   DOCUMENT("``True`` if viewport clipping eliminated this fragment.");
   bool viewClipped;
   DOCUMENT("``True`` if scissor clipping eliminated this fragment.");
@@ -1656,12 +2201,13 @@ pixel.
   DOCUMENT(R"(Determine if this fragment passed all tests and wrote to the texture.
 
 :return: ``True`` if it passed all tests, ``False`` if it failed any.
-:rtype: ``bool``
+:rtype: bool
 )");
   bool Passed() const
   {
-    return !sampleMasked && !backfaceCulled && !depthClipped && !viewClipped && !scissorClipped &&
-           !shaderDiscarded && !depthTestFailed && !stencilTestFailed && !predicationSkipped;
+    return !sampleMasked && !backfaceCulled && !depthClipped && !depthBoundsFailed &&
+           !viewClipped && !scissorClipped && !shaderDiscarded && !depthTestFailed &&
+           !stencilTestFailed && !predicationSkipped;
   }
 };
 
@@ -1673,6 +2219,7 @@ struct Thumbnail
   DOCUMENT("");
   Thumbnail() = default;
   Thumbnail(const Thumbnail &) = default;
+  Thumbnail &operator=(const Thumbnail &) = default;
 
   DOCUMENT("The :class:`FileType` of the data in the thumbnail.");
   FileType type = FileType::Raw;

@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2017-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -29,8 +29,9 @@
 // macros around newly added classes/members.
 // For enums, verify that all constants are documented in the parent docstring
 // Generally we ensure naming is roughly OK:
-// * types, member functions, and enum values must match the regexp /[A-Z][a-zA-Z0-9]+/
+// * types, member functions must match the regexp /[A-Z][a-zA-Z0-9]+/
 //   ie. we don't use underscore_seperated_words or mixedCase / camelCase.
+// * Enum values are similar that they must start with a capital, but we allow underscores.
 // * data members should be mixedCase / camelCase. So matching /[a-z][a-zA-Z0-9]+/
 // This isn't quite python standards but it fits best with the C++ code and the important
 // thing is that it's self-consistent.
@@ -43,42 +44,40 @@ enum class NameType
   Member,
 };
 
-inline bool checkname(const char *baseType, std::string name, NameType nameType)
+inline bool checkname(rdcstr &log, const char *baseType, rdcstr name, NameType nameType)
 {
   // skip __ prefixed names
-  if(name.length() > 2 && name[0] == '_' && name[1] == '_')
+  if(name.beginsWith("__"))
     return false;
 
   // skip any rdctype based types that are converted into equivalent python types
-  if((baseType && strstr(baseType, "rdcarray")) || name.find("rdcarray") != std::string::npos)
+  if((baseType && strstr(baseType, "rdcarray")) || name.contains("rdcarray"))
     return false;
-  if((baseType && strstr(baseType, "bytebuf")) || name.find("bytebuf") != std::string::npos)
+  if((baseType && strstr(baseType, "bytebuf")) || name.contains("bytebuf"))
     return false;
-  if((baseType && strstr(baseType, "rdcstr")) || name.find("rdcstr") != std::string::npos)
+  if((baseType && strstr(baseType, "rdcstr")) || name.contains("rdcstr"))
     return false;
   if((baseType && strstr(baseType, "StructuredBufferList")) ||
-     name.find("StructuredBufferList") != std::string::npos)
+     name.contains("StructuredBufferList"))
     return false;
-  if((baseType && strstr(baseType, "StructuredChunkList")) ||
-     name.find("StructuredChunkList") != std::string::npos)
+  if((baseType && strstr(baseType, "StructuredChunkList")) || name.contains("StructuredChunkList"))
     return false;
   if((baseType && strstr(baseType, "StructuredObjectList")) ||
-     name.find("StructuredObjectList") != std::string::npos)
+     name.contains("StructuredObjectList"))
     return false;
 
   // allow the config to have different names
-  if((baseType && strstr(baseType, "PersistantConfig")) ||
-     name.find("PersistantConfig") != std::string::npos)
+  if((baseType && strstr(baseType, "PersistantConfig")) || name.contains("PersistantConfig"))
     return false;
 
   // skip swig internal type
-  if((baseType && strstr(baseType, "SwigPyObject")) || name.find("SwigPyObject") != std::string::npos)
+  if((baseType && strstr(baseType, "SwigPyObject")) || name.contains("SwigPyObject"))
     return false;
 
   // remove the module prefix, if this is a type name we're checking
-  if(!strncmp(name.c_str(), "renderdoc.", 10))
+  if(name.beginsWith("renderdoc."))
     name.erase(0, 10);
-  if(!strncmp(name.c_str(), "qrenderdoc.", 11))
+  if(name.beginsWith("qrenderdoc."))
     name.erase(0, 11);
 
   // skip a few well-known members
@@ -94,7 +93,7 @@ inline bool checkname(const char *baseType, std::string name, NameType nameType)
   else
     badfirstChar = name[0] < 'A' || name[0] > 'Z';
 
-  if(badfirstChar || name.find('_') != std::string::npos)
+  if(badfirstChar || (nameType != NameType::EnumValue && name.contains('_')))
   {
     const char *nameTypeStr = "";
 
@@ -108,9 +107,9 @@ inline bool checkname(const char *baseType, std::string name, NameType nameType)
 
     snprintf(convert_error, sizeof(convert_error) - 1,
              "Name of %s '%s.%s' does not match naming scheme.\n"
-             "Should start with %s letter and not contain underscores",
+             "Should start with %s letter and not contain underscores\n",
              nameTypeStr, baseType, name.c_str(), member ? "lowercase" : "uppercase");
-    RENDERDOC_LogMessage(LogType::Error, "QTRD", __FILE__, __LINE__, convert_error);
+    log += convert_error;
 
     return true;
   }
@@ -118,7 +117,7 @@ inline bool checkname(const char *baseType, std::string name, NameType nameType)
   return false;
 }
 
-inline bool check_interface(swig_type_info **swig_types, size_t numTypes)
+inline bool check_interface(rdcstr &log, swig_type_info **swig_types, size_t numTypes)
 {
   // track all errors and fatal error at the end, so we see all of the problems at once instead of
   // requiring rebuilds over and over.
@@ -126,7 +125,7 @@ inline bool check_interface(swig_type_info **swig_types, size_t numTypes)
   // the end of the world.
   bool errors_found = false;
 
-  std::set<std::string> docstrings;
+  std::set<rdcstr> struct_docstrings;
   for(size_t i = 0; i < numTypes; i++)
   {
     SwigPyClientData *typeinfo = (SwigPyClientData *)swig_types[i]->clientdata;
@@ -137,22 +136,26 @@ inline bool check_interface(swig_type_info **swig_types, size_t numTypes)
 
     PyTypeObject *typeobj = typeinfo->pytype;
 
-    std::string typedoc = typeobj->tp_doc;
+    rdcstr typedoc = typeobj->tp_doc;
 
-    auto result = docstrings.insert(typedoc);
+    auto result = struct_docstrings.insert(typedoc);
 
     if(!result.second)
     {
       snprintf(convert_error, sizeof(convert_error) - 1,
-               "Duplicate docstring '%s' found on struct '%s' - are you missing a DOCUMENT()?",
+               "Duplicate docstring '%s' found on struct '%s' - are you missing a DOCUMENT()?\n",
                typedoc.c_str(), typeobj->tp_name);
-      RENDERDOC_LogMessage(LogType::Error, "QTRD", __FILE__, __LINE__, convert_error);
+      log += convert_error;
       errors_found = true;
     }
 
-    errors_found |= checkname("renderdoc", typeobj->tp_name, NameType::Type);
+    rdcstr typeName = typeobj->tp_name;
+    errors_found |= checkname(log, "renderdoc", typeName, NameType::Type);
 
     PyObject *dict = typeobj->tp_dict;
+
+    if(!dict && typeobj->tp_base)
+      dict = typeobj->tp_base->tp_dict;
 
     // check the object's dict to see if this is an enum (or struct with constants).
     // We require ALL constants be documented in a docstring with data:: directives
@@ -162,7 +165,7 @@ inline bool check_interface(swig_type_info **swig_types, size_t numTypes)
 
       if(keys)
       {
-        std::set<std::string> constants;
+        std::set<rdcstr> constants;
 
         Py_ssize_t len = PyList_Size(keys);
         for(Py_ssize_t i = 0; i < len; i++)
@@ -181,13 +184,19 @@ inline bool check_interface(swig_type_info **swig_types, size_t numTypes)
             if(str == NULL || len == 0)
             {
               snprintf(convert_error, sizeof(convert_error) - 1,
-                       "Couldn't get member name for %i'th member of '%s'", (int)i, typeobj->tp_name);
-              RENDERDOC_LogMessage(LogType::Error, "QTRD", __FILE__, __LINE__, convert_error);
+                       "Couldn't get member name for %i'th member of '%s'\n", (int)i,
+                       typeobj->tp_name);
+              log += convert_error;
               errors_found = true;
+            }
+            else if(str[0] == '_')
+            {
+              // ignore leading underscores. We assume that we don't do this ourselves so this lets
+              // us skip any internals we might get from looking at an Enum or IntFlag dict
             }
             else
             {
-              std::string name(str, str + len);
+              rdcstr name(str, len);
 
               NameType nameType = NameType::Member;
 
@@ -200,7 +209,21 @@ inline bool check_interface(swig_type_info **swig_types, size_t numTypes)
 
               // if it's a callable it's a method, ignore it
               if(!PyCallable_Check(value) && !PyType_IsSubtype(value->ob_type, &PyStaticMethod_Type))
-                errors_found |= checkname(typeobj->tp_name, name, nameType);
+              {
+                // some hardcoded exclusions that we allow to break the naming scheme
+                if(typeName == "KnownShaderTool")
+                {
+                  // these tools refer to executables so it would be strange to capitalise them.
+                }
+                else if(typeName == "GPUVendor" && name == "nVidia")
+                {
+                  // nVidia's capitalisation is more consistent this way than Nvidia
+                }
+                else
+                {
+                  errors_found |= checkname(log, typeobj->tp_name, name, nameType);
+                }
+              }
             }
 
             Py_DecRef(bytes);
@@ -211,29 +234,27 @@ inline bool check_interface(swig_type_info **swig_types, size_t numTypes)
 
         if(!constants.empty())
         {
-          std::set<std::string> documented;
-
-          const char *docstring = typedoc.data();
+          std::set<rdcstr> documented;
 
           const char identifier[] = ".. data::";
 
-          const char *datadoc = strstr(docstring, identifier);
+          int32_t offs = typedoc.find(identifier);
 
-          while(datadoc)
+          while(offs >= 0)
           {
-            datadoc += sizeof(identifier) - 1;
+            offs += sizeof(identifier) - 1;
 
-            while(isspace(*datadoc))
-              datadoc++;
+            while(isspace(typedoc[offs]))
+              offs++;
 
-            const char *eol = strchr(datadoc, '\n');
+            int32_t eol = typedoc.indexOf('\n', offs);
 
-            if(!eol)
+            if(eol < 0)
               break;
 
-            documented.insert(std::string(datadoc, eol));
+            documented.insert(typedoc.substr(offs, eol - offs));
 
-            datadoc = strstr(datadoc, identifier);
+            offs = typedoc.find(identifier, offs);
           }
 
           for(auto it = constants.begin(); it != constants.end(); ++it)
@@ -245,9 +266,9 @@ inline bool check_interface(swig_type_info **swig_types, size_t numTypes)
             if(documented.find(*it) == documented.end())
             {
               snprintf(convert_error, sizeof(convert_error) - 1,
-                       "'%s::%s' is not documented in class docstring", typeobj->tp_name,
+                       "'%s::%s' is not documented in class docstring\n", typeobj->tp_name,
                        it->c_str());
-              RENDERDOC_LogMessage(LogType::Error, "QTRD", __FILE__, __LINE__, convert_error);
+              log += convert_error;
               errors_found = true;
             }
           }
@@ -257,39 +278,60 @@ inline bool check_interface(swig_type_info **swig_types, size_t numTypes)
 
     PyMethodDef *method = typeobj->tp_methods;
 
+    std::set<rdcstr> method_docstrings;
     while(method->ml_doc)
     {
-      std::string method_doc = method->ml_doc;
+      rdcstr method_doc = method->ml_doc;
 
-      errors_found |= checkname(typeobj->tp_name, method->ml_name, NameType::Method);
+      errors_found |= checkname(log, typeobj->tp_name, method->ml_name, NameType::Method);
 
-      size_t i = 0;
+      int32_t i = 0;
       while(method_doc[i] == '\n')
         i++;
 
       // skip the first line as it's autodoc generated
       i = method_doc.find('\n', i);
-      if(i != std::string::npos)
+      if(i >= 0)
       {
         while(method_doc[i] == '\n')
           i++;
 
         method_doc.erase(0, i);
 
-        result = docstrings.insert(method_doc);
+        result = method_docstrings.insert(method_doc);
 
         if(!result.second)
         {
           snprintf(
               convert_error, sizeof(convert_error) - 1,
-              "Duplicate docstring '%s' found on method '%s.%s' - are you missing a DOCUMENT()?",
+              "Duplicate docstring '%s' found on method '%s.%s' - are you missing a DOCUMENT()?\n",
               method_doc.c_str(), typeobj->tp_name, method->ml_name);
-          RENDERDOC_LogMessage(LogType::Error, "QTRD", __FILE__, __LINE__, convert_error);
+          log += convert_error;
           errors_found = true;
         }
       }
 
       method++;
+    }
+
+    PyGetSetDef *getset = typeobj->tp_getset;
+    while(getset && getset->doc)
+    {
+      rdcstr getset_doc = getset->doc;
+
+      result = method_docstrings.insert(getset_doc);
+
+      if(!result.second)
+      {
+        snprintf(
+            convert_error, sizeof(convert_error) - 1,
+            "Duplicate docstring '%s' found on getset '%s.%s' - are you missing a DOCUMENT()?\n",
+            getset_doc.c_str(), typeobj->tp_name, getset->name);
+        log += convert_error;
+        errors_found = true;
+      }
+
+      getset++;
     }
   }
 

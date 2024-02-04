@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2016-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -53,6 +53,9 @@ public:
   void OnCaptureClosed() override;
   void OnSelectedEventChanged(uint32_t eventId) override {}
   void OnEventChanged(uint32_t eventId) override;
+
+  void SelectPipelineStage(PipelineStage stage);
+  ResourceId GetResource(RDTreeWidgetItem *item);
 
 private slots:
   // automatic slots
@@ -106,7 +109,8 @@ private:
   bool showNode(bool usedSlot, bool filledSlot);
 
   void setViewDetails(RDTreeWidgetItem *node, TextureDescription *tex, uint32_t firstMip,
-                      uint32_t numMips);
+                      uint32_t numMips, uint32_t firstSlice, uint32_t numSlices,
+                      const GLPipe::Texture *texBinding = NULL);
 
   void exportHTML(QXmlStreamWriter &xml, const GLPipe::VertexInput &vtx);
   void exportHTML(QXmlStreamWriter &xml, const GLPipe::Shader &sh);

@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2018-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -26,7 +26,10 @@
 #include "common/common.h"
 #include "core/core.h"
 #include "core/plugins.h"
+#include "core/settings.h"
 #include "official/RGP/DevDriverAPI.h"
+
+RDOC_CONFIG(bool, AMD_RGP_Enable, false, "Enable integration with AMD's RGP tool.");
 
 uint64_t MakeTagFromMarker(const char *marker)
 {
@@ -35,7 +38,7 @@ uint64_t MakeTagFromMarker(const char *marker)
 
   uint64_t ret = 0;
 
-  for(int i = 0; i < 7 && marker && marker[i]; i++)
+  for(int i = 0; i < 7 && marker[i]; i++)
     ret |= uint64_t(marker[i]) << (i * 8);
 
   return ret;
@@ -68,9 +71,7 @@ AMDRGPControl::AMDRGPControl()
   m_RGPDispatchTable->minorVersion = DEV_DRIVER_API_MINOR_VERSION;
   m_RGPContext = NULL;
 
-  const bool enabled = RenderDoc::Inst().GetConfigSetting("ExternalTool_RGPIntegration") == "1";
-
-  if(!enabled)
+  if(!AMD_RGP_Enable())
   {
     RDCLOG("AMD RGP Interop is not enabled");
     return;
@@ -81,7 +82,7 @@ AMDRGPControl::AMDRGPControl()
   RDCLOG("Attempting to enable AMD RGP Interop");
 
   // manually load in the DevDriverAPI dll and set up the function table
-  std::string dllName("DevDriverAPI");
+  rdcstr dllName("DevDriverAPI");
 
 #if ENABLED(RDOC_WIN32)
 #if ENABLED(RDOC_X64)
@@ -94,12 +95,12 @@ AMDRGPControl::AMDRGPControl()
 #endif
 
   // first try in the plugin location it will be in distributed builds
-  std::string dllPath = LocatePluginFile("amd/rgp", dllName.c_str());
+  rdcstr dllPath = LocatePluginFile("amd/rgp", dllName);
 
-  void *module = Process::LoadModule(dllPath.c_str());
+  void *module = Process::LoadModule(dllPath);
   if(module == NULL)
   {
-    module = Process::LoadModule(dllName.c_str());
+    module = Process::LoadModule(dllName);
   }
 
   if(module == NULL)
@@ -167,7 +168,7 @@ bool AMDRGPControl::Initialised()
   return m_RGPContext != NULL;
 }
 
-bool AMDRGPControl::TriggerCapture(const std::string &path)
+bool AMDRGPControl::TriggerCapture(const rdcstr &path)
 {
   if(m_RGPContext == NULL)
     return false;
@@ -228,12 +229,12 @@ bool AMDRGPControl::DriverSupportsInterop()
 
 #undef None
 
-#include "3rdparty/catch/catch.hpp"
+#include "catch/catch.hpp"
 
 TEST_CASE("Check that markers are distinct for begin and end", "[amd]")
 {
-  std::string beginMark = AMDRGPControl::GetBeginMarker();
-  std::string endMark = AMDRGPControl::GetEndMarker();
+  rdcstr beginMark = AMDRGPControl::GetBeginMarker();
+  rdcstr endMark = AMDRGPControl::GetEndMarker();
 
   CHECK(beginMark != endMark);
   CHECK(beginMark != "");

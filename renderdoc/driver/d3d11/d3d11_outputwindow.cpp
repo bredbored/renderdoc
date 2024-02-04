@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2018-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -25,6 +25,7 @@
 #include "d3d11_context.h"
 #include "d3d11_debug.h"
 #include "d3d11_device.h"
+#include "d3d11_replay.h"
 
 void D3D11Replay::OutputWindow::MakeRTV()
 {
@@ -35,6 +36,10 @@ void D3D11Replay::OutputWindow::MakeRTV()
   if(swap)
   {
     hr = swap->GetBuffer(0, __uuidof(ID3D11Texture2D), (void **)&texture);
+
+    SetDebugName(texture, "Output window backbuffer 0");
+
+    dev->CheckHRESULT(hr);
 
     if(FAILED(hr))
     {
@@ -52,7 +57,7 @@ void D3D11Replay::OutputWindow::MakeRTV()
     texDesc.CPUAccessFlags = 0;
     texDesc.MipLevels = 1;
     texDesc.MiscFlags = 0;
-    texDesc.SampleDesc.Count = 1;
+    texDesc.SampleDesc.Count = multisampled ? 4 : 1;
     texDesc.SampleDesc.Quality = 0;
     texDesc.Usage = D3D11_USAGE_DEFAULT;
     texDesc.Width = width;
@@ -60,9 +65,13 @@ void D3D11Replay::OutputWindow::MakeRTV()
     texDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
 
     hr = dev->CreateTexture2D(&texDesc, NULL, &texture);
+
+    SetDebugName(texture, "Output window fake backbuffer 0");
   }
 
   hr = dev->CreateRenderTargetView(texture, NULL, &rtv);
+
+  dev->CheckHRESULT(hr);
 
   SAFE_RELEASE(texture);
 
@@ -102,6 +111,10 @@ void D3D11Replay::OutputWindow::MakeDSV()
 
   HRESULT hr = dev->CreateTexture2D(&texDesc, NULL, &texture);
 
+  SetDebugName(texture, "Output window depth");
+
+  dev->CheckHRESULT(hr);
+
   if(FAILED(hr))
   {
     RDCERR("Failed to create DSV texture for main output, HRESULT: %s", ToStr(hr).c_str());
@@ -111,6 +124,8 @@ void D3D11Replay::OutputWindow::MakeDSV()
   }
 
   hr = dev->CreateDepthStencilView(texture, NULL, &dsv);
+
+  dev->CheckHRESULT(hr);
 
   SAFE_RELEASE(texture);
 
@@ -131,6 +146,7 @@ uint64_t D3D11Replay::MakeOutputWindow(WindowingData window, bool depth)
   DXGI_SWAP_CHAIN_DESC swapDesc = {};
   OutputWindow outw = {};
   outw.dev = m_pDevice;
+  outw.multisampled = depth;
 
   if(window.system == WindowingSystem::Win32)
   {
@@ -154,6 +170,8 @@ uint64_t D3D11Replay::MakeOutputWindow(WindowingData window, bool depth)
     HRESULT hr = S_OK;
 
     hr = m_pFactory->CreateSwapChain(m_pDevice, &swapDesc, &outw.swap);
+
+    m_pDevice->CheckHRESULT(hr);
 
     if(FAILED(hr))
     {
@@ -231,6 +249,8 @@ bool D3D11Replay::CheckResizeOutputWindow(uint64_t id)
       HRESULT hr = outw.swap->ResizeBuffers(desc.BufferCount, outw.width, outw.height,
                                             desc.BufferDesc.Format, desc.Flags);
 
+      m_pDevice->CheckHRESULT(hr);
+
       if(FAILED(hr))
       {
         RDCERR("Failed to resize swap chain, HRESULT: %s", ToStr(hr).c_str());
@@ -287,6 +307,8 @@ void D3D11Replay::GetOutputWindowData(uint64_t id, bytebuf &retData)
   if(!outw.rtv)
     return;
 
+  D3D11MarkerRegion renderoverlay("GetOutputWindowData");
+
   ID3D11Texture2D *texture = NULL;
   {
     ID3D11Resource *res = NULL;
@@ -300,6 +322,8 @@ void D3D11Replay::GetOutputWindowData(uint64_t id, bytebuf &retData)
     return;
   }
 
+  texture->Release();
+
   ID3D11Texture2D *readback = NULL;
 
   D3D11_TEXTURE2D_DESC texDesc;
@@ -308,26 +332,67 @@ void D3D11Replay::GetOutputWindowData(uint64_t id, bytebuf &retData)
   texDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
   texDesc.BindFlags = 0;
   texDesc.Usage = D3D11_USAGE_STAGING;
+  texDesc.SampleDesc.Count = 1;
 
   HRESULT hr = m_pDevice->CreateTexture2D(&texDesc, NULL, &readback);
+
+  SetDebugName(readback, "Output window readback");
+
+  m_pDevice->CheckHRESULT(hr);
 
   if(FAILED(hr))
   {
     RDCERR("Couldn't create staging texture for readback, HRESULT: %s", ToStr(hr).c_str());
-    SAFE_RELEASE(texture);
+    SAFE_RELEASE(readback);
     return;
+  }
+
+  ID3D11Texture2D *resolve = NULL;
+
+  if(outw.multisampled)
+  {
+    texDesc.CPUAccessFlags = 0;
+    texDesc.Usage = D3D11_USAGE_DEFAULT;
+
+    hr = m_pDevice->CreateTexture2D(&texDesc, NULL, &resolve);
+
+    SetDebugName(resolve, "Output window resolve");
+
+    m_pDevice->CheckHRESULT(hr);
+
+    if(FAILED(hr))
+    {
+      RDCERR("Couldn't create staging texture for readback, HRESULT: %s", ToStr(hr).c_str());
+      SAFE_RELEASE(readback);
+      SAFE_RELEASE(resolve);
+      return;
+    }
   }
 
   ID3D11DeviceContext *ctx = m_pDevice->GetImmediateContext();
 
-  ctx->CopyResource(readback, texture);
-
-  SAFE_RELEASE(texture);
+  if(outw.multisampled)
+  {
+    ctx->ResolveSubresource(resolve, 0, texture, 0, texDesc.Format);
+    ctx->CopyResource(readback, resolve);
+    SAFE_RELEASE(resolve);
+  }
+  else
+  {
+    ctx->CopyResource(readback, texture);
+  }
 
   D3D11_MAPPED_SUBRESOURCE mapped = {};
-  ctx->Map(readback, 0, D3D11_MAP_READ, 0, &mapped);
+  hr = ctx->Map(readback, 0, D3D11_MAP_READ, 0, &mapped);
+  m_pDevice->CheckHRESULT(hr);
 
   retData.resize(outw.width * outw.height * 3);
+
+  if(FAILED(hr) || m_pDevice->HasFatalError())
+  {
+    RDCERR("Failed to Map HRESULT: %s", ToStr(hr).c_str());
+    return;
+  }
 
   byte *src = (byte *)mapped.pData;
   byte *dst = retData.data();
@@ -406,7 +471,11 @@ void D3D11Replay::FlipOutputWindow(uint64_t id)
     return;
 
   if(m_OutputWindows[id].swap)
-    m_OutputWindows[id].swap->Present(0, 0);
+  {
+    HRESULT hr = m_OutputWindows[id].swap->Present(0, 0);
+
+    m_pDevice->CheckHRESULT(hr);
+  }
 
   if(m_RealState.active)
   {

@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2017-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -27,3 +27,4 @@
 #include "api/app/renderdoc_app.h"
 #include "api/replay/renderdoc_replay.h"
 #include "common/common.h"
+#include "os/os_specific.h"

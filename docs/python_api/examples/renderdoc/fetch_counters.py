@@ -7,23 +7,23 @@ if 'renderdoc' not in sys.modules and '_renderdoc' not in sys.modules:
 # Alias renderdoc for legibility
 rd = renderdoc
 
-draws = {}
+actions = {}
 
-# Define a recursive function for iterating over draws
+# Define a recursive function for iterating over actions
 def iterDraw(d, indent = ''):
-	global draws
+	global actions
 
-	# save the drawcall by eventId
-	draws[d.eventId] = d
+	# save the action by eventId
+	actions[d.eventId] = d
 
 	# Iterate over the draw's children
 	for d in d.children:
 		iterDraw(d, indent + '    ')
 
 def sampleCode(controller):
-	# Iterate over all of the root drawcalls, so we have names for each
+	# Iterate over all of the root actions, so we have names for each
 	# eventId
-	for d in controller.GetDrawcalls():
+	for d in controller.GetRootActions():
 		iterDraw(d)
 
 	# Enumerate the available counters
@@ -50,10 +50,10 @@ def sampleCode(controller):
 	# Look in the results for any draws with 0 samples written - this is an indication
 	# that if a lot of draws appear then culling could be better.
 	for r in results:
-		draw = draws[r.eventId]
+		draw = actions[r.eventId]
 
 		# Only care about draws, not about clears and other misc events
-		if not (draw.flags & rd.DrawFlags.Drawcall):
+		if not (draw.flags & rd.ActionFlags.Drawcall):
 			continue
 
 		if samplesPassedDesc.resultByteWidth == 4:
@@ -62,38 +62,46 @@ def sampleCode(controller):
 			val = r.value.u64
 
 		if val == 0:
-			print("EID %d '%s' had no samples pass depth/stencil test!" % (r.eventId, draw.name))
+			print("EID %d '%s' had no samples pass depth/stencil test!" % (r.eventId, draw.GetName(controller.GetStructuredFile())))
 
 def loadCapture(filename):
 	# Open a capture file handle
 	cap = rd.OpenCaptureFile()
 
 	# Open a particular file - see also OpenBuffer to load from memory
-	status = cap.OpenFile(filename, '', None)
+	result = cap.OpenFile(filename, '', None)
 
 	# Make sure the file opened successfully
-	if status != rd.ReplayStatus.Succeeded:
-		raise RuntimeError("Couldn't open file: " + str(status))
+	if result != rd.ResultCode.Succeeded:
+		raise RuntimeError("Couldn't open file: " + str(result))
 
 	# Make sure we can replay
 	if not cap.LocalReplaySupport():
 		raise RuntimeError("Capture cannot be replayed")
 
 	# Initialise the replay
-	status,controller = cap.OpenCapture(None)
+	result,controller = cap.OpenCapture(rd.ReplayOptions(), None)
 
-	if status != rd.ReplayStatus.Succeeded:
-		raise RuntimeError("Couldn't initialise replay: " + str(status))
+	if result != rd.ResultCode.Succeeded:
+		raise RuntimeError("Couldn't initialise replay: " + str(result))
 
 	return cap,controller
 
 if 'pyrenderdoc' in globals():
 	pyrenderdoc.Replay().BlockInvoke(sampleCode)
 else:
-	cap,controller = loadCapture('test.rdc')
+	rd.InitialiseReplay(rd.GlobalEnvironment(), [])
+
+	if len(sys.argv) <= 1:
+		print('Usage: python3 {} filename.rdc'.format(sys.argv[0]))
+		sys.exit(0)
+
+	cap,controller = loadCapture(sys.argv[1])
 
 	sampleCode(controller)
 
 	controller.Shutdown()
 	cap.Shutdown()
+
+	rd.ShutdownReplay()
 

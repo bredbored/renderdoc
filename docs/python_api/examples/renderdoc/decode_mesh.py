@@ -46,7 +46,6 @@ def unpackData(fmt, data):
 	formatChars[rd.CompType.UScaled] = formatChars[rd.CompType.UInt]
 	formatChars[rd.CompType.SNorm] = formatChars[rd.CompType.SInt]
 	formatChars[rd.CompType.SScaled] = formatChars[rd.CompType.SInt]
-	formatChars[rd.CompType.Double] = formatChars[rd.CompType.Float]
 
 	# We need to fetch compCount components
 	vertexFormat = str(fmt.compCount) + formatChars[fmt.compType][fmt.compByteWidth]
@@ -56,10 +55,10 @@ def unpackData(fmt, data):
 
 	# If the format needs post-processing such as normalisation, do that now
 	if fmt.compType == rd.CompType.UNorm:
-		divisor = float((1 << fmt.compByteWidth) - 1)
+		divisor = float((2 ** (fmt.compByteWidth * 8)) - 1)
 		value = tuple(float(i) / divisor for i in value)
 	elif fmt.compType == rd.CompType.SNorm:
-		maxNeg = -(1 << (fmt.compByteWidth - 1))
+		maxNeg = -float(2 ** (fmt.compByteWidth * 8)) / 2
 		divisor = float(-(maxNeg-1))
 		value = tuple((float(i) if (i == maxNeg) else (float(i) / divisor)) for i in value)
 
@@ -89,17 +88,17 @@ def getMeshInputs(controller, draw):
 		meshInput = MeshData()
 		meshInput.indexResourceId = ib.resourceId
 		meshInput.indexByteOffset = ib.byteOffset
-		meshInput.indexByteStride = draw.indexByteWidth
+		meshInput.indexByteStride = ib.byteStride
 		meshInput.baseVertex = draw.baseVertex
 		meshInput.indexOffset = draw.indexOffset
 		meshInput.numIndices = draw.numIndices
 
 		# If the draw doesn't use an index buffer, don't use it even if bound
-		if not (draw.flags & rd.DrawFlags.Indexed):
+		if not (draw.flags & rd.ActionFlags.Indexed):
 			meshInput.indexResourceId = rd.ResourceId.Null()
 
 		# The total offset is the attribute offset from the base of the vertex
-		meshInput.vertexByteOffset = attr.byteOffset + vbs[attr.vertexBuffer].byteOffset
+		meshInput.vertexByteOffset = attr.byteOffset + vbs[attr.vertexBuffer].byteOffset + draw.vertexOffset * vbs[attr.vertexBuffer].byteStride
 		meshInput.format = attr.format
 		meshInput.vertexResourceId = vbs[attr.vertexBuffer].resourceId
 		meshInput.vertexByteStride = vbs[attr.vertexBuffer].byteStride
@@ -137,9 +136,9 @@ def getMeshOutputs(controller, postvs):
 
 		# Construct a resource format for this element
 		meshOutput.format = rd.ResourceFormat()
-		meshOutput.format.compByteWidth = 8 if attr.compType == rd.CompType.Double else 4
+		meshOutput.format.compByteWidth = rd.VarTypeByteSize(attr.varType)
 		meshOutput.format.compCount = attr.compCount
-		meshOutput.format.compType = attr.compType
+		meshOutput.format.compType = rd.VarTypeCompType(attr.varType)
 		meshOutput.format.type = rd.ResourceFormatType.Regular
 
 		meshOutput.name = attr.semanticIdxName if attr.varName == '' else attr.varName
@@ -164,7 +163,7 @@ def getMeshOutputs(controller, postvs):
 		# while others will tightly pack
 		fmt = meshOutputs[i].format
 
-		accumOffset += (8 if fmt.compType == rd.CompType.Double else 4) * fmt.compCount
+		accumOffset += (8 if fmt.compByteWidth > 4 else 4) * fmt.compCount
 
 	return meshOutputs
 
@@ -192,7 +191,7 @@ def getIndices(controller, mesh):
 		return [i + mesh.baseVertex for i in indices]
 	else:
 		# With no index buffer, just generate a range
-		return tuple(range(vertexOffset, vertexOffset+mesh.numIndices))
+		return tuple(range(mesh.numIndices))
 
 def printMeshData(controller, meshData):
 	indices = getIndices(controller, meshData[0])
@@ -224,13 +223,13 @@ def printMeshData(controller, meshData):
 def sampleCode(controller):
 	# Find the biggest drawcall in the whole capture
 	draw = None
-	for d in controller.GetDrawcalls():
+	for d in controller.GetRootActions():
 		draw = biggestDraw(draw, d)
 
 	# Move to that draw
 	controller.SetFrameEvent(draw.eventId, True)
 
-	print("Decoding mesh inputs at %d: %s\n\n" % (draw.eventId, draw.name))
+	print("Decoding mesh inputs at %d: %s\n\n" % (draw.eventId, draw.GetName(controller.GetStructuredFile())))
 
 	# Calculate the mesh input configuration
 	meshInputs = getMeshInputs(controller, draw)
@@ -254,31 +253,39 @@ def loadCapture(filename):
 	cap = rd.OpenCaptureFile()
 
 	# Open a particular file - see also OpenBuffer to load from memory
-	status = cap.OpenFile(filename, '', None)
+	result = cap.OpenFile(filename, '', None)
 
 	# Make sure the file opened successfully
-	if status != rd.ReplayStatus.Succeeded:
-		raise RuntimeError("Couldn't open file: " + str(status))
+	if result != rd.ResultCode.Succeeded:
+		raise RuntimeError("Couldn't open file: " + str(result))
 
 	# Make sure we can replay
 	if not cap.LocalReplaySupport():
 		raise RuntimeError("Capture cannot be replayed")
 
 	# Initialise the replay
-	status,controller = cap.OpenCapture(None)
+	result,controller = cap.OpenCapture(rd.ReplayOptions(), None)
 
-	if status != rd.ReplayStatus.Succeeded:
-		raise RuntimeError("Couldn't initialise replay: " + str(status))
+	if result != rd.ResultCode.Succeeded:
+		raise RuntimeError("Couldn't initialise replay: " + str(result))
 
 	return (cap, controller)
 
 if 'pyrenderdoc' in globals():
 	pyrenderdoc.Replay().BlockInvoke(sampleCode)
 else:
-	cap,controller = loadCapture('test.rdc')
+	rd.InitialiseReplay(rd.GlobalEnvironment(), [])
+
+	if len(sys.argv) <= 1:
+		print('Usage: python3 {} filename.rdc'.format(sys.argv[0]))
+		sys.exit(0)
+
+	cap,controller = loadCapture(sys.argv[1])
 
 	sampleCode(controller)
 
 	controller.Shutdown()
 	cap.Shutdown()
+
+	rd.ShutdownReplay()
 

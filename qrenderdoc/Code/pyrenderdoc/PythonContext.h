@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2017-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -52,16 +52,20 @@ public:
   void Finish();
 
   PyThreadState *GetExecutingThreadState() { return m_State; }
+  void PausePythonThreading();
+  void ResumePythonThreading();
+
   static void GlobalInit();
   static void GlobalShutdown();
 
+  static QStringList GetApplicationExtensionsPaths();
   static void ProcessExtensionWork(std::function<void()> callback);
-  static bool LoadExtension(ICaptureContext &ctx, const rdcstr &extension);
+  static QString LoadExtension(ICaptureContext &ctx, const rdcstr &extension);
   static void ConvertPyArgs(const ExtensionCallbackData &data,
                             rdcarray<rdcpair<rdcstr, PyObject *>> &args);
   static void FreePyArgs(rdcarray<rdcpair<rdcstr, PyObject *>> &args);
 
-  bool CheckInterfaces();
+  bool CheckInterfaces(rdcstr &log);
 
   QString versionString();
 
@@ -82,9 +86,10 @@ public:
     if(obj)
       setPyGlobal(varName, obj);
     else
-      emit exception(lit("RuntimeError"), tr("Failed to set variable '%1' of type '%2'")
-                                              .arg(QString::fromUtf8(varName))
-                                              .arg(QString::fromUtf8(typeName)),
+      emit exception(lit("RuntimeError"),
+                     tr("Failed to set variable '%1' of type '%2'")
+                         .arg(QString::fromUtf8(varName))
+                         .arg(QString::fromUtf8(typeName)),
                      -1, {});
   }
 
@@ -93,8 +98,6 @@ public:
 
   QStringList completionOptions(QString base);
 
-  void setThreadBlocking(bool block) { m_Block = block; }
-  bool threadBlocking() { return m_Block; }
   void abort() { m_Abort = true; }
   bool shouldAbort() { return m_Abort; }
   QString currentFile() { return location.file; }
@@ -132,6 +135,9 @@ private:
   // not
   PyThreadState *m_State = NULL;
 
+  // this is stored so we can push/pop the GIL state properly
+  void *m_SavedThread = NULL;
+
   struct
   {
     QString file;
@@ -139,8 +145,6 @@ private:
   } location;
 
   bool m_Abort = false;
-
-  bool m_Block = false;
 
   static PyObject *QtObjectToPython(const char *typeName, QObject *object);
 

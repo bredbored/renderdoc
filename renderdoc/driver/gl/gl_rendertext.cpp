@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2018-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -49,7 +49,7 @@ void WrappedOpenGL::ContextData::CreateDebugData()
   // otherwise we fall back to immediate mode rendering by hand
   if(GL.glGetIntegerv && GL.glGenTextures && GL.glBindTexture && GL.glTexImage2D && GL.glTexParameteri)
   {
-    std::string ttfstring = GetEmbeddedResource(sourcecodepro_ttf);
+    rdcstr ttfstring = GetEmbeddedResource(sourcecodepro_ttf);
     byte *ttfdata = (byte *)ttfstring.c_str();
 
     byte *buf = new byte[FONT_TEX_WIDTH * FONT_TEX_HEIGHT];
@@ -61,7 +61,7 @@ void WrappedOpenGL::ContextData::CreateDebugData()
 #if ENABLED(RDOC_ANDROID)
     CharSize *= 2.0f;
 #endif
-    CharAspect = chardata->xadvance / charPixelHeight;
+    CharAspect = chardata[0].xadvance / charPixelHeight;
 
     stbtt_fontinfo f = {0};
     stbtt_InitFont(&f, ttfdata, 0);
@@ -72,11 +72,25 @@ void WrappedOpenGL::ContextData::CreateDebugData()
     float maxheight = float(ascent) * stbtt_ScaleForPixelHeight(&f, charPixelHeight);
 
     {
+      PixelPackState pack;
       PixelUnpackState unpack;
+      GLuint pixelPackBuffer = 0;
+      GLuint pixelUnpackBuffer = 0;
 
+      GL.glGetIntegerv(eGL_PIXEL_PACK_BUFFER_BINDING, (GLint *)&pixelPackBuffer);
+      GL.glGetIntegerv(eGL_PIXEL_UNPACK_BUFFER_BINDING, (GLint *)&pixelUnpackBuffer);
+      GL.glBindBuffer(eGL_PIXEL_PACK_BUFFER, 0);
+      GL.glBindBuffer(eGL_PIXEL_UNPACK_BUFFER, 0);
+
+      pack.Fetch(false);
       unpack.Fetch(false);
 
+      ResetPixelPackState(false, 1);
       ResetPixelUnpackState(false, 1);
+
+      GLenum oldActive = eGL_TEXTURE0;
+      GL.glGetIntegerv(eGL_ACTIVE_TEXTURE, (GLint *)&oldActive);
+      GL.glActiveTexture(eGL_TEXTURE0);
 
       GLuint curtex = 0;
       GL.glGetIntegerv(eGL_TEXTURE_BINDING_2D, (GLint *)&curtex);
@@ -94,8 +108,13 @@ void WrappedOpenGL::ContextData::CreateDebugData()
       GL.glTexParameteri(eGL_TEXTURE_2D, eGL_TEXTURE_MIN_FILTER, eGL_LINEAR);
 
       GL.glBindTexture(eGL_TEXTURE_2D, curtex);
+      GL.glActiveTexture(oldActive);
 
+      pack.Apply(false);
       unpack.Apply(false);
+
+      GL.glBindBuffer(eGL_PIXEL_PACK_BUFFER, pixelPackBuffer);
+      GL.glBindBuffer(eGL_PIXEL_UNPACK_BUFFER, pixelUnpackBuffer);
     }
 
     delete[] buf;
@@ -150,22 +169,22 @@ void WrappedOpenGL::ContextData::CreateDebugData()
          GL.glGetShaderInfoLog && GL.glDeleteShader && GL.glCreateProgram && GL.glAttachShader &&
          GL.glLinkProgram && GL.glGetProgramiv && GL.glGetProgramInfoLog)
       {
-        std::string vs;
-        std::string fs;
+        rdcstr vs;
+        rdcstr fs;
 
         ShaderType shaderType;
         int glslVersion;
-        std::string vertDefines, fragDefines;
+        rdcstr vertDefines, fragDefines;
 
         if(IsGLES)
         {
-          shaderType = eShaderGLSLES;
+          shaderType = ShaderType::GLSLES;
           glslVersion = 100;
           fragDefines = "precision highp float;";
         }
         else
         {
-          shaderType = eShaderGLSL;
+          shaderType = ShaderType::GLSL;
           glslVersion = 110;
 
 #if ENABLED(RDOC_APPLE)
@@ -254,6 +273,8 @@ void WrappedOpenGL::ContextData::CreateDebugData()
 
         GL.glDeleteShader(vert);
         GL.glDeleteShader(frag);
+
+        ArrayMS.Create();
       }
     }
 
@@ -261,42 +282,32 @@ void WrappedOpenGL::ContextData::CreateDebugData()
   }
 }
 
-void WrappedOpenGL::RenderOverlayText(float x, float y, const char *fmt, ...)
+void WrappedOpenGL::RenderText(float x, float y, const rdcstr &text)
 {
-  static char tmpBuf[4096];
-
-  va_list args;
-  va_start(args, fmt);
-  StringFormat::vsnprintf(tmpBuf, 4095, fmt, args);
-  tmpBuf[4095] = '\0';
-  va_end(args);
-
   ContextData &ctxdata = GetCtxData();
 
   GLPushPopState textState;
 
   textState.Push(ctxdata.Modern());
 
-  RenderOverlayStr(x, y, tmpBuf);
+  rdcarray<rdcstr> lines;
+  split(text, lines, '\n');
+
+  for(const rdcstr &line : lines)
+  {
+    RenderTextInternal(x, y, line);
+    y += 1.0f;
+  }
 
   textState.Pop(ctxdata.Modern());
 }
 
-void WrappedOpenGL::RenderOverlayStr(float x, float y, const char *text)
+void WrappedOpenGL::RenderTextInternal(float x, float y, const rdcstr &text)
 {
-  if(char *t = strchr((char *)text, '\n'))
-  {
-    *t = 0;
-    RenderOverlayStr(x, y, text);
-    RenderOverlayStr(x, y + 1.0f, t + 1);
-    *t = '\n';
-    return;
-  }
-
-  if(strlen(text) == 0)
+  if(text.empty())
     return;
 
-  RDCASSERT(strlen(text) < (size_t)FONT_MAX_CHARS);
+  RDCASSERT(text.size() < FONT_MAX_CHARS);
 
   ContextData &ctxdata = GetCtxData();
 
@@ -308,7 +319,7 @@ void WrappedOpenGL::RenderOverlayStr(float x, float y, const char *text)
   {
     GL.glBindBuffer(eGL_ARRAY_BUFFER, ctxdata.ArrayBuffer);
 
-    size_t len = strlen(text);
+    size_t len = text.size();
 
     if((int)len > FONT_MAX_CHARS)
     {
@@ -318,7 +329,7 @@ void WrappedOpenGL::RenderOverlayStr(float x, float y, const char *text)
       if(!printedWarning)
       {
         printedWarning = true;
-        RDCWARN("log string '%s' is too long", text, (int)len);
+        RDCWARN("log string '%s' is too long", text.c_str(), (int)len);
       }
 
       len = FONT_MAX_CHARS;
@@ -398,6 +409,8 @@ void WrappedOpenGL::RenderOverlayStr(float x, float y, const char *text)
     GL.glDisable(eGL_STENCIL_TEST);
     GL.glDisable(eGL_CULL_FACE);
     GL.glDisable(eGL_RASTERIZER_DISCARD);
+    if(HasExt[EXT_depth_bounds_test])
+      GL.glDisable(eGL_DEPTH_BOUNDS_TEST_EXT);
 
     GL.glBindFramebuffer(eGL_DRAW_FRAMEBUFFER, 0);
 
@@ -487,7 +500,7 @@ void WrappedOpenGL::RenderOverlayStr(float x, float y, const char *text)
       GL.glBindProgramPipeline(0);
 
     // draw string (based on sample code from stb_truetype.h)
-    std::vector<Vec4f> vertices;
+    rdcarray<Vec4f> vertices;
     {
       y += 1.0f;
       y *= charPixelHeight;
@@ -504,7 +517,7 @@ void WrappedOpenGL::RenderOverlayStr(float x, float y, const char *text)
 
       stbtt_aligned_quad q;
 
-      const char *prepass = text;
+      const char *prepass = text.c_str();
       while(*prepass)
       {
         char c = *prepass;
@@ -538,9 +551,10 @@ void WrappedOpenGL::RenderOverlayStr(float x, float y, const char *text)
 
       float mul = ctxdata.initParams.isYFlipped ? -1.0f : 1.0f;
 
-      while(*text)
+      const char *str = text.c_str();
+      while(*str)
       {
-        char c = *text;
+        char c = *str;
         if(c > FONT_FIRST_CHAR && c < FONT_LAST_CHAR)
         {
           stbtt_GetBakedQuad(chardata, FONT_TEX_WIDTH, FONT_TEX_HEIGHT, c - FONT_FIRST_CHAR - 1, &x,
@@ -558,7 +572,7 @@ void WrappedOpenGL::RenderOverlayStr(float x, float y, const char *text)
         {
           x += chardata[0].xadvance;
         }
-        ++text;
+        ++str;
       }
     }
     m_Platform.DrawQuads((float)ctxdata.initParams.width, (float)ctxdata.initParams.height, vertices);

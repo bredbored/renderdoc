@@ -1,4 +1,6 @@
 document.body.onload = function() {
+  var test_list = [];
+
   function htmlEntityEncode(str) {
     return str.replace(/&/g, '&amp;')
               .replace(/"/g, '&quot;')
@@ -6,6 +8,21 @@ document.body.onload = function() {
               .replace(/</g, '&lt;')
               .replace(/>/g, '&gt;')
   }
+
+  function linkTests(str) {
+  	var ret = str;
+  	for(var i=0; i < test_list.length; i++)	{
+  		ret = ret.replace(new RegExp('([^#">])\\b' + test_list[i] + '\\b', "g"), '$1<a href="#' + test_list[i] + '">' + test_list[i] + '</a>');
+		}
+		return ret;
+	}
+
+	window.onhashchange = function() {
+		test = window.location.hash.substr(1)
+		if(test_list.indexOf(test) >= 0) {
+			document.getElementById(test).classList.add('expanded');
+		}
+	}
 
   function formatDiff(diff) {
     var difflines = diff.split('\n')
@@ -87,11 +104,20 @@ document.body.onload = function() {
       } else if(m[1] == '//') {
       	// comments, skip
       } else if(m[1] == '..') {
-        html += '<div class="message">' + htmlEntityEncode(m[2]) + '</div>';
+        var str = htmlEntityEncode(m[2]);
+        if(indent == 0)
+          str = linkTests(str);
+
+        html += '<div class="message">' + str + '</div>';
       } else if(m[1] == '!+') {
         html += '<div class="failure"><span class="message">' + htmlEntityEncode(m[2]) + '</span>';
       } else if(m[1] == '!-') {
         html += '</div>';
+        while(indent > 4)
+        {
+          indent -= 4;
+          html += '</div></div>';
+        }
       } else if(m[1] == '!!') {
         html += '<div class="failure message">' + htmlEntityEncode(m[2]) + '</div>';
       } else if(m[1] == '**') {
@@ -161,18 +187,24 @@ document.body.onload = function() {
         if(words[0] == 'Callstack') {
           html += start ? '<div class="expandable callstack"><span class="expandtoggle"></span><div class="title">Callstack</div><div class="contents"><pre>' : '</pre></div></div>';
           instack = start;
+        } else if(words[0] == 'Raw') {
+          html += start ? '<div class="expandable"><span class="expandtoggle"></span><div class="title">' + words.slice(1).join(' ') + '</div><div class="contents"><pre>' : '</pre></div></div>';
+          instack = start;
         } else if(words[0] == 'Test') {
           test_name = words[1];
+          test_list.push(test_name)
           html += start ? '<div class="expandable test" id="' + test_name + '"><span class="expandtoggle"></span><div class="title">Test: ' + test_name + '</div><div class="contents">' : '</div></div>';
 
           if(start)
             last_test = test_name;
           else
             last_test = '';
+        } else if(words[0] == 'Section') {
+          html += start ? '<div class="expandable"><span class="expandtoggle"></span><div class="title">' + words.slice(1).join(' ') + '</div><div class="contents">' : '</div></div>';
         }
       } else if(m[1] == '$$') {
         if(m[2] == 'FAILED') {
-          failed_tests.push(test_name)
+        	html += '<div class="failed"></div>';
         }
       }
     } else {
@@ -194,9 +226,10 @@ document.body.onload = function() {
   document.body.innerHTML += html;
   document.body.style.visibility = 'inherit';
 
-  for(var i=0; i < failed_tests.length; i++) {
-    var test = document.getElementById(failed_tests[i]);
-    test.classList.add('expanded');
+  var failed = document.getElementsByClassName('failed');
+
+  for(var i=0; i < failed.length; i++) {
+    var test = failed[i].parentElement.parentElement;
     test.classList.add('failed');
   }
 

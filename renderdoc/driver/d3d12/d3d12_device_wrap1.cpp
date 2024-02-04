@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -29,6 +29,13 @@ HRESULT WrappedID3D12Device::CreatePipelineLibrary(_In_reads_(BlobLength) const 
                                                    SIZE_T BlobLength, REFIID riid,
                                                    _COM_Outptr_ void **ppPipelineLibrary)
 {
+  // CreatePipelineLibrary supports doing a dry run if ppPipelineLibrary receives
+  // nullptr. That feature is optional and not supported in every driver, since
+  // we are not supporting pipeline libraries anyway, returns the unsupported
+  // driver case.
+  if(ppPipelineLibrary == NULL)
+    return DXGI_ERROR_UNSUPPORTED;
+
 // we don't want to ever use pipeline libraries since then we can't get the
 // bytecode and pipeline config. So instead we always return that a blob is
 // non-matching and return a dummy interface that does nothing when stored.
@@ -41,7 +48,7 @@ HRESULT WrappedID3D12Device::CreatePipelineLibrary(_In_reads_(BlobLength) const 
   if(BlobLength > 0)
     return D3D12_ERROR_DRIVER_VERSION_MISMATCH;
 
-  WrappedID3D12PipelineLibrary1 *pipeLibrary = new WrappedID3D12PipelineLibrary1(this);
+  WrappedID3D12PipelineLibrary *pipeLibrary = new WrappedID3D12PipelineLibrary(this);
 
   if(riid == __uuidof(ID3D12PipelineLibrary))
   {

@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  * Copyright (c) 2014 Crytek
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -78,7 +78,7 @@ struct GLRenderState
   void Clear();
 
   void MarkReferenced(WrappedOpenGL *driver, bool initial) const;
-  void MarkDirty(WrappedOpenGL *driver) const;
+  static void MarkDirty(WrappedOpenGL *driver);
 
   enum
   {
@@ -157,6 +157,8 @@ struct GLRenderState
     GLint numSubroutines;
     GLuint Values[128];
   } Subroutines[6];
+  // since this array is serialised (and because GL will never support other shader stages) we leave
+  // this at 6 instead of NumShaderStages
 
   enum
   {

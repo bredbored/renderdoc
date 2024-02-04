@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  * Copyright (c) 2014 Crytek
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -29,12 +29,17 @@
 
 #include <thumbcache.h>
 #include <windows.h>
-#include "3rdparty/lz4/lz4.h"
-#include "3rdparty/stb/stb_image_resize.h"
 #include "common/common.h"
+#include "common/dds_readwrite.h"
+#include "compressonator/CMP_Core.h"
 #include "core/core.h"
 #include "jpeg-compressor/jpgd.h"
+#include "lz4/lz4.h"
+#include "maths/formatpacking.h"
+#include "maths/half_convert.h"
 #include "serialise/rdcfile.h"
+
+#include "stb/stb_image_resize2.h"
 
 // {5D6BF029-A6BA-417A-8523-120492B1DCE3}
 static const GUID CLSID_RDCThumbnailProvider = {0x5d6bf029,
@@ -49,13 +54,10 @@ struct RDCThumbnailProvider : public IThumbnailProvider, IInitializeWithStream
   unsigned int m_iRefcount;
   bool m_Inited;
   RDCThumb m_Thumb;
+  read_dds_data m_ddsData;
 
   RDCThumbnailProvider() : m_iRefcount(1), m_Inited(false) { InterlockedIncrement(&numProviders); }
-  virtual ~RDCThumbnailProvider()
-  {
-    delete[] m_Thumb.pixels;
-    InterlockedDecrement(&numProviders);
-  }
+  virtual ~RDCThumbnailProvider() { InterlockedDecrement(&numProviders); }
   ULONG STDMETHODCALLTYPE AddRef()
   {
     InterlockedIncrement(&m_iRefcount);
@@ -117,10 +119,46 @@ struct RDCThumbnailProvider : public IThumbnailProvider, IInitializeWithStream
 
     RDCDEBUG("RDCThumbnailProvider Initialize read %d bytes from file", numRead);
 
-    std::vector<byte> captureHeader(buf, buf + numRead);
+    bytebuf captureHeader(buf, numRead);
 
     delete[] buf;
 
+    if(is_dds_file(captureHeader.data(), numRead))
+    {
+      STATSTG stats = {};
+      pstream->Stat(&stats, STATFLAG_DEFAULT);
+      const uint32_t size = (uint32_t)stats.cbSize.QuadPart;
+      const size_t offset = captureHeader.size();
+      ULONG ddsNumRead = 0;
+
+      // read rest of file
+      if(size > captureHeader.size())
+      {
+        captureHeader.resize(size);
+        pstream->Read(captureHeader.begin() + offset, (ULONG)(size - offset), &ddsNumRead);
+      }
+
+      StreamReader reader(captureHeader.data(), (ULONG)size);
+      m_ddsData = {};
+      RDResult res = load_dds_from_file(&reader, m_ddsData);
+
+      if(res != ResultCode::Succeeded)
+      {
+        return E_INVALIDARG;
+      }
+      // Ignore volume slices and mip maps. We want to convert the first slice of the image as
+      // bitmap.
+      m_Thumb.height = (uint16_t)m_ddsData.height;
+      m_Thumb.width = (uint16_t)m_ddsData.width;
+
+      // size of slice 0
+      size_t len = m_ddsData.subresources[0].second;
+      m_Thumb.pixels.resize(len);
+      // slice 0 data
+      memcpy(m_Thumb.pixels.data(), m_ddsData.buffer.data() + m_ddsData.subresources[0].first, len);
+      m_Thumb.format = FileType::DDS;
+    }
+    else
     {
       RDCFile rdc;
       rdc.Open(captureHeader);
@@ -129,13 +167,7 @@ struct RDCThumbnailProvider : public IThumbnailProvider, IInitializeWithStream
 
       // we don't care about the error code (which would come from the truncated file), we just care
       // if we got the thumbnail
-      if(m_Thumb.len > 0 && m_Thumb.width > 0 && m_Thumb.height > 0 && m_Thumb.pixels)
-      {
-        buf = new byte[m_Thumb.len];
-        memcpy(buf, m_Thumb.pixels, m_Thumb.len);
-        m_Thumb.pixels = buf;
-      }
-      else
+      if(m_Thumb.pixels.empty() || m_Thumb.width == 0 || m_Thumb.height == 0)
       {
         ReadLegacyCaptureThumb(captureHeader);
       }
@@ -146,7 +178,7 @@ struct RDCThumbnailProvider : public IThumbnailProvider, IInitializeWithStream
     return S_OK;
   }
 
-  void STDMETHODCALLTYPE ReadLegacyCaptureThumb(std::vector<byte> &captureHeader)
+  void STDMETHODCALLTYPE ReadLegacyCaptureThumb(bytebuf &captureHeader)
   {
     // we want to support old capture files, so we decode the thumbnail by hand here with the
     // old header.
@@ -156,7 +188,7 @@ struct RDCThumbnailProvider : public IThumbnailProvider, IInitializeWithStream
     byte *readEnd = readPtr + captureHeader.size();
 
     if(captureHeader.size() < sizeof(MAGIC_HEADER) ||
-       memcmp(&MAGIC_HEADER, readPtr, sizeof(MAGIC_HEADER)))
+       memcmp(&MAGIC_HEADER, readPtr, sizeof(MAGIC_HEADER)) != 0)
     {
       RDCDEBUG("Legacy header did not have expected magic number");
       return;
@@ -232,7 +264,7 @@ struct RDCThumbnailProvider : public IThumbnailProvider, IInitializeWithStream
       // eSectionFlag_LZ4Compressed
       if(sectionFlags & 0x2)
       {
-        std::vector<byte> uncompressed;
+        bytebuf uncompressed;
 
         LZ4_streamDecode_t lZ4Decomp = {};
         LZ4_setStreamDecode(&lZ4Decomp, NULL, 0);
@@ -331,13 +363,11 @@ struct RDCThumbnailProvider : public IThumbnailProvider, IInitializeWithStream
     {
       RDCDEBUG("Got %ux%u thumbnail, %u pixels", thumbWidth, thumbHeight, thumbLen);
 
-      byte *pixels = new byte[thumbLen];
-      memcpy(pixels, readPtr, thumbLen);
+      m_Thumb.pixels.resize(thumbLen);
+      memcpy(m_Thumb.pixels.data(), readPtr, thumbLen);
 
       m_Thumb.width = (uint16_t)thumbWidth;
       m_Thumb.height = (uint16_t)thumbHeight;
-      m_Thumb.len = thumbLen;
-      m_Thumb.pixels = pixels;
     }
     else
     {
@@ -356,24 +386,225 @@ struct RDCThumbnailProvider : public IThumbnailProvider, IInitializeWithStream
       return E_NOTIMPL;
     }
 
-    if(m_Thumb.len == 0)
+    if(m_Thumb.pixels.empty())
     {
       RDCERR("Problem opening file");
       return E_NOTIMPL;
     }
 
-    const byte *jpgbuf = m_Thumb.pixels;
-    size_t thumblen = m_Thumb.len;
     uint32_t thumbwidth = m_Thumb.width, thumbheight = m_Thumb.height;
+    byte *thumbpixels = NULL;
 
-    if(jpgbuf == NULL)
-      return E_NOTIMPL;
+    if(m_Thumb.format == FileType::JPG)
+    {
+      int w = thumbwidth;
+      int h = thumbheight;
+      int comp = 3;
+      thumbpixels = jpgd::decompress_jpeg_image_from_memory(
+          m_Thumb.pixels.data(), (int)m_Thumb.pixels.size(), &w, &h, &comp, 3);
+    }
+    else
+    {
+      thumbwidth = m_ddsData.width;
+      thumbheight = m_ddsData.height;
+      const ResourceFormatType resourceType = m_ddsData.format.type;
+      const uint32_t decompressedStride = AlignUp4(thumbwidth) * 4;
+      const uint32_t decompressedBlockWidth = 16;    // in bytes (4 byte/pixel)
+      const uint32_t decompressedBlockMaxSize = 64;
+      const uint32_t compressedBlockSize = m_ddsData.format.ElementSize();
 
-    int w = thumbwidth;
-    int h = thumbheight;
-    int comp = 3;
-    byte *thumbpixels =
-        jpgd::decompress_jpeg_image_from_memory(jpgbuf, (int)thumblen, &w, &h, &comp, 3);
+      bool blockCompressed = false;
+
+      // check supported formats
+      switch(resourceType)
+      {
+        case ResourceFormatType::BC1:
+        case ResourceFormatType::BC2:
+        case ResourceFormatType::BC3:
+        case ResourceFormatType::BC4:
+        case ResourceFormatType::BC5:
+        case ResourceFormatType::BC6:
+        case ResourceFormatType::BC7: blockCompressed = true; break;
+        case ResourceFormatType::Regular:
+        case ResourceFormatType::D32S8:
+        case ResourceFormatType::D24S8:
+        case ResourceFormatType::D16S8:
+        case ResourceFormatType::A8:
+        case ResourceFormatType::R10G10B10A2:
+        case ResourceFormatType::R11G11B10:
+        case ResourceFormatType::R9G9B9E5:
+        case ResourceFormatType::R4G4B4A4:
+        case ResourceFormatType::R5G6B5:
+        case ResourceFormatType::R5G5B5A1: blockCompressed = false; break;
+        default:
+          // not supported
+          return E_NOTIMPL;
+      }
+
+      // Decompressed DDS, 3 byte/pixel without alpha
+      thumbpixels = (byte *)malloc(AlignUp4(thumbheight) * AlignUp4(thumbwidth) * 3);
+
+      if(blockCompressed)
+      {
+        bytebuf decompressed;    // Decompressed DDS, 4 byte/pixel
+        decompressed.resize(AlignUp4(thumbheight) * AlignUp4(thumbwidth) * 4);
+        unsigned char decompressedBlock[decompressedBlockMaxSize];
+        unsigned char greenBlock[16];
+        uint16_t decompressedBC6[48];
+        const byte *compBlockStart = m_Thumb.pixels.data();
+
+        for(uint32_t blockY = 0; blockY < AlignUp4(thumbheight) / 4; blockY++)
+        {
+          for(uint32_t blockX = 0; blockX < AlignUp4(thumbwidth) / 4; blockX++)
+          {
+            uint32_t decompressedBlockStart =
+                blockY * 4 * decompressedStride + blockX * decompressedBlockWidth;
+            switch(resourceType)
+            {
+              case ResourceFormatType::BC1:
+                DecompressBlockBC1(compBlockStart, decompressedBlock, NULL);
+                break;
+              case ResourceFormatType::BC2:
+                DecompressBlockBC2(compBlockStart, decompressedBlock, NULL);
+                break;
+              case ResourceFormatType::BC3:
+                DecompressBlockBC3(compBlockStart, decompressedBlock, NULL);
+                break;
+              case ResourceFormatType::BC4:
+                DecompressBlockBC4(compBlockStart, decompressedBlock, NULL);
+                break;
+              case ResourceFormatType::BC5:
+                DecompressBlockBC5(compBlockStart, decompressedBlock, greenBlock, NULL);
+                break;
+              case ResourceFormatType::BC6:
+                // Compressonator handles UF16/SF16 signed/unsigned cases. Returns signed half-float
+                DecompressBlockBC6(compBlockStart, decompressedBC6, NULL);
+                break;
+              case ResourceFormatType::BC7:
+                DecompressBlockBC7(compBlockStart, decompressedBlock, NULL);
+                break;
+              default: return E_NOTIMPL;    // other formats
+            }
+
+            unsigned char *decompPointer = decompressedBlock;
+            unsigned char *decompImagePointer = decompressed.data() + decompressedBlockStart;
+            for(int i = 0; i < 4; i++)
+            {
+              switch(resourceType)
+              {
+                case ResourceFormatType::BC1:
+                case ResourceFormatType::BC2:
+                case ResourceFormatType::BC3:
+                case ResourceFormatType::BC7:
+                  memcpy(decompImagePointer, decompPointer,
+                         16);    // copy one stride of the decompressed Block
+                  decompPointer += 16;
+                  break;
+                case ResourceFormatType::BC4:    // copy the color of the red channel into rgb
+                                                 // channels.
+                  for(int pixelInStride = 0; pixelInStride < 4; pixelInStride++)
+                  {
+                    decompImagePointer[pixelInStride * 4] = decompPointer[pixelInStride];
+                    decompImagePointer[(pixelInStride * 4) + 1] = decompPointer[pixelInStride];
+                    decompImagePointer[(pixelInStride * 4) + 2] = decompPointer[pixelInStride];
+                  }
+                  decompPointer += 4;
+                  break;
+                case ResourceFormatType::BC5:    // copy red and green channels.
+                  for(int pixelInStride = 0; pixelInStride < 4; pixelInStride++)
+                  {
+                    decompImagePointer[pixelInStride * 4] =
+                        decompressedBlock[pixelInStride + (i * 4)];    // copy red channel
+                    decompImagePointer[(pixelInStride * 4) + 1] =
+                        greenBlock[pixelInStride + (i * 4)];    // copy green channel
+                  }
+                  break;
+                case ResourceFormatType::BC6:
+                  for(int pixelInStride = 0; pixelInStride < 4; pixelInStride++)
+                  {
+                    // compute Pixel Index for the decompressedBC6 buffer. One block stide = 12
+                    // floats.
+                    int pixelIndex = pixelInStride * 3 + (i * 12);
+                    // decompressed BC6 block uses 16:16:16 color format. Convert to 8:8:8:8
+                    uint16_t r = decompressedBC6[pixelIndex];
+                    uint16_t g = decompressedBC6[pixelIndex + 1];
+                    uint16_t b = decompressedBC6[pixelIndex + 2];
+                    // convert to half float
+                    float redF = ConvertFromHalf(r);
+                    float greenF = ConvertFromHalf(g);
+                    float blueF = ConvertFromHalf(b);
+                    // clamp to 0..1
+                    redF = RDCCLAMP(redF, 0.0f, 1.0f);
+                    greenF = RDCCLAMP(greenF, 0.0f, 1.0f);
+                    blueF = RDCCLAMP(blueF, 0.0f, 1.0f);
+                    // scale to 0..255
+                    decompImagePointer[pixelInStride * 4] = (unsigned char)(redF * 255);
+                    decompImagePointer[(pixelInStride * 4) + 1] = (unsigned char)(greenF * 255);
+                    decompImagePointer[(pixelInStride * 4) + 2] = (unsigned char)(blueF * 255);
+                  }
+                  break;
+                default: return E_NOTIMPL;    // other formats
+              }
+              decompImagePointer += decompressedStride;
+            }
+            compBlockStart += compressedBlockSize;
+          }
+        }
+
+        byte *decompRead = decompressed.data();
+        byte *imgWrite = thumbpixels;
+        // Iterate over pixels (4byte/pixel in decompressed, 3byte/pixel in thumbpixels)
+        for(uint32_t y = 0; y < thumbheight; y++)
+        {
+          for(uint32_t x = 0; x < thumbwidth; x++)
+          {
+            memcpy(imgWrite + (thumbwidth * y + x) * 3, decompRead + decompressedStride * y + x * 4,
+                   3);
+          }
+        }
+      }
+      else
+      {
+        // read data as non-compressed
+        const byte *src = m_Thumb.pixels.data();
+        byte *dst = thumbpixels;
+
+        uint32_t texelSize = m_ddsData.format.ElementSize();
+
+        // account for padding
+        if(resourceType == ResourceFormatType::D32S8)
+          texelSize = 8;
+        else if(resourceType == ResourceFormatType::D16S8)
+          texelSize = 4;
+
+        for(uint32_t y = 0; y < thumbheight; y++)
+        {
+          for(uint32_t x = 0; x < thumbwidth; x++)
+          {
+            FloatVector rgba;
+
+            if(resourceType == ResourceFormatType::D32S8)
+              rgba.x = rgba.y = rgba.z = *(float *)src;
+            else if(resourceType == ResourceFormatType::D24S8)
+              rgba.x = rgba.y = rgba.z = float((*(uint32_t *)src) >> 8) / 16777215.0f;
+            else if(resourceType == ResourceFormatType::D16S8)
+              rgba.x = rgba.y = rgba.z = float(*(uint16_t *)src) / 65535.0f;
+            else
+              rgba = DecodeFormattedComponents(m_ddsData.format, src);
+
+            if(resourceType == ResourceFormatType::A8)
+              rgba.y = rgba.z = rgba.x;
+
+            dst[0] = byte(RDCCLAMP(rgba.x, 0.0f, 1.0f) * 255.0f);
+            dst[1] = byte(RDCCLAMP(rgba.y, 0.0f, 1.0f) * 255.0f);
+            dst[2] = byte(RDCCLAMP(rgba.z, 0.0f, 1.0f) * 255.0f);
+
+            src += texelSize;
+            dst += 3;
+          }
+        }
+      }
+    }
 
     float aspect = float(thumbwidth) / float(thumbheight);
 
@@ -395,7 +626,7 @@ struct RDCThumbnailProvider : public IThumbnailProvider, IInitializeWithStream
       byte *resizedpixels = (byte *)malloc(3 * bi.bV5Width * bi.bV5Height);
 
       stbir_resize_uint8_srgb(thumbpixels, thumbwidth, thumbheight, 0, resizedpixels, bi.bV5Width,
-                              bi.bV5Height, 0, 3, -1, 0);
+                              bi.bV5Height, 0, STBIR_RGB);
 
       free(thumbpixels);
 

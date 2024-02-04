@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  * Copyright (c) 2014 Crytek
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -23,14 +23,13 @@
  * THE SOFTWARE.
  ******************************************************************************/
 
-#include "dxbc_inspect.h"
+#include "dxbc_container.h"
 
+#include "os/os_specific.h"
 #include "dxbc_sdbg.h"
 
 namespace DXBC
 {
-static const uint32_t FOURCC_SDBG = MAKE_FOURCC('S', 'D', 'B', 'G');
-
 SDBGChunk::SDBGChunk(void *data)
 {
   m_HasDebugInfo = false;
@@ -66,16 +65,15 @@ SDBGChunk::SDBGChunk(void *data)
   SDBGType *Types = (SDBGType *)(dbgPostHeader + m_Header.types.offset);
   int32_t *Int32DB = (int32_t *)(dbgPostHeader + m_Header.int32DBOffset);
 
-  m_FileHeaders = std::vector<SDBGFileHeader>(FileHeaders, FileHeaders + m_Header.files.count);
-  m_Instructions =
-      std::vector<SDBGAsmInstruction>(Instructions, Instructions + m_Header.instructions.count);
-  m_Variables = std::vector<SDBGVariable>(Variables, Variables + m_Header.variables.count);
-  m_Inputs = std::vector<SDBGInputRegister>(Inputs, Inputs + m_Header.inputRegisters.count);
-  m_SymbolTable = std::vector<SDBGSymbol>(SymbolTable, SymbolTable + m_Header.symbolTable.count);
-  m_Scopes = std::vector<SDBGScope>(Scopes, Scopes + m_Header.scopes.count);
-  m_Types = std::vector<SDBGType>(Types, Types + m_Header.types.count);
-  m_Int32Database = std::vector<int32_t>(
-      Int32DB, Int32DB + (m_Header.asciiDBOffset - m_Header.int32DBOffset) / sizeof(int32_t));
+  m_FileHeaders = rdcarray<SDBGFileHeader>(FileHeaders, m_Header.files.count);
+  m_Instructions = rdcarray<SDBGAsmInstruction>(Instructions, m_Header.instructions.count);
+  m_Variables = rdcarray<SDBGVariable>(Variables, m_Header.variables.count);
+  m_Inputs = rdcarray<SDBGInputRegister>(Inputs, m_Header.inputRegisters.count);
+  m_SymbolTable = rdcarray<SDBGSymbol>(SymbolTable, m_Header.symbolTable.count);
+  m_Scopes = rdcarray<SDBGScope>(Scopes, m_Header.scopes.count);
+  m_Types = rdcarray<SDBGType>(Types, m_Header.types.count);
+  m_Int32Database = rdcarray<int32_t>(
+      Int32DB, (m_Header.asciiDBOffset - m_Header.int32DBOffset) / sizeof(int32_t));
 
   char *asciiDatabase = dbgPostHeader + m_Header.asciiDBOffset;
 
@@ -85,20 +83,22 @@ SDBGChunk::SDBGChunk(void *data)
 
   for(size_t i = 0; i < m_FileHeaders.size(); i++)
   {
-    std::string filename =
-        std::string(asciiDatabase + m_FileHeaders[i].filenameOffset, m_FileHeaders[i].filenameLen);
-    std::string source =
-        std::string(asciiDatabase + m_FileHeaders[i].sourceOffset, m_FileHeaders[i].sourceLen);
+    rdcstr filename =
+        rdcstr(asciiDatabase + m_FileHeaders[i].filenameOffset, m_FileHeaders[i].filenameLen);
+    rdcstr source = rdcstr(asciiDatabase + m_FileHeaders[i].sourceOffset, m_FileHeaders[i].sourceLen);
 
-    this->Files.push_back(make_rdcpair(filename, source));
+    this->Files.push_back({filename, source});
   }
 
   // successful grab of info
   m_HasDebugInfo = true;
 }
 
-void SDBGChunk::GetLineInfo(size_t instruction, uintptr_t offset, LineColumnInfo &lineInfo) const
+void SDBGChunk::GetLineInfo(size_t instruction, uintptr_t, LineColumnInfo &lineInfo) const
 {
+  if(instruction == ~0U)
+    instruction = 0;
+
   if(instruction < m_Instructions.size())
   {
     int32_t symID = m_Instructions[instruction].symbol;
@@ -111,22 +111,29 @@ void SDBGChunk::GetLineInfo(size_t instruction, uintptr_t offset, LineColumnInfo
       lineInfo.lineEnd = sym.lineNum;
       lineInfo.colStart = 0;
       lineInfo.colEnd = 0;
-      lineInfo.callstack = {m_Entry};
     }
   }
 }
 
-bool SDBGChunk::HasLocals() const
+void SDBGChunk::GetCallstack(size_t instruction, uintptr_t offset, rdcarray<rdcstr> &callstack) const
+{
+  if(instruction < m_Instructions.size())
+  {
+    callstack = {m_Entry};
+  }
+}
+
+bool SDBGChunk::HasSourceMapping() const
 {
   return false;
 }
 
-void SDBGChunk::GetLocals(size_t instruction, uintptr_t offset,
-                          rdcarray<LocalVariableMapping> &locals) const
+void SDBGChunk::GetLocals(const DXBC::DXBCContainer *dxbc, size_t instruction, uintptr_t offset,
+                          rdcarray<SourceVariableMapping> &locals) const
 {
 }
 
-std::string SDBGChunk::GetSymbolName(int symbolID)
+rdcstr SDBGChunk::GetSymbolName(int symbolID)
 {
   RDCASSERT(symbolID >= 0 && symbolID < (int)m_SymbolTable.size());
 
@@ -135,14 +142,19 @@ std::string SDBGChunk::GetSymbolName(int symbolID)
   return GetSymbolName(sym.symbol.offset, sym.symbol.count);
 }
 
-std::string SDBGChunk::GetSymbolName(int32_t symbolOffset, int32_t symbolLength)
+rdcstr SDBGChunk::GetSymbolName(int32_t symbolOffset, int32_t symbolLength)
 {
   RDCASSERT(symbolOffset < m_Header.compilerSigOffset);
   RDCASSERT(symbolOffset + symbolLength <= m_Header.compilerSigOffset);
 
   int32_t offset = sizeof(m_Header) + m_Header.asciiDBOffset + symbolOffset;
 
-  return std::string(&m_RawData[offset], symbolLength);
+  return rdcstr(&m_RawData[offset], symbolLength);
+}
+
+IDebugInfo *ProcessSDBGChunk(void *data)
+{
+  return new SDBGChunk(data);
 }
 
 };    // namespace DXBC

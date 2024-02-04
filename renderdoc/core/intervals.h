@@ -1,30 +1,32 @@
 /******************************************************************************
-* The MIT License (MIT)
-*
-* Copyright (c) 2018-2019 Baldur Karlsson
-*
-* Permission is hereby granted, free of charge, to any person obtaining a copy
-* of this software and associated documentation files (the "Software"), to deal
-* in the Software without restriction, including without limitation the rights
-* to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-* copies of the Software, and to permit persons to whom the Software is
-* furnished to do so, subject to the following conditions:
-*
-* The above copyright notice and this permission notice shall be included in
-* all copies or substantial portions of the Software.
-*
-* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-* AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-* OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-* THE SOFTWARE.
-******************************************************************************/
+ * The MIT License (MIT)
+ *
+ * Copyright (c) 2019-2023 Baldur Karlsson
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ ******************************************************************************/
+
 #pragma once
 
-#include <algorithm>
 #include <map>
+#include "api/replay/rdcflatmap.h"
+#include "api/replay/renderdoc_replay.h"
 #include "common/common.h"
 
 template <typename T>
@@ -81,7 +83,7 @@ public:
   inline void split(uint64_t x)
   {
     if(this->start() < x)
-      this->iter = this->owner->insert(std::pair<uint64_t, T>(x, this->value())).first;
+      this->iter = this->owner->insert(rdcpair<uint64_t, T>(x, this->value())).first;
   }
 
   // Merge this interval with the interval to the left, if both intervals have
@@ -160,35 +162,30 @@ template <typename T>
 struct Intervals
 {
 public:
-  typedef IntervalRef<T, std::map<uint64_t, T>, typename std::map<uint64_t, T>::iterator> interval;
-  typedef IntervalsIter<T, std::map<uint64_t, T>, typename std::map<uint64_t, T>::iterator, interval> iterator;
+  using MapType = rdcflatmap<uint64_t, T, 0>;
 
-  typedef ConstIntervalRef<T, const std::map<uint64_t, T>, typename std::map<uint64_t, T>::const_iterator>
-      const_interval;
-  typedef IntervalsIter<T, const std::map<uint64_t, T>,
-                        typename std::map<uint64_t, T>::const_iterator, const_interval>
-      const_iterator;
+  typedef IntervalRef<T, MapType, typename MapType::iterator> interval;
+  typedef IntervalsIter<T, MapType, typename MapType::iterator, interval> iterator;
+
+  typedef ConstIntervalRef<T, const MapType, typename MapType::const_iterator> const_interval;
+  typedef IntervalsIter<T, const MapType, typename MapType::const_iterator, const_interval> const_iterator;
 
 private:
-  std::map<uint64_t, T> StartPoints;
+  MapType StartPoints;
 
-  iterator Wrap(typename std::map<uint64_t, T>::iterator iter)
-  {
-    return iterator(&StartPoints, iter);
-  }
-
-  const_iterator Wrap(typename std::map<uint64_t, T>::const_iterator iter) const
+  iterator Wrap(typename MapType::iterator iter) { return iterator(&StartPoints, iter); }
+  const_iterator Wrap(typename MapType::const_iterator iter) const
   {
     return const_iterator(&StartPoints, iter);
   }
 
 public:
-  Intervals() : StartPoints{{0, T()}} {}
+  Intervals() { StartPoints.insert({0, T()}); }
   inline iterator end() { return Wrap(StartPoints.end()); }
   inline iterator begin() { return Wrap(StartPoints.begin()); }
   inline const_iterator begin() const { return Wrap(StartPoints.begin()); }
   inline const_iterator end() const { return Wrap(StartPoints.end()); }
-  typedef typename std::map<uint64_t, T>::size_type size_type;
+  typedef typename MapType::size_type size_type;
   inline size_type size() const { return StartPoints.size(); }
   // Find the interval containing `x`.
   iterator find(uint64_t x)

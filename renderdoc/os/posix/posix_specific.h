@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2016-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -28,9 +28,24 @@
 #include <signal.h>
 #include "data/embedded_files.h"
 
-#define __PRETTY_FUNCTION_SIGNATURE__ __PRETTY_FUNCTION__
+// this works on all supported clang versions
+#if defined(__clang__)
 
-#define OS_DEBUG_BREAK() raise(SIGTRAP)
+#define DELIBERATE_FALLTHROUGH() [[clang::fallthrough]]
+
+// works on GCC 7.0 and up. Before then there was no warning, so we're fine
+#elif defined(__GNUC__) && (__GNUC__ >= 7)
+
+#define DELIBERATE_FALLTHROUGH() __attribute__((fallthrough))
+
+#else
+
+#define DELIBERATE_FALLTHROUGH() \
+  do                             \
+  {                              \
+  } while(0)
+
+#endif
 
 #if ENABLED(RDOC_APPLE)
 
@@ -52,7 +67,7 @@ struct EmbeddedResourceType
   EmbeddedResourceType(const unsigned char *b, int l) : base(b), len(l) {}
   const unsigned char *base;
   int len;
-  std::string Get() const { return std::string(base, base + len); }
+  rdcstr Get() const { return rdcstr((char *)base, (size_t)len); }
 };
 
 #define EmbeddedResource(filename) \
@@ -67,12 +82,7 @@ inline void ForceCrash()
 {
   __builtin_trap();
 }
-inline void DebugBreak()
-{
-  raise(SIGTRAP);
-}
 bool DebuggerPresent();
-void WriteOutput(int channel, const char *str);
 };
 
 namespace Threading
@@ -103,6 +113,30 @@ inline uint32_t CountLeadingZeroes(uint32_t value)
 inline uint64_t CountLeadingZeroes(uint64_t value)
 {
   return value == 0 ? 64 : __builtin_clzl(value);
+}
+#endif
+
+inline uint32_t CountTrailingZeroes(uint32_t value)
+{
+  return value == 0 ? 32 : __builtin_ctz(value);
+}
+
+#if ENABLED(RDOC_X64)
+inline uint64_t CountTrailingZeroes(uint64_t value)
+{
+  return value == 0 ? 64 : __builtin_ctzl(value);
+}
+#endif
+
+inline uint32_t CountOnes(uint32_t value)
+{
+  return __builtin_popcount(value);
+}
+
+#if ENABLED(RDOC_X64)
+inline uint64_t CountOnes(uint64_t value)
+{
+  return __builtin_popcountl(value);
 }
 #endif
 };

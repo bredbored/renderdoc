@@ -12,8 +12,28 @@ from sphinx import __version__
 # the searchindex.js system relies upon the object types
 # in the PythonDomain to create search entries
 from sphinx.domains import ObjType
+from sphinx.util import logging
+
+try:
+    from sphinx.domains.python import ObjectEntry
+except:
+    from collections import namedtuple
+    ObjectEntry = namedtuple('ObjectEntry', ['docname', 'node_id', 'objtype'])
 
 PythonDomain.object_types['parameter'] = ObjType('parameter', 'param')
+
+if 'getLogger' in dir(logging):
+    LOG = logging.getLogger(__name__)
+else:
+    LOG = None
+
+
+def get_indexentries(app):
+    try:
+        return app.env.get_domain('index').data['entries']
+    except:
+        pass
+    return app.env.indexentries
 
 
 def _is_html(app):
@@ -21,10 +41,10 @@ def _is_html(app):
 
 
 def _tempdata(app):
-    if '_sphinx_paramlinks_index' in app.env.indexentries:
-        idx = app.env.indexentries['_sphinx_paramlinks_index']
+    if '_sphinx_paramlinks_index' in get_indexentries(app):
+        idx = get_indexentries(app)['_sphinx_paramlinks_index']
     else:
-        app.env.indexentries['_sphinx_paramlinks_index'] = idx = {}
+        get_indexentries(app)['_sphinx_paramlinks_index'] = idx = {}
     return idx
 
 
@@ -57,7 +77,15 @@ def autodoc_process_docstring(app, what, name, obj, options, lines):
             doc_idx.append(item)
             return ":param %s_sphinx_paramlinks_%s.%s:" % (
                 modifier, objname, paramname)
-        return re.sub(r'^:param ([^:]+? )?([^:]+?):', cvt, line)
+        
+        def secondary_cvt(m):
+            modifier, objname, paramname = m.group(1) or '', name, m.group(2)
+            return ":type %s_sphinx_paramlinks_%s.%s:" % (
+                modifier, objname, paramname)
+        
+        line = re.sub(r'^:param ([^:]+? )?([^:]+?):', cvt, line)
+        line = re.sub(r'^:type ([^:]+? )?([^:]+?):', secondary_cvt, line)
+        return line
 
     if what in ('function', 'method', 'class'):
         lines[:] = [_cvt_param(name, line) for line in lines]
@@ -196,16 +224,23 @@ def lookup_params(app, env, node, contnode):
 
 
 def add_stylesheet(app):
-    app.add_stylesheet('sphinx_paramlinks.css')
+    if 'add_css_file' in dir(app):
+        app.add_css_file('sphinx_paramlinks.css')
+    else:
+        app.add_stylesheet('sphinx_paramlinks.css')
 
 
 def copy_stylesheet(app, exception):
-    app.info(
-        bold('The name of the builder is: %s' % app.builder.name), nonl=True)
+    logger = LOG
+    if logger is None:
+        logger = app
+    logger.info(
+            bold('The name of the builder is: %s' % app.builder.name), nonl=True)
 
     if not _is_html(app) or exception:
         return
-    app.info(bold('Copying sphinx_paramlinks stylesheet... '), nonl=True)
+
+    logger.info(bold('Copying sphinx_paramlinks stylesheet... '), nonl=True)
 
     source = os.path.abspath(os.path.dirname(__file__))
 
@@ -215,7 +250,8 @@ def copy_stylesheet(app, exception):
     # give it the path to a .css file and it does the right thing.
     dest = os.path.join(app.builder.outdir, '_static', 'sphinx_paramlinks.css')
     copyfile(os.path.join(source, "sphinx_paramlinks.css"), dest)
-    app.info('done')
+
+    logger.info('done')
 
 
 def build_index(app, doctree):
@@ -223,13 +259,18 @@ def build_index(app, doctree):
 
     for docname in entries:
         doc_entries = entries[docname]
-        app.env.indexentries[docname].extend(doc_entries)
+        get_indexentries(app)[docname].extend(doc_entries)
 
         for entry in doc_entries:
             sing, desc, ref, extra = entry[:4]
-            app.env.domains['py'].data['objects'][ref] = (docname, 'parameter')
+            if LooseVersion(__version__) >= LooseVersion('4.0.0'):
+                app.env.domains['py'].data['objects'][ref] = ObjectEntry(docname, ref, 'parameter', False)
+            elif LooseVersion(__version__) >= LooseVersion('3.0.0'):
+                app.env.domains['py'].data['objects'][ref] = ObjectEntry(docname, ref, 'parameter')
+            else:
+                app.env.domains['py'].data['objects'][ref] = (docname, 'parameter')
 
-    app.env.indexentries.pop('_sphinx_paramlinks_index')
+    get_indexentries(app).pop('_sphinx_paramlinks_index')
 
 
 def setup(app):

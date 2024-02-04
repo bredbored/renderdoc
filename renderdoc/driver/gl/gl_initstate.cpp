@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2017-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -132,6 +132,11 @@ void DoSerialise(SerialiserType &ser, SamplerInitialData &el)
   SERIALISE_MEMBER(magFilter);
   SERIALISE_MEMBER(maxAniso);
   SERIALISE_MEMBER(wrap);
+
+  // samplers from before 0x23 didn't have this field filled out at all. Set it to 1.0 as a
+  // reasonably sensible default
+  if(ser.VersionLess(0x23))
+    el.maxAniso = 1.0f;
 }
 
 template <typename SerialiserType>
@@ -165,12 +170,18 @@ void DoSerialise(SerialiserType &ser, TextureStateInitialData &el)
   SERIALISE_MEMBER(texBuffer);
   SERIALISE_MEMBER(texBufOffs);
   SERIALISE_MEMBER(texBufSize);
+
+  if(ser.VersionAtLeast(0x23))
+    SERIALISE_MEMBER(maxAniso);
+  else if(ser.IsReading())
+    el.maxAniso = 1.0f;    // no default is perfect, but at least set 1.0 instead of leaving it
+                           // uninitialised or 0.0
 }
 
 void WrappedOpenGL::TextureData::GetCompressedImageDataGLES(int mip, GLenum target, size_t size,
                                                             byte *buf)
 {
-  const std::vector<byte> &data = compressedData[mip];
+  const rdcarray<byte> &data = compressedData[mip];
 
   memset(buf, 0, size);
 
@@ -401,6 +412,11 @@ void GLResourceManager::ContextPrepare_InitialState(GLResource res)
       if(!IsGLES)
         GL.glGetSamplerParameterfv(res.name, eGL_TEXTURE_LOD_BIAS, &data.lodBias);
 
+      if(HasExt[ARB_texture_filter_anisotropic])
+        GL.glGetSamplerParameterfv(res.name, eGL_TEXTURE_MAX_ANISOTROPY, &data.maxAniso);
+      else
+        data.maxAniso = 1.0f;
+
       // technically border color has been in since GL 1.0, but since this extension was really
       // early and dovetails nicely with OES_texture_border_color which added both border colors and
       // clamping, we check it.
@@ -553,141 +569,40 @@ bool GLResourceManager::Prepare_InitialState(GLResource res)
   // and we just start getting commands there, but that case already isn't supported as we don't
   // detect it and insert state-change chunks, we assume all commands will come from a single
   // thread.
+  RDCASSERT(res.ContextShareGroup);
+
   ContextPair &ctx = m_Driver->GetCtx();
   if(res.ContextShareGroup == ctx.ctx || res.ContextShareGroup == ctx.shareGroup)
   {
     // call immediately, we are on the right context or share group
     ContextPrepare_InitialState(res);
   }
+  else if(IsResourceTrackedForPersistency(res))
+  {
+    GLWindowingData oldContextData = m_Driver->m_ActiveContexts[Threading::GetCurrentID()];
+
+    ContextShareGroup *shareGroup = (ContextShareGroup *)res.ContextShareGroup;
+
+    GLWindowingData savedContext;
+
+    if(m_Driver->m_Platform.PushChildContext(oldContextData, shareGroup->m_BackDoor, &savedContext))
+    {
+      m_Driver->m_ActiveContexts[Threading::GetCurrentID()] = shareGroup->m_BackDoor;
+
+      ContextPrepare_InitialState(res);
+
+      // restore the context
+      m_Driver->m_ActiveContexts[Threading::GetCurrentID()] = oldContextData;
+      m_Driver->m_Platform.PopChildContext(oldContextData, shareGroup->m_BackDoor, savedContext);
+    }
+  }
   else
   {
+    // queue if we can't use the backdoor
     m_Driver->QueuePrepareInitialState(res);
   }
 
   return true;
-}
-
-void GLResourceManager::CreateTextureImage(GLuint tex, GLenum internalFormat,
-                                           GLenum internalFormatHint, GLenum textype, GLint dim,
-                                           GLint width, GLint height, GLint depth, GLint samples,
-                                           int mips)
-{
-  if(textype == eGL_TEXTURE_BUFFER)
-  {
-    return;
-  }
-  else if(textype == eGL_TEXTURE_2D_MULTISAMPLE)
-  {
-    GL.glTextureStorage2DMultisampleEXT(tex, textype, samples, internalFormat, width, height,
-                                        GL_TRUE);
-  }
-  else if(textype == eGL_TEXTURE_2D_MULTISAMPLE_ARRAY)
-  {
-    GL.glTextureStorage3DMultisampleEXT(tex, textype, samples, internalFormat, width, height, depth,
-                                        GL_TRUE);
-  }
-  else
-  {
-    GL.glTextureParameteriEXT(tex, textype, eGL_TEXTURE_MAX_LEVEL, mips - 1);
-    GL.glTextureParameteriEXT(tex, textype, eGL_TEXTURE_MIN_FILTER, eGL_NEAREST);
-    GL.glTextureParameteriEXT(tex, textype, eGL_TEXTURE_MAG_FILTER, eGL_NEAREST);
-    GL.glTextureParameteriEXT(tex, textype, eGL_TEXTURE_WRAP_S, eGL_CLAMP_TO_EDGE);
-    GL.glTextureParameteriEXT(tex, textype, eGL_TEXTURE_WRAP_T, eGL_CLAMP_TO_EDGE);
-
-    bool isCompressed = IsCompressedFormat(internalFormat);
-
-    GLenum baseFormat = eGL_RGBA;
-    GLenum dataType = internalFormatHint != eGL_NONE ? internalFormatHint : eGL_UNSIGNED_BYTE;
-    if(!isCompressed)
-    {
-      baseFormat = GetBaseFormat(internalFormat);
-
-      if(internalFormatHint == eGL_NONE)
-        dataType = GetDataType(internalFormat);
-    }
-
-    GLenum targets[] = {
-        eGL_TEXTURE_CUBE_MAP_POSITIVE_X, eGL_TEXTURE_CUBE_MAP_NEGATIVE_X,
-        eGL_TEXTURE_CUBE_MAP_POSITIVE_Y, eGL_TEXTURE_CUBE_MAP_NEGATIVE_Y,
-        eGL_TEXTURE_CUBE_MAP_POSITIVE_Z, eGL_TEXTURE_CUBE_MAP_NEGATIVE_Z,
-    };
-
-    int count = ARRAY_COUNT(targets);
-
-    if(textype != eGL_TEXTURE_CUBE_MAP)
-    {
-      targets[0] = textype;
-      count = 1;
-    }
-
-    GLsizei w = (GLsizei)width;
-    GLsizei h = (GLsizei)height;
-    GLsizei d = (GLsizei)depth;
-
-    for(int m = 0; m < mips; m++)
-    {
-      for(int t = 0; t < count; t++)
-      {
-        if(isCompressed)
-        {
-          GLsizei compSize = (GLsizei)GetCompressedByteSize(w, h, d, internalFormat);
-
-          std::vector<byte> dummy;
-          dummy.resize(compSize);
-
-          if(dim == 1)
-            GL.glCompressedTextureImage1DEXT(tex, targets[t], m, internalFormat, w, 0, compSize,
-                                             &dummy[0]);
-          else if(dim == 2)
-            GL.glCompressedTextureImage2DEXT(tex, targets[t], m, internalFormat, w, h, 0, compSize,
-                                             &dummy[0]);
-          else if(dim == 3)
-            GL.glCompressedTextureImage3DEXT(tex, targets[t], m, internalFormat, w, h, d, 0,
-                                             compSize, &dummy[0]);
-        }
-        else
-        {
-          if(dim == 1)
-            GL.glTextureImage1DEXT(tex, targets[t], m, internalFormat, w, 0, baseFormat, dataType,
-                                   NULL);
-          else if(dim == 2)
-            GL.glTextureImage2DEXT(tex, targets[t], m, internalFormat, w, h, 0, baseFormat,
-                                   dataType, NULL);
-          else if(dim == 3)
-            GL.glTextureImage3DEXT(tex, targets[t], m, internalFormat, w, h, d, 0, baseFormat,
-                                   dataType, NULL);
-        }
-      }
-
-      w = RDCMAX(1, w >> 1);
-      if(textype != eGL_TEXTURE_1D_ARRAY)
-        h = RDCMAX(1, h >> 1);
-      if(textype != eGL_TEXTURE_2D_ARRAY && textype != eGL_TEXTURE_CUBE_MAP_ARRAY)
-        d = RDCMAX(1, d >> 1);
-    }
-  }
-
-  if(IsCaptureMode(m_State))
-  {
-    // register this texture and set up its texture details, so it's available for emulation
-    // readback.
-    GLResource res = TextureRes(m_Driver->GetCtx(), tex);
-    ResourceId id = RegisterResource(res);
-
-    WrappedOpenGL::TextureData &details = m_Driver->m_Textures[id];
-
-    details.resource = res;
-    details.curType = textype;
-    details.dimension = dim;
-    details.emulated = details.view = false;
-    details.width = width;
-    details.height = height;
-    details.depth = depth;
-    details.samples = samples;
-    details.creationFlags = TextureCategory::NoFlags;
-    details.internalFormat = internalFormat;
-    details.mipsValid = (1 << mips) - 1;
-  }
 }
 
 void GLResourceManager::PrepareTextureInitialContents(ResourceId liveid, ResourceId origid,
@@ -742,10 +657,13 @@ void GLResourceManager::PrepareTextureInitialContents(ResourceId liveid, Resourc
       GL.glGetTextureParameterivEXT(res.name, details.curType, eGL_TEXTURE_CUBE_MAP_SEAMLESS,
                                     (GLint *)&state.seamless);
 
-    GL.glGetTextureParameterivEXT(res.name, details.curType, eGL_TEXTURE_BASE_LEVEL,
-                                  (GLint *)&state.baseLevel);
-    GL.glGetTextureParameterivEXT(res.name, details.curType, eGL_TEXTURE_MAX_LEVEL,
-                                  (GLint *)&state.maxLevel);
+    if(details.curType != eGL_TEXTURE_RECTANGLE)
+    {
+      GL.glGetTextureParameterivEXT(res.name, details.curType, eGL_TEXTURE_BASE_LEVEL,
+                                    (GLint *)&state.baseLevel);
+      GL.glGetTextureParameterivEXT(res.name, details.curType, eGL_TEXTURE_MAX_LEVEL,
+                                    (GLint *)&state.maxLevel);
+    }
 
     if(HasExt[ARB_texture_swizzle] || HasExt[EXT_texture_swizzle])
     {
@@ -797,6 +715,12 @@ void GLResourceManager::PrepareTextureInitialContents(ResourceId liveid, Resourc
         GL.glGetTextureParameterfvEXT(res.name, details.curType, eGL_TEXTURE_LOD_BIAS,
                                       &state.lodBias);
 
+      if(HasExt[ARB_texture_filter_anisotropic])
+        GL.glGetTextureParameterfvEXT(res.name, details.curType, eGL_TEXTURE_MAX_ANISOTROPY,
+                                      &state.maxAniso);
+      else
+        state.maxAniso = 1.0f;
+
       // CLAMP isn't supported (border texels gone), assume they meant CLAMP_TO_EDGE
       if(state.wrap[0] == eGL_CLAMP)
         state.wrap[0] = eGL_CLAMP_TO_EDGE;
@@ -828,9 +752,9 @@ void GLResourceManager::PrepareTextureInitialContents(ResourceId liveid, Resourc
         mips = 1;
 
       // create texture of identical format/size to store initial contents
-      CreateTextureImage(tex, details.internalFormat, details.internalFormatHint, details.curType,
-                         details.dimension, details.width, details.height, details.depth,
-                         details.samples, mips);
+      m_Driver->CreateTextureImage(
+          tex, details.internalFormat, details.initFormatHint, details.initTypeHint, details.curType,
+          details.dimension, details.width, details.height, details.depth, details.samples, mips);
 
       // we need to set maxlevel appropriately for number of mips to force the texture to be
       // complete.
@@ -895,8 +819,16 @@ void GLResourceManager::PrepareTextureInitialContents(ResourceId liveid, Resourc
         if(details.curType == eGL_TEXTURE_CUBE_MAP)
           d *= 6;
         else if(details.curType == eGL_TEXTURE_CUBE_MAP_ARRAY ||
-                details.curType == eGL_TEXTURE_1D_ARRAY || details.curType == eGL_TEXTURE_2D_ARRAY)
+                details.curType == eGL_TEXTURE_2D_ARRAY)
           d = details.depth;
+
+        // glCopyImageSubData treats 1D arrays sanely - with depth as array size - but at odds
+        // with the rest of the API.
+        if(details.curType == eGL_TEXTURE_1D_ARRAY)
+        {
+          h = 1;
+          d = details.height;
+        }
 
         // AMD throws an error copying mips that are smaller than the block size in one dimension,
         // so do copy via CPU instead (will be slow, potentially we could optimise this if there's a
@@ -981,6 +913,9 @@ void GLResourceManager::PrepareTextureInitialContents(ResourceId liveid, Resourc
         }
       }
 
+      GL.glFlush();
+      GL.glFinish();
+
       if(avoidCopySubImage)
       {
         pack.Apply(false);
@@ -990,8 +925,11 @@ void GLResourceManager::PrepareTextureInitialContents(ResourceId liveid, Resourc
         GL.glBindBuffer(eGL_PIXEL_UNPACK_BUFFER, pixelUnpackBuffer);
       }
 
-      GL.glTextureParameterivEXT(res.name, details.curType, eGL_TEXTURE_MAX_LEVEL,
-                                 (GLint *)&state.maxLevel);
+      if(details.curType != eGL_TEXTURE_RECTANGLE)
+      {
+        GL.glTextureParameterivEXT(res.name, details.curType, eGL_TEXTURE_MAX_LEVEL,
+                                   (GLint *)&state.maxLevel);
+      }
 
       if(!ms)
       {
@@ -999,6 +937,26 @@ void GLResourceManager::PrepareTextureInitialContents(ResourceId liveid, Resourc
                                    (GLint *)&state.minFilter);
         GL.glTextureParameterivEXT(res.name, details.curType, eGL_TEXTURE_MAG_FILTER,
                                    (GLint *)&state.magFilter);
+      }
+
+      // if this is an MSAA texture then during capture we now need to unpack to an array, ready to
+      // serialise. When replaying, we come in here for 'creating' initial states so we want to keep
+      // it as MSAA
+      if(ms && IsCaptureMode(m_State))
+      {
+        GLuint oldtex = 0;
+        GL.glGetIntegerv(eGL_TEXTURE_BINDING_2D_ARRAY, (GLint *)&oldtex);
+
+        GLuint msaaTex = tex;
+
+        tex = 0;
+        m_Driver->CopyTex2DMSToArray(tex, msaaTex, details.width, details.height, details.depth,
+                                     details.samples, details.internalFormat);
+
+        // destroy the MSAA texture, we don't need it anymore
+        GL.glDeleteTextures(1, &msaaTex);
+
+        GL.glBindTexture(eGL_TEXTURE_2D_ARRAY, oldtex);
       }
     }
 
@@ -1022,45 +980,12 @@ void GLResourceManager::PrepareTextureInitialContents(ResourceId liveid, Resourc
   SetInitialContents(origid, initContents);
 }
 
-void GLResourceManager::Force_ReferenceViews()
-{
-  // don't need to force anything if we're already including all resources
-  if(RenderDoc::Inst().GetCaptureOptions().refAllResources)
-    return;
-
-  for(auto recordit = m_ResourceRecords.begin(); recordit != m_ResourceRecords.end(); ++recordit)
-  {
-    GLResourceRecord *record = recordit->second;
-
-    // if this resource has some viewers, check to see if they were referenced by the frame but we
-    // weren't, and force our own reference as well so that our initial states are included
-    if(record && !record->viewTextures.empty())
-    {
-      // if this data resource was referenced already, just skip
-      if(m_FrameReferencedResources.find(record->GetResourceID()) != m_FrameReferencedResources.end())
-        continue;
-
-      // see if any of our viewers were referenced
-      for(auto it = record->viewTextures.begin(); it != record->viewTextures.end(); ++it)
-      {
-        // if so, return true to force our inclusion, for the benefit of the view
-        if(m_FrameReferencedResources.find(*it) != m_FrameReferencedResources.end())
-        {
-          RDCDEBUG("Forcing inclusion of %llu for %llu", record->GetResourceID(), *it);
-          MarkResourceFrameReferenced(record->GetResourceID(), eFrameRef_ReadBeforeWrite);
-          break;
-        }
-      }
-    }
-  }
-}
-
 uint64_t GLResourceManager::GetSize_InitialState(ResourceId resid, const GLInitialContents &initial)
 {
   if(initial.type == eResBuffer)
   {
     // buffers just have their contents, no metadata needed
-    return initial.bufferLength + WriteSerialiser::GetChunkAlignment() + 16;
+    return initial.bufferLength + WriteSerialiser::GetChunkAlignment() + 64;
   }
   else if(initial.type == eResProgram)
   {
@@ -1116,17 +1041,22 @@ uint64_t GLResourceManager::GetSize_InitialState(ResourceId resid, const GLIniti
       uint32_t h = RDCMAX(TextureState.height >> i, 1U);
       uint32_t d = RDCMAX(TextureState.depth >> i, 1U);
 
-      if(TextureState.type == eGL_TEXTURE_CUBE_MAP_ARRAY ||
-         TextureState.type == eGL_TEXTURE_1D_ARRAY || TextureState.type == eGL_TEXTURE_2D_ARRAY)
+      if(TextureState.type == eGL_TEXTURE_CUBE_MAP_ARRAY || TextureState.type == eGL_TEXTURE_2D_ARRAY)
         d = TextureState.depth;
 
-      uint32_t size = 0;
+      if(TextureState.samples > 1)
+        d = RDCMAX(1U, TextureState.depth) * TextureState.samples;
+
+      if(TextureState.type == eGL_TEXTURE_1D_ARRAY)
+        h = TextureState.height;
+
+      uint64_t size = 0;
 
       // calculate the actual byte size of this mip
       if(isCompressed)
-        size = (uint32_t)GetCompressedByteSize(w, h, d, TextureState.internalformat);
+        size = (uint64_t)GetCompressedByteSize(w, h, d, TextureState.internalformat);
       else
-        size = (uint32_t)GetByteSize(w, h, d, fmt, type);
+        size = (uint64_t)GetByteSize(w, h, d, fmt, type);
 
       int targetcount = 1;
 
@@ -1182,7 +1112,7 @@ bool GLResourceManager::Serialise_InitialState(SerialiserType &ser, ResourceId i
   if(initial)
     initContents = *initial;
 
-  SERIALISE_ELEMENT(id).TypedAs("GLResource"_lit);
+  SERIALISE_ELEMENT(id).TypedAs("GLResource"_lit).Important();
   SERIALISE_ELEMENT_LOCAL(Type, initial->type);
 
   if(IsReplayingAndReading())
@@ -1226,7 +1156,8 @@ bool GLResourceManager::Serialise_InitialState(SerialiserType &ser, ResourceId i
 
     // not using SERIALISE_ELEMENT_ARRAY so we can deliberately avoid allocation - we serialise
     // directly into upload memory
-    ser.Serialise("BufferContents"_lit, BufferContents, BufferContentsSize, SerialiserFlags::NoFlags);
+    ser.Serialise("BufferContents"_lit, BufferContents, BufferContentsSize, SerialiserFlags::NoFlags)
+        .Important();
 
     if(mappedBuffer.name)
       GL.glUnmapNamedBufferEXT(mappedBuffer.name);
@@ -1254,7 +1185,7 @@ bool GLResourceManager::Serialise_InitialState(SerialiserType &ser, ResourceId i
 
       uint32_t numShaders = 0;
 
-      std::vector<std::string> vertexOutputs;
+      rdcarray<rdcstr> vertexOutputs;
       for(size_t i = 0; i < ARRAY_COUNT(details.stageShaders); i++)
       {
         if(details.stageShaders[i] == ResourceId())
@@ -1264,25 +1195,25 @@ bool GLResourceManager::Serialise_InitialState(SerialiserType &ser, ResourceId i
 
         const auto &shadDetails = m_Driver->m_Shaders[details.stageShaders[i]];
 
-        IsProgramSPIRV |= shadDetails.reflection.encoding == ShaderEncoding::SPIRV;
+        IsProgramSPIRV |= shadDetails.reflection->encoding == ShaderEncoding::OpenGLSPIRV;
 
         GLuint shad = drv.glCreateShader(shadDetails.type);
 
         if(shadDetails.type == eGL_VERTEX_SHADER)
         {
-          for(const SigParameter &sig : shadDetails.reflection.outputSignature)
+          for(const SigParameter &sig : shadDetails.reflection->outputSignature)
           {
-            std::string name = sig.varName;
+            rdcstr name = sig.varName;
 
-            // look for :row added to split up matrix variables
-            size_t colon = name.find(":row");
+            // look for :row or :col added to split up matrix variables
+            int32_t colon = name.find(":");
 
             // remove it, if present
-            if(colon != std::string::npos)
+            if(colon >= 0)
               name.resize(colon);
 
             // only push matrix variables once
-            if(std::find(vertexOutputs.begin(), vertexOutputs.end(), name) == vertexOutputs.end())
+            if(!vertexOutputs.contains(name))
               vertexOutputs.push_back(name);
           }
         }
@@ -1293,9 +1224,18 @@ bool GLResourceManager::Serialise_InitialState(SerialiserType &ser, ResourceId i
           for(size_t s = 0; s < shadDetails.sources.size(); s++)
             srcs[s] = (char *)shadDetails.sources[s].c_str();
           drv.glShaderSource(shad, (GLsizei)shadDetails.sources.size(), srcs, NULL);
-
           SAFE_DELETE_ARRAY(srcs);
-          drv.glCompileShader(shad);
+
+          char **includes = new char *[shadDetails.includepaths.size()];
+          for(size_t s = 0; s < shadDetails.includepaths.size(); s++)
+            includes[s] = (char *)shadDetails.includepaths[s].c_str();
+
+          if(shadDetails.includepaths.empty())
+            drv.glCompileShader(shad);
+          else
+            drv.glCompileShaderIncludeARB(shad, (GLsizei)shadDetails.includepaths.size(), includes,
+                                          NULL);
+          SAFE_DELETE_ARRAY(includes);
           drv.glAttachShader(initProg, shad);
           drv.glDeleteShader(shad);
         }
@@ -1326,55 +1266,55 @@ bool GLResourceManager::Serialise_InitialState(SerialiserType &ser, ResourceId i
       // eventually get one to work that's fine.
       m_Driver->SuppressDebugMessages(true);
 
-      std::vector<const char *> vertexOutputsPtr;
-      vertexOutputsPtr.resize(vertexOutputs.size());
-      for(size_t i = 0; i < vertexOutputs.size(); i++)
-        vertexOutputsPtr[i] = vertexOutputs[i].c_str();
-
-      if(!IsProgramSPIRV)
-        drv.glTransformFeedbackVaryings(initProg, (GLsizei)vertexOutputsPtr.size(),
-                                        &vertexOutputsPtr[0], eGL_INTERLEAVED_ATTRIBS);
-      drv.glLinkProgram(initProg);
-
-      GLint status = 0;
-      drv.glGetProgramiv(initProg, eGL_LINK_STATUS, &status);
-
-      // if it failed to link, first remove the varyings hack above as maybe the driver is barfing
-      // on trying to make some output a varying
-      if(status == 0 && !IsProgramSPIRV)
+      if(numShaders)
       {
-        drv.glTransformFeedbackVaryings(initProg, 0, NULL, eGL_INTERLEAVED_ATTRIBS);
+        rdcarray<const char *> vertexOutputsPtr;
+        vertexOutputsPtr.resize(vertexOutputs.size());
+        for(size_t i = 0; i < vertexOutputs.size(); i++)
+          vertexOutputsPtr[i] = vertexOutputs[i].c_str();
+
+        if(!IsProgramSPIRV)
+          drv.glTransformFeedbackVaryings(initProg, (GLsizei)vertexOutputsPtr.size(),
+                                          &vertexOutputsPtr[0], eGL_INTERLEAVED_ATTRIBS);
         drv.glLinkProgram(initProg);
 
+        GLint status = 0;
         drv.glGetProgramiv(initProg, eGL_LINK_STATUS, &status);
-      }
 
-      // if it failed to link, try again as a separable program.
-      // we can't do this by default because of the silly rules meaning
-      // shaders need fixup to be separable-compatible.
-      if(status == 0)
-      {
-        drv.glProgramParameteri(initProg, eGL_PROGRAM_SEPARABLE, 1);
-        drv.glLinkProgram(initProg);
-
-        drv.glGetProgramiv(initProg, eGL_LINK_STATUS, &status);
-      }
-
-      m_Driver->SuppressDebugMessages(false);
-
-      if(status == 0)
-      {
-        if(numShaders == 0)
+        // if it failed to link, first remove the varyings hack above as maybe the driver is barfing
+        // on trying to make some output a varying
+        if(status == 0 && !IsProgramSPIRV)
         {
-          RDCWARN("No shaders attached to program");
+          drv.glTransformFeedbackVaryings(initProg, 0, NULL, eGL_INTERLEAVED_ATTRIBS);
+          drv.glLinkProgram(initProg);
+
+          drv.glGetProgramiv(initProg, eGL_LINK_STATUS, &status);
         }
-        else
+
+        // if it failed to link, try again as a separable program.
+        // we can't do this by default because of the silly rules meaning
+        // shaders need fixup to be separable-compatible.
+        if(status == 0)
+        {
+          drv.glProgramParameteri(initProg, eGL_PROGRAM_SEPARABLE, 1);
+          drv.glLinkProgram(initProg);
+
+          drv.glGetProgramiv(initProg, eGL_LINK_STATUS, &status);
+        }
+
+        if(status == 0)
         {
           char buffer[1025] = {0};
           drv.glGetProgramInfoLog(initProg, 1024, NULL, buffer);
           RDCERR("Link error: %s", buffer);
         }
       }
+      else
+      {
+        RDCWARN("No shaders attached to program");
+      }
+
+      m_Driver->SuppressDebugMessages(false);
 
       // normally we'd serialise programs and uniforms into the initial state program, but on some
       // drivers uniform locations can change between it and the live program, so we serialise the
@@ -1452,8 +1392,9 @@ bool GLResourceManager::Serialise_InitialState(SerialiserType &ser, ResourceId i
     // Otherwise this texture has no initial state to apply
     if(TextureState.internalformat != eGL_NONE && !ser.IsErrored())
     {
-      WrappedOpenGL::TextureData &details =
-          ser.IsWriting() ? m_Driver->m_Textures[id] : m_Driver->m_Textures[GetLiveID(id)];
+      WrappedOpenGL::TextureData &details = (ser.IsWriting() || IsStructuredExporting(m_State))
+                                                ? m_Driver->m_Textures[id]
+                                                : m_Driver->m_Textures[GetLiveID(id)];
 
       if(TextureState.type == eGL_TEXTURE_BUFFER || TextureState.isView)
       {
@@ -1505,10 +1446,18 @@ bool GLResourceManager::Serialise_InitialState(SerialiserType &ser, ResourceId i
             GLsizei h = (GLsizei)TextureState.height;
             GLsizei d = (GLsizei)TextureState.depth;
 
+            GLenum baseFormat = isCompressed ? eGL_NONE : GetBaseFormat(TextureState.internalformat);
+            GLenum dataType = isCompressed ? eGL_NONE : GetDataType(TextureState.internalformat);
+
+            if(details.initFormatHint != eGL_NONE)
+              baseFormat = details.initFormatHint;
+            if(details.initTypeHint != eGL_NONE)
+              dataType = details.initTypeHint;
+
             // see how many mips we actually have available
             int liveMips = GetNumMips(TextureState.type, liveRes.name, w, h, d);
 
-            std::vector<byte> scratchBuf;
+            rdcarray<byte> scratchBuf;
 
             // loop over the number of mips we should have
             for(int m = 1; m < TextureState.mips; m++)
@@ -1518,9 +1467,11 @@ bool GLResourceManager::Serialise_InitialState(SerialiserType &ser, ResourceId i
               d = RDCMAX(1, d >> 1);
 
               if(TextureState.type == eGL_TEXTURE_CUBE_MAP_ARRAY ||
-                 TextureState.type == eGL_TEXTURE_1D_ARRAY ||
                  TextureState.type == eGL_TEXTURE_2D_ARRAY)
                 d = (GLsizei)TextureState.depth;
+
+              if(TextureState.type == eGL_TEXTURE_1D_ARRAY)
+                h = (GLsizei)TextureState.height;
 
               // if this mip doesn't exist yet, we must create it with dummy data.
               if(m >= liveMips)
@@ -1550,20 +1501,15 @@ bool GLResourceManager::Serialise_InitialState(SerialiserType &ser, ResourceId i
                   else
                   {
                     if(TextureState.dim == 1)
-                      GL.glTextureImage1DEXT(liveRes.name, targets[t], m,
-                                             TextureState.internalformat, (GLsizei)w, 0,
-                                             GetBaseFormat(TextureState.internalformat),
-                                             GetDataType(TextureState.internalformat), NULL);
+                      GL.glTextureImage1DEXT(liveRes.name, targets[t], m, TextureState.internalformat,
+                                             (GLsizei)w, 0, baseFormat, dataType, NULL);
                     else if(TextureState.dim == 2)
-                      GL.glTextureImage2DEXT(liveRes.name, targets[t], m,
-                                             TextureState.internalformat, (GLsizei)w, (GLsizei)h, 0,
-                                             GetBaseFormat(TextureState.internalformat),
-                                             GetDataType(TextureState.internalformat), NULL);
+                      GL.glTextureImage2DEXT(liveRes.name, targets[t], m, TextureState.internalformat,
+                                             (GLsizei)w, (GLsizei)h, 0, baseFormat, dataType, NULL);
                     else if(TextureState.dim == 3)
-                      GL.glTextureImage3DEXT(
-                          liveRes.name, targets[t], m, TextureState.internalformat, (GLsizei)w,
-                          (GLsizei)h, (GLsizei)d, 0, GetBaseFormat(TextureState.internalformat),
-                          GetDataType(TextureState.internalformat), NULL);
+                      GL.glTextureImage3DEXT(liveRes.name, targets[t], m,
+                                             TextureState.internalformat, (GLsizei)w, (GLsizei)h,
+                                             (GLsizei)d, 0, baseFormat, dataType, NULL);
                   }
                 }
               }
@@ -1574,28 +1520,14 @@ bool GLResourceManager::Serialise_InitialState(SerialiserType &ser, ResourceId i
 
         GLuint tex = 0;
         GLuint prevtex = 0;
+        GLuint prevArrayTex = 0;
+        GLuint msaaTex = 0;
 
         // push the texture binding
         if(!IsStructuredExporting(m_State) && !ser.IsErrored())
+        {
           GL.glGetIntegerv(TextureBinding(TextureState.type), (GLint *)&prevtex);
-
-        // create texture of identical format/size as the live resource to store initial contents
-        if(IsReplayingAndReading() && !ser.IsErrored())
-        {
-          GL.glGenTextures(1, &tex);
-          GL.glBindTexture(TextureState.type, tex);
-
-          CreateTextureImage(tex, TextureState.internalformat, details.internalFormatHint,
-                             TextureState.type, TextureState.dim, TextureState.width,
-                             TextureState.height, TextureState.depth, TextureState.samples,
-                             TextureState.mips);
-        }
-        else if(ser.IsWriting())
-        {
-          // on writing, bind the prepared texture with initial contents to grab
-          tex = initial->resource.name;
-
-          GL.glBindTexture(TextureState.type, tex);
+          GL.glGetIntegerv(eGL_TEXTURE_BINDING_2D_ARRAY, (GLint *)&prevArrayTex);
         }
 
         // multisample textures have no mips
@@ -1603,29 +1535,105 @@ bool GLResourceManager::Serialise_InitialState(SerialiserType &ser, ResourceId i
            TextureState.type == eGL_TEXTURE_2D_MULTISAMPLE_ARRAY)
           TextureState.mips = 1;
 
+        bool hasInitialData = true;
+
         if(TextureState.samples > 1)
         {
-          GLNOTIMP("Not implemented - initial states of multisampled textures");
+          // multisampled initial data was added in 0x21, before then, multisampled textures had no
+          // initial data.
+          hasInitialData = ser.VersionAtLeast(0x21);
         }
-        else
+
+        uint32_t copySlices = RDCMAX(1U, TextureState.depth);
+        uint32_t texDim = TextureState.dim;
+
+        // create texture of identical format/size as the live resource to store initial contents
+        if(IsReplayingAndReading() && !ser.IsErrored())
+        {
+          GL.glGenTextures(1, &tex);
+          GL.glBindTexture(TextureState.type, tex);
+
+          // create MSAA texture we'll use for applying
+          m_Driver->CreateTextureImage(tex, TextureState.internalformat, details.initFormatHint,
+                                       details.initTypeHint, TextureState.type, TextureState.dim,
+                                       TextureState.width, TextureState.height, TextureState.depth,
+                                       TextureState.samples, TextureState.mips);
+
+          // create intermediary array for serialising
+          if(TextureState.samples > 1)
+          {
+            msaaTex = tex;
+
+            GL.glGenTextures(1, &tex);
+            GL.glBindTexture(eGL_TEXTURE_2D_ARRAY, tex);
+
+            copySlices = RDCMAX(1U, TextureState.depth) * TextureState.samples;
+            texDim = 3;
+
+            GL.glTextureParameteriEXT(tex, eGL_TEXTURE_2D_ARRAY, eGL_TEXTURE_MAX_LEVEL, 0);
+            GL.glTextureParameteriEXT(tex, eGL_TEXTURE_2D_ARRAY, eGL_TEXTURE_MIN_FILTER, eGL_NEAREST);
+            GL.glTextureParameteriEXT(tex, eGL_TEXTURE_2D_ARRAY, eGL_TEXTURE_MAG_FILTER, eGL_NEAREST);
+            GL.glTextureParameteriEXT(tex, eGL_TEXTURE_2D_ARRAY, eGL_TEXTURE_WRAP_S,
+                                      eGL_CLAMP_TO_EDGE);
+            GL.glTextureParameteriEXT(tex, eGL_TEXTURE_2D_ARRAY, eGL_TEXTURE_WRAP_T,
+                                      eGL_CLAMP_TO_EDGE);
+
+            // must use immutable tex storage here, for MSAA<->Array copies
+            GL.glTextureStorage3DEXT(tex, eGL_TEXTURE_2D_ARRAY, 1,
+                                     GetSizedFormat(TextureState.internalformat),
+                                     TextureState.width, TextureState.height, copySlices);
+
+            // read back from the array we prepared
+            targets[0] = eGL_TEXTURE_2D_ARRAY;
+          }
+        }
+        else if(IsStructuredExporting(m_State))
+        {
+          if(TextureState.samples > 1)
+          {
+            copySlices = RDCMAX(1U, TextureState.depth) * TextureState.samples;
+            texDim = 3;
+          }
+        }
+        else if(ser.IsWriting())
+        {
+          // on writing, bind the prepared texture with initial contents to grab
+          tex = initial->resource.name;
+
+          // if this is an MSAA texture, we prepared an array to serialise
+          if(TextureState.samples > 1)
+          {
+            GL.glBindTexture(eGL_TEXTURE_2D_ARRAY, tex);
+
+            copySlices = RDCMAX(1U, TextureState.depth) * TextureState.samples;
+
+            targets[0] = eGL_TEXTURE_2D_ARRAY;
+          }
+          else
+          {
+            GL.glBindTexture(TextureState.type, tex);
+          }
+        }
+
+        if(hasInitialData)
         {
           GLenum fmt = eGL_NONE;
           GLenum type = eGL_NONE;
-          uint32_t size = 0;
+          uint64_t size = 0;
 
           // fetch the maximum possible size that any mip/slice could take, so we can allocate
           // scratch memory.
           if(isCompressed)
           {
-            size = (uint32_t)GetCompressedByteSize(TextureState.width, TextureState.height,
+            size = (uint64_t)GetCompressedByteSize(TextureState.width, TextureState.height,
                                                    TextureState.depth, TextureState.internalformat);
           }
           else
           {
             fmt = GetBaseFormat(TextureState.internalformat);
             type = GetDataType(TextureState.internalformat);
-            size = (uint32_t)GetByteSize(TextureState.width, TextureState.height,
-                                         TextureState.depth, fmt, type);
+            size = (uint64_t)GetByteSize(RDCMAX(1U, TextureState.width),
+                                         RDCMAX(1U, TextureState.height), copySlices, fmt, type);
           }
 
           // on read and write, we allocate a single buffer big enough for all mips and re-use it
@@ -1639,15 +1647,17 @@ bool GLResourceManager::Serialise_InitialState(SerialiserType &ser, ResourceId i
             uint32_t h = RDCMAX(TextureState.height >> i, 1U);
             uint32_t d = RDCMAX(TextureState.depth >> i, 1U);
 
-            if(TextureState.type == eGL_TEXTURE_CUBE_MAP_ARRAY ||
-               TextureState.type == eGL_TEXTURE_1D_ARRAY || TextureState.type == eGL_TEXTURE_2D_ARRAY)
-              d = TextureState.depth;
+            if(targets[0] == eGL_TEXTURE_CUBE_MAP_ARRAY || targets[0] == eGL_TEXTURE_2D_ARRAY)
+              d = copySlices;
+
+            if(targets[0] == eGL_TEXTURE_1D_ARRAY)
+              h = TextureState.height;
 
             // calculate the actual byte size of this mip
             if(isCompressed)
-              size = (uint32_t)GetCompressedByteSize(w, h, d, TextureState.internalformat);
+              size = (uint64_t)GetCompressedByteSize(w, h, d, TextureState.internalformat);
             else
-              size = (uint32_t)GetByteSize(w, h, d, fmt, type);
+              size = (uint64_t)GetByteSize(w, h, d, fmt, type);
 
             // loop over the number of targets (this will only ever be >1 for cubemaps)
             for(int trg = 0; trg < targetcount; trg++)
@@ -1658,7 +1668,7 @@ bool GLResourceManager::Serialise_InitialState(SerialiserType &ser, ResourceId i
                 if(isCompressed)
                 {
                   if(IsGLES)
-                    details.GetCompressedImageDataGLES(i, targets[trg], size, scratchBuf);
+                    details.GetCompressedImageDataGLES(i, targets[trg], (size_t)size, scratchBuf);
                   else
                     GL.glGetCompressedTextureImageEXT(tex, targets[trg], i, scratchBuf);
                 }
@@ -1670,7 +1680,8 @@ bool GLResourceManager::Serialise_InitialState(SerialiserType &ser, ResourceId i
               }
 
               // serialise without allocating memory as we already have our scratch buf sized.
-              ser.Serialise("SubresourceContents"_lit, scratchBuf, size, SerialiserFlags::NoFlags);
+              ser.Serialise("SubresourceContents"_lit, scratchBuf, size, SerialiserFlags::NoFlags)
+                  .Important();
 
               // on replay, restore the data into the initial contents texture
               if(IsReplayingAndReading() && !ser.IsErrored())
@@ -1680,33 +1691,33 @@ bool GLResourceManager::Serialise_InitialState(SerialiserType &ser, ResourceId i
                   if(IsGLES)
                   {
                     size_t startOffs =
-                        IsCubeFace(targets[trg]) ? CubeTargetIndex(targets[trg]) * size : 0;
+                        IsCubeFace(targets[trg]) ? CubeTargetIndex(targets[trg]) * (size_t)size : 0;
 
-                    details.compressedData[i].resize(startOffs + size);
-                    memcpy(details.compressedData[i].data() + startOffs, scratchBuf, size);
+                    details.compressedData[i].resize(startOffs + (size_t)size);
+                    memcpy(details.compressedData[i].data() + startOffs, scratchBuf, (size_t)size);
                   }
 
-                  if(TextureState.dim == 1)
+                  if(texDim == 1)
                     GL.glCompressedTextureSubImage1DEXT(tex, targets[trg], i, 0, w,
                                                         TextureState.internalformat, (GLsizei)size,
                                                         scratchBuf);
-                  else if(TextureState.dim == 2)
+                  else if(texDim == 2)
                     GL.glCompressedTextureSubImage2DEXT(tex, targets[trg], i, 0, 0, w, h,
                                                         TextureState.internalformat, (GLsizei)size,
                                                         scratchBuf);
-                  else if(TextureState.dim == 3)
+                  else if(texDim == 3)
                     GL.glCompressedTextureSubImage3DEXT(tex, targets[trg], i, 0, 0, 0, w, h, d,
                                                         TextureState.internalformat, (GLsizei)size,
                                                         scratchBuf);
                 }
                 else
                 {
-                  if(TextureState.dim == 1)
+                  if(texDim == 1)
                     GL.glTextureSubImage1DEXT(tex, targets[trg], i, 0, w, fmt, type, scratchBuf);
-                  else if(TextureState.dim == 2)
+                  else if(texDim == 2)
                     GL.glTextureSubImage2DEXT(tex, targets[trg], i, 0, 0, w, h, fmt, type,
                                               scratchBuf);
-                  else if(TextureState.dim == 3)
+                  else if(texDim == 3)
                     GL.glTextureSubImage3DEXT(tex, targets[trg], i, 0, 0, 0, w, h, d, fmt, type,
                                               scratchBuf);
                 }
@@ -1720,7 +1731,22 @@ bool GLResourceManager::Serialise_InitialState(SerialiserType &ser, ResourceId i
 
         // restore the previous texture binding
         if(!IsStructuredExporting(m_State) && !ser.IsErrored())
+        {
           GL.glBindTexture(TextureState.type, prevtex);
+          GL.glBindTexture(eGL_TEXTURE_2D_ARRAY, prevArrayTex);
+        }
+
+        // the array texture has been serialised. If we're reading, copy back into the MSAA texture
+        // and destroy the temp array texture
+        if(IsReplayingAndReading() && TextureState.samples > 1)
+        {
+          m_Driver->CopyArrayToTex2DMS(msaaTex, tex, TextureState.width, TextureState.height,
+                                       TextureState.depth, TextureState.samples,
+                                       TextureState.internalformat, ~0U);
+
+          GL.glDeleteTextures(1, &tex);
+          tex = msaaTex;
+        }
 
         initContents.resource = TextureRes(m_Driver->GetCtx(), tex);
       }
@@ -1828,7 +1854,39 @@ template bool GLResourceManager::Serialise_InitialState<>(WriteSerialiser &ser, 
                                                           GLResourceRecord *record,
                                                           const GLInitialContents *initial);
 
-void GLResourceManager::Create_InitialState(ResourceId id, GLResource live, bool hasData)
+bool GLResourceManager::Serialise_InitialState(WriteSerialiser &ser, ResourceId id,
+                                               GLResourceRecord *record,
+                                               const GLInitialContents *initial)
+{
+  GLResource res = record->Resource;
+
+  if(IsResourceTrackedForPersistency(res))
+  {
+    GLWindowingData oldContextData = m_Driver->m_ActiveContexts[Threading::GetCurrentID()];
+
+    GLWindowingData backdoor = ((ContextShareGroup *)res.ContextShareGroup)->m_BackDoor;
+
+    GLWindowingData savedContext;
+
+    if(m_Driver->m_Platform.PushChildContext(oldContextData, backdoor, &savedContext))
+    {
+      m_Driver->m_ActiveContexts[Threading::GetCurrentID()] = backdoor;
+
+      bool success = Serialise_InitialState<WriteSerialiser>(ser, id, record, initial);
+
+      // restore the context
+      m_Driver->m_ActiveContexts[Threading::GetCurrentID()] = oldContextData;
+
+      m_Driver->m_Platform.PopChildContext(oldContextData, backdoor, savedContext);
+
+      return success;
+    }
+  }
+
+  return Serialise_InitialState<WriteSerialiser>(ser, id, record, initial);
+}
+
+void GLResourceManager::Create_InitialState(ResourceId id, GLResource live, bool)
 {
   if(IsStructuredExporting(m_State))
     return;
@@ -1960,8 +2018,16 @@ void GLResourceManager::Apply_InitialState(GLResource live, const GLInitialConte
           if(details.curType == eGL_TEXTURE_CUBE_MAP)
             d *= 6;
           else if(details.curType == eGL_TEXTURE_CUBE_MAP_ARRAY ||
-                  details.curType == eGL_TEXTURE_1D_ARRAY || details.curType == eGL_TEXTURE_2D_ARRAY)
+                  details.curType == eGL_TEXTURE_2D_ARRAY)
             d = details.depth;
+
+          // glCopyImageSubData treats 1D arrays sanely - with depth as array size - but at odds
+          // with the rest of the API.
+          if(details.curType == eGL_TEXTURE_1D_ARRAY)
+          {
+            h = 1;
+            d = details.height;
+          }
 
           // AMD throws an error copying mips that are smaller than the block size in one dimension,
           // so do copy via CPU instead (will be slow, potentially we could optimise this if there's
@@ -2061,10 +2127,13 @@ void GLResourceManager::Apply_InitialState(GLResource live, const GLInitialConte
         GL.glTextureParameterivEXT(live.name, details.curType, eGL_TEXTURE_CUBE_MAP_SEAMLESS,
                                    (GLint *)&state.seamless);
 
-      GL.glTextureParameterivEXT(live.name, details.curType, eGL_TEXTURE_BASE_LEVEL,
-                                 (GLint *)&state.baseLevel);
-      GL.glTextureParameterivEXT(live.name, details.curType, eGL_TEXTURE_MAX_LEVEL,
-                                 (GLint *)&state.maxLevel);
+      if(details.curType != eGL_TEXTURE_RECTANGLE)
+      {
+        GL.glTextureParameterivEXT(live.name, details.curType, eGL_TEXTURE_BASE_LEVEL,
+                                   (GLint *)&state.baseLevel);
+        GL.glTextureParameterivEXT(live.name, details.curType, eGL_TEXTURE_MAX_LEVEL,
+                                   (GLint *)&state.maxLevel);
+      }
 
       // assume that emulated (luminance, alpha-only etc) textures are not swizzled
       if(!details.emulated && (HasExt[ARB_texture_swizzle] || HasExt[EXT_texture_swizzle]))
@@ -2100,6 +2169,10 @@ void GLResourceManager::Apply_InitialState(GLResource live, const GLInitialConte
         if(!IsGLES)
           GL.glTextureParameterfvEXT(live.name, details.curType, eGL_TEXTURE_LOD_BIAS,
                                      &state.lodBias);
+
+        if(HasExt[ARB_texture_filter_anisotropic] && state.maxAniso >= 1.0f)
+          GL.glTextureParameterfvEXT(live.name, details.curType, eGL_TEXTURE_MAX_ANISOTROPY,
+                                     &state.maxAniso);
         if(details.curType != eGL_TEXTURE_RECTANGLE)
         {
           GL.glTextureParameterfvEXT(live.name, details.curType, eGL_TEXTURE_MIN_LOD, &state.minLod);
@@ -2113,34 +2186,37 @@ void GLResourceManager::Apply_InitialState(GLResource live, const GLInitialConte
 
       GLenum fmt = details.internalFormat;
 
-      // update width from here as it's authoratitive - the texture might have been resized in
-      // multiple rebinds that we will not have serialised before.
-      details.width =
-          state.texBufSize / uint32_t(GetByteSize(1, 1, 1, GetBaseFormat(fmt), GetDataType(fmt)));
+      if(buffer && fmt != eGL_NONE)
+      {
+        // update width from here as it's authoratitive - the texture might have been resized in
+        // multiple rebinds that we will not have serialised before.
+        details.width =
+            state.texBufSize / uint32_t(GetByteSize(1, 1, 1, GetBaseFormat(fmt), GetDataType(fmt)));
 
-      if(GL.glTextureBufferRangeEXT)
-      {
-        // restore texbuffer only state
-        GL.glTextureBufferRangeEXT(live.name, eGL_TEXTURE_BUFFER, details.internalFormat, buffer,
-                                   state.texBufOffs, state.texBufSize);
-      }
-      else
-      {
-        uint32_t bufSize = 0;
-        GL.glGetNamedBufferParameterivEXT(buffer, eGL_BUFFER_SIZE, (GLint *)&bufSize);
-        if(state.texBufOffs > 0 || state.texBufSize > bufSize)
+        if(GL.glTextureBufferRangeEXT && (state.texBufOffs > 0 || state.texBufSize > 0))
         {
-          const char *msg =
-              "glTextureBufferRangeEXT is not supported on your GL implementation, but is needed "
-              "for correct replay.\n"
-              "The original capture created a texture buffer with a range - replay will use the "
-              "whole buffer, which is likely incorrect.";
-          RDCERR("%s", msg);
-          m_Driver->AddDebugMessage(MessageCategory::Resource_Manipulation, MessageSeverity::High,
-                                    MessageSource::IncorrectAPIUse, msg);
+          // restore texbuffer only state
+          GL.glTextureBufferRangeEXT(live.name, eGL_TEXTURE_BUFFER, details.internalFormat, buffer,
+                                     state.texBufOffs, state.texBufSize);
         }
+        else
+        {
+          uint32_t bufSize = 0;
+          GL.glGetNamedBufferParameterivEXT(buffer, eGL_BUFFER_SIZE, (GLint *)&bufSize);
+          if(state.texBufOffs > 0 || state.texBufSize > bufSize)
+          {
+            const char *msg =
+                "glTextureBufferRangeEXT is not supported on your GL implementation, but is needed "
+                "for correct replay.\n"
+                "The original capture created a texture buffer with a range - replay will use the "
+                "whole buffer, which is likely incorrect.";
+            RDCERR("%s", msg);
+            m_Driver->AddDebugMessage(MessageCategory::Resource_Manipulation, MessageSeverity::High,
+                                      MessageSource::IncorrectAPIUse, msg);
+          }
 
-        GL.glTextureBufferEXT(live.name, eGL_TEXTURE_BUFFER, details.internalFormat, buffer);
+          GL.glTextureBufferEXT(live.name, eGL_TEXTURE_BUFFER, details.internalFormat, buffer);
+        }
       }
     }
   }
@@ -2154,11 +2230,11 @@ void GLResourceManager::Apply_InitialState(GLResource live, const GLInitialConte
 
     if(prog.stageShaders[0] != ResourceId())
       changedBindings |= CopyProgramAttribBindings(
-          initial.resource.name, live.name, &m_Driver->m_Shaders[prog.stageShaders[0]].reflection);
+          initial.resource.name, live.name, m_Driver->m_Shaders[prog.stageShaders[0]].reflection);
 
     if(prog.stageShaders[4] != ResourceId())
       changedBindings |= CopyProgramFragDataBindings(
-          initial.resource.name, live.name, &m_Driver->m_Shaders[prog.stageShaders[4]].reflection);
+          initial.resource.name, live.name, m_Driver->m_Shaders[prog.stageShaders[4]].reflection);
 
     // we need to re-link the program to apply the bindings, as long as it's linkable.
     // See the comment on shaderProgramUnlinkable for more information.
@@ -2239,7 +2315,9 @@ void GLResourceManager::Apply_InitialState(GLResource live, const GLInitialConte
             }
             else if(details.curType == eGL_TEXTURE_CUBE_MAP_ARRAY ||
                     details.curType == eGL_TEXTURE_1D_ARRAY ||
-                    details.curType == eGL_TEXTURE_2D_ARRAY)
+                    details.curType == eGL_TEXTURE_2D_ARRAY ||
+                    details.curType == eGL_TEXTURE_2D_MULTISAMPLE_ARRAY ||
+                    details.curType == eGL_TEXTURE_3D)
             {
               if(a.numViews > 1)
               {
@@ -2330,6 +2408,8 @@ void GLResourceManager::Apply_InitialState(GLResource live, const GLInitialConte
         GL.glSamplerParameterf(live.name, eGL_TEXTURE_MAX_LOD, data.maxLod);
         if(!IsGLES)
           GL.glSamplerParameterf(live.name, eGL_TEXTURE_LOD_BIAS, data.lodBias);
+        if(HasExt[ARB_texture_filter_anisotropic] && data.maxAniso >= 1.0f)
+          GL.glSamplerParameterf(live.name, eGL_TEXTURE_MAX_ANISOTROPY, data.maxAniso);
 
         // see fetch in PrepareTextureInitialContents
         if(HasExt[ARB_texture_border_clamp])
@@ -2356,8 +2436,13 @@ void GLResourceManager::Apply_InitialState(GLResource live, const GLInitialConte
       GL.glGetIntegerv(eGL_MAX_TRANSFORM_FEEDBACK_SEPARATE_ATTRIBS, &maxCount);
 
       for(int i = 0; i < (int)ARRAY_COUNT(data.Buffer) && i < maxCount; i++)
-        GL.glBindBufferRange(eGL_TRANSFORM_FEEDBACK_BUFFER, i, data.Buffer[i].name,
-                             (GLintptr)data.Offset[i], (GLsizei)data.Size[i]);
+      {
+        if(data.Offset[i] == 0 && data.Size[i] == 0)
+          GL.glBindBufferBase(eGL_TRANSFORM_FEEDBACK_BUFFER, i, data.Buffer[i].name);
+        else
+          GL.glBindBufferRange(eGL_TRANSFORM_FEEDBACK_BUFFER, i, data.Buffer[i].name,
+                               (GLintptr)data.Offset[i], (GLsizei)data.Size[i]);
+      }
 
       GL.glBindTransformFeedback(eGL_TRANSFORM_FEEDBACK, prevfeedback);
     }
@@ -2394,8 +2479,12 @@ void GLResourceManager::Apply_InitialState(GLResource live, const GLInitialConte
           if(data.programs[a].name == data.programs[b].name)
             stages |= ShaderBit(b);
 
+        // go via ID to pick up replacements
+        ResourceId id = GetOriginalID(GetID(data.programs[a]));
+        GLuint prog = GetLiveResource(id).name;
+
         // bind the program on all relevant stages
-        m_Driver->glUseProgramStages(live.name, stages, data.programs[a].name);
+        m_Driver->glUseProgramStages(live.name, stages, prog);
 
         // now we can continue - any of the stages we just bound will discard themselves with the
         // 'previous' check above.
@@ -2404,7 +2493,12 @@ void GLResourceManager::Apply_InitialState(GLResource live, const GLInitialConte
       // if we have a compute program, bind that. It's outside of the others since it can't be
       // shared
       if(data.programs[5].name)
-        m_Driver->glUseProgramStages(live.name, eGL_COMPUTE_SHADER_BIT, data.programs[5].name);
+      {
+        ResourceId id = GetOriginalID(GetID(data.programs[5]));
+        GLuint prog = GetLiveResource(id).name;
+
+        m_Driver->glUseProgramStages(live.name, eGL_COMPUTE_SHADER_BIT, prog);
+      }
     }
   }
   else if(live.Namespace == eResVertexArray)
@@ -2431,18 +2525,27 @@ void GLResourceManager::Apply_InitialState(GLResource live, const GLInitialConte
 
         if(attrib.size != 0)
         {
+          uint32_t offset = attrib.offset;
+
+          if(offset == 0xdeadbeef)
+            offset = 0;
+
           if(attrib.type == eGL_DOUBLE)
-            GL.glVertexAttribLFormat(i, attrib.size, attrib.type, attrib.offset);
+            GL.glVertexAttribLFormat(i, attrib.size, attrib.type, offset);
           else if(attrib.integer == 0)
             GL.glVertexAttribFormat(i, attrib.size, attrib.type, (GLboolean)attrib.normalized,
-                                    attrib.offset);
+                                    offset);
           else
-            GL.glVertexAttribIFormat(i, attrib.size, attrib.type, attrib.offset);
+            GL.glVertexAttribIFormat(i, attrib.size, attrib.type, offset);
         }
 
         const VertexBufferInitialData &buf = data.VertexBuffers[i];
 
-        GL.glBindVertexBuffer(i, buf.Buffer.name, (GLintptr)buf.Offset, (GLsizei)buf.Stride);
+        uint64_t vboffset = buf.Offset;
+        if(vboffset == 0xdeadbeef)
+          vboffset = 0;
+
+        GL.glBindVertexBuffer(i, buf.Buffer.name, (GLintptr)vboffset, (GLsizei)buf.Stride);
         GL.glVertexBindingDivisor(i, buf.Divisor);
       }
 

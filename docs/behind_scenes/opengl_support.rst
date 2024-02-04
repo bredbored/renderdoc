@@ -3,8 +3,6 @@ OpenGL & OpenGL ES Support
 
 This page documents the support of OpenGL & OpenGL ES in RenderDoc. This gives an overview of what RenderDoc is capable of, and primarily lists information that is relevant. You might also be interested in the :doc:`full list of features <../getting_started/features>`.
 
-The latest information and up-to-date support is always available on the `GitHub wiki <https://github.com/baldurk/renderdoc/wiki/OpenGL>`_.
-
 Capture requirements
 --------------------
 
@@ -38,10 +36,9 @@ RenderDoc supports many ARB, EXT and other vendor-agnostic extensions - primaril
 OpenGL remaining work
 ---------------------
 
-There are a couple of places where OpenGL is not yet at feature parity with other APIs.
+There is one place where OpenGL is not at feature parity with other APIs.
 
 * Shader debugging is not supported on any shader stage.
-* Pixel history is not implemented.
 
 Android
 -------
@@ -51,7 +48,7 @@ OpenGL ES capture and replay on Android is natively supported. For more informat
 OS X
 ----
 
-OS X is not yet officially supported for OpenGL capture, however work is in progress on development builds.
+OS X is not supported.
 
 See Also
 --------

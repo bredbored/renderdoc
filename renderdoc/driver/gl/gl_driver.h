@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  * Copyright (c) 2014 Crytek
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -25,18 +25,17 @@
 
 #pragma once
 
-#include <list>
 #include "common/common.h"
 #include "common/timing.h"
 #include "core/core.h"
 #include "driver/shaders/spirv/spirv_reflect.h"
-#include "replay/replay_driver.h"
 #include "gl_common.h"
 #include "gl_dispatch_table.h"
 #include "gl_manager.h"
 #include "gl_renderstate.h"
-#include "gl_replay.h"
 #include "gl_resources.h"
+
+class GLReplay;
 
 namespace glslang
 {
@@ -57,8 +56,10 @@ struct GLInitParams
   uint32_t height;
   bool isYFlipped;
 
+  rdcstr renderer, version;
+
   // check if a frame capture section version is supported
-  static const uint64_t CurrentVersion = 0x1F;
+  static const uint64_t CurrentVersion = 0x23;
   static bool IsSupportedVersion(uint64_t ver);
 };
 
@@ -77,20 +78,46 @@ struct Replacement
   GLResource res;
 };
 
+struct ContextShareGroup
+{
+  GLPlatform &m_Platform;
+  GLWindowingData m_BackDoor;    // holds the backdoor context for the share group
+
+  explicit ContextShareGroup(GLPlatform &platform, const GLWindowingData &windata)
+      : m_Platform(platform)
+  {
+    // create a backdoor context for the purpose of retrieving resources
+    m_BackDoor = m_Platform.CloneTemporaryContext(windata);
+  }
+  ~ContextShareGroup()
+  {
+    // destroy the backdoor context
+    m_Platform.DeleteClonedContext(m_BackDoor);
+  }
+};
+
+struct GLDrawParams
+{
+  uint32_t indexWidth = 0;
+  Topology topo = Topology::Unknown;
+};
+
 class WrappedOpenGL : public IFrameCapturer
 {
 private:
   friend class GLReplay;
+  friend struct GLRenderState;
   friend class GLResourceManager;
 
   GLPlatform &m_Platform;
 
-  std::vector<DebugMessage> m_DebugMessages;
+  RDResult m_FatalError = ResultCode::Succeeded;
+  rdcarray<DebugMessage> m_DebugMessages;
   template <typename SerialiserType>
   void Serialise_DebugMessages(SerialiserType &ser);
-  std::vector<DebugMessage> GetDebugMessages();
-
-  std::string m_DebugMsgContext;
+  rdcarray<DebugMessage> GetDebugMessages();
+  RDResult FatalErrorCheck() { return m_FatalError; }
+  rdcstr m_DebugMsgContext;
 
   bool m_SuppressDebugMessages;
 
@@ -110,48 +137,73 @@ private:
   }
 
   // checks if the given object has tons of updates. If so it's probably
-  // in the vein of "one global object, updated per-draw as necessary", or it's just
+  // in the vein of "one global object, updated per-action as necessary", or it's just
   // really high traffic, in which case we just want to save the state of it at frame
   // start, then track changes while frame capturing
   bool RecordUpdateCheck(GLResourceRecord *record);
 
   // internals
   CaptureState m_State;
-  bool m_AppControlledCapture;
+  bool m_AppControlledCapture = false;
+  bool m_FirstFrameCapture = false;
+  void *m_FirstFrameCaptureContext = NULL;
+
+  PerformanceTimer m_CaptureTimer;
 
   bool m_MarkedActive = false;
 
   bool m_UsesVRMarkers;
 
-  GLReplay m_Replay;
+  GLReplay *m_Replay = NULL;
   RDCDriver m_DriverType;
+
+  struct ArrayMSPrograms
+  {
+    void Create();
+    void Destroy();
+
+    GLuint MS2Array = 0, Array2MS = 0;
+    GLuint DepthMS2Array = 0, DepthArray2MS = 0;
+  };
+
+  void CopyDepthArrayToTex2DMS(GLuint destMS, GLuint srcArray, GLint width, GLint height,
+                               GLint arraySize, GLint samples, GLenum intFormat,
+                               uint32_t selectedSlice);
+  void CopyDepthTex2DMSToArray(GLuint &destArray, GLuint srcMS, GLint width, GLint height,
+                               GLint arraySize, GLint samples, GLenum intFormat);
 
   uint64_t m_SectionVersion;
   GLInitParams m_GlobalInitParams;
+  ReplayOptions m_ReplayOptions;
 
   WriteSerialiser m_ScratchSerialiser;
-  std::set<std::string> m_StringDB;
+  std::set<rdcstr> m_StringDB;
 
   StreamReader *m_FrameReader = NULL;
 
   static std::map<uint64_t, GLWindowingData> m_ActiveContexts;
 
+  void *m_LastCtx;
+  int m_ImplicitThreadSwitches = 0;
+
   GLContextTLSData m_EmptyTLSData;
   uint64_t m_CurCtxDataTLS;
-  std::vector<GLContextTLSData *> m_CtxDataVector;
-
-  uintptr_t m_ShareGroupID;
+  rdcarray<GLContextTLSData *> m_CtxDataVector;
 
   uint32_t m_InternalShader = 0;
 
-  std::vector<GLWindowingData> m_LastContexts;
+  rdcarray<GLWindowingData> m_LastContexts;
 
   std::set<void *> m_AcceptedCtx;
+
+  std::set<const char *> m_UnsupportedFunctions;
+
+  rdcarray<rdcpair<GLResourceRecord *, Chunk *>> m_BufferResizes;
 
 public:
   enum
   {
-    MAX_QUERIES = 17,
+    MAX_QUERIES = 19,
     MAX_QUERY_INDICES = 8
   };
 
@@ -170,8 +222,10 @@ private:
 
   GLResourceManager *m_ResourceManager;
 
+  uint64_t m_TimeBase = 0;
+  double m_TimeFrequency = 1.0f;
   SDFile *m_StructuredFile;
-  SDFile m_StoredStructuredData;
+  SDFile *m_StoredStructuredData;
 
   void AddResource(ResourceId id, ResourceType type, const char *defaultNamePrefix);
   void DerivedResource(GLResource parent, ResourceId child);
@@ -179,7 +233,7 @@ private:
   void AddResourceCurChunk(ResourceId id);
   void AddResourceInitChunk(GLResource res);
 
-  uint32_t m_FrameCounter;
+  uint32_t m_FrameCounter = 0;
   uint32_t m_NoCtxFrames;
   uint32_t m_FailedFrame;
   CaptureFailReason m_FailedReason;
@@ -219,49 +273,55 @@ private:
     }
   }
 
-  std::vector<FrameDescription> m_CapturedFrames;
-  FrameRecord m_FrameRecord;
-  std::vector<DrawcallDescription *> m_Drawcalls;
+  rdcarray<FrameDescription> m_CapturedFrames;
+  rdcarray<ActionDescription *> m_Actions;
+  rdcarray<GLDrawParams> m_DrawcallParams;
 
   // replay
 
-  std::vector<APIEvent> m_CurEvents, m_Events;
-  bool m_AddedDrawcall;
+  rdcarray<APIEvent> m_CurEvents, m_Events;
+  bool m_AddedAction;
 
-  bool HasNonDebugMarkers();
+  ArrayMSPrograms m_ArrayMS;
+
+  const ArrayMSPrograms &GetArrayMS()
+  {
+    return IsReplayMode(m_State) ? m_ArrayMS : GetCtxData().ArrayMS;
+  }
 
   bool m_ReplayMarkers = true;
 
   uint64_t m_CurChunkOffset;
   SDChunkMetaData m_ChunkMetadata;
-  uint32_t m_CurEventID, m_CurDrawcallID;
+  uint32_t m_CurEventID, m_CurActionID;
   uint32_t m_FirstEventID;
   uint32_t m_LastEventID;
+  GLChunk m_LastChunk;
 
-  ReplayStatus m_FailedReplayStatus = ReplayStatus::APIReplayFailed;
+  RDResult m_FailedReplayResult = ResultCode::APIReplayFailed;
 
-  DrawcallDescription m_ParentDrawcall;
+  ActionDescription m_ParentAction;
 
-  std::list<DrawcallDescription *> m_DrawcallStack;
+  Topology m_LastTopology = Topology::Unknown;
+  uint32_t m_LastIndexWidth = 0;
 
-  std::map<ResourceId, std::vector<EventUsage>> m_ResourceUses;
+  rdcarray<ActionDescription *> m_ActionStack;
+
+  std::map<ResourceId, rdcarray<EventUsage>> m_ResourceUses;
 
   bool m_FetchCounters;
 
-  // buffer used
-  std::vector<byte> m_ScratchBuf;
+  bytebuf m_ScratchBuf;
 
   struct BufferData
   {
     GLResource resource;
-    GLenum curType;
-    BufferCategory creationFlags;
-    uint64_t size;
+    GLenum curType = eGL_NONE;
+    BufferCategory creationFlags = BufferCategory::NoFlags;
+    uint64_t size = 0;
   };
 
   std::map<ResourceId, BufferData> m_Buffers;
-
-  std::vector<rdcpair<ResourceId, Replacement>> m_DependentReplacements;
 
   // this object is only created on old captures where VAO0 was a single global object. In new
   // captures each context has its own VAO0.
@@ -280,12 +340,15 @@ private:
   uint32_t m_InitChunkIndex = 0;
 
   bool ProcessChunk(ReadSerialiser &ser, GLChunk chunk);
-  ReplayStatus ContextReplayLog(CaptureState readType, uint32_t startEventID, uint32_t endEventID,
-                                bool partial);
+  RDResult ContextReplayLog(CaptureState readType, uint32_t startEventID, uint32_t endEventID,
+                            bool partial);
   bool ContextProcessChunk(ReadSerialiser &ser, GLChunk chunk);
-  void AddUsage(const DrawcallDescription &d);
-  void AddDrawcall(const DrawcallDescription &d, bool hasEvents);
+  void AddUsage(const ActionDescription &a);
+  void AddAction(const ActionDescription &a);
   void AddEvent();
+
+  template <typename SerialiserType>
+  bool Serialise_Present(SerialiserType &ser);
 
   template <typename SerialiserType>
   bool Serialise_CaptureScope(SerialiserType &ser);
@@ -310,6 +373,11 @@ private:
   void CleanupResourceRecord(GLResourceRecord *record, bool freeParents);
   void CleanupCapture();
   void FreeCaptureData();
+
+  void CopyArrayToTex2DMS(GLuint destMS, GLuint srcArray, GLint width, GLint height,
+                          GLint arraySize, GLint samples, GLenum intFormat, uint32_t selectedSlice);
+  void CopyTex2DMSToArray(GLuint &destArray, GLuint srcMS, GLint width, GLint height,
+                          GLint arraySize, GLint samples, GLenum intFormat);
 
   struct ContextData
   {
@@ -342,7 +410,7 @@ private:
 
     void *ctx;
 
-    void *shareGroup;
+    ContextShareGroup *shareGroup;
 
     GLDEBUGPROC m_RealDebugFunc;
     const void *m_RealDebugFuncParam;
@@ -356,17 +424,17 @@ private:
 
     GLInitParams initParams;
 
-    // map from window handle void* to uint64_t unix timestamp with
-    // the last time a window was seen/associated with this context.
-    // Decays after a few seconds since there's no good explicit
-    // 'remove' type call for GL, only wglCreateContext/wglMakeCurrent
-    std::map<void *, uint64_t> windows;
+    // map from window handle void* to the windowing system used and the uint64_t unix timestamp of
+    // the last time a window was seen/associated with this context. Decays after a few seconds
+    // since there's no good explicit 'remove' type call for GL, only
+    // wglCreateContext/wglMakeCurrent
+    std::map<void *, rdcpair<WindowingSystem, uint64_t>> windows;
 
     // a window is only associated with one context at once, so any
     // time we associate a window, it broadcasts to all other
     // contexts to let them know to remove it
-    void UnassociateWindow(void *wndHandle);
-    void AssociateWindow(WrappedOpenGL *driver, void *wndHandle);
+    void UnassociateWindow(WrappedOpenGL *driver, void *wndHandle);
+    void AssociateWindow(WrappedOpenGL *driver, WindowingSystem winSystem, void *wndHandle);
 
     void CreateDebugData();
 
@@ -382,12 +450,14 @@ private:
     GLuint GlyphTexture;
     GLuint DummyVAO;
 
+    ArrayMSPrograms ArrayMS;
+
     float CharSize;
     float CharAspect;
 
     // extensions
-    std::vector<std::string> glExts;
-    std::string glExtsString;
+    rdcarray<rdcstr> glExts;
+    rdcstr glExtsString;
 
     // state
     GLResourceRecord *m_BufferRecord[16];
@@ -400,8 +470,14 @@ private:
     GLuint m_ProgramPipeline;
     GLuint m_Program;
 
+    GLint m_MaxImgBind = 0;
+    GLint m_MaxAtomicBind = 0;
+    GLint m_MaxSSBOBind = 0;
+
     GLResourceRecord *GetActiveTexRecord(GLenum target)
     {
+      if(IsProxyTarget(target))
+        return NULL;
       return m_TextureRecord[TextureIdx(target)][m_TextureUnit];
     }
     void SetActiveTexRecord(GLenum target, GLResourceRecord *record)
@@ -409,6 +485,12 @@ private:
       if(IsProxyTarget(target))
         return;
       m_TextureRecord[TextureIdx(target)][m_TextureUnit] = record;
+    }
+    void ClearMatchingActiveTexRecord(GLResourceRecord *record)
+    {
+      for(size_t i = 0; i < ARRAY_COUNT(m_TextureRecord); i++)
+        if(m_TextureRecord[i][m_TextureUnit] == record)
+          m_TextureRecord[i][m_TextureUnit] = NULL;
     }
     GLResourceRecord *GetTexUnitRecord(GLenum target, GLenum texunit)
     {
@@ -457,10 +539,11 @@ private:
       GLsizei stride;
       void *pointer;
     };
-    std::vector<VertexAttrib> attribs;
+    rdcarray<VertexAttrib> attribs;
     GLuint prevArrayBufferBinding;
   };
-  ClientMemoryData *CopyClientMemoryArrays(GLint first, GLsizei count, GLenum indexType,
+  ClientMemoryData *CopyClientMemoryArrays(GLint first, GLsizei count, GLint baseinstance,
+                                           GLsizei instancecount, GLenum indexType,
                                            const void *&indices);
   void RestoreClientMemoryArrays(ClientMemoryData *clientMemoryArrays, GLenum indexType);
 
@@ -469,11 +552,12 @@ private:
   ContextData &GetCtxData();
   GLuint GetUniformProgram();
 
-  void MakeValidContextCurrent(GLWindowingData &prevctx, void *favourWnd);
+  GLWindowingData *MakeValidContextCurrent(GLWindowingData existing, GLWindowingData &newContext);
 
   void ReplaceResource(ResourceId from, ResourceId to);
   void RemoveReplacement(ResourceId id);
   void FreeTargetResource(ResourceId id);
+  void RefreshDerivedReplacements();
 
   struct QueuedResource
   {
@@ -485,11 +569,12 @@ private:
     }
   };
 
-  std::vector<QueuedResource> m_QueuedInitialFetches;
-  std::vector<QueuedResource> m_QueuedReleases;
+  rdcarray<QueuedResource> m_QueuedInitialFetches;
+  rdcarray<QueuedResource> m_QueuedReleases;
 
   void QueuePrepareInitialState(GLResource res);
   void QueueResourceRelease(GLResource res);
+  void CheckQueuedInitialFetches(void *ctx);
 
   void ReleaseResource(GLResource res);
 
@@ -497,11 +582,11 @@ private:
   static const int FONT_TEX_HEIGHT = 128;
   static const int FONT_MAX_CHARS = 256;
 
-  void RenderOverlayText(float x, float y, const char *fmt, ...);
-  void RenderOverlayStr(float x, float y, const char *str);
+  void RenderText(float x, float y, const rdcstr &text);
+  void RenderTextInternal(float x, float y, const rdcstr &text);
 
   void CreateReplayBackbuffer(const GLInitParams &params, ResourceId fboOrigId, GLuint &fbo,
-                              std::string bbname);
+                              rdcstr bbname);
 
   RenderDoc::FramePixels *SaveBackbufferImage();
   std::map<void *, RenderDoc::FramePixels *> m_BackbufferImages;
@@ -509,8 +594,8 @@ private:
   void BuildGLExtensions();
   void BuildGLESExtensions();
 
-  std::vector<std::string> m_GLExtensions;
-  std::vector<std::string> m_GLESExtensions;
+  rdcarray<rdcstr> m_GLExtensions;
+  rdcarray<rdcstr> m_GLESExtensions;
 
   std::set<uint32_t> m_UnsafeDraws;
 
@@ -533,58 +618,72 @@ public:
   APIProperties APIProps;
 
   uint64_t GetLogVersion() { return m_SectionVersion; }
-  static std::string GetChunkName(uint32_t idx);
+  static rdcstr GetChunkName(uint32_t idx);
   GLResourceManager *GetResourceManager() { return m_ResourceManager; }
   CaptureState GetState() { return m_State; }
-  GLReplay *GetReplay() { return &m_Replay; }
+  GLReplay *GetReplay() { return m_Replay; }
   WriteSerialiser &GetSerialiser() { return m_ScratchSerialiser; }
-  void SetDriverType(RDCDriver type) { m_DriverType = type; }
+  void SetDriverType(RDCDriver type);
   bool isGLESMode() { return m_DriverType == RDCDriver::OpenGLES; }
   RDCDriver GetDriverType() { return m_DriverType; }
   ContextPair &GetCtx();
   GLResourceRecord *GetContextRecord();
 
+  void UseUnusedSupportedFunction(const char *name);
+  void CheckImplicitThread();
+
+  void CreateTextureImage(GLuint tex, GLenum internalFormat, GLenum initFormatHint,
+                          GLenum initTypeHint, GLenum textype, GLint dim, GLint width, GLint height,
+                          GLint depth, GLint samples, int mips);
+
   void PushInternalShader() { m_InternalShader++; }
   void PopInternalShader() { m_InternalShader--; }
   bool IsInternalShader() { return m_InternalShader > 0; }
-  void *ShareCtx(void *ctx) { return ctx ? m_ContextData[ctx].shareGroup : NULL; }
+  ContextShareGroup *GetShareGroup(void *ctx) { return ctx ? m_ContextData[ctx].shareGroup : NULL; }
   void SetStructuredExport(uint64_t sectionVersion)
   {
     m_SectionVersion = sectionVersion;
     m_State = CaptureState::StructuredExport;
   }
-  SDFile &GetStructuredFile() { return *m_StructuredFile; }
+  SDFile *GetStructuredFile() { return m_StructuredFile; }
+  SDFile *DetachStructuredFile()
+  {
+    SDFile *ret = m_StoredStructuredData;
+    m_StoredStructuredData = m_StructuredFile = NULL;
+    return ret;
+  }
   void SetFetchCounters(bool in) { m_FetchCounters = in; };
-  void SetDebugMsgContext(const char *context) { m_DebugMsgContext = context; }
+  void SetDebugMsgContext(const rdcstr &context) { m_DebugMsgContext = context; }
   void AddDebugMessage(DebugMessage msg)
   {
     if(IsReplayMode(m_State))
       m_DebugMessages.push_back(msg);
   }
-  void AddDebugMessage(MessageCategory c, MessageSeverity sv, MessageSource src, std::string d);
+  void AddDebugMessage(MessageCategory c, MessageSeverity sv, MessageSource src, rdcstr d);
 
   void RegisterDebugCallback();
 
   bool IsUnsafeDraw(uint32_t eventId) { return m_UnsafeDraws.find(eventId) != m_UnsafeDraws.end(); }
   // replay interface
-  void Initialise(GLInitParams &params, uint64_t sectionVersion);
+  void Initialise(GLInitParams &params, uint64_t sectionVersion, const ReplayOptions &opts);
   void ReplayLog(uint32_t startEventID, uint32_t endEventID, ReplayLogType replayType);
-  ReplayStatus ReadLogInitialisation(RDCFile *rdc, bool storeStructuredBuffers);
+  RDResult ReadLogInitialisation(RDCFile *rdc, bool storeStructuredBuffers);
 
   GLuint GetFakeVAO0() { return m_Global_VAO0; }
   GLuint GetCurrentDefaultFBO() { return m_CurrentDefaultFBO; }
-  FrameRecord &GetFrameRecord() { return m_FrameRecord; }
   const APIEvent &GetEvent(uint32_t eventId);
 
-  const DrawcallDescription &GetRootDraw() { return m_ParentDrawcall; }
-  const DrawcallDescription *GetDrawcall(uint32_t eventId);
+  const ActionDescription &GetRootAction() { return m_ParentAction; }
+  const ActionDescription *GetAction(uint32_t eventId);
+  const GLDrawParams &GetDrawParameters(uint32_t eventId);
 
   void SuppressDebugMessages(bool suppress) { m_SuppressDebugMessages = suppress; }
-  std::vector<EventUsage> GetUsage(ResourceId id) { return m_ResourceUses[id]; }
+  rdcarray<EventUsage> GetUsage(ResourceId id) { return m_ResourceUses[id]; }
   void CreateContext(GLWindowingData winData, void *shareContext, GLInitParams initParams,
                      bool core, bool attribsCreate);
   void RegisterReplayContext(GLWindowingData winData, void *shareContext, bool core,
                              bool attribsCreate);
+  void UnregisterReplayContext(GLWindowingData winData);
   void DeleteContext(void *contextHandle);
   GLInitParams &GetInitParams(GLWindowingData winData)
   {
@@ -592,41 +691,47 @@ public:
   }
   void ActivateContext(GLWindowingData winData);
   bool ForceSharedObjects(void *oldContext, void *newContext);
-  void SwapBuffers(void *windowHandle);
+  void SwapBuffers(WindowingSystem winSystem, void *windowHandle);
   void HandleVRFrameMarkers(const GLchar *buf, GLsizei length);
   bool UsesVRFrameMarkers() { return m_UsesVRMarkers; }
   void FirstFrame(void *ctx, void *wndHandle);
 
   void ReplayMarkers(bool replay) { m_ReplayMarkers = replay; }
-  void StartFrameCapture(void *dev, void *wnd);
-  bool EndFrameCapture(void *dev, void *wnd);
-  bool DiscardFrameCapture(void *dev, void *wnd);
+  RDCDriver GetFrameCaptureDriver() { return GetDriverType(); }
+  void StartFrameCapture(DeviceOwnedWindow devWnd);
+  bool EndFrameCapture(DeviceOwnedWindow devWnd);
+  bool DiscardFrameCapture(DeviceOwnedWindow devWnd);
 
   // map with key being mip level, value being stored data
-  typedef std::map<int, std::vector<byte>> CompressedDataStore;
+  typedef std::map<int, bytebuf> CompressedDataStore;
 
   struct ShaderData
   {
-    ShaderData() : type(eGL_NONE), version(0) {}
+    ShaderData() : type(eGL_NONE), version(0) { reflection = new ShaderReflection; }
+    ~ShaderData() { SAFE_DELETE(reflection); }
+    ShaderData(const ShaderData &o) = delete;
+    ShaderData &operator=(const ShaderData &o) = delete;
+
     GLenum type;
-    std::vector<std::string> sources;
-    std::vector<std::string> includepaths;
-    SPVModule spirv;
-    std::string disassembly;
-    ShaderReflection reflection;
+    rdcarray<rdcstr> sources;
+    rdcarray<rdcstr> includepaths;
+    rdcspv::Reflector spirv;
+    rdcstr disassembly;
+    std::map<size_t, uint32_t> spirvInstructionLines;
+    ShaderReflection *reflection;
     int version;
 
     // used only when we're capturing and don't have driver-side reflection so we need to emulate
     glslang::TShader *glslangShader = NULL;
 
     // used for if the application actually uploaded SPIR-V
-    std::vector<uint32_t> spirvWords;
+    rdcarray<uint32_t> spirvWords;
     SPIRVPatchData patchData;
 
     // the parameters passed to glSpecializeShader
-    std::string entryPoint;
-    std::vector<uint32_t> specIDs;
-    std::vector<uint32_t> specValues;
+    rdcstr entryPoint;
+    rdcarray<uint32_t> specIDs;
+    rdcarray<uint32_t> specValues;
 
     // pre-calculated bindpoint mapping for SPIR-V shaders. NOT valid for normal GLSL shaders
     ShaderBindpointMapping mapping;
@@ -640,7 +745,7 @@ public:
   struct ProgramData
   {
     ProgramData() : linked(false) { RDCEraseEl(stageShaders); }
-    std::vector<ResourceId> shaders;
+    rdcarray<ResourceId> shaders;
 
     std::map<GLint, GLint> locationTranslate;
 
@@ -652,7 +757,7 @@ public:
     // the application to modify anything.
     bool shaderProgramUnlinkable = false;
     bool linked;
-    ResourceId stageShaders[6];
+    ResourceId stageShaders[NumShaderStages];
 
     // used only when we're capturing and don't have driver-side reflection so we need to emulate
     glslang::TProgram *glslangProgram = NULL;
@@ -673,8 +778,8 @@ public:
       GLbitfield use;
     };
 
-    ResourceId stagePrograms[6];
-    ResourceId stageShaders[6];
+    ResourceId stagePrograms[NumShaderStages];
+    ResourceId stageShaders[NumShaderStages];
   };
 
   std::map<ResourceId, ShaderData> m_Shaders;
@@ -689,7 +794,7 @@ public:
       ResourceId shadId = progdata.stageShaders[i];
       if(shadId != ResourceId())
       {
-        stages.refls[i] = &m_Shaders[shadId].reflection;
+        stages.refls[i] = m_Shaders[shadId].reflection;
         stages.mappings[i] = &m_Shaders[shadId].mapping;
       }
     }
@@ -697,8 +802,10 @@ public:
 
   void FillReflectionArray(GLResource program, PerStageReflections &stages)
   {
-    FillReflectionArray(GetResourceManager()->GetID(program), stages);
+    FillReflectionArray(GetResourceManager()->GetResID(program), stages);
   }
+
+  ResourceId ExtractFBOAttachment(GLenum target, GLenum attachment);
 
   struct TextureData
   {
@@ -713,7 +820,8 @@ public:
           samples(0),
           creationFlags(TextureCategory::NoFlags),
           internalFormat(eGL_NONE),
-          internalFormatHint(eGL_NONE),
+          initFormatHint(eGL_NONE),
+          initTypeHint(eGL_NONE),
           mipsValid(0),
           renderbufferReadTex(0)
     {
@@ -725,7 +833,8 @@ public:
     bool emulated, view;
     GLint width, height, depth, samples;
     TextureCategory creationFlags;
-    GLenum internalFormat, internalFormatHint;
+    GLenum internalFormat;
+    GLenum initFormatHint, initTypeHint;
     GLuint mipsValid;
 
     // since renderbuffers cannot be read from, we have to create a texture of identical
@@ -906,6 +1015,8 @@ public:
   IMPLEMENT_FUNCTION_SERIALISED(void, glDrawBuffer, GLenum buf);
   IMPLEMENT_FUNCTION_SERIALISED(void, glDrawBuffers, GLsizei n, const GLenum *bufs);
   IMPLEMENT_FUNCTION_SERIALISED(void, glBindFramebuffer, GLenum target, GLuint framebuffer);
+  IMPLEMENT_FUNCTION_SERIALISED(void, glInvalidateNamedFramebufferData, GLuint framebufferHandle,
+                                GLsizei numAttachments, const GLenum *attachments);
   IMPLEMENT_FUNCTION_SERIALISED(void, glFramebufferTexture, GLenum target, GLenum attachment,
                                 GLuint texture, GLint level);
   IMPLEMENT_FUNCTION_SERIALISED(void, glFramebufferTexture1D, GLenum target, GLenum attachment,
@@ -2234,9 +2345,6 @@ public:
                                 GLuint buffer);
   IMPLEMENT_FUNCTION_SERIALISED(void, glTransformFeedbackBufferRange, GLuint xfb, GLuint index,
                                 GLuint buffer, GLintptr offset, GLsizeiptr size);
-
-  IMPLEMENT_FUNCTION_SERIALISED(void, glInvalidateNamedFramebufferData, GLuint framebuffer,
-                                GLsizei numAttachments, const GLenum *attachments);
   IMPLEMENT_FUNCTION_SERIALISED(void, glInvalidateNamedFramebufferSubData, GLuint framebuffer,
                                 GLsizei numAttachments, const GLenum *attachments, GLint x, GLint y,
                                 GLsizei width, GLsizei height);
@@ -2459,17 +2567,10 @@ public:
 class ScopedDebugContext
 {
 public:
-  ScopedDebugContext(WrappedOpenGL *driver, const char *fmt, ...)
+  ScopedDebugContext(WrappedOpenGL *driver, const rdcstr &msg)
   {
-    va_list args;
-    va_start(args, fmt);
-    char buf[1024];
-    buf[1023] = 0;
-    StringFormat::vsnprintf(buf, 1023, fmt, args);
-    va_end(args);
-
     m_Driver = driver;
-    m_Driver->SetDebugMsgContext(buf);
+    m_Driver->SetDebugMsgContext(msg);
   }
 
   ~ScopedDebugContext() { m_Driver->SetDebugMsgContext(""); }

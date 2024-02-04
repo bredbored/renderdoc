@@ -32,6 +32,7 @@
 #include <QMimeData>
 #include <QMouseEvent>
 #include <QPainter>
+#include <QPainterPath>
 #include <QScreen>
 #include <QSplitter>
 #include <QTabBar>
@@ -161,7 +162,7 @@ void ToolWindowManager::addToolWindows(QList<QWidget *> toolWindows,
     }
     if(m_toolWindows.contains(toolWindow))
     {
-      qWarning("this tool window has already been added");
+      qWarning() << "this tool window has already been added" << toolWindow->objectName();
       continue;
     }
     toolWindow->hide();
@@ -197,7 +198,7 @@ void ToolWindowManager::moveToolWindows(QList<QWidget *> toolWindows,
   {
     if(!m_toolWindows.contains(toolWindow))
     {
-      qWarning("unknown tool window");
+      qWarning() << "unknown tool window:" << (toolWindow ? toolWindow->objectName() : QString());
       return;
     }
     ToolWindowManagerWrapper *oldWrapper = wrapperOf(toolWindow);
@@ -207,6 +208,23 @@ void ToolWindowManager::moveToolWindows(QList<QWidget *> toolWindows,
     }
     if(oldWrapper && !wrappersToUpdate.contains(oldWrapper))
       wrappersToUpdate.push_back(oldWrapper);
+  }
+  // if we don't have a reference area, we can't use any types that need a reference
+  if(area.area() == NULL && (area.type() == AddTo || area.type() == LeftOf || area.type() == RightOf ||
+                             area.type() == TopOf || area.type() == BottomOf ||
+                             area.type() == LeftWindowSide || area.type() == RightWindowSide ||
+                             area.type() == TopWindowSide || area.type() == BottomWindowSide))
+
+  {
+    // if the last area is available, use that.
+    if(m_lastUsedArea)
+      area = AreaReference(AddTo, m_lastUsedArea);
+    // if we have no tool windows at all, add into empty space
+    else if(m_toolWindows.isEmpty() || m_toolWindows == toolWindows)
+      area = AreaReference(EmptySpace);
+    // otherwise we have to make it a new floating area
+    else
+      area = AreaReference(NewFloatingArea);
   }
   if(area.type() == LastUsedArea && !m_lastUsedArea)
   {
@@ -456,7 +474,7 @@ void ToolWindowManager::removeToolWindow(QWidget *toolWindow, bool allowCloseAlr
 {
   if(!m_toolWindows.contains(toolWindow))
   {
-    qWarning("unknown tool window");
+    qWarning() << "unknown tool window:" << (toolWindow ? toolWindow->objectName() : QString());
     return;
   }
 
@@ -465,7 +483,8 @@ void ToolWindowManager::removeToolWindow(QWidget *toolWindow, bool allowCloseAlr
 
   if(!manager)
   {
-    qWarning("unknown tool window");
+    qWarning() << "window not child of any tool window"
+               << (toolWindow ? toolWindow->objectName() : QString());
     return;
   }
 
@@ -475,6 +494,11 @@ void ToolWindowManager::removeToolWindow(QWidget *toolWindow, bool allowCloseAlr
       return;
   }
 
+  forceCloseToolWindow(toolWindow);
+}
+
+void ToolWindowManager::forceCloseToolWindow(QWidget *toolWindow)
+{
   moveToolWindow(toolWindow, NoArea);
   m_toolWindows.removeOne(toolWindow);
   m_toolWindowProperties.remove(toolWindow);
@@ -519,7 +543,7 @@ void ToolWindowManager::closeToolWindow(QWidget *toolWindow)
     return;
   }
 
-  qWarning("window not child of any tool window");
+  qWarning() << "window not child of any tool window" << toolWindow->objectName();
 }
 
 void ToolWindowManager::raiseToolWindow(QWidget *toolWindow)
@@ -541,7 +565,7 @@ void ToolWindowManager::raiseToolWindow(QWidget *toolWindow)
   if(area)
     area->setCurrentWidget(toolWindow);
   else
-    qWarning("parent is not a tool window area");
+    qWarning() << "parent is not a tool window area" << toolWindow->objectName();
 }
 
 QWidget *ToolWindowManager::createToolWindow(const QString &objectName)
@@ -630,8 +654,12 @@ void ToolWindowManager::restoreState(const QVariantMap &dataMap)
   QVariantList floatWins = dataMap[QStringLiteral("floatingWindows")].toList();
   foreach(QVariant windowData, floatWins)
   {
+    QVariantMap floatData = windowData.toMap();
+    if(floatData.empty())
+      continue;
+
     ToolWindowManagerWrapper *wrapper = new ToolWindowManagerWrapper(this, true);
-    wrapper->restoreState(windowData.toMap());
+    wrapper->restoreState(floatData);
     wrapper->updateTitle();
     wrapper->show();
     if(wrapper->windowState() & Qt::WindowMaximized)
@@ -659,7 +687,8 @@ void ToolWindowManager::releaseToolWindow(QWidget *toolWindow)
   ToolWindowManagerArea *previousTabWidget = findClosestParent<ToolWindowManagerArea *>(toolWindow);
   if(!previousTabWidget)
   {
-    qWarning("cannot find tab widget for tool window");
+    qWarning() << "cannot find tab widget for tool window:"
+               << (toolWindow ? toolWindow->objectName() : QString());
     return;
   }
   previousTabWidget->removeTab(previousTabWidget->indexOf(toolWindow));
@@ -749,6 +778,37 @@ void ToolWindowManager::simplifyLayout()
       // QTimer::singleShot(1000, area, SLOT(deleteLater()));
       area->deleteLater();
     }
+    // search up the stack looking for splitters that have only one child which is a splitter
+    splitter = qobject_cast<QSplitter *>(area->parentWidget());
+    QSplitter *parentSplitter = splitter ? qobject_cast<QSplitter *>(splitter->parentWidget()) : NULL;
+    while(splitter && parentSplitter)
+    {
+      // this splitter has only one child, and its direct parent is a splitter. Move our child
+      // widget
+      // into the parent and delete.
+      if(splitter->count() == 1)
+      {
+        int idx = parentSplitter->indexOf(splitter);
+        if(idx == -1)
+        {
+          qCritical() << "Couldn't find splitter in parent widget";
+          break;
+        }
+
+        QWidget *child = splitter->widget(0);
+
+        parentSplitter->insertWidget(idx, child);
+        child->show();
+
+        splitter->setParent(NULL);
+        splitter->hide();
+        splitter->deleteLater();
+      }
+
+      // move up the stack
+      splitter = parentSplitter;
+      parentSplitter = qobject_cast<QSplitter *>(splitter->parentWidget());
+    }
   }
 }
 
@@ -773,14 +833,16 @@ void ToolWindowManager::startDrag(const QList<QWidget *> &toolWindows,
   }
 
   m_draggedWrapper = wrapper;
-  m_draggedToolWindows = toolWindows;
+  m_draggedToolWindows.clear();
+  for(QWidget *w : toolWindows)
+    m_draggedToolWindows.push_back(w);
   qApp->installEventFilter(this);
 }
 
 QVariantMap ToolWindowManager::saveSplitterState(QSplitter *splitter)
 {
   QVariantMap result;
-  result[QStringLiteral("state")] = splitter->saveState().toBase64();
+  result[QStringLiteral("state")] = QString::fromLatin1(splitter->saveState().toBase64());
   result[QStringLiteral("type")] = QStringLiteral("splitter");
   QVariantList items;
   for(int i = 0; i < splitter->count(); i++)
@@ -865,7 +927,9 @@ void ToolWindowManager::updateDragPosition()
     {
       continue;
     }
-    if(area->rect().contains(area->mapFromGlobal(pos)))
+    QRect globalAreaRect(area->mapToGlobal(area->rect().topLeft()),
+                         area->mapToGlobal(area->rect().bottomRight()));
+    if(globalAreaRect.contains(pos))
     {
       m_hoverArea = area;
       break;
@@ -1143,8 +1207,9 @@ void ToolWindowManager::updateDragPosition()
   {
     bool allowFloat = m_allowFloatingWindow;
 
-    for(QWidget *w : m_draggedToolWindows)
-      allowFloat &= !(toolWindowProperties(w) & DisallowFloatWindow);
+    for(QPointer<QWidget> w : m_draggedToolWindows)
+      if(w)
+        allowFloat &= !(toolWindowProperties(w) & DisallowFloatWindow);
 
     // no hotspot highlighted, draw geometry for a float window if previewing a tear-off, or draw
     // nothing if we're dragging a float window as it moves itself.
@@ -1156,9 +1221,9 @@ void ToolWindowManager::updateDragPosition()
     else
     {
       QRect r;
-      for(QWidget *w : m_draggedToolWindows)
+      for(QPointer<QWidget> w : m_draggedToolWindows)
       {
-        if(w->isVisible())
+        if(w && w->isVisible())
           r = r.united(w->rect());
       }
       m_previewOverlay->setGeometry(pos.x(), pos.y(), r.width(), r.height());
@@ -1198,8 +1263,21 @@ void ToolWindowManager::finishDrag()
   qApp->removeEventFilter(this);
 
   // move these locally to prevent re-entrancy
-  QList<QWidget *> draggedToolWindows = m_draggedToolWindows;
+  QList<QWidget *> draggedToolWindows;
   ToolWindowManagerWrapper *draggedWrapper = m_draggedWrapper;
+
+  for(QPointer<QWidget> w : m_draggedToolWindows)
+    if(w)
+      draggedToolWindows.push_back(w);
+
+  if(m_draggedToolWindows.size() != draggedToolWindows.size())
+  {
+    qWarning("Some dragged windows were all deleted before finishDrag: %d -> %d",
+             (int)m_draggedToolWindows.size(), (int)draggedToolWindows.size());
+
+    if(draggedToolWindows.empty())
+      return;
+  }
 
   m_draggedToolWindows.clear();
   m_draggedWrapper = NULL;
@@ -1395,7 +1473,7 @@ bool ToolWindowManager::allowClose(QWidget *toolWindow)
 {
   if(!m_toolWindows.contains(toolWindow))
   {
-    qWarning("unknown tool window");
+    qWarning() << "unknown tool window:" << (toolWindow ? toolWindow->objectName() : QString());
     return true;
   }
   int methodIndex = toolWindow->metaObject()->indexOfMethod(

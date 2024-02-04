@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2017-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -27,7 +27,7 @@
 
 #if ENABLED(ENABLE_UNIT_TESTS)
 
-#include "3rdparty/catch/catch.hpp"
+#include "catch/catch.hpp"
 
 static int value = 0;
 
@@ -35,8 +35,8 @@ TEST_CASE("Test spin lock", "[threading]")
 {
   int finalValue = 0;
 
-  std::vector<Threading::ThreadHandle> threads;
-  std::vector<int> threadcount;
+  rdcarray<Threading::ThreadHandle> threads;
+  rdcarray<int> threadcount;
 
   threads.resize(8);
   threadcount.resize(8);

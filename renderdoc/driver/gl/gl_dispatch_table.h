@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  * Copyright (c) 2014 Crytek
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -132,7 +132,7 @@ struct GLDispatchTable
   PFNGLCOMPRESSEDTEXSUBIMAGE2DPROC glCompressedTexSubImage2D;    // aliases glCompressedTexSubImage2DARB
   PFNGLCOMPRESSEDTEXSUBIMAGE3DPROC glCompressedTexSubImage3D;    // aliases glCompressedTexSubImage3DARB, glCompressedTexSubImage3DOES
   PFNGLTEXBUFFERRANGEPROC glTexBufferRange;        // aliases glTexBufferRangeEXT, glTexBufferRangeOES
-  PFNGLTEXTUREVIEWPROC glTextureView;              // aliases glTextureViewEXT, glTextureViewOES
+  PFNGLTEXTUREVIEWPROC glTextureView;              // aliases glTextureViewOES, glTextureViewEXT
   PFNGLTEXPARAMETERIIVPROC glTexParameterIiv;      // aliases glTexParameterIivEXT, glTexParameterIivOES
   PFNGLTEXPARAMETERIUIVPROC glTexParameterIuiv;    // aliases glTexParameterIuivEXT, glTexParameterIuivOES
   PFNGLGENERATEMIPMAPPROC glGenerateMipmap;        // aliases glGenerateMipmapEXT
@@ -337,8 +337,8 @@ struct GLDispatchTable
   PFNGLBINDBUFFERSBASEPROC glBindBuffersBase;
   PFNGLBINDBUFFERSRANGEPROC glBindBuffersRange;
   PFNGLMAPBUFFERPROC glMapBuffer;    // aliases glMapBufferARB, glMapBufferOES
-  PFNGLMAPBUFFERRANGEPROC glMapBufferRange;
-  PFNGLFLUSHMAPPEDBUFFERRANGEPROC glFlushMappedBufferRange;
+  PFNGLMAPBUFFERRANGEPROC glMapBufferRange;    // aliases glMapBufferRangeEXT
+  PFNGLFLUSHMAPPEDBUFFERRANGEPROC glFlushMappedBufferRange;    // aliases glFlushMappedBufferRangeEXT
   PFNGLUNMAPBUFFERPROC glUnmapBuffer;    // aliases glUnmapBufferARB, glUnmapBufferOES
   PFNGLTRANSFORMFEEDBACKVARYINGSPROC glTransformFeedbackVaryings;    // aliases glTransformFeedbackVaryingsEXT
   PFNGLGENTRANSFORMFEEDBACKSPROC glGenTransformFeedbacks;
@@ -986,12 +986,8 @@ void SetDriverForHooks(WrappedOpenGL *driver);
 // best we can do.
 // On apple we suppress hooks while entering any CGL function so we don't record internal work that
 // can mess up the replay
-#if ENABLED(RDOC_WIN32) || ENABLED(RDOC_APPLE)
 void EnableGLHooks();
 void DisableGLHooks();
-#else
-#define EnableGLHooks() (void)0
-#endif
 
 #if ENABLED(RDOC_WIN32)
 void DisableWGLHooksForEGL();

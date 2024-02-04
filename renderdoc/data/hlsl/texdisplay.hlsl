@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -50,10 +50,14 @@ v2f RENDERDOC_TexDisplayVS(uint vertID : SV_VertexID)
 
   float2 pos = positions[vertID];
 
-  OUT.pos = float4(Position.xy + pos.xy * TextureResolution.xy * Scale * ScreenAspect.xy, 0, 1) -
-            float4(1.0, -1.0, 0, 0);
+  OUT.pos = float4(Position.xy + pos.xy * VertexScale.xy, 0, 1) - float4(1.0, -1.0, 0, 0);
   OUT.tex.xy = float2(pos.x, -pos.y);
   return OUT;
+}
+
+bool fxc_workaround_isnan(float f)
+{
+  return (asuint(f) & 0x7fffffff) > 0x7f800000;
 }
 
 // main texture display shader, used for the texture viewer. It samples the right resource
@@ -169,6 +173,7 @@ float4 RENDERDOC_TexDisplayPS(v2f IN) : SV_Target0
   // workaround for D3DCompiler bug. For some reason it assumes texture samples can
   // never come back as NaN, so involving a cbuffer value like this here ensures
   // the below isnan()s don't get optimised out.
+  // update: this doesn't work when optimisation is disabled :(
   if(Channels.x < 0.5f)
     col.x = pre_range_col.x = AlwaysZero;
   if(Channels.y < 0.5f)
@@ -181,8 +186,8 @@ float4 RENDERDOC_TexDisplayPS(v2f IN) : SV_Target0
   // show nans, infs and negatives
   if(OutputDisplayFormat & TEXDISPLAY_NANS)
   {
-    if(isnan(pre_range_col.r) || isnan(pre_range_col.g) || isnan(pre_range_col.b) ||
-       isnan(pre_range_col.a))
+    if(fxc_workaround_isnan(pre_range_col.r) || fxc_workaround_isnan(pre_range_col.g) ||
+       fxc_workaround_isnan(pre_range_col.b) || fxc_workaround_isnan(pre_range_col.a))
       return float4(1, 0, 0, 1);
 
     if(isinf(pre_range_col.r) || isinf(pre_range_col.g) || isinf(pre_range_col.b) ||

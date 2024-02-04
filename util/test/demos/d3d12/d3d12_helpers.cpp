@@ -1,26 +1,26 @@
 /******************************************************************************
-* The MIT License (MIT)
-*
-* Copyright (c) 2018-2019 Baldur Karlsson
-*
-* Permission is hereby granted, free of charge, to any person obtaining a copy
-* of this software and associated documentation files (the "Software"), to deal
-* in the Software without restriction, including without limitation the rights
-* to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-* copies of the Software, and to permit persons to whom the Software is
-* furnished to do so, subject to the following conditions:
-*
-* The above copyright notice and this permission notice shall be included in
-* all copies or substantial portions of the Software.
-*
-* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-* AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-* OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-* THE SOFTWARE.
-******************************************************************************/
+ * The MIT License (MIT)
+ *
+ * Copyright (c) 2019-2023 Baldur Karlsson
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ ******************************************************************************/
 
 #include "d3d12_test.h"
 
@@ -156,6 +156,32 @@ D3D12_ROOT_PARAMETER1 cbvParam(D3D12_SHADER_VISIBILITY vis, UINT space, UINT reg
   return ret;
 }
 
+D3D12_ROOT_PARAMETER1 srvParam(D3D12_SHADER_VISIBILITY vis, UINT space, UINT reg)
+{
+  D3D12_ROOT_PARAMETER1 ret;
+
+  ret.ShaderVisibility = vis;
+  ret.ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+  ret.Descriptor.RegisterSpace = space;
+  ret.Descriptor.ShaderRegister = reg;
+  ret.Descriptor.Flags = D3D12_ROOT_DESCRIPTOR_FLAG_NONE;
+
+  return ret;
+}
+
+D3D12_ROOT_PARAMETER1 uavParam(D3D12_SHADER_VISIBILITY vis, UINT space, UINT reg)
+{
+  D3D12_ROOT_PARAMETER1 ret;
+
+  ret.ShaderVisibility = vis;
+  ret.ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+  ret.Descriptor.RegisterSpace = space;
+  ret.Descriptor.ShaderRegister = reg;
+  ret.Descriptor.Flags = D3D12_ROOT_DESCRIPTOR_FLAG_NONE;
+
+  return ret;
+}
+
 D3D12_ROOT_PARAMETER1 constParam(D3D12_SHADER_VISIBILITY vis, UINT space, UINT reg, UINT num)
 {
   D3D12_ROOT_PARAMETER1 ret;
@@ -170,11 +196,17 @@ D3D12_ROOT_PARAMETER1 constParam(D3D12_SHADER_VISIBILITY vis, UINT space, UINT r
 }
 
 D3D12_ROOT_PARAMETER1 tableParam(D3D12_SHADER_VISIBILITY vis, D3D12_DESCRIPTOR_RANGE_TYPE type,
-                                 UINT space, UINT basereg, UINT numreg, UINT descOffset)
+                                 UINT space, UINT basereg, UINT numreg, UINT descOffset,
+                                 D3D12_DESCRIPTOR_RANGE_FLAGS flags)
 {
   // this is a super hack but avoids the need to be clumsy with allocation of these structs
   static D3D12_DESCRIPTOR_RANGE1 ranges[32] = {};
   static int rangeIdx = 0;
+
+  if(type == D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER)
+  {
+    flags &= ~D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE;
+  }
 
   D3D12_DESCRIPTOR_RANGE1 &range = ranges[rangeIdx];
   rangeIdx = (rangeIdx + 1) % ARRAY_COUNT(ranges);
@@ -193,12 +225,13 @@ D3D12_ROOT_PARAMETER1 tableParam(D3D12_SHADER_VISIBILITY vis, D3D12_DESCRIPTOR_R
   range.BaseShaderRegister = basereg;
   range.NumDescriptors = numreg;
   range.OffsetInDescriptorsFromTableStart = descOffset;
-  range.Flags = D3D12_DESCRIPTOR_RANGE_FLAG_NONE;
+  range.Flags = flags;
 
   return ret;
 }
 
-D3D12BufferCreator::D3D12BufferCreator(D3D12GraphicsTest *test) : m_Test(test)
+D3D12BufferCreator::D3D12BufferCreator(ID3D12DevicePtr dev, D3D12GraphicsTest *test)
+    : m_Dev(dev), m_Test(test)
 {
   m_BufDesc.Alignment = 0;
   m_BufDesc.DepthOrArraySize = 1;
@@ -217,6 +250,8 @@ D3D12BufferCreator::D3D12BufferCreator(D3D12GraphicsTest *test) : m_Test(test)
   m_HeapDesc.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
   m_HeapDesc.CreationNodeMask = 1;
   m_HeapDesc.VisibleNodeMask = 1;
+
+  m_InitialState = D3D12_RESOURCE_STATE_COMMON;
 }
 
 D3D12BufferCreator &D3D12BufferCreator::UAV()
@@ -228,12 +263,14 @@ D3D12BufferCreator &D3D12BufferCreator::UAV()
 D3D12BufferCreator &D3D12BufferCreator::Upload()
 {
   m_HeapDesc.Type = D3D12_HEAP_TYPE_UPLOAD;
+  m_InitialState = D3D12_RESOURCE_STATE_GENERIC_READ;
   return *this;
 }
 
 D3D12BufferCreator &D3D12BufferCreator::Readback()
 {
   m_HeapDesc.Type = D3D12_HEAP_TYPE_READBACK;
+  m_InitialState = D3D12_RESOURCE_STATE_COPY_DEST;
   return *this;
 }
 
@@ -249,30 +286,29 @@ D3D12BufferCreator &D3D12BufferCreator::Size(UINT size)
   return *this;
 }
 
+D3D12BufferCreator &D3D12BufferCreator::InitialState(D3D12_RESOURCE_STATES initialState)
+{
+  m_InitialState = initialState;
+  return *this;
+}
+
 D3D12BufferCreator::operator ID3D12ResourcePtr() const
 {
-  D3D12_RESOURCE_STATES initialState = D3D12_RESOURCE_STATE_COMMON;
-
-  if(m_HeapDesc.Type == D3D12_HEAP_TYPE_UPLOAD)
-    initialState = D3D12_RESOURCE_STATE_GENERIC_READ;
-  else if(m_HeapDesc.Type == D3D12_HEAP_TYPE_READBACK)
-    initialState = D3D12_RESOURCE_STATE_COPY_DEST;
-
   ID3D12ResourcePtr buf;
-  CHECK_HR(m_Test->dev->CreateCommittedResource(&m_HeapDesc, D3D12_HEAP_FLAG_NONE, &m_BufDesc,
-                                                initialState, NULL, __uuidof(ID3D12Resource),
-                                                (void **)&buf));
+  CHECK_HR(m_Dev->CreateCommittedResource(&m_HeapDesc, D3D12_HEAP_FLAG_NONE, &m_BufDesc,
+                                          m_InitialState, NULL, __uuidof(ID3D12Resource),
+                                          (void **)&buf));
 
-  if(m_Initdata)
+  if(m_Initdata && m_Test)
     m_Test->SetBufferData(buf, D3D12_RESOURCE_STATE_COMMON, (const byte *)m_Initdata,
                           m_BufDesc.Width);
 
   return buf;
 }
 
-D3D12TextureCreator::D3D12TextureCreator(D3D12GraphicsTest *test, DXGI_FORMAT format, UINT width,
+D3D12TextureCreator::D3D12TextureCreator(ID3D12DevicePtr dev, DXGI_FORMAT format, UINT width,
                                          UINT height, UINT depth)
-    : m_Test(test)
+    : m_Dev(dev)
 {
   m_InitialState = D3D12_RESOURCE_STATE_COMMON;
 
@@ -297,6 +333,8 @@ D3D12TextureCreator::D3D12TextureCreator(D3D12GraphicsTest *test, DXGI_FORMAT fo
   m_HeapDesc.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
   m_HeapDesc.CreationNodeMask = 1;
   m_HeapDesc.VisibleNodeMask = 1;
+
+  m_ClearVal.Format = DXGI_FORMAT_UNKNOWN;
 }
 
 D3D12TextureCreator &D3D12TextureCreator::Mips(UINT mips)
@@ -336,6 +374,12 @@ D3D12TextureCreator &D3D12TextureCreator::DSV()
   return *this;
 }
 
+D3D12TextureCreator &D3D12TextureCreator::NoSRV()
+{
+  m_TexDesc.Flags |= D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE;
+  return *this;
+}
+
 D3D12TextureCreator &D3D12TextureCreator::Upload()
 {
   m_HeapDesc.Type = D3D12_HEAP_TYPE_UPLOAD;
@@ -348,31 +392,57 @@ D3D12TextureCreator &D3D12TextureCreator::Readback()
   return *this;
 }
 
+D3D12TextureCreator &D3D12TextureCreator::CustomHeap(D3D12_HEAP_PROPERTIES heap)
+{
+  m_HeapDesc = heap;
+  return *this;
+}
+
+D3D12TextureCreator &D3D12TextureCreator::Shared()
+{
+  m_HeapFlags = D3D12_HEAP_FLAG_SHARED;
+  m_TexDesc.Flags |= D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
+  return *this;
+}
+
 D3D12TextureCreator &D3D12TextureCreator::InitialState(D3D12_RESOURCE_STATES state)
 {
   m_InitialState = state;
   return *this;
 }
 
+D3D12TextureCreator &D3D12TextureCreator::ClearVal(const D3D12_CLEAR_VALUE &clearVal)
+{
+  m_ClearVal = clearVal;
+  return *this;
+}
+
 D3D12TextureCreator::operator ID3D12ResourcePtr() const
 {
   ID3D12ResourcePtr tex;
-  CHECK_HR(m_Test->dev->CreateCommittedResource(&m_HeapDesc, D3D12_HEAP_FLAG_NONE, &m_TexDesc,
-                                                m_InitialState, NULL, __uuidof(ID3D12Resource),
-                                                (void **)&tex));
+  CHECK_HR(m_Dev->CreateCommittedResource(
+      &m_HeapDesc, m_HeapFlags, &m_TexDesc, m_InitialState,
+      (m_ClearVal.Format == DXGI_FORMAT_UNKNOWN) ? NULL : &m_ClearVal, __uuidof(ID3D12Resource),
+      (void **)&tex));
   return tex;
 }
 
-D3D12ViewCreator::D3D12ViewCreator(D3D12GraphicsTest *test, ID3D12DescriptorHeap *heap,
-                                   ViewType viewType, ID3D12Resource *res)
-    : m_Test(test), m_Type(viewType), m_Heap(heap), m_Res(res)
+D3D12ViewCreator::D3D12ViewCreator(ID3D12DevicePtr dev, ID3D12DescriptorHeap *heap,
+                                   ID3D12DescriptorHeap *clearHeap, ViewType viewType,
+                                   ID3D12Resource *res)
+    : m_Dev(dev), m_Type(viewType), m_Heap(heap), m_ClearHeap(clearHeap), m_Res(res)
 {
   D3D12_RESOURCE_DESC resdesc = res->GetDesc();
   D3D12_RESOURCE_DIMENSION dim = resdesc.Dimension;
 
   Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
 
-  if(dim == D3D12_RESOURCE_DIMENSION_BUFFER)
+  if(m_Type == ViewType::CBV)
+  {
+    desc.cbv.BufferLocation = m_Res->GetGPUVirtualAddress();
+    desc.cbv.SizeInBytes = 0;
+  }
+  else if(dim == D3D12_RESOURCE_DIMENSION_BUFFER)
   {
     SetupDescriptors(viewType, ResourceType::Buffer);
   }
@@ -508,124 +578,233 @@ void D3D12ViewCreator::SetupDescriptors(ViewType viewType, ResourceType resType)
           // &firstMip, &numMips, &firstSlice, &numSlices, &planeSlice
           {NULL, NULL, NULL, NULL, NULL},
           {
-              &desc.srv.Texture1D.MostDetailedMip, &desc.srv.Texture1D.MipLevels, NULL, NULL, NULL,
+              &desc.srv.Texture1D.MostDetailedMip,
+              &desc.srv.Texture1D.MipLevels,
+              NULL,
+              NULL,
+              NULL,
           },
           {
-              &desc.srv.Texture1DArray.MostDetailedMip, &desc.srv.Texture1DArray.MipLevels,
-              &desc.srv.Texture1DArray.FirstArraySlice, &desc.srv.Texture1DArray.ArraySize, NULL,
+              &desc.srv.Texture1DArray.MostDetailedMip,
+              &desc.srv.Texture1DArray.MipLevels,
+              &desc.srv.Texture1DArray.FirstArraySlice,
+              &desc.srv.Texture1DArray.ArraySize,
+              NULL,
           },
           {
-              &desc.srv.Texture2D.MostDetailedMip, &desc.srv.Texture2D.MipLevels, NULL, NULL,
+              &desc.srv.Texture2D.MostDetailedMip,
+              &desc.srv.Texture2D.MipLevels,
+              NULL,
+              NULL,
               &desc.srv.Texture2D.PlaneSlice,
           },
           {
-              &desc.srv.Texture2DArray.MostDetailedMip, &desc.srv.Texture2DArray.MipLevels,
-              &desc.srv.Texture2DArray.FirstArraySlice, &desc.srv.Texture2DArray.ArraySize,
+              &desc.srv.Texture2DArray.MostDetailedMip,
+              &desc.srv.Texture2DArray.MipLevels,
+              &desc.srv.Texture2DArray.FirstArraySlice,
+              &desc.srv.Texture2DArray.ArraySize,
               &desc.srv.Texture2DArray.PlaneSlice,
           },
           {
-              NULL, NULL, NULL, NULL, NULL,
+              NULL,
+              NULL,
+              NULL,
+              NULL,
+              NULL,
           },
           {
-              NULL, NULL, &desc.srv.Texture2DMSArray.FirstArraySlice,
-              &desc.srv.Texture2DMSArray.ArraySize, NULL,
+              NULL,
+              NULL,
+              &desc.srv.Texture2DMSArray.FirstArraySlice,
+              &desc.srv.Texture2DMSArray.ArraySize,
+              NULL,
           },
           {
-              &desc.srv.Texture3D.MostDetailedMip, &desc.srv.Texture2D.MipLevels, NULL, NULL, NULL,
+              &desc.srv.Texture3D.MostDetailedMip,
+              &desc.srv.Texture2D.MipLevels,
+              NULL,
+              NULL,
+              NULL,
           },
       },
       // RTV
       {
           // &firstMip, &numMips, &firstSlice, &numSlices
           {
-              NULL, NULL, NULL, NULL, NULL,
+              NULL,
+              NULL,
+              NULL,
+              NULL,
+              NULL,
           },
           {
-              &desc.rtv.Texture1D.MipSlice, NULL, NULL, NULL, NULL,
+              &desc.rtv.Texture1D.MipSlice,
+              NULL,
+              NULL,
+              NULL,
+              NULL,
           },
           {
-              &desc.rtv.Texture1DArray.MipSlice, NULL, &desc.rtv.Texture1DArray.FirstArraySlice,
-              &desc.rtv.Texture1DArray.ArraySize, NULL,
+              &desc.rtv.Texture1DArray.MipSlice,
+              NULL,
+              &desc.rtv.Texture1DArray.FirstArraySlice,
+              &desc.rtv.Texture1DArray.ArraySize,
+              NULL,
           },
           {
-              &desc.rtv.Texture2D.MipSlice, NULL, NULL, NULL, &desc.rtv.Texture2D.PlaneSlice,
+              &desc.rtv.Texture2D.MipSlice,
+              NULL,
+              NULL,
+              NULL,
+              &desc.rtv.Texture2D.PlaneSlice,
           },
           {
-              &desc.rtv.Texture2DArray.MipSlice, NULL, &desc.rtv.Texture2DArray.FirstArraySlice,
-              &desc.rtv.Texture2DArray.ArraySize, &desc.rtv.Texture2DArray.PlaneSlice,
+              &desc.rtv.Texture2DArray.MipSlice,
+              NULL,
+              &desc.rtv.Texture2DArray.FirstArraySlice,
+              &desc.rtv.Texture2DArray.ArraySize,
+              &desc.rtv.Texture2DArray.PlaneSlice,
           },
           {
-              NULL, NULL, NULL, NULL, NULL,
+              NULL,
+              NULL,
+              NULL,
+              NULL,
+              NULL,
           },
           {
-              NULL, NULL, &desc.rtv.Texture2DMSArray.FirstArraySlice,
-              &desc.rtv.Texture2DMSArray.ArraySize, NULL,
+              NULL,
+              NULL,
+              &desc.rtv.Texture2DMSArray.FirstArraySlice,
+              &desc.rtv.Texture2DMSArray.ArraySize,
+              NULL,
           },
           {
-              &desc.rtv.Texture3D.MipSlice, NULL, &desc.rtv.Texture3D.FirstWSlice,
-              &desc.rtv.Texture3D.WSize, NULL,
+              &desc.rtv.Texture3D.MipSlice,
+              NULL,
+              &desc.rtv.Texture3D.FirstWSlice,
+              &desc.rtv.Texture3D.WSize,
+              NULL,
           },
       },
       // DSV
       {
           // &firstMip, &numMips, &firstSlice, &numSlices
           {
-              NULL, NULL, NULL, NULL, NULL,
+              NULL,
+              NULL,
+              NULL,
+              NULL,
+              NULL,
           },
           {
-              &desc.dsv.Texture1D.MipSlice, NULL, NULL, NULL, NULL,
+              &desc.dsv.Texture1D.MipSlice,
+              NULL,
+              NULL,
+              NULL,
+              NULL,
           },
           {
-              &desc.dsv.Texture1DArray.MipSlice, NULL, &desc.dsv.Texture1DArray.FirstArraySlice,
-              &desc.dsv.Texture1DArray.ArraySize, NULL,
+              &desc.dsv.Texture1DArray.MipSlice,
+              NULL,
+              &desc.dsv.Texture1DArray.FirstArraySlice,
+              &desc.dsv.Texture1DArray.ArraySize,
+              NULL,
           },
           {
-              &desc.dsv.Texture2D.MipSlice, NULL, NULL, NULL, NULL,
+              &desc.dsv.Texture2D.MipSlice,
+              NULL,
+              NULL,
+              NULL,
+              NULL,
           },
           {
-              &desc.dsv.Texture2DArray.MipSlice, NULL, &desc.dsv.Texture2DArray.FirstArraySlice,
-              &desc.dsv.Texture2DArray.ArraySize, NULL,
+              &desc.dsv.Texture2DArray.MipSlice,
+              NULL,
+              &desc.dsv.Texture2DArray.FirstArraySlice,
+              &desc.dsv.Texture2DArray.ArraySize,
+              NULL,
           },
           {
-              NULL, NULL, NULL, NULL, NULL,
+              NULL,
+              NULL,
+              NULL,
+              NULL,
+              NULL,
           },
           {
-              NULL, NULL, &desc.dsv.Texture2DMSArray.FirstArraySlice,
-              &desc.dsv.Texture2DMSArray.ArraySize, NULL,
+              NULL,
+              NULL,
+              &desc.dsv.Texture2DMSArray.FirstArraySlice,
+              &desc.dsv.Texture2DMSArray.ArraySize,
+              NULL,
           },
           {
-              NULL, NULL, NULL, NULL, NULL,
+              NULL,
+              NULL,
+              NULL,
+              NULL,
+              NULL,
           },
       },
       // UAV
       {
           // &firstMip, &numMips, &firstSlice, &numSlices
           {
-              NULL, NULL, NULL, NULL, NULL,
+              NULL,
+              NULL,
+              NULL,
+              NULL,
+              NULL,
           },
           {
-              &desc.uav.Texture1D.MipSlice, NULL, NULL, NULL, NULL,
+              &desc.uav.Texture1D.MipSlice,
+              NULL,
+              NULL,
+              NULL,
+              NULL,
           },
           {
-              &desc.uav.Texture1DArray.MipSlice, NULL, &desc.uav.Texture1DArray.FirstArraySlice,
-              &desc.uav.Texture1DArray.ArraySize, NULL,
+              &desc.uav.Texture1DArray.MipSlice,
+              NULL,
+              &desc.uav.Texture1DArray.FirstArraySlice,
+              &desc.uav.Texture1DArray.ArraySize,
+              NULL,
           },
           {
-              &desc.uav.Texture2D.MipSlice, NULL, NULL, NULL, &desc.uav.Texture2D.PlaneSlice,
+              &desc.uav.Texture2D.MipSlice,
+              NULL,
+              NULL,
+              NULL,
+              &desc.uav.Texture2D.PlaneSlice,
           },
           {
-              &desc.uav.Texture2DArray.MipSlice, NULL, &desc.uav.Texture2DArray.FirstArraySlice,
-              &desc.uav.Texture2DArray.ArraySize, &desc.uav.Texture2DArray.PlaneSlice,
+              &desc.uav.Texture2DArray.MipSlice,
+              NULL,
+              &desc.uav.Texture2DArray.FirstArraySlice,
+              &desc.uav.Texture2DArray.ArraySize,
+              &desc.uav.Texture2DArray.PlaneSlice,
           },
           {
-              NULL, NULL, NULL, NULL, NULL,
+              NULL,
+              NULL,
+              NULL,
+              NULL,
+              NULL,
           },
           {
-              NULL, NULL, NULL, NULL, NULL,
+              NULL,
+              NULL,
+              NULL,
+              NULL,
+              NULL,
           },
           {
-              &desc.uav.Texture3D.MipSlice, NULL, &desc.uav.Texture3D.FirstWSlice,
-              &desc.uav.Texture3D.WSize, NULL,
+              &desc.uav.Texture3D.MipSlice,
+              NULL,
+              &desc.uav.Texture3D.FirstWSlice,
+              &desc.uav.Texture3D.WSize,
+              NULL,
           },
       },
   };
@@ -649,6 +828,24 @@ D3D12ViewCreator &D3D12ViewCreator::Format(DXGI_FORMAT f)
 {
   // this is always in the same place, just write it once
   desc.srv.Format = f;
+  return *this;
+}
+
+D3D12ViewCreator &D3D12ViewCreator::Offset(UINT offset)
+{
+  if(m_Type == ViewType::CBV)
+    desc.cbv.BufferLocation += offset;
+  else
+    TEST_ERROR("This view & resource doesn't support SizeBytes");
+  return *this;
+}
+
+D3D12ViewCreator &D3D12ViewCreator::SizeBytes(UINT size)
+{
+  if(m_Type == ViewType::CBV)
+    desc.cbv.SizeInBytes = size;
+  else
+    TEST_ERROR("This view & resource doesn't support SizeBytes");
   return *this;
 }
 
@@ -694,8 +891,6 @@ D3D12ViewCreator &D3D12ViewCreator::FirstMip(UINT mip)
 {
   if(firstMip)
     *firstMip = mip;
-  else
-    TEST_ERROR("This view & resource doesn't support FirstMip");
   return *this;
 }
 
@@ -703,8 +898,6 @@ D3D12ViewCreator &D3D12ViewCreator::NumMips(UINT num)
 {
   if(numMips)
     *numMips = num;
-  else
-    TEST_ERROR("This view & resource doesn't support NumMips");
   return *this;
 }
 
@@ -712,8 +905,6 @@ D3D12ViewCreator &D3D12ViewCreator::FirstSlice(UINT mip)
 {
   if(firstSlice)
     *firstSlice = mip;
-  else
-    TEST_ERROR("This view & resource doesn't support FirstSlice");
   return *this;
 }
 
@@ -721,8 +912,6 @@ D3D12ViewCreator &D3D12ViewCreator::NumSlices(UINT num)
 {
   if(numSlices)
     *numSlices = num;
-  else
-    TEST_ERROR("This view & resource doesn't support NumSlices");
   return *this;
 }
 
@@ -736,8 +925,6 @@ D3D12ViewCreator &D3D12ViewCreator::PlaneSlice(UINT plane)
 {
   if(planeSlice)
     *planeSlice = plane;
-  else
-    TEST_ERROR("This view & resource doesn't support NumSlices");
   return *this;
 }
 
@@ -757,10 +944,10 @@ D3D12_CPU_DESCRIPTOR_HANDLE D3D12ViewCreator::CreateCPU(ID3D12DescriptorHeap *he
                                                         uint32_t descriptor)
 {
   static UINT increment[] = {
-      m_Test->dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV),
+      m_Dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV),
       0,    // D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER
-      m_Test->dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV),
-      m_Test->dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV),
+      m_Dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV),
+      m_Dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV),
   };
 
   D3D12_CPU_DESCRIPTOR_HANDLE cpu = heap->GetCPUDescriptorHandleForHeapStart();
@@ -770,12 +957,17 @@ D3D12_CPU_DESCRIPTOR_HANDLE D3D12ViewCreator::CreateCPU(ID3D12DescriptorHeap *he
   if(m_Type == ViewType::DSV)
   {
     cpu.ptr += increment[D3D12_DESCRIPTOR_HEAP_TYPE_DSV] * descriptor;
-    m_Test->dev->CreateDepthStencilView(m_Res, &desc.dsv, cpu);
+    m_Dev->CreateDepthStencilView(m_Res, &desc.dsv, cpu);
   }
   else if(m_Type == ViewType::RTV)
   {
     cpu.ptr += increment[D3D12_DESCRIPTOR_HEAP_TYPE_RTV] * descriptor;
-    m_Test->dev->CreateRenderTargetView(m_Res, &desc.rtv, cpu);
+    m_Dev->CreateRenderTargetView(m_Res, &desc.rtv, cpu);
+  }
+  else if(m_Type == ViewType::CBV)
+  {
+    cpu.ptr += increment[D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV] * descriptor;
+    m_Dev->CreateConstantBufferView(&desc.cbv, cpu);
   }
   else if(m_Type == ViewType::SRV)
   {
@@ -798,7 +990,7 @@ D3D12_CPU_DESCRIPTOR_HANDLE D3D12ViewCreator::CreateCPU(ID3D12DescriptorHeap *he
     desc.srv.Shader4ComponentMapping = Shader4ComponentMapping;
 
     cpu.ptr += increment[D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV] * descriptor;
-    m_Test->dev->CreateShaderResourceView(m_Res, &desc.srv, cpu);
+    m_Dev->CreateShaderResourceView(m_Res, &desc.srv, cpu);
   }
   else if(m_Type == ViewType::UAV)
   {
@@ -819,7 +1011,7 @@ D3D12_CPU_DESCRIPTOR_HANDLE D3D12ViewCreator::CreateCPU(ID3D12DescriptorHeap *he
     }
 
     cpu.ptr += increment[D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV] * descriptor;
-    m_Test->dev->CreateUnorderedAccessView(m_Res, NULL, &desc.uav, cpu);
+    m_Dev->CreateUnorderedAccessView(m_Res, NULL, &desc.uav, cpu);
   }
 
   return cpu;
@@ -831,10 +1023,10 @@ D3D12_GPU_DESCRIPTOR_HANDLE D3D12ViewCreator::CreateGPU(ID3D12DescriptorHeap *he
   CreateCPU(heap, descriptor);
 
   static UINT increment[] = {
-      m_Test->dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV),
+      m_Dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV),
       0,    // D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER
-      m_Test->dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV),
-      m_Test->dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV),
+      m_Dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV),
+      m_Dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV),
   };
 
   D3D12_GPU_DESCRIPTOR_HANDLE gpu = heap->GetGPUDescriptorHandleForHeapStart();
@@ -849,7 +1041,7 @@ D3D12_GPU_DESCRIPTOR_HANDLE D3D12ViewCreator::CreateGPU(ID3D12DescriptorHeap *he
   return gpu;
 }
 
-D3D12PSOCreator::D3D12PSOCreator(D3D12GraphicsTest *test) : m_Test(test)
+D3D12PSOCreator::D3D12PSOCreator(ID3D12DevicePtr dev) : m_Dev(dev)
 {
   GraphicsDesc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
   GraphicsDesc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
@@ -868,47 +1060,105 @@ D3D12PSOCreator::D3D12PSOCreator(D3D12GraphicsTest *test) : m_Test(test)
   GraphicsDesc.BlendState.RenderTarget[0].DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
   GraphicsDesc.BlendState.RenderTarget[0].BlendOpAlpha = D3D12_BLEND_OP_ADD;
   GraphicsDesc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+  GraphicsDesc.DepthStencilState.DepthEnable = FALSE;
+  GraphicsDesc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+  GraphicsDesc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+  GraphicsDesc.DepthStencilState.StencilReadMask = 0xff;
+  GraphicsDesc.DepthStencilState.StencilWriteMask = 0xff;
+  GraphicsDesc.DepthStencilState.FrontFace.StencilFunc = D3D12_COMPARISON_FUNC_EQUAL;
+  GraphicsDesc.DepthStencilState.FrontFace.StencilFailOp = D3D12_STENCIL_OP_KEEP;
+  GraphicsDesc.DepthStencilState.FrontFace.StencilDepthFailOp = D3D12_STENCIL_OP_KEEP;
+  GraphicsDesc.DepthStencilState.FrontFace.StencilPassOp = D3D12_STENCIL_OP_REPLACE;
+  GraphicsDesc.DepthStencilState.BackFace = GraphicsDesc.DepthStencilState.FrontFace;
 }
 
 D3D12PSOCreator &D3D12PSOCreator::VS(ID3DBlobPtr blob)
 {
-  GraphicsDesc.VS.pShaderBytecode = blob->GetBufferPointer();
-  GraphicsDesc.VS.BytecodeLength = blob->GetBufferSize();
+  if(blob)
+  {
+    GraphicsDesc.VS.pShaderBytecode = blob->GetBufferPointer();
+    GraphicsDesc.VS.BytecodeLength = blob->GetBufferSize();
+  }
+  else
+  {
+    GraphicsDesc.VS.pShaderBytecode = NULL;
+    GraphicsDesc.VS.BytecodeLength = 0;
+  }
   return *this;
 }
 
 D3D12PSOCreator &D3D12PSOCreator::HS(ID3DBlobPtr blob)
 {
-  GraphicsDesc.HS.pShaderBytecode = blob->GetBufferPointer();
-  GraphicsDesc.HS.BytecodeLength = blob->GetBufferSize();
+  if(blob)
+  {
+    GraphicsDesc.HS.pShaderBytecode = blob->GetBufferPointer();
+    GraphicsDesc.HS.BytecodeLength = blob->GetBufferSize();
+  }
+  else
+  {
+    GraphicsDesc.HS.pShaderBytecode = NULL;
+    GraphicsDesc.HS.BytecodeLength = 0;
+  }
   return *this;
 }
 
 D3D12PSOCreator &D3D12PSOCreator::DS(ID3DBlobPtr blob)
 {
-  GraphicsDesc.DS.pShaderBytecode = blob->GetBufferPointer();
-  GraphicsDesc.DS.BytecodeLength = blob->GetBufferSize();
+  if(blob)
+  {
+    GraphicsDesc.DS.pShaderBytecode = blob->GetBufferPointer();
+    GraphicsDesc.DS.BytecodeLength = blob->GetBufferSize();
+  }
+  else
+  {
+    GraphicsDesc.DS.pShaderBytecode = NULL;
+    GraphicsDesc.DS.BytecodeLength = 0;
+  }
   return *this;
 }
 
 D3D12PSOCreator &D3D12PSOCreator::GS(ID3DBlobPtr blob)
 {
-  GraphicsDesc.GS.pShaderBytecode = blob->GetBufferPointer();
-  GraphicsDesc.GS.BytecodeLength = blob->GetBufferSize();
+  if(blob)
+  {
+    GraphicsDesc.GS.pShaderBytecode = blob->GetBufferPointer();
+    GraphicsDesc.GS.BytecodeLength = blob->GetBufferSize();
+  }
+  else
+  {
+    GraphicsDesc.GS.pShaderBytecode = NULL;
+    GraphicsDesc.GS.BytecodeLength = 0;
+  }
   return *this;
 }
 
 D3D12PSOCreator &D3D12PSOCreator::PS(ID3DBlobPtr blob)
 {
-  GraphicsDesc.PS.pShaderBytecode = blob->GetBufferPointer();
-  GraphicsDesc.PS.BytecodeLength = blob->GetBufferSize();
+  if(blob)
+  {
+    GraphicsDesc.PS.pShaderBytecode = blob->GetBufferPointer();
+    GraphicsDesc.PS.BytecodeLength = blob->GetBufferSize();
+  }
+  else
+  {
+    GraphicsDesc.PS.pShaderBytecode = NULL;
+    GraphicsDesc.PS.BytecodeLength = 0;
+  }
   return *this;
 }
 
 D3D12PSOCreator &D3D12PSOCreator::CS(ID3DBlobPtr blob)
 {
-  ComputeDesc.CS.pShaderBytecode = blob->GetBufferPointer();
-  ComputeDesc.CS.BytecodeLength = blob->GetBufferSize();
+  if(blob)
+  {
+    ComputeDesc.CS.pShaderBytecode = blob->GetBufferPointer();
+    ComputeDesc.CS.BytecodeLength = blob->GetBufferSize();
+  }
+  else
+  {
+    ComputeDesc.CS.pShaderBytecode = NULL;
+    ComputeDesc.CS.BytecodeLength = 0;
+  }
   return *this;
 }
 
@@ -921,7 +1171,25 @@ D3D12PSOCreator &D3D12PSOCreator::InputLayout(const std::vector<D3D12_INPUT_ELEM
 
 D3D12PSOCreator &D3D12PSOCreator::InputLayout()
 {
-  return InputLayout(m_Test->DefaultInputLayout());
+  const D3D12_INPUT_CLASSIFICATION vertex = D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA;
+  static const std::vector<D3D12_INPUT_ELEMENT_DESC> defaultLayout = {
+      {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, vertex, 0},
+      {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 12, vertex, 0},
+      {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 28, vertex, 0},
+  };
+  return InputLayout(defaultLayout);
+}
+
+D3D12PSOCreator &D3D12PSOCreator::StripRestart(D3D12_INDEX_BUFFER_STRIP_CUT_VALUE stripCut)
+{
+  GraphicsDesc.IBStripCutValue = stripCut;
+  return *this;
+}
+
+D3D12PSOCreator &D3D12PSOCreator::Topology(D3D12_PRIMITIVE_TOPOLOGY_TYPE topo)
+{
+  GraphicsDesc.PrimitiveTopologyType = topo;
+  return *this;
 }
 
 D3D12PSOCreator &D3D12PSOCreator::RootSig(ID3D12RootSignaturePtr rootSig)
@@ -957,13 +1225,63 @@ D3D12PSOCreator::operator ID3D12PipelineStatePtr() const
   ID3D12PipelineStatePtr pso;
   if(ComputeDesc.CS.BytecodeLength > 0)
   {
-    CHECK_HR(m_Test->dev->CreateComputePipelineState(&ComputeDesc, __uuidof(ID3D12PipelineState),
-                                                     (void **)&pso));
+    CHECK_HR(m_Dev->CreateComputePipelineState(&ComputeDesc, __uuidof(ID3D12PipelineState),
+                                               (void **)&pso));
   }
   else
   {
-    CHECK_HR(m_Test->dev->CreateGraphicsPipelineState(&GraphicsDesc, __uuidof(ID3D12PipelineState),
-                                                      (void **)&pso));
+    CHECK_HR(m_Dev->CreateGraphicsPipelineState(&GraphicsDesc, __uuidof(ID3D12PipelineState),
+                                                (void **)&pso));
   }
   return pso;
+}
+
+D3D12_INDIRECT_ARGUMENT_DESC vbArg(UINT slot)
+{
+  return {D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW, slot};
+}
+
+D3D12_INDIRECT_ARGUMENT_DESC ibArg()
+{
+  return {D3D12_INDIRECT_ARGUMENT_TYPE_INDEX_BUFFER_VIEW};
+}
+
+D3D12_INDIRECT_ARGUMENT_DESC uavArg(UINT root)
+{
+  return {D3D12_INDIRECT_ARGUMENT_TYPE_UNORDERED_ACCESS_VIEW, root};
+}
+
+D3D12_INDIRECT_ARGUMENT_DESC srvArg(UINT root)
+{
+  return {D3D12_INDIRECT_ARGUMENT_TYPE_SHADER_RESOURCE_VIEW, root};
+}
+
+D3D12_INDIRECT_ARGUMENT_DESC cbvArg(UINT root)
+{
+  return {D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW, root};
+}
+
+D3D12_INDIRECT_ARGUMENT_DESC constArg(UINT root, UINT wordOffset, UINT wordCount)
+{
+  D3D12_INDIRECT_ARGUMENT_DESC ret;
+  ret.Type = D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT;
+  ret.Constant.RootParameterIndex = root;
+  ret.Constant.DestOffsetIn32BitValues = wordOffset;
+  ret.Constant.Num32BitValuesToSet = wordCount;
+  return ret;
+}
+
+D3D12_INDIRECT_ARGUMENT_DESC drawArg()
+{
+  return {D3D12_INDIRECT_ARGUMENT_TYPE_DRAW};
+}
+
+D3D12_INDIRECT_ARGUMENT_DESC drawIndexedArg()
+{
+  return {D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED};
+}
+
+D3D12_INDIRECT_ARGUMENT_DESC dispatchArg()
+{
+  return {D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH};
 }

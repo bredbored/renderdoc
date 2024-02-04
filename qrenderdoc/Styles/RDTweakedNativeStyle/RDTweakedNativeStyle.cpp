@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2016-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -26,6 +26,7 @@
 #include <QDebug>
 #include <QFontMetrics>
 #include <QPainter>
+#include <QPainterPath>
 #include <QPen>
 #include <QStyleOption>
 
@@ -34,7 +35,13 @@ namespace Constants
 static const int MenuBarItemHPadding = 4;
 static const int MenuBarItemVPadding = 2;
 static const int MenuBarItemSpacing = 4;
+static const int ToolButtonIconSpacing = 4;
 };
+
+static QWindow *widgetWindow(const QWidget *widget)
+{
+  return widget ? widget->window()->windowHandle() : NULL;
+}
 
 RDTweakedNativeStyle::RDTweakedNativeStyle(QStyle *parent) : QProxyStyle(parent)
 {
@@ -42,6 +49,38 @@ RDTweakedNativeStyle::RDTweakedNativeStyle(QStyle *parent) : QProxyStyle(parent)
 
 RDTweakedNativeStyle::~RDTweakedNativeStyle()
 {
+}
+
+QRect RDTweakedNativeStyle::subControlRect(ComplexControl cc, const QStyleOptionComplex *opt,
+                                           SubControl sc, const QWidget *widget) const
+{
+  if(cc == QStyle::CC_ToolButton)
+  {
+    int indicatorWidth = proxy()->pixelMetric(PM_MenuButtonIndicator, opt, widget);
+
+    QRect ret = opt->rect;
+
+    const QStyleOptionToolButton *toolbutton = qstyleoption_cast<const QStyleOptionToolButton *>(opt);
+
+    // return the normal rect if there's no menu
+    if(!shouldDrawToolButtonMenuArrow(toolbutton))
+    {
+      return ret;
+    }
+
+    if(sc == QStyle::SC_ToolButton)
+    {
+      ret.setRight(ret.right() - indicatorWidth);
+    }
+    else if(sc == QStyle::SC_ToolButtonMenu)
+    {
+      ret.setLeft(ret.right() - indicatorWidth);
+    }
+
+    return ret;
+  }
+
+  return QProxyStyle::subControlRect(cc, opt, sc, widget);
 }
 
 QRect RDTweakedNativeStyle::subElementRect(SubElement element, const QStyleOption *opt,
@@ -67,12 +106,11 @@ QSize RDTweakedNativeStyle::sizeFromContents(ContentsType type, const QStyleOpti
 {
   QSize sz = size;
 
-  // Toolbuttons are always at least icon sized, for consistency.
   if(type == QStyle::CT_ToolButton)
   {
     const QStyleOptionToolButton *toolbutton = qstyleoption_cast<const QStyleOptionToolButton *>(opt);
     if(toolbutton)
-      sz = sz.expandedTo(toolbutton->iconSize);
+      sz = adjustToolButtonSize(toolbutton, sz, widget);
   }
 
   // menu bar items can be sized for both the icon *and* the text
@@ -145,13 +183,24 @@ void RDTweakedNativeStyle::drawComplexControl(ComplexControl control, const QSty
     backCol.setAlphaF(0.2);
 
     QStyleOptionToolButton menu;
+    bool hasMenu = false;
+    bool hasSeparateMenu = false;
 
     // draw the menu arrow, if there is one
-    if((toolbutton->subControls & SC_ToolButtonMenu) ||
-       (toolbutton->features & QStyleOptionToolButton::MenuButtonPopup))
+    if(shouldDrawToolButtonMenuArrow(toolbutton))
     {
       menu = *toolbutton;
       menu.rect = subControlRect(control, opt, SC_ToolButtonMenu, widget);
+      hasMenu = true;
+      // We always draw an arrow if a menu is present (normally Qt only does it for MenuButtonPopup,
+      // where there is both a button with a default action and a menu triggered by a small arrow,
+      // and not InstantPopup where there is only a button). If the button uses MenuButtonPopup,
+      // we want to draw a line to distinguish the menu part of the button and the main part,
+      // but we don't need that line if the arrow is decorative only.
+      if(toolbutton->features & QStyleOptionToolButton::MenuButtonPopup)
+      {
+        hasSeparateMenu = true;
+      }
     }
 
     QStyle::State masked = opt->state & (State_On | State_MouseOver);
@@ -164,7 +213,7 @@ void RDTweakedNativeStyle::drawComplexControl(ComplexControl control, const QSty
       QRect rect = opt->rect.adjusted(0, 0, -1, -1);
       p->setPen(opt->palette.color(QPalette::Shadow));
       p->drawRect(rect);
-      if(menu.rect.isValid())
+      if(hasSeparateMenu)
         p->drawLine(menu.rect.topLeft(), menu.rect.bottomLeft());
 
       // when the mouse is over, make it a little stronger
@@ -182,7 +231,7 @@ void RDTweakedNativeStyle::drawComplexControl(ComplexControl control, const QSty
     // draw the label text/icon
     drawControl(CE_ToolButtonLabel, &labelTextIcon, p, widget);
 
-    if(menu.rect.isValid())
+    if(hasMenu)
     {
       menu.rect.adjust(2, 0, 0, 0);
       drawPrimitive(PE_IndicatorArrowDown, &menu, p, widget);
@@ -366,7 +415,7 @@ void RDTweakedNativeStyle::drawControl(ControlElement control, const QStyleOptio
     }
 
     int flags = Qt::AlignCenter | Qt::TextShowMnemonic | Qt::TextDontClip | Qt::TextSingleLine;
-    if(!styleHint(SH_UnderlineShortcut, opt, widget))
+    if(!proxy()->styleHint(SH_UnderlineShortcut, opt, widget))
       flags |= Qt::TextHideMnemonic;
 
     rect.adjust(Constants::MenuBarItemHPadding, Constants::MenuBarItemVPadding,
@@ -374,8 +423,9 @@ void RDTweakedNativeStyle::drawControl(ControlElement control, const QStyleOptio
 
     int iconSize = pixelMetric(QStyle::PM_SmallIconSize, opt, widget);
 
-    QPixmap pix = menuopt->icon.pixmap(
-        iconSize, iconSize, (menuopt->state & State_Enabled) ? QIcon::Normal : QIcon::Disabled);
+    QPixmap pix =
+        menuopt->icon.pixmap(widgetWindow(widget), QSize(iconSize, iconSize),
+                             (menuopt->state & State_Enabled) ? QIcon::Normal : QIcon::Disabled);
 
     if(!pix.isNull())
     {
@@ -389,7 +439,122 @@ void RDTweakedNativeStyle::drawControl(ControlElement control, const QStyleOptio
 
     return;
   }
+  else if(control == QStyle::CE_ToolButtonLabel)
+  {
+    // unfortunately Qt made a 'fix' at some point to some unalterable magic numbers which reduces
+    // the spacing around the icon and ends up being too small at least in cases we care about.
+    // So we instead render the label ourselves
 
+    const QStyleOptionToolButton *toolopt = qstyleoption_cast<const QStyleOptionToolButton *>(opt);
+
+    if((toolopt->features & QStyleOptionToolButton::Arrow) && toolopt->arrowType != Qt::NoArrow)
+    {
+      return QProxyStyle::drawControl(control, opt, p, widget);
+    }
+
+    QRect rect = toolopt->rect;
+
+    // even though our style doesn't shift the button contents, this is the tweaked native style so
+    // we need to check for that
+    if(toolopt->state & (State_Sunken | State_On))
+    {
+      rect.translate(proxy()->pixelMetric(PM_ButtonShiftHorizontal, toolopt, widget),
+                     proxy()->pixelMetric(PM_ButtonShiftVertical, toolopt, widget));
+    }
+
+    int textFlags = Qt::TextShowMnemonic;
+    if(!proxy()->styleHint(SH_UnderlineShortcut, opt, widget))
+      textFlags |= Qt::TextHideMnemonic;
+
+    // fetch the icon if we're not text-only and there's a valid icon
+    QPixmap pixmap;
+    QSize iconSize = toolopt->iconSize;
+    if(!toolopt->icon.isNull() && toolopt->toolButtonStyle != Qt::ToolButtonTextOnly)
+    {
+      QIcon::Mode mode = QIcon::Normal;
+
+      if((toolopt->state & State_Enabled) == 0)
+        mode = QIcon::Disabled;
+      else if((opt->state & (State_AutoRaise | State_MouseOver)) ==
+              (State_AutoRaise | State_MouseOver))
+        mode = QIcon::Active;
+
+      iconSize.setWidth(qMin(toolopt->iconSize.width(), toolopt->rect.width()));
+      iconSize.setHeight(qMin(toolopt->iconSize.height(), toolopt->rect.height()));
+
+      pixmap = toolopt->icon.pixmap(widget->window()->windowHandle(), iconSize, mode,
+                                    toolopt->state & State_On ? QIcon::On : QIcon::Off);
+      double d = widget->devicePixelRatioF();
+      iconSize = pixmap.size();
+      iconSize /= pixmap.devicePixelRatio();
+    }
+
+    // if we're only rendering the icon, render it now centred
+    if(toolopt->toolButtonStyle == Qt::ToolButtonIconOnly)
+    {
+      drawItemPixmap(p, rect, Qt::AlignCenter, pixmap);
+    }
+    else
+    {
+      // otherwise we're expecting to render text, set the font
+      p->setFont(toolopt->font);
+
+      QRect iconRect = rect, textRect = rect;
+
+      if(toolopt->toolButtonStyle == Qt::ToolButtonTextOnly)
+      {
+        textFlags |= Qt::AlignCenter;
+        iconRect = QRect();
+      }
+      else if(toolopt->toolButtonStyle == Qt::ToolButtonTextUnderIcon)
+      {
+        // take spacing above and below for the icon
+        iconRect.setHeight(iconSize.height() + Constants::ToolButtonIconSpacing * 2);
+        // place the text below the icon
+        textRect.setTop(textRect.top() + iconRect.height());
+        // center the text below the icon
+        textFlags |= Qt::AlignCenter;
+      }
+      else
+      {
+        // take spacing left and right for the icon and remove it from the text rect
+        iconRect.setWidth(iconSize.width() + Constants::ToolButtonIconSpacing * 2);
+        textRect.setLeft(textRect.left() + iconRect.width());
+
+        // left align the text horizontally next to the icon, but still vertically center it.
+        textFlags |= Qt::AlignLeft | Qt::AlignVCenter;
+      }
+
+      if(iconRect.isValid())
+        proxy()->drawItemPixmap(p, QStyle::visualRect(opt->direction, rect, iconRect),
+                                Qt::AlignCenter, pixmap);
+
+      // elide text from the right if there's not enough space
+      QFontMetrics metrics(toolopt->font);
+
+      int space = metrics.width(QLatin1Char(' '));
+      textRect = QStyle::visualRect(opt->direction, rect, textRect);
+
+      if(toolopt->toolButtonStyle == Qt::ToolButtonTextOnly)
+      {
+        textRect.adjust(3 + space, 0, -3 - space, 0);
+      }
+
+      const QString elidedText = metrics.elidedText(toolopt->text, Qt::ElideRight, textRect.width());
+
+      // if we elided, align left now
+      if(elidedText.length() < toolopt->text.length())
+      {
+        textFlags &= ~Qt::AlignCenter;
+        textFlags |= Qt::AlignLeft | Qt::AlignVCenter;
+      }
+
+      proxy()->drawItemText(p, textRect, textFlags, toolopt->palette,
+                            toolopt->state & State_Enabled, elidedText, QPalette::ButtonText);
+    }
+
+    return;
+  }
 // https://bugreports.qt.io/browse/QTBUG-14949
 // work around itemview rendering bug - the first line in a multi-line text that is elided stops
 // all subsequent text from rendering. Should be fixed in 5.11, but for all other versions we need
@@ -397,7 +562,7 @@ void RDTweakedNativeStyle::drawControl(ControlElement control, const QStyleOptio
 //
 // However in 5.11.1 at least on macOS it still seems to be broken
 #if 1    //(QT_VERSION < QT_VERSION_CHECK(5, 11, 0))
-  if(control == QStyle::CE_ItemViewItem)
+  else if(control == QStyle::CE_ItemViewItem)
   {
     const QStyleOptionViewItem *viewopt = qstyleoption_cast<const QStyleOptionViewItem *>(opt);
 
@@ -428,4 +593,35 @@ void RDTweakedNativeStyle::drawControl(ControlElement control, const QStyleOptio
 #endif
 
   QProxyStyle::drawControl(control, opt, p, widget);
+}
+
+bool RDTweakedNativeStyle::shouldDrawToolButtonMenuArrow(const QStyleOptionToolButton *toolbutton) const
+{
+  // Qt normally only draws the arrow for MenuButtonPopup; we want it for all tools button with
+  // menus (including InstantPopup).
+  return (toolbutton->subControls & SC_ToolButtonMenu) ||
+         (toolbutton->features & QStyleOptionToolButton::HasMenu);
+}
+
+QSize RDTweakedNativeStyle::adjustToolButtonSize(const QStyleOptionToolButton *toolbutton,
+                                                 const QSize &size, const QWidget *widget) const
+{
+  QSize sz = size;
+
+  // Toolbuttons are always at least icon sized, for consistency.
+  sz = sz.expandedTo(toolbutton->iconSize);
+
+  if(shouldDrawToolButtonMenuArrow(toolbutton))
+  {
+    // QToolButton::sizeHint automatically increases the width for MenuButtonPopup separate from
+    // calling sizeFromContents. But we want to draw the arrow for all tool buttons with menus,
+    // not just those using MenuButtonPopup. Check for MenuButtonPopup to avoid increasing the
+    // size twice.
+    if(!(toolbutton->features & QStyleOptionToolButton::MenuButtonPopup))
+    {
+      sz.setWidth(sz.width() + proxy()->pixelMetric(PM_MenuButtonIndicator, toolbutton, widget));
+    }
+  }
+
+  return sz;
 }

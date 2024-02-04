@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2016-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -22,23 +22,14 @@
  * THE SOFTWARE.
  ******************************************************************************/
 
+#include "d3d12_hooks.h"
 #include "driver/dxgi/dxgi_wrapped.h"
 #include "hooks/hooks.h"
 #include "serialise/serialiser.h"
 #include "d3d12_command_queue.h"
 #include "d3d12_device.h"
 
-#if ENABLED(RDOC_X64)
-
-#define BIT_SPECIFIC_DLL(dll32, dll64) dll64
-
-#else
-
-#define BIT_SPECIFIC_DLL(dll32, dll64) dll32
-
-#endif
-
-typedef HRESULT(__cdecl *PFN_AmdExtD3DCreateInterface)(IUnknown *, REFIID, void **);
+#include "driver/dx/official/D3D11On12On7.h"
 
 typedef HRESULT(WINAPI *PFN_D3D12_ENABLE_EXPERIMENTAL_FEATURES)(UINT NumFeatures, const IID *pIIDs,
                                                                 void *pConfigurationStructs,
@@ -49,15 +40,72 @@ ID3DDevice *GetD3D12DeviceIfAlloc(IUnknown *dev)
   if(WrappedID3D12CommandQueue::IsAlloc(dev))
     return (WrappedID3D12CommandQueue *)dev;
 
+  if(WrappedID3D12Device::IsAlloc(dev))
+    return (WrappedID3D12Device *)dev;
+
   return NULL;
 }
+
+class WrappedD3D11On12On7 : public RefCounter12<ID3D11On12On7>
+{
+public:
+  WrappedD3D11On12On7(ID3D11On12On7 *real) : RefCounter12(real) {}
+  virtual ~WrappedD3D11On12On7() {}
+  //////////////////////////////
+  // Implement IUnknown
+  ULONG STDMETHODCALLTYPE AddRef() { return RefCounter12::AddRef(); }
+  ULONG STDMETHODCALLTYPE Release() { return RefCounter12::Release(); }
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppvObject)
+  {
+    if(riid == __uuidof(IUnknown))
+    {
+      *ppvObject = (IUnknown *)this;
+      AddRef();
+      return S_OK;
+    }
+
+    return E_NOINTERFACE;
+  }
+
+  //////////////////////////////
+  // Implement ID3D11On12On7
+
+  // Enables usage similar to D3D11On12CreateDevice.
+  void STDMETHODCALLTYPE SetThreadDeviceCreationParams(ID3D12Device *pDevice,
+                                                       ID3D12CommandQueue *pGraphicsQueue)
+  {
+    RDCASSERT(WrappedID3D12Device::IsAlloc(pDevice));
+    m_pReal->SetThreadDeviceCreationParams(((WrappedID3D12Device *)pDevice)->GetReal(),
+                                           Unwrap(pGraphicsQueue));
+  }
+
+  // Enables usage similar to ID3D11On12Device::CreateWrappedResource.
+  // Note that the D3D11 resource creation parameters should be similar to the D3D12 resource,
+  // or else unexpected/undefined behavior may occur.
+  void STDMETHODCALLTYPE SetThreadResourceCreationParams(ID3D12Resource *pResource)
+  {
+    m_pReal->SetThreadResourceCreationParams(Unwrap(pResource));
+  }
+
+  ID3D11On12On7Device *STDMETHODCALLTYPE GetThreadLastCreatedDevice()
+  {
+    // don't need to wrap/unwrap, it only deals with ID3D11On12On7Resource
+    return m_pReal->GetThreadLastCreatedDevice();
+  }
+
+  ID3D11On12On7Resource *STDMETHODCALLTYPE GetThreadLastCreatedResource()
+  {
+    // don't need to wrap/unwrap
+    return m_pReal->GetThreadLastCreatedResource();
+  }
+};
 
 // dummy class to present to the user, while we maintain control
 //
 // The inheritance is awful for these. See WrappedID3D12DebugDevice for why there are multiple
 // parent classes
 class WrappedID3D12Debug : public RefCounter12<ID3D12Debug>,
-                           public ID3D12Debug3,
+                           public ID3D12Debug6,
                            public ID3D12Debug1,
                            public ID3D12Debug2
 {
@@ -100,6 +148,24 @@ public:
       AddRef();
       return S_OK;
     }
+    if(riid == __uuidof(ID3D12Debug4))
+    {
+      *ppvObject = (ID3D12Debug4 *)this;
+      AddRef();
+      return S_OK;
+    }
+    if(riid == __uuidof(ID3D12Debug5))
+    {
+      *ppvObject = (ID3D12Debug5 *)this;
+      AddRef();
+      return S_OK;
+    }
+    if(riid == __uuidof(ID3D12Debug6))
+    {
+      *ppvObject = (ID3D12Debug6 *)this;
+      AddRef();
+      return S_OK;
+    }
 
     return E_NOINTERFACE;
   }
@@ -115,6 +181,15 @@ public:
   virtual void STDMETHODCALLTYPE SetGPUBasedValidationFlags(D3D12_GPU_BASED_VALIDATION_FLAGS Flags)
   {
   }
+  //////////////////////////////
+  // Implement ID3D12Debug4
+  virtual void STDMETHODCALLTYPE DisableDebugLayer(void) {}
+  //////////////////////////////
+  // Implement ID3D12Debug5
+  virtual void STDMETHODCALLTYPE SetEnableAutoName(BOOL Enable) {}
+  //////////////////////////////
+  // Implement ID3D12Debug6
+  virtual void STDMETHODCALLTYPE SetForceLegacyBarrierValidation(BOOL Enable) {}
 };
 
 class D3D12Hook : LibraryHook
@@ -135,71 +210,59 @@ public:
 
     LibraryHooks::RegisterLibraryHook("d3d12.dll", NULL);
 
-    // these are hooked to prevent AMD extensions from activating and causing later crashes when not
-    // replayed correctly
-    LibraryHooks::RegisterLibraryHook(BIT_SPECIFIC_DLL("amdxc32.dll", "amdxc64.dll"), NULL);
-    AmdExtD3DCreateInterface.Register(BIT_SPECIFIC_DLL("amdxc32.dll", "amdxc64.dll"),
-                                      "AmdExtD3DCreateInterface", AmdExtD3DCreateInterface_hook);
-
     CreateDevice.Register("d3d12.dll", "D3D12CreateDevice", D3D12CreateDevice_hook);
     GetDebugInterface.Register("d3d12.dll", "D3D12GetDebugInterface", D3D12GetDebugInterface_hook);
     EnableExperimentalFeatures.Register("d3d12.dll", "D3D12EnableExperimentalFeatures",
                                         D3D12EnableExperimentalFeatures_hook);
+    GetD3D11On12On7.Register("d3d11on12.dll", "GetD3D11On12On7Interface",
+                             GetD3D11On12On7Interface_hook);
+
+    m_RecurseSlot = Threading::AllocateTLSSlot();
+    Threading::SetTLSValue(m_RecurseSlot, NULL);
   }
 
 private:
   static D3D12Hook d3d12hooks;
 
-  HookedFunction<PFN_AmdExtD3DCreateInterface> AmdExtD3DCreateInterface;
-
-  static HRESULT __cdecl AmdExtD3DCreateInterface_hook(IUnknown *, REFIID, void **ppvObject)
-  {
-    RDCLOG("Attempt to create AMD extension interface via AmdExtD3DCreateInterface was blocked.");
-
-    if(ppvObject)
-      *ppvObject = NULL;
-
-    return E_FAIL;
-  }
-
   HookedFunction<PFN_D3D12_GET_DEBUG_INTERFACE> GetDebugInterface;
   HookedFunction<PFN_D3D12_CREATE_DEVICE> CreateDevice;
   HookedFunction<PFN_D3D12_ENABLE_EXPERIMENTAL_FEATURES> EnableExperimentalFeatures;
+  HookedFunction<PFNGetD3D11On12On7Interface> GetD3D11On12On7;
 
   // re-entrancy detection (can happen in rare cases with e.g. fraps)
-  bool m_InsideCreate = false;
+  uint64_t m_RecurseSlot = 0;
 
-  HRESULT Create_Internal(IUnknown *pAdapter, D3D_FEATURE_LEVEL MinimumFeatureLevel, REFIID riid,
-                          void **ppDevice)
+  void EndRecurse() { Threading::SetTLSValue(m_RecurseSlot, NULL); }
+  bool CheckRecurse()
+  {
+    if(Threading::GetTLSValue(m_RecurseSlot) == NULL)
+    {
+      Threading::SetTLSValue(m_RecurseSlot, (void *)1);
+      return false;
+    }
+
+    return true;
+  }
+
+  friend HRESULT CreateD3D12_Internal(RealD3D12CreateFunction real, IUnknown *pAdapter,
+                                      D3D_FEATURE_LEVEL MinimumFeatureLevel, REFIID riid,
+                                      void **ppDevice);
+
+  HRESULT Create_Internal(RealD3D12CreateFunction real, IUnknown *pAdapter,
+                          D3D_FEATURE_LEVEL MinimumFeatureLevel, REFIID riid, void **ppDevice)
   {
     // if we're already inside a wrapped create i.e. this function, then DON'T do anything
     // special. Just grab the trampolined function and call it.
-    if(m_InsideCreate)
-    {
-      PFN_D3D12_CREATE_DEVICE createFunc = CreateDevice();
-
-      if(!createFunc)
-      {
-        HMODULE d3d12 = GetModuleHandleA("d3d12.dll");
-
-        if(d3d12)
-          createFunc = (PFN_D3D12_CREATE_DEVICE)GetProcAddress(d3d12, "D3D12CreateDevice");
-
-        if(!createFunc)
-        {
-          RDCERR("Something went seriously wrong, d3d12.dll couldn't be loaded!");
-          return E_UNEXPECTED;
-        }
-      }
-
-      return createFunc(pAdapter, MinimumFeatureLevel, riid, ppDevice);
-    }
-
-    m_InsideCreate = true;
+    if(CheckRecurse())
+      return real(pAdapter, MinimumFeatureLevel, riid, ppDevice);
 
     if(riid != __uuidof(ID3D12Device) && riid != __uuidof(ID3D12Device1) &&
        riid != __uuidof(ID3D12Device2) && riid != __uuidof(ID3D12Device3) &&
-       riid != __uuidof(ID3D12Device4) && riid != __uuidof(ID3D12Device5))
+       riid != __uuidof(ID3D12Device4) && riid != __uuidof(ID3D12Device5) &&
+       riid != __uuidof(ID3D12Device6) && riid != __uuidof(ID3D12Device7) &&
+       riid != __uuidof(ID3D12Device8) && riid != __uuidof(ID3D12Device9) &&
+       riid != __uuidof(ID3D12Device10) && riid != __uuidof(ID3D12Device11) &&
+       riid != __uuidof(ID3D12Device12))
     {
       RDCERR("Unsupported UUID %s for D3D12CreateDevice", ToStr(riid).c_str());
       return E_NOINTERFACE;
@@ -217,24 +280,7 @@ private:
 
     RDCDEBUG("Calling real createdevice...");
 
-    PFN_D3D12_CREATE_DEVICE createFunc = CreateDevice();
-
-    if(createFunc == NULL)
-      createFunc = (PFN_D3D12_CREATE_DEVICE)GetProcAddress(GetModuleHandleA("d3d12.dll"),
-                                                           "D3D12CreateDevice");
-
-    // shouldn't ever get here, we should either have it from procaddress or the trampoline, but
-    // let's be safe.
-    if(createFunc == NULL)
-    {
-      RDCERR("Something went seriously wrong with the hooks!");
-
-      m_InsideCreate = false;
-
-      return E_UNEXPECTED;
-    }
-
-    HRESULT ret = createFunc(pAdapter, MinimumFeatureLevel, riid, ppDevice);
+    HRESULT ret = real(pAdapter, MinimumFeatureLevel, riid, ppDevice);
 
     RDCDEBUG("Called real createdevice... HRESULT: %s", ToStr(ret).c_str());
 
@@ -274,8 +320,43 @@ private:
           ID3D12Device5 *dev5 = (ID3D12Device5 *)*ppDevice;
           dev = (ID3D12Device *)dev5;
         }
+        else if(riid == __uuidof(ID3D12Device6))
+        {
+          ID3D12Device6 *dev6 = (ID3D12Device6 *)*ppDevice;
+          dev = (ID3D12Device *)dev6;
+        }
+        else if(riid == __uuidof(ID3D12Device7))
+        {
+          ID3D12Device7 *dev7 = (ID3D12Device7 *)*ppDevice;
+          dev = (ID3D12Device *)dev7;
+        }
+        else if(riid == __uuidof(ID3D12Device8))
+        {
+          ID3D12Device8 *dev8 = (ID3D12Device8 *)*ppDevice;
+          dev = (ID3D12Device *)dev8;
+        }
+        else if(riid == __uuidof(ID3D12Device9))
+        {
+          ID3D12Device9 *dev9 = (ID3D12Device9 *)*ppDevice;
+          dev = (ID3D12Device *)dev9;
+        }
+        else if(riid == __uuidof(ID3D12Device10))
+        {
+          ID3D12Device10 *dev9 = (ID3D12Device10 *)*ppDevice;
+          dev = (ID3D12Device *)dev9;
+        }
+        else if(riid == __uuidof(ID3D12Device11))
+        {
+          ID3D12Device11 *dev9 = (ID3D12Device11 *)*ppDevice;
+          dev = (ID3D12Device *)dev9;
+        }
+        else if(riid == __uuidof(ID3D12Device12))
+        {
+          ID3D12Device12 *dev9 = (ID3D12Device12 *)*ppDevice;
+          dev = (ID3D12Device *)dev9;
+        }
 
-        WrappedID3D12Device *wrap = new WrappedID3D12Device(dev, params, EnableDebugLayer);
+        WrappedID3D12Device *wrap = WrappedID3D12Device::Create(dev, params, EnableDebugLayer);
 
         RDCDEBUG("created wrapped device.");
 
@@ -291,6 +372,20 @@ private:
           *ppDevice = (ID3D12Device4 *)wrap;
         else if(riid == __uuidof(ID3D12Device5))
           *ppDevice = (ID3D12Device5 *)wrap;
+        else if(riid == __uuidof(ID3D12Device6))
+          *ppDevice = (ID3D12Device6 *)wrap;
+        else if(riid == __uuidof(ID3D12Device7))
+          *ppDevice = (ID3D12Device7 *)wrap;
+        else if(riid == __uuidof(ID3D12Device8))
+          *ppDevice = (ID3D12Device8 *)wrap;
+        else if(riid == __uuidof(ID3D12Device9))
+          *ppDevice = (ID3D12Device9 *)wrap;
+        else if(riid == __uuidof(ID3D12Device10))
+          *ppDevice = (ID3D12Device10 *)wrap;
+        else if(riid == __uuidof(ID3D12Device11))
+          *ppDevice = (ID3D12Device11 *)wrap;
+        else if(riid == __uuidof(ID3D12Device12))
+          *ppDevice = (ID3D12Device12 *)wrap;
       }
     }
     else if(SUCCEEDED(ret))
@@ -302,7 +397,7 @@ private:
       RDCDEBUG("failed. HRESULT: %s", ToStr(ret).c_str());
     }
 
-    m_InsideCreate = false;
+    EndRecurse();
 
     return ret;
   }
@@ -311,40 +406,93 @@ private:
                                                D3D_FEATURE_LEVEL MinimumFeatureLevel, REFIID riid,
                                                void **ppDevice)
   {
-    return d3d12hooks.Create_Internal(pAdapter, MinimumFeatureLevel, riid, ppDevice);
+    PFN_D3D12_CREATE_DEVICE createFunc = d3d12hooks.CreateDevice();
+
+    if(!createFunc)
+    {
+      HMODULE d3d12 = GetModuleHandleA("d3d12.dll");
+
+      if(d3d12)
+        createFunc = (PFN_D3D12_CREATE_DEVICE)GetProcAddress(d3d12, "D3D12CreateDevice");
+
+      if(!createFunc)
+      {
+        RDCERR("Something went seriously wrong, d3d12.dll couldn't be loaded!");
+        return E_UNEXPECTED;
+      }
+    }
+
+    return d3d12hooks.Create_Internal(createFunc, pAdapter, MinimumFeatureLevel, riid, ppDevice);
   }
 
   static HRESULT WINAPI D3D12EnableExperimentalFeatures_hook(UINT NumFeatures, const IID *pIIDs,
                                                              void *pConfigurationStructs,
                                                              UINT *pConfigurationStructSizes)
   {
-    // in future in theory we could whitelist some features. For now we don't allow any.
+    rdcarray<IID> allowedIIDs;
+
+    // allow enabling unsigned DXIL.
+    for(UINT i = 0; i < NumFeatures; i++)
+    {
+      if(pIIDs[i] == D3D12ExperimentalShaderModels)
+        allowedIIDs.push_back(D3D12ExperimentalShaderModels);
+    }
+
+    // there's no "partially successful" error code, so we just lie to the application and pretend
+    // that any filtered IIDs also succeeded
+    if(!allowedIIDs.empty())
+      return d3d12hooks.EnableExperimentalFeatures()((UINT)allowedIIDs.size(), allowedIIDs.data(),
+                                                     NULL, NULL);
 
     // header says "The call returns E_NOINTERFACE if an unrecognized feature is passed in or
-    // Windows Developer mode is not on." so this is the most appropriate error.
+    // Windows Developer mode is not on." so this is the most appropriate error for if no IIDs are
+    // allowed.
     return E_NOINTERFACE;
+  }
+
+  static HRESULT WINAPI GetD3D11On12On7Interface_hook(ID3D11On12On7 **ppIface)
+  {
+    ID3D11On12On7 *real = NULL;
+    d3d12hooks.GetD3D11On12On7()(&real);
+    *ppIface = (ID3D11On12On7 *)(new WrappedD3D11On12On7(real));
+    return S_OK;
   }
 
   static HRESULT WINAPI D3D12GetDebugInterface_hook(REFIID riid, void **ppvDebug)
   {
-    if(riid != __uuidof(ID3D12Debug))
+    if(riid == __uuidof(ID3D12Debug))
     {
       *ppvDebug = (ID3D12Debug *)(new WrappedID3D12Debug());
       return S_OK;
     }
-    else if(riid != __uuidof(ID3D12Debug1))
+    else if(riid == __uuidof(ID3D12Debug1))
     {
       *ppvDebug = (ID3D12Debug1 *)(new WrappedID3D12Debug());
       return S_OK;
     }
-    else if(riid != __uuidof(ID3D12Debug2))
+    else if(riid == __uuidof(ID3D12Debug2))
     {
       *ppvDebug = (ID3D12Debug2 *)(new WrappedID3D12Debug());
       return S_OK;
     }
-    else if(riid != __uuidof(ID3D12Debug3))
+    else if(riid == __uuidof(ID3D12Debug3))
     {
       *ppvDebug = (ID3D12Debug3 *)(new WrappedID3D12Debug());
+      return S_OK;
+    }
+    else if(riid == __uuidof(ID3D12Debug4))
+    {
+      *ppvDebug = (ID3D12Debug4 *)(new WrappedID3D12Debug());
+      return S_OK;
+    }
+    else if(riid == __uuidof(ID3D12Debug5))
+    {
+      *ppvDebug = (ID3D12Debug5 *)(new WrappedID3D12Debug());
+      return S_OK;
+    }
+    else if(riid == __uuidof(ID3D12Debug6))
+    {
+      *ppvDebug = (ID3D12Debug6 *)(new WrappedID3D12Debug());
       return S_OK;
     }
     else
@@ -364,3 +512,9 @@ private:
 };
 
 D3D12Hook D3D12Hook::d3d12hooks;
+
+HRESULT CreateD3D12_Internal(RealD3D12CreateFunction real, IUnknown *pAdapter,
+                             D3D_FEATURE_LEVEL MinimumFeatureLevel, REFIID riid, void **ppDevice)
+{
+  return D3D12Hook::d3d12hooks.Create_Internal(real, pAdapter, MinimumFeatureLevel, riid, ppDevice);
+}

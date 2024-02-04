@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2016-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -23,12 +23,14 @@
  ******************************************************************************/
 
 #include "RDHeaderView.h"
-#include <QDebug>
+#include <QAbstractScrollArea>
 #include <QLabel>
 #include <QMouseEvent>
 #include <QPainter>
 #include <QPixmap>
 #include <QPointer>
+#include <QScrollBar>
+#include <QTreeView>
 #include "Code/QRDUtils.h"
 
 /////////////////////////////////////////////////////////////////////////////////
@@ -50,6 +52,15 @@ RDHeaderView::RDHeaderView(Qt::Orientation orient, QWidget *parent) : QHeaderVie
   m_sectionPreview = new QLabel(this);
 
   setDefaultAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+
+  QTreeView *treeView = qobject_cast<QTreeView *>(parent);
+  if(treeView)
+  {
+    QObject::connect(treeView, &QTreeView::expanded,
+                     [this](const QModelIndex &) { rowsChanged(QModelIndex(), 0, 0); });
+    QObject::connect(treeView, &QTreeView::collapsed,
+                     [this](const QModelIndex &) { rowsChanged(QModelIndex(), 0, 0); });
+  }
 }
 
 RDHeaderView::~RDHeaderView()
@@ -87,6 +98,12 @@ void RDHeaderView::setModel(QAbstractItemModel *model)
                      &RDHeaderView::columnsInserted);
     QObject::connect(model, &QAbstractItemModel::rowsInserted, this, &RDHeaderView::rowsChanged);
     QObject::connect(model, &QAbstractItemModel::rowsRemoved, this, &RDHeaderView::rowsChanged);
+    QObject::connect(model, &QAbstractItemModel::dataChanged,
+                     [this](const QModelIndex &topLeft, const QModelIndex &bottomRight,
+                            const QVector<int> &roles) {
+                       if(roles.contains(Qt::DisplayRole))
+                         rowsChanged(QModelIndex(), 0, 0);
+                     });
   }
 }
 
@@ -94,6 +111,8 @@ void RDHeaderView::reset()
 {
   if(m_customSizing)
     cacheSections();
+
+  QHeaderView::reset();
 }
 
 void RDHeaderView::cacheSections()
@@ -102,6 +121,9 @@ void RDHeaderView::cacheSections()
     return;
 
   QAbstractItemModel *m = this->model();
+
+  if(!m)
+    return;
 
   int oldCount = m_sections.count();
   m_sections.resize(m->columnCount());
@@ -230,7 +252,10 @@ int RDHeaderView::visualIndexAt(int position) const
 
 int RDHeaderView::logicalIndexAt(int position) const
 {
-  return visualIndexAt(position);
+  if(m_customSizing)
+    return visualIndexAt(position);
+
+  return QHeaderView::logicalIndexAt(position);
 }
 
 int RDHeaderView::count() const
@@ -482,6 +507,13 @@ void RDHeaderView::setColumnStretchHints(const QList<int> &hints)
   resizeSectionsWithHints();
 }
 
+void RDHeaderView::setPinnedColumns(int numColumns, QAbstractScrollArea *scroll)
+{
+  m_pinnedColumns = numColumns;
+  QObject::connect(scroll->horizontalScrollBar(), &QScrollBar::valueChanged,
+                   [this]() { viewport()->update(); });
+}
+
 void RDHeaderView::setRootIndex(const QModelIndex &index)
 {
   QHeaderView::setRootIndex(index);
@@ -510,7 +542,7 @@ void RDHeaderView::columnsInserted(const QModelIndex &parent, int first, int las
     cacheSections();
 }
 
-void RDHeaderView::rowsChanged(const QModelIndex &parent, int first, int last)
+void RDHeaderView::rowsChanged(const QModelIndex &, int, int)
 {
   if(!m_sectionStretchHints.isEmpty())
   {
@@ -546,6 +578,8 @@ void RDHeaderView::mousePressEvent(QMouseEvent *event)
       paintSection(&painter, QRect(QPoint(0, 0), m_sectionPreview->size()), idx);
       painter.end();
 
+      m_cursorPos = QCursor::pos().x();
+
       m_sectionPreview->setPixmap(preview);
 
       m_sectionPreviewOffset = mousePos - secPos;
@@ -553,6 +587,7 @@ void RDHeaderView::mousePressEvent(QMouseEvent *event)
       m_sectionPreview->move(mousePos - m_sectionPreviewOffset, 0);
       m_sectionPreview->show();
 
+      QHeaderView::mousePressEvent(event);
       return;
     }
   }
@@ -717,6 +752,8 @@ void RDHeaderView::mouseReleaseEvent(QMouseEvent *event)
     int mousePos = event->x();
     int idx = logicalIndexAt(mousePos);
 
+    m_sectionPreview->hide();
+
     if(idx >= 0)
     {
       int secSize = sectionSize(idx);
@@ -745,20 +782,16 @@ void RDHeaderView::mouseReleaseEvent(QMouseEvent *event)
           else
             moveSection(srcSection, dstSection);
         }
+
+        return;
       }
     }
-
-    m_sectionPreview->hide();
   }
 
   m_movingSection = -1;
 
   if(m_customSizing)
-  {
     m_resizeState = qMakePair(NoResize, -1);
-
-    return QAbstractItemView::mouseReleaseEvent(event);
-  }
 
   QHeaderView::mouseReleaseEvent(event);
 }

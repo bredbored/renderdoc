@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  * Copyright (c) 2014 Crytek
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -25,6 +25,7 @@
 
 #pragma once
 
+#include "api/replay/stringise.h"
 #include "common/common.h"
 #include "common/wrapped_pool.h"
 #include "driver/dx/official/dxgi1_6.h"
@@ -47,8 +48,9 @@ class RefCountDXGIObject : public IDXGIObject
 public:
   RefCountDXGIObject(IDXGIObject *real) : m_pReal(real), m_iRefcount(1) {}
   virtual ~RefCountDXGIObject() {}
-  static bool HandleWrap(REFIID riid, void **ppvObject);
-  static HRESULT WrapQueryInterface(IUnknown *real, REFIID riid, void **ppvObject);
+  static bool HandleWrap(const char *ifaceName, REFIID riid, void **ppvObject);
+  static HRESULT WrapQueryInterface(IUnknown *real, const char *ifaceName, REFIID riid,
+                                    void **ppvObject);
 
   //////////////////////////////
   // implement IUnknown
@@ -57,14 +59,27 @@ public:
       /* [annotation][iid_is][out] */
       __RPC__deref_out void **ppvObject)
   {
+    return QueryInterface("IUnknown", riid, ppvObject);
+  }
+
+  // optional overload that's useful for passing down the name of the current interface to put in
+  // any 'unknown interface' query logs.
+  HRESULT STDMETHODCALLTYPE QueryInterface(const char *ifaceName, REFIID riid, void **ppvObject)
+  {
     if(riid == __uuidof(IUnknown))
     {
       AddRef();
       *ppvObject = (IUnknown *)(IDXGIObject *)this;
       return S_OK;
     }
+    else if(riid == __uuidof(IDXGIObject))
+    {
+      AddRef();
+      *ppvObject = (IDXGIObject *)this;
+      return S_OK;
+    }
 
-    return WrapQueryInterface(m_pReal, riid, ppvObject);
+    return WrapQueryInterface(m_pReal, ifaceName, riid, ppvObject);
   }
 
   ULONG STDMETHODCALLTYPE AddRef()
@@ -111,33 +126,15 @@ public:
       /* [retval][out] */ void **ppParent);
 };
 
-#define IMPLEMENT_IDXGIOBJECT_WITH_REFCOUNTDXGIOBJECT                                      \
-  ULONG STDMETHODCALLTYPE AddRef() { return RefCountDXGIObject::AddRef(); }                \
-  ULONG STDMETHODCALLTYPE Release() { return RefCountDXGIObject::Release(); }              \
-  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppvObject)                  \
-  {                                                                                        \
-    return RefCountDXGIObject::QueryInterface(riid, ppvObject);                            \
-  }                                                                                        \
-  HRESULT STDMETHODCALLTYPE SetPrivateData(REFIID Name, UINT DataSize, const void *pData)  \
-  {                                                                                        \
-    return RefCountDXGIObject::SetPrivateData(Name, DataSize, pData);                      \
-  }                                                                                        \
-  HRESULT STDMETHODCALLTYPE SetPrivateDataInterface(REFIID Name, const IUnknown *pUnknown) \
-  {                                                                                        \
-    return RefCountDXGIObject::SetPrivateDataInterface(Name, pUnknown);                    \
-  }                                                                                        \
-  HRESULT STDMETHODCALLTYPE GetPrivateData(REFIID Name, UINT *pDataSize, void *pData)      \
-  {                                                                                        \
-    return RefCountDXGIObject::GetPrivateData(Name, pDataSize, pData);                     \
-  }                                                                                        \
-  HRESULT STDMETHODCALLTYPE GetParent(REFIID riid, void **ppvObject)                       \
-  {                                                                                        \
-    return RefCountDXGIObject::GetParent(riid, ppvObject);                                 \
-  }
-
 #define IMPLEMENT_IDXGIOBJECT_WITH_REFCOUNTDXGIOBJECT_CUSTOMQUERY                          \
-  ULONG STDMETHODCALLTYPE AddRef() { return RefCountDXGIObject::AddRef(); }                \
-  ULONG STDMETHODCALLTYPE Release() { return RefCountDXGIObject::Release(); }              \
+  ULONG STDMETHODCALLTYPE AddRef()                                                         \
+  {                                                                                        \
+    return RefCountDXGIObject::AddRef();                                                   \
+  }                                                                                        \
+  ULONG STDMETHODCALLTYPE Release()                                                        \
+  {                                                                                        \
+    return RefCountDXGIObject::Release();                                                  \
+  }                                                                                        \
   HRESULT STDMETHODCALLTYPE SetPrivateData(REFIID Name, UINT DataSize, const void *pData)  \
   {                                                                                        \
     return RefCountDXGIObject::SetPrivateData(Name, DataSize, pData);                      \
@@ -155,7 +152,21 @@ public:
     return RefCountDXGIObject::GetParent(riid, ppvObject);                                 \
   }
 
-class WrappedIDXGISwapChain4;
+struct ID3DDevice;
+
+struct IDXGISwapper
+{
+  virtual ID3DDevice *GetD3DDevice() = 0;
+  virtual int GetNumBackbuffers() = 0;
+  virtual IUnknown **GetBackbuffers() = 0;
+  virtual int GetLastPresentedBuffer() = 0;
+  virtual UINT GetWidth() = 0;
+  virtual UINT GetHeight() = 0;
+  virtual DXGI_FORMAT GetFormat() = 0;
+  virtual HWND GetHWND() = 0;
+};
+
+struct IFrameCapturer;
 
 struct ID3DDevice
 {
@@ -164,6 +175,9 @@ struct ID3DDevice
   virtual ULONG STDMETHODCALLTYPE Release() = 0;
   virtual HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppvObject) = 0;
 
+  virtual void *GetFrameCapturerDevice() = 0;
+  virtual IFrameCapturer *GetFrameCapturer() = 0;
+
   virtual IUnknown *GetRealIUnknown() = 0;
 
   virtual IID GetBackbufferUUID() = 0;
@@ -171,16 +185,18 @@ struct ID3DDevice
   virtual bool IsDeviceUUID(REFIID guid) = 0;
   virtual IUnknown *GetDeviceInterface(REFIID guid) = 0;
 
-  virtual void FirstFrame(WrappedIDXGISwapChain4 *swapChain) = 0;
+  virtual void FirstFrame(IDXGISwapper *swapper) = 0;
 
   virtual void NewSwapchainBuffer(IUnknown *backbuffer) = 0;
-  virtual void ReleaseSwapchainResources(WrappedIDXGISwapChain4 *swapChain, UINT QueueCount,
+  virtual void ReleaseSwapchainResources(IDXGISwapper *swapper, UINT QueueCount,
                                          IUnknown *const *ppPresentQueue,
                                          IUnknown **unwrappedQueues) = 0;
-  virtual IUnknown *WrapSwapchainBuffer(WrappedIDXGISwapChain4 *swap, DXGI_SWAP_CHAIN_DESC *swapDesc,
+  virtual IUnknown *WrapSwapchainBuffer(IDXGISwapper *swapper, DXGI_FORMAT bufferFormat,
                                         UINT buffer, IUnknown *realSurface) = 0;
 
-  virtual HRESULT Present(WrappedIDXGISwapChain4 *swapChain, UINT SyncInterval, UINT Flags) = 0;
+  virtual IDXGIResource *WrapExternalDXGIResource(IDXGIResource *res) = 0;
+
+  virtual HRESULT Present(IDXGISwapper *swapper, UINT SyncInterval, UINT Flags) = 0;
 };
 
 typedef ID3DDevice *(*D3DDeviceCallback)(IUnknown *dev);
@@ -216,7 +232,7 @@ public:
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppvObject)
   {
     // ensure the real object has this interface
-    void *outObj;
+    void *outObj = NULL;
     HRESULT hr = m_pWrapped->QueryInterface(riid, &outObj);
 
     IUnknown *unk = (IUnknown *)outObj;
@@ -545,7 +561,7 @@ public:
   }
 };
 
-class WrappedIDXGISwapChain4 : public IDXGISwapChain4, public RefCountDXGIObject
+class WrappedIDXGISwapChain4 : public IDXGISwapChain4, public RefCountDXGIObject, public IDXGISwapper
 {
   IDXGISwapChain *m_pReal;
   IDXGISwapChain1 *m_pReal1;
@@ -554,17 +570,37 @@ class WrappedIDXGISwapChain4 : public IDXGISwapChain4, public RefCountDXGIObject
   IDXGISwapChain4 *m_pReal4;
   ID3DDevice *m_pDevice;
 
-  static std::vector<D3DDeviceCallback> m_D3DCallbacks;
+  static rdcarray<D3DDeviceCallback> m_D3DCallbacks;
 
   HWND m_Wnd;
 
   static const int MAX_NUM_BACKBUFFERS = 8;
 
   IUnknown *m_pBackBuffers[MAX_NUM_BACKBUFFERS];
+  int32_t m_LastPresentedBuffer = -1;
 
   void ReleaseBuffersForResize(UINT QueueCount, IUnknown *const *ppPresentQueue,
                                IUnknown **unwrappedQueues);
   void WrapBuffersAfterResize();
+
+  void TickLastPresentedBuffer()
+  {
+    DXGI_SWAP_CHAIN_DESC desc = {};
+
+    m_pReal->GetDesc(&desc);
+
+    if(desc.SwapEffect == DXGI_SWAP_EFFECT_DISCARD)
+    {
+      // discard always presents from 0
+      m_LastPresentedBuffer = 0;
+    }
+    else
+    {
+      // other modes use each buffer in turn
+      m_LastPresentedBuffer++;
+      m_LastPresentedBuffer %= desc.BufferCount;
+    }
+  }
 
 public:
   WrappedIDXGISwapChain4(IDXGISwapChain *real, HWND wnd, ID3DDevice *device);
@@ -572,7 +608,7 @@ public:
 
   static void RegisterD3DDeviceCallback(D3DDeviceCallback callback)
   {
-    if(std::find(m_D3DCallbacks.begin(), m_D3DCallbacks.end(), callback) == m_D3DCallbacks.end())
+    if(!m_D3DCallbacks.contains(callback))
       m_D3DCallbacks.push_back(callback);
   }
 
@@ -591,19 +627,47 @@ public:
   ID3DDevice *GetD3DDevice() { return m_pDevice; }
   int GetNumBackbuffers() { return MAX_NUM_BACKBUFFERS; }
   IUnknown **GetBackbuffers() { return m_pBackBuffers; }
+  int GetLastPresentedBuffer() { return RDCMAX(m_LastPresentedBuffer, 0); }
   IMPLEMENT_IDXGIOBJECT_WITH_REFCOUNTDXGIOBJECT_CUSTOMQUERY;
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppvObject);
 
-  DXGI_SWAP_CHAIN_DESC GetDescWithHWND()
+  HWND GetHWND()
   {
-    DXGI_SWAP_CHAIN_DESC ret = {};
+    DXGI_SWAP_CHAIN_DESC desc = {};
 
-    m_pReal->GetDesc(&ret);
+    m_pReal->GetDesc(&desc);
 
-    if(ret.OutputWindow == NULL)
-      ret.OutputWindow = m_Wnd;
+    if(desc.OutputWindow != NULL)
+      return desc.OutputWindow;
 
-    return ret;
+    return m_Wnd;
+  }
+
+  UINT GetWidth()
+  {
+    DXGI_SWAP_CHAIN_DESC desc = {};
+
+    m_pReal->GetDesc(&desc);
+
+    return desc.BufferDesc.Width;
+  }
+
+  UINT GetHeight()
+  {
+    DXGI_SWAP_CHAIN_DESC desc = {};
+
+    m_pReal->GetDesc(&desc);
+
+    return desc.BufferDesc.Height;
+  }
+
+  DXGI_FORMAT GetFormat()
+  {
+    DXGI_SWAP_CHAIN_DESC desc = {};
+
+    m_pReal->GetDesc(&desc);
+
+    return desc.BufferDesc.Format;
   }
 
   //////////////////////////////
@@ -843,6 +907,93 @@ public:
   }
 };
 
+class WrappedIDXGIOutputDuplication : public IDXGIOutputDuplication, public RefCountDXGIObject
+{
+  ID3DDevice *m_Device;
+  IDXGIOutputDuplication *m_pReal;
+
+public:
+  IMPLEMENT_IDXGIOBJECT_WITH_REFCOUNTDXGIOBJECT_CUSTOMQUERY;
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppvObject);
+
+  WrappedIDXGIOutputDuplication(ID3DDevice *device, IDXGIOutputDuplication *real);
+  ~WrappedIDXGIOutputDuplication();
+
+  IDXGIOutputDuplication *GetReal() { return m_pReal; }
+  //////////////////////////////
+  // implement IDXGIOutputDuplication
+
+  virtual void STDMETHODCALLTYPE GetDesc(
+      /* [annotation][out] */
+      _Out_ DXGI_OUTDUPL_DESC *pDesc)
+  {
+    return m_pReal->GetDesc(pDesc);
+  }
+
+  virtual HRESULT STDMETHODCALLTYPE AcquireNextFrame(
+      /* [annotation][in] */
+      _In_ UINT TimeoutInMilliseconds,
+      /* [annotation][out] */
+      _Out_ DXGI_OUTDUPL_FRAME_INFO *pFrameInfo,
+      /* [annotation][out] */
+      _COM_Outptr_ IDXGIResource **ppDesktopResource);
+
+  virtual HRESULT STDMETHODCALLTYPE GetFrameDirtyRects(
+      /* [annotation][in] */
+      _In_ UINT DirtyRectsBufferSize,
+      /* [annotation][out] */
+      _Out_writes_bytes_to_(DirtyRectsBufferSize, *pDirtyRectsBufferSizeRequired)
+          RECT *pDirtyRectsBuffer,
+      /* [annotation][out] */
+      _Out_ UINT *pDirtyRectsBufferSizeRequired)
+  {
+    return m_pReal->GetFrameDirtyRects(DirtyRectsBufferSize, pDirtyRectsBuffer,
+                                       pDirtyRectsBufferSizeRequired);
+  }
+
+  virtual HRESULT STDMETHODCALLTYPE GetFrameMoveRects(
+      /* [annotation][in] */
+      _In_ UINT MoveRectsBufferSize,
+      /* [annotation][out] */
+      _Out_writes_bytes_to_(MoveRectsBufferSize, *pMoveRectsBufferSizeRequired)
+          DXGI_OUTDUPL_MOVE_RECT *pMoveRectBuffer,
+      /* [annotation][out] */
+      _Out_ UINT *pMoveRectsBufferSizeRequired)
+  {
+    return m_pReal->GetFrameMoveRects(MoveRectsBufferSize, pMoveRectBuffer,
+                                      pMoveRectsBufferSizeRequired);
+  }
+
+  virtual HRESULT STDMETHODCALLTYPE GetFramePointerShape(
+      /* [annotation][in] */
+      _In_ UINT PointerShapeBufferSize,
+      /* [annotation][out] */
+      _Out_writes_bytes_to_(PointerShapeBufferSize,
+                            *pPointerShapeBufferSizeRequired) void *pPointerShapeBuffer,
+      /* [annotation][out] */
+      _Out_ UINT *pPointerShapeBufferSizeRequired,
+      /* [annotation][out] */
+      _Out_ DXGI_OUTDUPL_POINTER_SHAPE_INFO *pPointerShapeInfo)
+  {
+    return m_pReal->GetFramePointerShape(PointerShapeBufferSize, pPointerShapeBuffer,
+                                         pPointerShapeBufferSizeRequired, pPointerShapeInfo);
+  }
+
+  virtual HRESULT STDMETHODCALLTYPE MapDesktopSurface(
+      /* [annotation][out] */
+      _Out_ DXGI_MAPPED_RECT *pLockedRect)
+  {
+    return m_pReal->MapDesktopSurface(pLockedRect);
+  }
+
+  virtual HRESULT STDMETHODCALLTYPE UnMapDesktopSurface(void)
+  {
+    return m_pReal->UnMapDesktopSurface();
+  }
+
+  virtual HRESULT STDMETHODCALLTYPE ReleaseFrame(void) { return m_pReal->ReleaseFrame(); }
+};
+
 class WrappedIDXGIOutput6 : public IDXGIOutput6, public RefCountDXGIObject
 {
   RefCountDXGIObject *m_Owner;
@@ -889,18 +1040,12 @@ public:
       /* [annotation][out] */
       _Out_ DXGI_MODE_DESC *pClosestMatch,
       /* [annotation][in] */
-      _In_opt_ IUnknown *pConcernedDevice)
-  {
-    return m_pReal->FindClosestMatchingMode(pModeToMatch, pClosestMatch, pConcernedDevice);
-  }
+      _In_opt_ IUnknown *pConcernedDevice);
 
   virtual HRESULT STDMETHODCALLTYPE WaitForVBlank(void) { return m_pReal->WaitForVBlank(); }
   virtual HRESULT STDMETHODCALLTYPE TakeOwnership(
       /* [annotation][in] */
-      _In_ IUnknown *pDevice, BOOL Exclusive)
-  {
-    return m_pReal->TakeOwnership(pDevice, Exclusive);
-  }
+      _In_ IUnknown *pDevice, BOOL Exclusive);
 
   virtual void STDMETHODCALLTYPE ReleaseOwnership(void) { return m_pReal->ReleaseOwnership(); }
   virtual HRESULT STDMETHODCALLTYPE GetGammaControlCapabilities(
@@ -965,26 +1110,17 @@ public:
       /* [annotation][out] */
       _Out_ DXGI_MODE_DESC1 *pClosestMatch,
       /* [annotation][in] */
-      _In_opt_ IUnknown *pConcernedDevice)
-  {
-    return m_pReal1->FindClosestMatchingMode1(pModeToMatch, pClosestMatch, pConcernedDevice);
-  }
+      _In_opt_ IUnknown *pConcernedDevice);
 
   virtual HRESULT STDMETHODCALLTYPE GetDisplaySurfaceData1(
       /* [annotation][in] */
-      _In_ IDXGIResource *pDestination)
-  {
-    return m_pReal1->GetDisplaySurfaceData1(pDestination);
-  }
+      _In_ IDXGIResource *pDestination);
 
   virtual HRESULT STDMETHODCALLTYPE DuplicateOutput(
       /* [annotation][in] */
       _In_ IUnknown *pDevice,
       /* [annotation][out] */
-      _COM_Outptr_ IDXGIOutputDuplication **ppOutputDuplication)
-  {
-    return m_pReal1->DuplicateOutput(pDevice, ppOutputDuplication);
-  }
+      _COM_Outptr_ IDXGIOutputDuplication **ppOutputDuplication);
 
   //////////////////////////////
   // implement IDXGIOutput2
@@ -999,10 +1135,7 @@ public:
       /* [annotation][out] */
       _In_ IUnknown *pConcernedDevice,
       /* [annotation][out] */
-      _Out_ UINT *pFlags)
-  {
-    return m_pReal3->CheckOverlaySupport(EnumFormat, pConcernedDevice, pFlags);
-  }
+      _Out_ UINT *pFlags);
 
   //////////////////////////////
   // implement IDXGIOutput4
@@ -1032,11 +1165,7 @@ public:
       /* [annotation][in] */
       _In_reads_(SupportedFormatsCount) const DXGI_FORMAT *pSupportedFormats,
       /* [annotation][out] */
-      _COM_Outptr_ IDXGIOutputDuplication **ppOutputDuplication)
-  {
-    return m_pReal5->DuplicateOutput1(pDevice, Flags, SupportedFormatsCount, pSupportedFormats,
-                                      ppOutputDuplication);
-  }
+      _COM_Outptr_ IDXGIOutputDuplication **ppOutputDuplication);
 
   //////////////////////////////
   // implement IDXGIOutput6
@@ -1203,8 +1332,7 @@ public:
   WrappedIDXGIDevice4(IDXGIDevice *real, ID3DDevice *d3d);
   virtual ~WrappedIDXGIDevice4();
 
-  static const int AllocPoolCount = 4;
-  ALLOCATE_WITH_WRAPPED_POOL(WrappedIDXGIDevice4, AllocPoolCount);
+  ALLOCATE_WITH_WRAPPED_POOL(WrappedIDXGIDevice4);
 
   IMPLEMENT_IDXGIOBJECT_WITH_REFCOUNTDXGIOBJECT_CUSTOMQUERY;
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppvObject);
@@ -1560,8 +1688,7 @@ public:
     }
     else
     {
-      RDCWARN("Wrapping unknown adapter GUID %s", ToStr(riid).c_str());
-      RefCountDXGIObject::HandleWrap(riid, ppvAdapter);
+      RefCountDXGIObject::HandleWrap("IDXGIAdapter", riid, ppvAdapter);
     }
   }
 

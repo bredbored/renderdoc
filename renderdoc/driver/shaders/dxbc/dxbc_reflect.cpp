@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2017-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -23,84 +23,125 @@
  ******************************************************************************/
 
 #include "dxbc_reflect.h"
-#include "api/replay/renderdoc_replay.h"
+#include "common/formatting.h"
 #include "core/core.h"
-#include "dxbc_inspect.h"
+#include "dxbc_bytecode.h"
+#include "dxbc_container.h"
 
-static ShaderConstant MakeConstantBufferVariable(const DXBC::CBufferVariable &var);
+static ShaderConstant MakeConstantBufferVariable(bool cbufferPacking,
+                                                 const DXBC::CBufferVariable &var);
 
-static ShaderVariableType MakeShaderVariableType(DXBC::CBufferVariableType type)
+static void FixupEmptyStructs(rdcarray<ShaderConstant> &members)
 {
-  ShaderVariableType ret;
-
-  switch(type.descriptor.type)
+  for(size_t i = 0; i < members.size(); i++)
   {
-    // D3D treats all cbuffer variables as 32-bit regardless of declaration
-    case DXBC::VARTYPE_MIN12INT:
-    case DXBC::VARTYPE_MIN16INT:
-    case DXBC::VARTYPE_INT: ret.descriptor.type = VarType::SInt; break;
-    case DXBC::VARTYPE_BOOL:
-    case DXBC::VARTYPE_MIN16UINT:
-    case DXBC::VARTYPE_UINT: ret.descriptor.type = VarType::UInt; break;
-    case DXBC::VARTYPE_DOUBLE: ret.descriptor.type = VarType::Double; break;
-    case DXBC::VARTYPE_FLOAT:
-    case DXBC::VARTYPE_MIN8FLOAT:
-    case DXBC::VARTYPE_MIN10FLOAT:
-    case DXBC::VARTYPE_MIN16FLOAT:
-    default: ret.descriptor.type = VarType::Float; break;
+    if(members[i].byteOffset == ~0U)
+    {
+      // don't try to calculate offset for trailing empty structs, just delete them
+      if(i == members.size() - 1)
+        members.pop_back();
+      // other empty struct members take the offset of the next member
+      else
+        members[i].byteOffset = members[i + 1].byteOffset;
+    }
   }
-  ret.descriptor.rows = (uint8_t)type.descriptor.rows;
-  ret.descriptor.columns = (uint8_t)type.descriptor.cols;
-  ret.descriptor.elements = type.descriptor.elements;
-  ret.descriptor.name = type.descriptor.name;
-  ret.descriptor.rowMajorStorage = (type.descriptor.varClass == DXBC::CLASS_MATRIX_ROWS ||
-                                    type.descriptor.varClass == DXBC::CLASS_VECTOR ||
-                                    type.descriptor.varClass == DXBC::CLASS_SCALAR);
+}
 
-  uint32_t baseElemSize = (ret.descriptor.type == VarType::Double) ? 8 : 4;
+static ShaderConstantType MakeShaderConstantType(bool cbufferPacking, DXBC::CBufferVariableType type)
+{
+  ShaderConstantType ret;
 
-  // in D3D matrices always take up a float4 per row/column
-  ret.descriptor.matrixByteStride = uint8_t(baseElemSize * 4);
+  ret.baseType = type.varType;
+  ret.rows = (uint8_t)type.rows;
+  ret.columns = (uint8_t)type.cols;
+  ret.elements = type.elements;
+  ret.name = type.name;
+  if(type.varClass == DXBC::CLASS_MATRIX_ROWS || type.varClass == DXBC::CLASS_VECTOR ||
+     type.varClass == DXBC::CLASS_SCALAR)
+    ret.flags |= ShaderVariableFlags::RowMajorMatrix;
 
-  if(type.descriptor.varClass == DXBC::CLASS_STRUCT)
+  uint32_t baseElemSize = (ret.baseType == VarType::Double) ? 8 : 4;
+
+  // in D3D matrices in cbuffers always take up a float4 per row/column. Structured buffers in
+  // SRVs/UAVs are tightly packed
+  if(cbufferPacking)
+    ret.matrixByteStride = uint8_t(baseElemSize * 4);
+  else
+    ret.matrixByteStride = uint8_t(baseElemSize * (ret.RowMajor() ? ret.columns : ret.rows));
+
+  if(type.varClass == DXBC::CLASS_STRUCT)
   {
-    ret.descriptor.arrayByteStride = type.descriptor.bytesize / RDCMAX(1U, type.descriptor.elements);
+    // fxc's reported byte size for UAV structs is not reliable (booo). It seems to assume some
+    // padding that doesn't exist, especially in arrays. So e.g.:
+    // struct nested_with_padding
+    // {
+    //   float a; float4 b; float c; float3 d[4];
+    // };
+    // is tightly packed and only contains 1+4+1+4*3 floats = 18*4 = 72 bytes
+    // however an array of nested_with_padding foo[2] will have size listed as 176 bytes.
+    //
+    // fortunately, since packing is tight we can look at the 'columns' field which is the number of
+    // floats in the struct, and multiply that
+    uint32_t stride = type.bytesize / RDCMAX(1U, type.elements);
+    if(!cbufferPacking)
+    {
+      stride = type.cols * sizeof(float);
+      // the exception is empty structs have 1 cols, probably because of a max(1,...) somewhere
+      if(type.bytesize == 0)
+        stride = 0;
+    }
+
+    ret.arrayByteStride = stride;
+    // in D3D only cbuffers have 16-byte aligned structs
+    if(cbufferPacking)
+      ret.arrayByteStride = AlignUp16(ret.arrayByteStride);
+
+    ret.rows = ret.columns = 0;
+
+    ret.baseType = VarType::Struct;
   }
   else
   {
-    if(ret.descriptor.rowMajorStorage)
-      ret.descriptor.arrayByteStride = ret.descriptor.matrixByteStride * ret.descriptor.rows;
+    if(ret.RowMajor())
+      ret.arrayByteStride = ret.matrixByteStride * ret.rows;
     else
-      ret.descriptor.arrayByteStride = ret.descriptor.matrixByteStride * ret.descriptor.columns;
+      ret.arrayByteStride = ret.matrixByteStride * ret.columns;
   }
 
   ret.members.reserve(type.members.size());
   for(size_t i = 0; i < type.members.size(); i++)
-    ret.members.push_back(MakeConstantBufferVariable(type.members[i]));
+    ret.members.push_back(MakeConstantBufferVariable(cbufferPacking, type.members[i]));
+
+  FixupEmptyStructs(ret.members);
 
   if(!ret.members.empty())
   {
-    ret.descriptor.rows = 0;
-    ret.descriptor.columns = 0;
+    ret.rows = 0;
+    ret.columns = 0;
   }
 
   return ret;
 }
 
-static ShaderConstant MakeConstantBufferVariable(const DXBC::CBufferVariable &var)
+static ShaderConstant MakeConstantBufferVariable(bool cbufferPacking, const DXBC::CBufferVariable &var)
 {
   ShaderConstant ret;
 
   ret.name = var.name;
-  ret.byteOffset = var.descriptor.offset;
+  ret.byteOffset = var.offset;
   ret.defaultValue = 0;
-  ret.type = MakeShaderVariableType(var.type);
+  ret.type = MakeShaderConstantType(cbufferPacking, var.type);
+
+  // fxc emits negative values for offsets of empty structs sometimes. Replace that with a single
+  // value so we can say 'use the previous value'
+  if(ret.type.baseType == VarType::Struct && ret.type.members.empty() && ret.byteOffset > 0xF0000000)
+    ret.byteOffset = ~0U;
 
   return ret;
 }
 
-static void MakeResourceList(bool srv, DXBC::DXBCFile *dxbc,
-                             const std::vector<DXBC::ShaderInputBind> &in,
+static void MakeResourceList(bool srv, DXBC::DXBCContainer *dxbc,
+                             const rdcarray<DXBC::ShaderInputBind> &in,
                              rdcarray<Bindpoint> &mapping, rdcarray<ShaderResource> &refl)
 {
   for(size_t i = 0; i < in.size(); i++)
@@ -142,43 +183,70 @@ static void MakeResourceList(bool srv, DXBC::DXBCFile *dxbc,
         break;
     }
 
-    if(r.retType != DXBC::RETURN_TYPE_UNKNOWN && r.retType != DXBC::RETURN_TYPE_MIXED &&
-       r.retType != DXBC::RETURN_TYPE_CONTINUED)
+    if(r.type == DXBC::ShaderInputBind::TYPE_BYTEADDRESS ||
+       r.type == DXBC::ShaderInputBind::TYPE_UAV_RWBYTEADDRESS)
     {
-      res.variableType.descriptor.rows = 1;
-      res.variableType.descriptor.columns = (uint8_t)r.numSamples;
-      res.variableType.descriptor.elements = 1;
+      res.variableType.rows = res.variableType.columns = 1;
+      res.variableType.elements = 1;
+      res.variableType.baseType = VarType::UByte;
+      res.variableType.name = "byte";
+    }
+    else if(r.retType != DXBC::RETURN_TYPE_UNKNOWN && r.retType != DXBC::RETURN_TYPE_MIXED &&
+            r.retType != DXBC::RETURN_TYPE_CONTINUED)
+    {
+      res.variableType.rows = 1;
+      res.variableType.columns = (uint8_t)r.numComps;
+      res.variableType.elements = 1;
 
-      std::string name;
+      rdcstr name;
 
       switch(r.retType)
       {
-        case DXBC::RETURN_TYPE_UNORM: name = "unorm float"; break;
-        case DXBC::RETURN_TYPE_SNORM: name = "snorm float"; break;
-        case DXBC::RETURN_TYPE_SINT: name = "int"; break;
-        case DXBC::RETURN_TYPE_UINT: name = "uint"; break;
-        case DXBC::RETURN_TYPE_FLOAT: name = "float"; break;
-        case DXBC::RETURN_TYPE_DOUBLE: name = "double"; break;
+        case DXBC::RETURN_TYPE_UNORM:
+          name = "unorm float";
+          res.variableType.baseType = VarType::Float;
+          break;
+        case DXBC::RETURN_TYPE_SNORM:
+          name = "snorm float";
+          res.variableType.baseType = VarType::Float;
+          break;
+        case DXBC::RETURN_TYPE_SINT:
+          name = "int";
+          res.variableType.baseType = VarType::SInt;
+          break;
+        case DXBC::RETURN_TYPE_UINT:
+          name = "uint";
+          res.variableType.baseType = VarType::UInt;
+          break;
+        case DXBC::RETURN_TYPE_FLOAT:
+          name = "float";
+          res.variableType.baseType = VarType::Float;
+          break;
+        case DXBC::RETURN_TYPE_DOUBLE:
+          name = "double";
+          res.variableType.baseType = VarType::Double;
+          break;
         default: name = "unknown"; break;
       }
 
-      if(r.numSamples > 1)
-        name += StringFormat::Fmt("%u", r.numSamples);
+      if(r.numComps > 1)
+        name += StringFormat::Fmt("%u", r.numComps);
 
-      res.variableType.descriptor.name = name;
+      res.variableType.name = name;
     }
     else
     {
-      if(dxbc->m_ResourceBinds.find(r.name) != dxbc->m_ResourceBinds.end())
+      auto it = dxbc->GetReflection()->ResourceBinds.find(r.name);
+      if(it != dxbc->GetReflection()->ResourceBinds.end())
       {
-        res.variableType = MakeShaderVariableType(dxbc->m_ResourceBinds[r.name]);
+        res.variableType = MakeShaderConstantType(false, it->second);
       }
       else
       {
-        res.variableType.descriptor.rows = 0;
-        res.variableType.descriptor.columns = 0;
-        res.variableType.descriptor.elements = 0;
-        res.variableType.descriptor.name = "";
+        res.variableType.rows = 0;
+        res.variableType.columns = 0;
+        res.variableType.elements = 0;
+        res.variableType.name = "";
       }
     }
 
@@ -195,7 +263,7 @@ static void MakeResourceList(bool srv, DXBC::DXBCFile *dxbc,
   }
 }
 
-void MakeShaderReflection(DXBC::DXBCFile *dxbc, ShaderReflection *refl,
+void MakeShaderReflection(DXBC::DXBCContainer *dxbc, ShaderReflection *refl,
                           ShaderBindpointMapping *mapping)
 {
   if(dxbc == NULL || !RenderDoc::Inst().IsReplayApp())
@@ -203,12 +271,14 @@ void MakeShaderReflection(DXBC::DXBCFile *dxbc, ShaderReflection *refl,
 
   switch(dxbc->m_Type)
   {
-    case D3D11_ShaderType_Pixel: refl->stage = ShaderStage::Pixel; break;
-    case D3D11_ShaderType_Vertex: refl->stage = ShaderStage::Vertex; break;
-    case D3D11_ShaderType_Geometry: refl->stage = ShaderStage::Geometry; break;
-    case D3D11_ShaderType_Hull: refl->stage = ShaderStage::Hull; break;
-    case D3D11_ShaderType_Domain: refl->stage = ShaderStage::Domain; break;
-    case D3D11_ShaderType_Compute: refl->stage = ShaderStage::Compute; break;
+    case DXBC::ShaderType::Pixel: refl->stage = ShaderStage::Pixel; break;
+    case DXBC::ShaderType::Vertex: refl->stage = ShaderStage::Vertex; break;
+    case DXBC::ShaderType::Geometry: refl->stage = ShaderStage::Geometry; break;
+    case DXBC::ShaderType::Hull: refl->stage = ShaderStage::Hull; break;
+    case DXBC::ShaderType::Domain: refl->stage = ShaderStage::Domain; break;
+    case DXBC::ShaderType::Compute: refl->stage = ShaderStage::Compute; break;
+    case DXBC::ShaderType::Amplification: refl->stage = ShaderStage::Amplification; break;
+    case DXBC::ShaderType::Mesh: refl->stage = ShaderStage::Mesh; break;
     default:
       RDCERR("Unexpected DXBC shader type %u", dxbc->m_Type);
       refl->stage = ShaderStage::Vertex;
@@ -217,101 +287,176 @@ void MakeShaderReflection(DXBC::DXBCFile *dxbc, ShaderReflection *refl,
 
   refl->entryPoint = "main";
 
-  if(dxbc->m_DebugInfo)
+  if(dxbc->GetDebugInfo())
   {
-    refl->entryPoint = dxbc->m_DebugInfo->GetEntryFunction();
+    refl->entryPoint = dxbc->GetDebugInfo()->GetEntryFunction();
 
     refl->debugInfo.encoding = ShaderEncoding::HLSL;
 
-    refl->debugInfo.compileFlags = DXBC::EncodeFlags(dxbc->m_DebugInfo);
+    refl->debugInfo.sourceDebugInformation = true;
 
-    refl->debugInfo.files.resize(dxbc->m_DebugInfo->Files.size());
-    for(size_t i = 0; i < dxbc->m_DebugInfo->Files.size(); i++)
-    {
-      refl->debugInfo.files[i].filename = dxbc->m_DebugInfo->Files[i].first;
-      refl->debugInfo.files[i].contents = dxbc->m_DebugInfo->Files[i].second;
-    }
+    refl->debugInfo.compileFlags = dxbc->GetDebugInfo()->GetShaderCompileFlags();
 
-    std::string entry = dxbc->m_DebugInfo->GetEntryFunction();
+    refl->debugInfo.files = dxbc->GetDebugInfo()->Files;
+
+    dxbc->GetDebugInfo()->GetLineInfo(~0U, ~0U, refl->debugInfo.entryLocation);
+
+    rdcstr entry = dxbc->GetDebugInfo()->GetEntryFunction();
     if(entry.empty())
       entry = "main";
 
     // assume the debug info put the file with the entry point at the start. SDBG seems to do this
     // by default, and SPDB has an extra sorting step that probably maybe possibly does this.
   }
+  else
+  {
+    // ensure we at least have shader compiler flags to indicate the right profile
+    rdcstr profile;
+    switch(dxbc->m_Type)
+    {
+      case DXBC::ShaderType::Pixel: profile = "ps"; break;
+      case DXBC::ShaderType::Vertex: profile = "vs"; break;
+      case DXBC::ShaderType::Geometry: profile = "gs"; break;
+      case DXBC::ShaderType::Hull: profile = "hs"; break;
+      case DXBC::ShaderType::Domain: profile = "ds"; break;
+      case DXBC::ShaderType::Compute: profile = "cs"; break;
+      default: profile = "xx"; break;
+    }
+    profile += StringFormat::Fmt("_%u_%u", dxbc->m_Version.Major, dxbc->m_Version.Minor);
+
+    refl->debugInfo.compileFlags = DXBC::EncodeFlags(0, profile);
+  }
+
+  if(dxbc->GetDXBCByteCode())
+  {
+    refl->debugInfo.debugStatus = dxbc->GetDXBCByteCode()->GetDebugStatus();
+
+    refl->debugInfo.debuggable = refl->debugInfo.debugStatus.empty();
+  }
+  else
+  {
+    refl->debugInfo.debuggable = false;
+
+    if(dxbc->GetDXILByteCode())
+      refl->debugInfo.debugStatus = "Debugging DXIL is not supported";
+    else
+      refl->debugInfo.debugStatus = "Shader contains no recognised bytecode";
+  }
 
   refl->encoding = ShaderEncoding::DXBC;
-  refl->rawBytes = dxbc->m_ShaderBlob;
+  refl->debugInfo.compiler = KnownShaderTool::fxc;
+  if(dxbc->GetDXILByteCode())
+  {
+    refl->encoding = ShaderEncoding::DXIL;
+    refl->debugInfo.compiler = KnownShaderTool::dxcDXIL;
+  }
+  refl->rawBytes = dxbc->GetShaderBlob();
 
-  refl->dispatchThreadsDimension[0] = dxbc->DispatchThreadsDimension[0];
-  refl->dispatchThreadsDimension[1] = dxbc->DispatchThreadsDimension[1];
-  refl->dispatchThreadsDimension[2] = dxbc->DispatchThreadsDimension[2];
+  const DXBC::Reflection *dxbcRefl = dxbc->GetReflection();
 
-  refl->inputSignature = dxbc->m_InputSig;
-  refl->outputSignature = dxbc->m_OutputSig;
+  refl->dispatchThreadsDimension[0] = dxbcRefl->DispatchThreadsDimension[0];
+  refl->dispatchThreadsDimension[1] = dxbcRefl->DispatchThreadsDimension[1];
+  refl->dispatchThreadsDimension[2] = dxbcRefl->DispatchThreadsDimension[2];
+
+  refl->inputSignature = dxbcRefl->InputSig;
+  refl->outputSignature = dxbcRefl->OutputSig;
+
+  switch(dxbc->GetOutputTopology())
+  {
+    case D3D_PRIMITIVE_TOPOLOGY_POINTLIST: refl->outputTopology = Topology::PointList; break;
+    case D3D_PRIMITIVE_TOPOLOGY_LINELIST: refl->outputTopology = Topology::LineList; break;
+    case D3D_PRIMITIVE_TOPOLOGY_LINESTRIP: refl->outputTopology = Topology::LineStrip; break;
+    case D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST: refl->outputTopology = Topology::TriangleList; break;
+    case D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP:
+      refl->outputTopology = Topology::TriangleStrip;
+      break;
+    case D3D_PRIMITIVE_TOPOLOGY_LINELIST_ADJ: refl->outputTopology = Topology::LineList_Adj; break;
+    case D3D_PRIMITIVE_TOPOLOGY_LINESTRIP_ADJ:
+      refl->outputTopology = Topology::LineStrip_Adj;
+      break;
+    case D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST_ADJ:
+      refl->outputTopology = Topology::TriangleList_Adj;
+      break;
+    case D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP_ADJ:
+      refl->outputTopology = Topology::TriangleStrip_Adj;
+      break;
+    default: refl->outputTopology = Topology::Unknown; break;
+  }
 
   mapping->inputAttributes.resize(D3Dx_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT);
   for(int s = 0; s < D3Dx_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT; s++)
     mapping->inputAttributes[s] = s;
 
-  mapping->constantBlocks.resize(dxbc->m_CBuffers.size());
-  refl->constantBlocks.resize(dxbc->m_CBuffers.size());
-  for(size_t i = 0; i < dxbc->m_CBuffers.size(); i++)
+  mapping->constantBlocks.resize(dxbcRefl->CBuffers.size());
+  refl->constantBlocks.resize(dxbcRefl->CBuffers.size());
+  for(size_t i = 0; i < dxbcRefl->CBuffers.size(); i++)
   {
     ConstantBlock &cb = refl->constantBlocks[i];
 
-    cb.name = dxbc->m_CBuffers[i].name;
+    cb.name = dxbcRefl->CBuffers[i].name;
     cb.bufferBacked = true;
-    cb.byteSize = dxbc->m_CBuffers[i].descriptor.byteSize;
+    cb.byteSize = dxbcRefl->CBuffers[i].descriptor.byteSize;
     cb.bindPoint = (int32_t)i;
 
     Bindpoint map;
-    map.arraySize = 1;
-    map.bindset = dxbc->m_CBuffers[i].space;
-    map.bind = dxbc->m_CBuffers[i].reg;
+    map.arraySize = dxbcRefl->CBuffers[i].bindCount;
+    map.bindset = dxbcRefl->CBuffers[i].space;
+    map.bind = dxbcRefl->CBuffers[i].reg;
     map.used = true;
 
     mapping->constantBlocks[i] = map;
 
-    cb.variables.reserve(dxbc->m_CBuffers[i].variables.size());
-    for(size_t v = 0; v < dxbc->m_CBuffers[i].variables.size(); v++)
+    cb.variables.reserve(dxbcRefl->CBuffers[i].variables.size());
+    for(size_t v = 0; v < dxbcRefl->CBuffers[i].variables.size(); v++)
     {
-      cb.variables.push_back(MakeConstantBufferVariable(dxbc->m_CBuffers[i].variables[v]));
+      cb.variables.push_back(MakeConstantBufferVariable(true, dxbcRefl->CBuffers[i].variables[v]));
     }
+
+    FixupEmptyStructs(cb.variables);
   }
 
-  mapping->samplers.resize(dxbc->m_Samplers.size());
-  refl->samplers.resize(dxbc->m_Samplers.size());
-  for(size_t i = 0; i < dxbc->m_Samplers.size(); i++)
+  mapping->samplers.resize(dxbcRefl->Samplers.size());
+  refl->samplers.resize(dxbcRefl->Samplers.size());
+  for(size_t i = 0; i < dxbcRefl->Samplers.size(); i++)
   {
     ShaderSampler &s = refl->samplers[i];
 
-    s.name = dxbc->m_Samplers[i].name;
+    s.name = dxbcRefl->Samplers[i].name;
     s.bindPoint = (int32_t)i;
 
     Bindpoint map;
     map.arraySize = 1;
-    map.bindset = dxbc->m_Samplers[i].space;
-    map.bind = dxbc->m_Samplers[i].reg;
+    map.bindset = dxbcRefl->Samplers[i].space;
+    map.bind = dxbcRefl->Samplers[i].reg;
     map.used = true;
 
     mapping->samplers[i] = map;
   }
 
-  mapping->readOnlyResources.resize(dxbc->m_SRVs.size());
-  refl->readOnlyResources.resize(dxbc->m_SRVs.size());
-  MakeResourceList(true, dxbc, dxbc->m_SRVs, mapping->readOnlyResources, refl->readOnlyResources);
+  mapping->readOnlyResources.resize(dxbcRefl->SRVs.size());
+  refl->readOnlyResources.resize(dxbcRefl->SRVs.size());
+  MakeResourceList(true, dxbc, dxbcRefl->SRVs, mapping->readOnlyResources, refl->readOnlyResources);
 
-  mapping->readWriteResources.resize(dxbc->m_UAVs.size());
-  refl->readWriteResources.resize(dxbc->m_UAVs.size());
-  MakeResourceList(false, dxbc, dxbc->m_UAVs, mapping->readWriteResources, refl->readWriteResources);
+  mapping->readWriteResources.resize(dxbcRefl->UAVs.size());
+  refl->readWriteResources.resize(dxbcRefl->UAVs.size());
+  MakeResourceList(false, dxbc, dxbcRefl->UAVs, mapping->readWriteResources,
+                   refl->readWriteResources);
 
   uint32_t numInterfaces = 0;
-  for(size_t i = 0; i < dxbc->m_Interfaces.variables.size(); i++)
-    numInterfaces = RDCMAX(dxbc->m_Interfaces.variables[i].descriptor.offset + 1, numInterfaces);
+  for(size_t i = 0; i < dxbcRefl->Interfaces.variables.size(); i++)
+    numInterfaces = RDCMAX(dxbcRefl->Interfaces.variables[i].offset + 1, numInterfaces);
 
   refl->interfaces.resize(numInterfaces);
-  for(size_t i = 0; i < dxbc->m_Interfaces.variables.size(); i++)
-    refl->interfaces[dxbc->m_Interfaces.variables[i].descriptor.offset] =
-        dxbc->m_Interfaces.variables[i].name;
+  for(size_t i = 0; i < dxbcRefl->Interfaces.variables.size(); i++)
+    refl->interfaces[dxbcRefl->Interfaces.variables[i].offset] =
+        dxbcRefl->Interfaces.variables[i].name;
+
+  refl->taskPayload.bufferBacked = false;
+  refl->taskPayload.name = dxbcRefl->TaskPayload.name;
+  refl->taskPayload.variables.reserve(dxbcRefl->TaskPayload.members.size());
+  for(size_t v = 0; v < dxbcRefl->TaskPayload.members.size(); v++)
+  {
+    refl->taskPayload.variables.push_back(
+        MakeConstantBufferVariable(false, dxbcRefl->TaskPayload.members[v]));
+  }
 }

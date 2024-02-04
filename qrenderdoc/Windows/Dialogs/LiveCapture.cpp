@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2016-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -33,12 +33,12 @@
 #include <QStyledItemDelegate>
 #include <QToolBar>
 #include <QToolButton>
-#include "3rdparty/toolwindowmanager/ToolWindowManager.h"
 #include "Code/QRDUtils.h"
 #include "Code/Resources.h"
 #include "Code/qprocessinfo.h"
 #include "Widgets/Extended/RDLabel.h"
 #include "Windows/MainWindow.h"
+#include "toolwindowmanager/ToolWindowManager.h"
 #include "ui_LiveCapture.h"
 
 static const int PIDRole = Qt::UserRole + 1;
@@ -220,10 +220,12 @@ void LiveCapture::on_captures_mouseClicked(QMouseEvent *e)
     contextOpenMenu.addAction(&thisAction);
     contextOpenMenu.addAction(&newAction);
 
+    QAction contextRenameAction(tr("&Rename capture"), this);
     QAction contextSaveAction(tr("&Save"), this);
     QAction contextDeleteAction(tr("&Delete"), this);
 
     contextMenu.addAction(contextOpenMenu.menuAction());
+    contextMenu.addAction(&contextRenameAction);
     contextMenu.addAction(&contextSaveAction);
     contextMenu.addAction(&contextDeleteAction);
 
@@ -234,12 +236,15 @@ void LiveCapture::on_captures_mouseClicked(QMouseEvent *e)
     else
     {
       contextOpenMenu.setEnabled(false);
+      contextRenameAction.setEnabled(false);
       contextSaveAction.setText(tr("&Save All"));
       contextDeleteAction.setText(tr("&Delete All"));
     }
 
     QObject::connect(&thisAction, &QAction::triggered, this, &LiveCapture::openCapture_triggered);
     QObject::connect(&newAction, &QAction::triggered, this, &LiveCapture::openNewWindow_triggered);
+    QObject::connect(&contextRenameAction, &QAction::triggered,
+                     [this]() { ui->captures->editItem(ui->captures->selectedItems()[0]); });
     QObject::connect(&contextSaveAction, &QAction::triggered, this,
                      &LiveCapture::saveCapture_triggered);
     QObject::connect(&contextDeleteAction, &QAction::triggered, this,
@@ -286,7 +291,7 @@ void LiveCapture::on_triggerImmediateCapture_clicked()
 
 void LiveCapture::on_cycleActiveWindow_clicked()
 {
-  m_Connection->CycleActiveWindow();
+  m_CycleWindow.release();
 }
 
 void LiveCapture::on_triggerDelayedCapture_clicked()
@@ -355,10 +360,30 @@ void LiveCapture::saveCapture_triggered()
       if(path.endsWith(lit(".rdc")))
         path.chop(4);
 
+      // don't save duplicates if we have multiple captures from the same frame (possible if the
+      // application is not presenting at all and using the API to capture)
+      QMap<uint32_t, uint32_t> existingFiles;
+
       for(QListWidgetItem *item : ui->captures->selectedItems())
       {
         Capture *cap = GetCapture(item);
-        saveCapture(cap, QFormatStr("%1-frame%2.rdc").arg(path).arg(cap->frameNumber));
+
+        QString filename = QFormatStr("%1-frame%2").arg(path).arg(cap->frameNumber);
+        if(cap->frameNumber == ~0U)
+          filename = QFormatStr("%1-capture").arg(path);
+
+        if(existingFiles.contains(cap->frameNumber))
+        {
+          filename += QFormatStr("_%1").arg(existingFiles[cap->frameNumber]);
+          existingFiles[cap->frameNumber]++;
+        }
+        else
+        {
+          // start on 2 next time
+          existingFiles[cap->frameNumber] = 2;
+        }
+
+        saveCapture(cap, QFormatStr("%1.rdc").arg(filename));
       }
     }
   }
@@ -387,7 +412,7 @@ void LiveCapture::deleteCapture_triggered()
       else
       {
         // if connected, prefer using the live connection
-        if(m_Connection && m_Connection->Connected() && !cap->local)
+        if(m_Connected.available() && !cap->local)
         {
           QMutexLocker l(&m_DeleteCapturesLock);
           m_DeleteCaptures.push_back(cap->remoteID);
@@ -395,6 +420,11 @@ void LiveCapture::deleteCapture_triggered()
         else
         {
           m_Ctx.Replay().DeleteCapture(cap->path, cap->local);
+        }
+
+        if(cap->local)
+        {
+          m_Main->RemoveRecentCapture(cap->path);
         }
       }
     }
@@ -624,6 +654,8 @@ void LiveCapture::updateAPIStatus()
     if(!m_APIs[api].supported)
     {
       apiStatus += tr(", %1 (Unsupported)").arg(api);
+      if(!m_APIs[api].supportMessage.isEmpty())
+        apiStatus += lit("\n") + m_APIs[api].supportMessage;
     }
     else if(!m_APIs[api].presenting)
     {
@@ -634,6 +666,8 @@ void LiveCapture::updateAPIStatus()
 
   // remove the redundant starting ", "
   apiStatus.remove(0, 2);
+
+  apiStatus.replace(QLatin1Char('\n'), lit("<br>"));
 
   ui->apiStatus->setText(apiStatus);
 
@@ -647,22 +681,33 @@ QString LiveCapture::MakeText(Capture *cap)
     text += tr(" (Remote)");
 
   text += lit("\n") + cap->api;
-  text += tr("\nFrame #%1 ").arg(cap->frameNumber) +
-          cap->timestamp.toString(lit("yyyy-MM-dd HH:mm:ss"));
+  if(!cap->title.isEmpty())
+    text += QFormatStr("\n%1").arg(cap->title);
+  else if(cap->frameNumber == ~0U)
+    text += tr("\nUser-defined Capture");
+  else
+    text += tr("\nFrame #%1").arg(cap->frameNumber);
+
+  if(cap->byteSize > 0)
+    text += QFormatStr(" (%1 MB)").arg(double(cap->byteSize) / 1000000.0, 0, 'f', 2);
+
+  text += cap->timestamp.toString(lit("\nyyyy-MM-dd HH:mm:ss"));
 
   return text;
 }
 
-bool LiveCapture::checkAllowClose()
+bool LiveCapture::checkAllowClose(int totalUnsavedCaptures, bool &noToAll)
 {
   m_IgnoreThreadClosed = true;
 
   bool suppressRemoteWarning = false;
-  bool notoall = false;
 
   QMessageBox::StandardButtons msgFlags = RDDialog::YesNoCancel;
 
-  if(ui->captures->count() > 1)
+  const int unsavedCaptures = unsavedCaptureCount();
+  const bool multipleClosures = totalUnsavedCaptures > unsavedCaptures;
+
+  if(unsavedCaptures > 1 || multipleClosures)
     msgFlags |= QMessageBox::NoToAll;
 
   for(int i = 0; i < ui->captures->count(); i++)
@@ -680,18 +725,50 @@ bool LiveCapture::checkAllowClose()
 
     QMessageBox::StandardButton res = QMessageBox::No;
 
-    if(!suppressRemoteWarning && !notoall)
+    if(!suppressRemoteWarning && !noToAll)
     {
+      QString frameName = tr("Frame #%1").arg(cap->frameNumber);
+      if(cap->frameNumber == ~0U)
+        frameName = tr("User-defined Capture");
+
       res = RDDialog::question(this, tr("Unsaved capture"),
-                               tr("Save this capture '%1 Frame #%2' at %3?")
+                               tr("Save this capture '%1 %2' at %3?")
                                    .arg(cap->name)
-                                   .arg(cap->frameNumber)
+                                   .arg(frameName)
                                    .arg(cap->timestamp.toString(lit("HH:mm:ss"))),
                                msgFlags);
 
       if(res == QMessageBox::NoToAll)
       {
-        notoall = true;
+        // if we're closing multiple connections make sure the user is sure of what they're doing
+        if(multipleClosures)
+        {
+          QMessageBox::StandardButton res2 = RDDialog::question(
+              this, tr("Discarding all captures"),
+              tr("Multiple connections open have potentially unsaved captures, "
+                 "this will discard all captures in all connections, are you sure?"));
+
+          // if the user is sure, apply the no to all
+          if(res2 == QMessageBox::Yes)
+          {
+            noToAll = true;
+          }
+          else
+          {
+            // otherwise if the user changed their mind at this stage, cancel everything rather than
+            // trying to continue, to keep the flow simple and ensure the user is clear what is
+            // happening at all points. We do not support discarding all captures in one connection
+            // then individually filtering another.
+            m_IgnoreThreadClosed = false;
+            return false;
+          }
+        }
+        else
+        {
+          // if we're not closing multiple, we can just immediately accept the 'no to all'
+          noToAll = true;
+        }
+
         res = QMessageBox::No;
       }
     }
@@ -704,10 +781,8 @@ bool LiveCapture::checkAllowClose()
 
     // we either have to save or delete the capture. Make sure that if it's remote that we are able
     // to by having an active connection or replay context on that host.
-    if(suppressRemoteWarning == false && (!m_Connection || !m_Connection->Connected()) &&
-       !cap->local && (!m_Ctx.Replay().CurrentRemote() ||
-                       QString(m_Ctx.Replay().CurrentRemote()->hostname) != m_Hostname ||
-                       !m_Ctx.Replay().CurrentRemote()->connected))
+    if(suppressRemoteWarning == false && !m_Connected.available() && !cap->local &&
+       m_Ctx.Replay().CurrentRemote().Hostname() != rdcstr(m_Hostname))
     {
       QMessageBox::StandardButton res2 = RDDialog::question(
           this, tr("No active replay context"),
@@ -748,13 +823,17 @@ bool LiveCapture::checkAllowClose()
   return true;
 }
 
+bool LiveCapture::checkAllowClose()
+{
+  bool dummy = false;
+  return checkAllowClose(unsavedCaptureCount(), dummy);
+}
+
 void LiveCapture::openCapture(Capture *cap)
 {
   cap->opened = true;
 
-  if(!cap->local && (!m_Ctx.Replay().CurrentRemote() ||
-                     QString(m_Ctx.Replay().CurrentRemote()->hostname) != m_Hostname ||
-                     !m_Ctx.Replay().CurrentRemote()->connected))
+  if(!cap->local && m_Ctx.Replay().CurrentRemote().Hostname() != rdcstr(m_Hostname))
   {
     RDDialog::critical(
         this, tr("No active replay context"),
@@ -764,11 +843,21 @@ void LiveCapture::openCapture(Capture *cap)
     return;
   }
 
-  m_Main->LoadCapture(cap->path, !cap->saved, cap->local);
+  m_Main->LoadCapture(cap->path, m_Ctx.Config().DefaultReplayOptions, !cap->saved, cap->local);
 }
 
 bool LiveCapture::saveCapture(Capture *cap, QString path)
 {
+  // if this is the current capture, do the save through the main window
+  if(QString(m_Ctx.GetCaptureFilename()) == cap->path)
+  {
+    // if there's no target path, let the main window prompt for save.
+    if(path.isEmpty())
+      return m_Main->PromptSaveCaptureAs();
+    else
+      return m_Main->SaveCurrentCapture(path);
+  }
+
   if(path.isEmpty())
   {
     path = m_Main->GetSavePath();
@@ -779,9 +868,10 @@ bool LiveCapture::saveCapture(Capture *cap, QString path)
 
   if(QString(m_Ctx.GetCaptureFilename()) == path)
   {
-    RDDialog::critical(this, tr("Cannot save"), tr("Can't overwrite currently open capture at %1\n"
-                                                   "Close the capture or save to another location.")
-                                                    .arg(path));
+    RDDialog::critical(this, tr("Cannot save"),
+                       tr("Can't overwrite currently open capture at %1\n"
+                          "Close the capture or save to another location.")
+                           .arg(path));
     return false;
   }
 
@@ -811,7 +901,7 @@ bool LiveCapture::saveCapture(Capture *cap, QString path)
       return false;
     }
   }
-  else if(m_Connection && m_Connection->Connected())
+  else if(m_Connected.available())
   {
     // if we have a current live connection, prefer using it
     m_CopyCaptureLocalPath = path;
@@ -821,13 +911,12 @@ bool LiveCapture::saveCapture(Capture *cap, QString path)
   }
   else
   {
-    if(!m_Ctx.Replay().CurrentRemote() ||
-       QString(m_Ctx.Replay().CurrentRemote()->hostname) != m_Hostname ||
-       !m_Ctx.Replay().CurrentRemote()->connected)
+    if(m_Ctx.Replay().CurrentRemote().Hostname() != rdcstr(m_Hostname))
     {
       RDDialog::critical(this, tr("No active replay context"),
                          tr("This capture is on remote host %1 and there is no active replay "
-                            "context on that host.\n") +
+                            "context on that host.\n")
+                                 .arg(m_Hostname) +
                              tr("Without an active replay context the capture cannot be saved, "
                                 "try switching to a replay context on %1.")
                                  .arg(m_Hostname));
@@ -850,9 +939,10 @@ bool LiveCapture::saveCapture(Capture *cap, QString path)
   if(!cap->saved)
     m_Ctx.Replay().DeleteCapture(cap->path, cap->local);
 
+  m_Main->RemoveRecentCapture(cap->path);
   cap->saved = true;
   cap->path = path;
-  AddRecentFile(m_Ctx.Config().RecentCaptureFiles, path, 10);
+  AddRecentFile(m_Ctx.Config().RecentCaptureFiles, path);
   m_Main->PopulateRecentCaptureFiles();
   return true;
 }
@@ -872,7 +962,7 @@ void LiveCapture::cleanItems()
       else
       {
         // if connected, prefer using the live connection
-        if(m_Connection && m_Connection->Connected() && !cap->local)
+        if(m_Connected.available() && !cap->local)
         {
           QMutexLocker l(&m_DeleteCapturesLock);
           m_DeleteCaptures.push_back(cap->remoteID);
@@ -881,12 +971,47 @@ void LiveCapture::cleanItems()
         {
           m_Ctx.Replay().DeleteCapture(cap->path, cap->local);
         }
+
+        if(cap->local)
+        {
+          m_Main->RemoveRecentCapture(cap->path);
+        }
       }
     }
 
     delete cap;
   }
   ui->captures->clear();
+}
+
+void LiveCapture::fileSaved(QString from, QString to)
+{
+  for(int i = 0; i < ui->captures->count(); i++)
+  {
+    Capture *cap = GetCapture(ui->captures->item(i));
+
+    if(cap->path == from)
+    {
+      cap->path = to;
+      cap->saved = true;
+      cap->local = true;
+    }
+  }
+}
+
+int LiveCapture::unsavedCaptureCount()
+{
+  int ret = 0;
+
+  for(int i = 0; i < ui->captures->count(); i++)
+  {
+    Capture *cap = GetCapture(ui->captures->item(i));
+
+    if(!cap->saved)
+      ret++;
+  }
+
+  return ret;
 }
 
 void LiveCapture::previewToggle_toggled(bool checked)
@@ -958,6 +1083,8 @@ void LiveCapture::on_captures_itemSelectionChanged()
   int numSelected = ui->captures->selectedItems().size();
 
   openButton->setEnabled(numSelected == 1);
+  saveAction->setEnabled(numSelected != 0);
+  deleteAction->setEnabled(numSelected != 0);
 
   if(ui->captures->selectedItems().size() == 1)
   {
@@ -1000,18 +1127,17 @@ void LiveCapture::captureCopied(uint32_t ID, const QString &localPath)
   }
 }
 
-void LiveCapture::captureAdded(const NewCaptureData &newCapture)
+void LiveCapture::captureAdded(const QString &name, const NewCaptureData &newCapture)
 {
   Capture *cap = new Capture();
 
-  cap->name = QString::fromUtf8(m_Connection->GetTarget());
+  cap->name = name;
 
   cap->api = newCapture.api;
-  if(cap->api.isEmpty())
-    cap->api = QString::fromUtf8(m_Connection->GetAPI());
 
   cap->timestamp =
       QDateTime(QDate(1970, 1, 1), QTime(0, 0, 0), Qt::UTC).addSecs(newCapture.timestamp).toLocalTime();
+  cap->byteSize = newCapture.byteSize;
 
   cap->thumb = QImage(newCapture.thumbnail.data(), newCapture.thumbWidth, newCapture.thumbHeight,
                       newCapture.thumbWidth * 3, QImage::Format_RGB888)
@@ -1022,6 +1148,7 @@ void LiveCapture::captureAdded(const NewCaptureData &newCapture)
   cap->path = newCapture.path;
   cap->local = newCapture.local;
   cap->frameNumber = newCapture.frameNumber;
+  cap->title = newCapture.title;
 
   QListWidgetItem *item = new QListWidgetItem();
   item->setFlags(item->flags() | Qt::ItemIsEditable);
@@ -1041,6 +1168,9 @@ void LiveCapture::captureAdded(const NewCaptureData &newCapture)
 
 void LiveCapture::connectionClosed()
 {
+  ui->progressLabel->setVisible(false);
+  ui->progressBar->setVisible(false);
+
   if(m_IgnoreThreadClosed)
     return;
 
@@ -1054,9 +1184,7 @@ void LiveCapture::connectionClosed()
       // to this machine as a remote context
       if(!cap->local)
       {
-        if(!m_Ctx.Replay().CurrentRemote() ||
-           QString(m_Ctx.Replay().CurrentRemote()->hostname) != m_Hostname ||
-           !m_Ctx.Replay().CurrentRemote()->connected)
+        if(m_Ctx.Replay().CurrentRemote().Hostname() != rdcstr(m_Hostname))
           return;
       }
 
@@ -1122,11 +1250,15 @@ void LiveCapture::selfClose()
 
 void LiveCapture::connectionThreadEntry()
 {
-  m_Connection = RENDERDOC_CreateTargetControl(m_Hostname.toUtf8().data(), m_RemoteIdent,
-                                               GetSystemUsername().toUtf8().data(), true);
+  ITargetControl *conn =
+      RENDERDOC_CreateTargetControl(m_Hostname, m_RemoteIdent, GetSystemUsername(), true);
+  m_Connected.release();
 
-  if(!m_Connection || !m_Connection->Connected())
+  if(!conn || !conn->Connected())
   {
+    if(conn)
+      conn->Shutdown();
+
     GUIInvoke::call(this, [this]() {
       setTitle(tr("Connection failed"));
       ui->connectionStatus->setText(tr("Failed"));
@@ -1135,12 +1267,17 @@ void LiveCapture::connectionThreadEntry()
       connectionClosed();
     });
 
+    m_Connected.acquire();
     return;
   }
 
-  GUIInvoke::call(this, [this]() {
-    uint32_t pid = m_Connection->GetPID();
-    QString target = QString::fromUtf8(m_Connection->GetTarget());
+  uint32_t pid = conn->GetPID();
+  QString target = conn->GetTarget();
+
+  GUIInvoke::call(this, [this, pid, target]() {
+    if(!m_Connected.available())
+      return;
+
     if(pid)
       setTitle(QFormatStr("%1 [PID %2]").arg(target).arg(pid));
     else
@@ -1151,26 +1288,31 @@ void LiveCapture::connectionThreadEntry()
     ui->connectionStatus->setText(tr("Established"));
   });
 
-  while(m_Connection && m_Connection->Connected())
+  while(conn && conn->Connected())
   {
     if(m_TriggerCapture.tryAcquire())
     {
-      m_Connection->TriggerCapture((uint)m_CaptureNumFrames);
+      conn->TriggerCapture((uint)m_CaptureNumFrames);
       m_CaptureNumFrames = 1;
     }
 
     if(m_QueueCapture.tryAcquire())
     {
-      m_Connection->QueueCapture((uint32_t)m_QueueCaptureFrameNum, (uint32_t)m_CaptureNumFrames);
+      conn->QueueCapture((uint32_t)m_QueueCaptureFrameNum, (uint32_t)m_CaptureNumFrames);
       m_QueueCaptureFrameNum = 0;
       m_CaptureNumFrames = 1;
     }
 
     if(m_CopyCapture.tryAcquire())
     {
-      m_Connection->CopyCapture(m_CopyCaptureID, m_CopyCaptureLocalPath.toUtf8().data());
+      conn->CopyCapture(m_CopyCaptureID, m_CopyCaptureLocalPath);
       m_CopyCaptureLocalPath = QString();
       m_CopyCaptureID = ~0U;
+    }
+
+    if(m_CycleWindow.tryAcquire())
+    {
+      conn->CycleActiveWindow();
     }
 
     QVector<uint32_t> dels;
@@ -1180,16 +1322,17 @@ void LiveCapture::connectionThreadEntry()
     }
 
     for(uint32_t del : dels)
-      m_Connection->DeleteCapture(del);
+      conn->DeleteCapture(del);
 
     if(!m_Disconnect.available())
     {
-      m_Connection->Shutdown();
-      m_Connection = NULL;
+      conn->Shutdown();
+      conn = NULL;
+      m_Connected.acquire();
       return;
     }
 
-    TargetControlMessage msg = m_Connection->ReceiveMessage([this](float progress) {
+    TargetControlMessage msg = conn->ReceiveMessage([this](float progress) {
       GUIInvoke::call(this, [this, progress]() {
         if(progress >= 0.0f && progress < 1.0f)
         {
@@ -1209,13 +1352,11 @@ void LiveCapture::connectionThreadEntry()
 
     if(msg.type == TargetControlMessageType::RegisterAPI)
     {
-      QString api = msg.apiUse.name;
-      bool presenting = msg.apiUse.presenting;
-      bool supported = msg.apiUse.supported;
-      GUIInvoke::call(this, [this, api, presenting, supported]() {
-        m_APIs[api] = APIStatus(presenting, supported);
+      GUIInvoke::call(this, [this, msg]() {
+        m_APIs[msg.apiUse.name] =
+            APIStatus(msg.apiUse.presenting, msg.apiUse.supported, msg.apiUse.supportMessage);
 
-        if(presenting && supported)
+        if(msg.apiUse.presenting && msg.apiUse.supported)
         {
           ui->triggerImmediateCapture->setEnabled(true);
           ui->triggerDelayedCapture->setEnabled(true);
@@ -1230,7 +1371,6 @@ void LiveCapture::connectionThreadEntry()
     {
       float progress = msg.capProgress;
       GUIInvoke::call(this, [this, progress]() {
-
         if(progress >= 0.0f && progress < 1.0f)
         {
           ui->progressLabel->setText(tr("Capture in Progress:"));
@@ -1244,14 +1384,16 @@ void LiveCapture::connectionThreadEntry()
           ui->progressLabel->setVisible(false);
           ui->progressBar->setVisible(false);
         }
-
       });
     }
 
     if(msg.type == TargetControlMessageType::NewCapture)
     {
       NewCaptureData cap = msg.newCapture;
-      GUIInvoke::call(this, [this, cap]() { captureAdded(cap); });
+      if(cap.api.isEmpty())
+        cap.api = conn->GetAPI();
+      QString name = conn->GetTarget();
+      GUIInvoke::call(this, [this, name, cap]() { captureAdded(name, cap); });
     }
 
     if(msg.type == TargetControlMessageType::CaptureCopied)
@@ -1274,6 +1416,10 @@ void LiveCapture::connectionThreadEntry()
           QMutexLocker l(&m_ChildrenLock);
           m_Children.push_back(c);
         }
+
+        // force a child update immediately, don't wait for the tick which is intended for decaying
+        // processes that exit
+        GUIInvoke::call(this, [this]() { childUpdate(); });
       }
     }
 
@@ -1282,6 +1428,18 @@ void LiveCapture::connectionThreadEntry()
       uint32_t windows = msg.capturableWindowCount;
       GUIInvoke::call(this, [this, windows]() { ui->cycleActiveWindow->setEnabled(windows > 1); });
     }
+
+    if(msg.type == TargetControlMessageType::RequestShow)
+    {
+      GUIInvoke::call(this, [this]() { m_Main->BringToFront(); });
+    }
+  }
+
+  if(conn)
+  {
+    conn->Shutdown();
+    conn = NULL;
+    m_Connected.acquire();
   }
 
   GUIInvoke::call(this, [this]() {

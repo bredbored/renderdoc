@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  * Copyright (c) 2014 Crytek
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -48,20 +48,18 @@ DECLARE_REFLECTION_ENUM(RDCGLenum);
 // appropriate libEGL.dll into plugins/gles/ in your RenderDoc folder.
 #define RENDERDOC_SUPPORT_GL
 #define RENDERDOC_SUPPORT_GLES
-
-// checks a runtime opt-out option to disallow hooking EGL on windows. This means that the
-// underlying GL or D3D calls will be captured instead.
-bool ShouldHookEGL();
+#define RENDERDOC_SUPPORT_EGL
 
 #else
 
 // other cases are defined by build-time configuration
 
-// for consistency, we always enable this on other platforms - if GLES support is disabled at
-// compile time then it does nothing.
-#define RENDERDOC_HOOK_EGL OPTION_ON
-
 #endif
+
+// checks a runtime opt-out option to disallow hooking EGL. On Windows with no EGL support then the
+// EGL library is an emulator, so this means we'll capture the underlying calls it makes to the
+// native API. On Android this is useful if we detect that GLES layering is supported.
+bool ShouldHookEGL();
 
 #define GL_APICALL
 
@@ -129,7 +127,7 @@ struct GLWindowingData
 
 #endif
 
-#if defined(RENDERDOC_SUPPORT_GLES)
+#if defined(RENDERDOC_SUPPORT_EGL)
 
 // force include the elgplatform.h, as we want to use
 // our own because the system one could be a bit older and
@@ -147,7 +145,7 @@ struct GLWindowingData
     dpy = NULL;
     ctx = NULL;
     wnd = (GLWindowPtr)NULL;
-    egl_wnd = (GLESWindowPtr)NULL;
+    egl_wnd = (EGLSurface)NULL;
     cfg = NULL;
   }
 
@@ -163,35 +161,30 @@ struct GLWindowingData
   typedef void *GLConfigPtr;
 #endif
 
-#if defined(RENDERDOC_SUPPORT_GLES)
-  typedef EGLDisplay GLESDisplayPtr;
-  typedef EGLContext GLESContextPtr;
-  typedef EGLSurface GLESWindowPtr;
-  typedef EGLConfig GLESConfigPtr;
-#else
-  typedef void *GLESDisplayPtr;
-  typedef void *GLESContextPtr;
-  typedef void *GLESWindowPtr;
-  typedef void *GLESConfigPtr;
+#if !defined(RENDERDOC_SUPPORT_EGL)
+  typedef void *EGLDisplay;
+  typedef void *EGLContext;
+  typedef void *EGLSurface;
+  typedef void *EGLConfig;
 #endif
 
   union
   {
     GLDisplayPtr dpy;
-    GLESDisplayPtr egl_dpy;
+    EGLDisplay egl_dpy;
   };
   union
   {
     GLContextPtr ctx;
-    GLESContextPtr egl_ctx;
+    EGLContext egl_ctx;
   };
   union
   {
     GLConfigPtr cfg;
-    GLESConfigPtr egl_cfg;
+    EGLConfig egl_cfg;
   };
   GLWindowPtr wnd;
-  GLESWindowPtr egl_wnd;
+  EGLSurface egl_wnd;
 };
 
 #elif ENABLED(RDOC_APPLE)
@@ -205,29 +198,26 @@ struct GLWindowingData
     ctx = NULL;
     wnd = NULL;
     pix = NULL;
-
-    layer = NULL;
   }
 
   union
   {
     CGLContextObj ctx;
-    void *nsctx;    // during replay only, this is the NSOpenGLContext
+    void *nsgl_ctx;    // during replay only, this is the NSOpenGLContext
   };
 
   void *wnd;    // during capture, this is the CGL window ID. During replay, it's the NSView
   CGLPixelFormatObj pix;
-
-  void *layer;    // during replay only, this is the CALayer
 };
 
-#define DECL_HOOK_EXPORT(function)                                                                    \
-  __attribute__((used)) static struct                                                                 \
-  {                                                                                                   \
-    const void *replacment;                                                                           \
-    const void *replacee;                                                                             \
-  } _interpose_def_##function __attribute__((section("__DATA,__interpose"))) = {                      \
-      (const void *)(unsigned long)&GL_EXPORT_NAME(function), (const void *)(unsigned long)&function, \
+#define DECL_HOOK_EXPORT(function)                                               \
+  __attribute__((used)) static struct                                            \
+  {                                                                              \
+    const void *replacment;                                                      \
+    const void *replacee;                                                        \
+  } _interpose_def_##function __attribute__((section("__DATA,__interpose"))) = { \
+      (const void *)(unsigned long)&GL_EXPORT_NAME(function),                    \
+      (const void *)(unsigned long)&function,                                    \
   };
 
 #elif ENABLED(RDOC_ANDROID)
@@ -263,11 +253,42 @@ struct GLWindowingData
   EGLConfig egl_cfg;
 };
 
+#elif ENABLED(RDOC_SWITCH)
+
+// force include the eglplatform.h
+#include "official/eglplatform.h"
+
+#include "official/egl.h"
+#include "official/eglext.h"
+
+struct GLWindowingData
+{
+  GLWindowingData()
+  {
+    egl_ctx = NULL;
+    egl_dpy = NULL;
+    wnd = NULL;
+    egl_wnd = NULL;
+    egl_cfg = NULL;
+  }
+
+  union
+  {
+    void *ctx;
+    EGLContext egl_ctx;
+  };
+  EGLSurface egl_wnd;
+  void *wnd;
+  EGLDisplay egl_dpy;
+  EGLConfig egl_cfg;
+};
+
 #else
 #error "Unknown platform"
 #endif
 
-#include "api/replay/renderdoc_replay.h"
+#undef None
+#undef Bool
 
 struct GLPlatform
 {
@@ -283,13 +304,29 @@ struct GLPlatform
   virtual GLWindowingData MakeOutputWindow(WindowingData window, bool depth,
                                            GLWindowingData share_context) = 0;
 
+  // for pushing and popping a child context. The default implementation just does
+  // MakeContextCurrent but platforms can override this if they need more complex state handling
+  virtual bool PushChildContext(GLWindowingData existing, GLWindowingData newChild,
+                                GLWindowingData *saved)
+  {
+    bool success = MakeContextCurrent(newChild);
+    *saved = existing;
+    return success;
+  }
+  virtual void PopChildContext(GLWindowingData existing, GLWindowingData newChild,
+                               GLWindowingData saved)
+  {
+    MakeContextCurrent(saved);
+  }
   // for 'backwards compatible' overlay rendering
-  virtual void DrawQuads(float width, float height, const std::vector<Vec4f> &vertices) = 0;
+  virtual void DrawQuads(float width, float height, const rdcarray<Vec4f> &vertices) = 0;
 
   // for initialisation at replay time
+  virtual bool CanCreateGLContext() = 0;
   virtual bool CanCreateGLESContext() = 0;
   virtual bool PopulateForReplay() = 0;
-  virtual ReplayStatus InitialiseAPI(GLWindowingData &replayContext, RDCDriver api) = 0;
+  virtual void SetDriverType(RDCDriver api) = 0;
+  virtual RDResult InitialiseAPI(GLWindowingData &replayContext, RDCDriver api, bool debug) = 0;
   virtual void *GetReplayFunction(const char *funcname) = 0;
 };
 
@@ -308,14 +345,16 @@ class GLDummyPlatform : public GLPlatform
   {
     return GLWindowingData();
   }
-  virtual void DrawQuads(float width, float height, const std::vector<Vec4f> &vertices) {}
+  virtual void DrawQuads(float width, float height, const rdcarray<Vec4f> &vertices) {}
   virtual void *GetReplayFunction(const char *funcname) { return NULL; }
   // for initialisation at replay time
+  virtual bool CanCreateGLContext() { return true; }
   virtual bool CanCreateGLESContext() { return true; }
   virtual bool PopulateForReplay() { return true; }
-  virtual ReplayStatus InitialiseAPI(GLWindowingData &replayContext, RDCDriver api)
+  virtual void SetDriverType(RDCDriver api) {}
+  virtual RDResult InitialiseAPI(GLWindowingData &replayContext, RDCDriver api, bool debug)
   {
-    return ReplayStatus::Succeeded;
+    return ResultCode::Succeeded;
   }
 };
 
@@ -325,7 +364,7 @@ struct GLVersion
   int minor;
 };
 
-std::vector<GLVersion> GetReplayVersions(RDCDriver api);
+rdcarray<GLVersion> GetReplayVersions(RDCDriver api);
 
 #if defined(RENDERDOC_SUPPORT_GL)
 
@@ -334,7 +373,7 @@ GLPlatform &GetGLPlatform();
 
 #endif
 
-#if defined(RENDERDOC_SUPPORT_GLES)
+#if defined(RENDERDOC_SUPPORT_EGL)
 
 // using EGL. Different name since it both platform GL and EGL libraries can be available at once
 GLPlatform &GetEGLPlatform();
@@ -388,8 +427,6 @@ typedef BOOL(APIENTRY *PFNWGLDXLOCKOBJECTSNVPROC)(HANDLE hDevice, GLint count, H
 typedef BOOL(APIENTRY *PFNWGLDXUNLOCKOBJECTSNVPROC)(HANDLE hDevice, GLint count, HANDLE *hObjects);
 #endif
 
-#include "api/replay/renderdoc_replay.h"
-
 // bit of a hack, to work around C4127: conditional expression is constant
 // on template parameters
 template <typename T>
@@ -414,12 +451,11 @@ T CheckConstParam(T t);
 
 #define USE_SCRATCH_SERIALISER() WriteSerialiser &ser = m_ScratchSerialiser;
 
-#define SERIALISE_TIME_CALL(...)                                                                    \
-  m_ScratchSerialiser.ChunkMetadata().timestampMicro = RenderDoc::Inst().GetMicrosecondTimestamp(); \
-  __VA_ARGS__;                                                                                      \
-  m_ScratchSerialiser.ChunkMetadata().durationMicro =                                               \
-      RenderDoc::Inst().GetMicrosecondTimestamp() -                                                 \
-      m_ScratchSerialiser.ChunkMetadata().timestampMicro;
+#define SERIALISE_TIME_CALL(...)                                          \
+  m_ScratchSerialiser.ChunkMetadata().timestampMicro = Timing::GetTick(); \
+  __VA_ARGS__;                                                            \
+  m_ScratchSerialiser.ChunkMetadata().durationMicro =                     \
+      Timing::GetTick() - m_ScratchSerialiser.ChunkMetadata().timestampMicro;
 
 // A handy macros to say "is the serialiser reading and we're doing replay-mode stuff?"
 // The reason we check both is that checking the first allows the compiler to eliminate the other
@@ -431,11 +467,12 @@ T CheckConstParam(T t);
 // on GL we don't have an easy way of checking which functions/extensions were used or which
 // functions/extensions on replay could suffice. So we check at the last minute on replay and bail
 // out if it's not present
-#define CheckReplayFunctionPresent(func)                         \
-  if(func == NULL)                                               \
-  {                                                              \
-    m_FailedReplayStatus = ReplayStatus::APIHardwareUnsupported; \
-    return false;                                                \
+#define CheckReplayFunctionPresent(func)                       \
+  if(GL.func == NULL)                                          \
+  {                                                            \
+    RDCERR("Function " #func " not available on replay.");     \
+    m_FailedReplayResult = ResultCode::APIHardwareUnsupported; \
+    return false;                                              \
   }
 
 // no longer in glcorearb.h or glext.h
@@ -453,14 +490,13 @@ extern Threading::CriticalSection glLock;
 // replay only class for handling marker regions
 struct GLMarkerRegion
 {
-  GLMarkerRegion(const std::string &marker, GLenum source = eGL_DEBUG_SOURCE_APPLICATION,
-                 GLuint id = 0);
+  GLMarkerRegion(const rdcstr &marker, GLenum source = eGL_DEBUG_SOURCE_APPLICATION, GLuint id = 0);
   ~GLMarkerRegion();
 
-  static void Begin(const std::string &marker, GLenum source = eGL_DEBUG_SOURCE_APPLICATION,
+  static void Begin(const rdcstr &marker, GLenum source = eGL_DEBUG_SOURCE_APPLICATION,
                     GLuint id = 0);
-  static void Set(const std::string &marker, GLenum source = eGL_DEBUG_SOURCE_APPLICATION,
-                  GLuint id = 0, GLenum severity = eGL_DEBUG_SEVERITY_NOTIFICATION);
+  static void Set(const rdcstr &marker, GLenum source = eGL_DEBUG_SOURCE_APPLICATION, GLuint id = 0,
+                  GLenum severity = eGL_DEBUG_SEVERITY_NOTIFICATION);
   static void End();
 };
 
@@ -468,12 +504,13 @@ struct GLMarkerRegion
 // - i.e. change state through here, and track dirty bits.
 struct GLPushPopState
 {
-  bool enableBits[8];
+  bool enableBits[9];
   GLenum ClipOrigin, ClipDepth;
   GLenum EquationRGB, EquationAlpha;
   GLenum SourceRGB, SourceAlpha;
   GLenum DestinationRGB, DestinationAlpha;
   GLenum PolygonMode;
+  GLdouble bounds[2];
   GLfloat Viewportf[4];
   GLint Viewport[4];
   GLenum ActiveTexture;
@@ -507,7 +544,7 @@ struct GLPushPopState
 };
 
 template <class DispatchTable>
-void DrawQuads(DispatchTable &GL, float width, float height, const std::vector<Vec4f> &vertices)
+void DrawQuads(DispatchTable &GL, float width, float height, const rdcarray<Vec4f> &vertices)
 {
   const GLenum GL_MATRIX_MODE = (GLenum)0x0BA0;
   const GLenum GL_MODELVIEW = (GLenum)0x1700;
@@ -564,18 +601,22 @@ Topology MakePrimitiveTopology(GLenum Topo);
 GLenum MakeGLPrimitiveTopology(Topology Topo);
 BufferCategory MakeBufferCategory(GLenum bufferTarget);
 AddressMode MakeAddressMode(GLenum addr);
-TextureFilter MakeFilter(GLenum minf, GLenum magf, bool shadowSampler, float maxAniso);
+TextureFilter MakeFilter(GLenum minf, GLenum magf, float maxAniso);
 ShaderStage MakeShaderStage(GLenum type);
 CompareFunction MakeCompareFunc(GLenum func);
 StencilOperation MakeStencilOp(GLenum op);
 LogicOperation MakeLogicOp(GLenum op);
 BlendMultiplier MakeBlendMultiplier(GLenum blend);
 BlendOperation MakeBlendOp(GLenum op);
+TextureSwizzle MakeSwizzle(GLenum s);
 
 void ClearGLErrors();
 
 GLuint GetBoundVertexBuffer(GLuint idx);
 GLint GetNumVertexBuffers();
+
+struct ShaderReflection;
+struct ShaderBindpointMapping;
 
 void EvaluateSPIRVBindpointMapping(GLuint curProg, int shadIdx, const ShaderReflection *refl,
                                    ShaderBindpointMapping &mapping);
@@ -659,6 +700,9 @@ DECLARE_REFLECTION_ENUM(AttribType);
 
 enum GLframebufferbitfield
 {
+  COLOR_BUFFER_BIT = 0x4000,
+  DEPTH_BUFFER_BIT = 0x100,
+  STENCIL_BUFFER_BIT = 0x400,
 };
 
 DECLARE_REFLECTION_ENUM(GLframebufferbitfield);
@@ -689,6 +733,7 @@ extern bool IsGLES;
   EXT_TO_CHECK(33, 30, ARB_texture_swizzle)                      \
   EXT_TO_CHECK(33, 99, ARB_occlusion_query2)                     \
   EXT_TO_CHECK(33, 99, ARB_timer_query)                          \
+  EXT_TO_CHECK(33, 30, ARB_shader_bit_encoding)                  \
   EXT_TO_CHECK(40, 32, ARB_draw_buffers_blend)                   \
   EXT_TO_CHECK(40, 31, ARB_draw_indirect)                        \
   EXT_TO_CHECK(40, 32, ARB_gpu_shader5)                          \
@@ -713,6 +758,7 @@ extern bool IsGLES;
   EXT_TO_CHECK(43, 31, ARB_compute_shader)                       \
   EXT_TO_CHECK(43, 32, ARB_copy_image)                           \
   EXT_TO_CHECK(43, 30, ARB_ES3_compatibility)                    \
+  EXT_TO_CHECK(43, 30, ARB_invalidate_subdata)                   \
   EXT_TO_CHECK(43, 99, ARB_internalformat_query2)                \
   EXT_TO_CHECK(43, 31, ARB_program_interface_query)              \
   EXT_TO_CHECK(43, 31, ARB_shader_storage_buffer_object)         \
@@ -760,7 +806,9 @@ extern bool IsGLES;
   EXT_TO_CHECK(99, 99, NV_read_depth_stencil)                    \
   EXT_TO_CHECK(99, 99, EXT_disjoint_timer_query)                 \
   EXT_TO_CHECK(99, 99, EXT_multisampled_render_to_texture)       \
-  EXT_TO_CHECK(99, 99, OVR_multiview)
+  EXT_TO_CHECK(99, 99, OVR_multiview)                            \
+  EXT_TO_CHECK(99, 99, OES_texture_float)                        \
+  EXT_TO_CHECK(99, 99, EXT_discard_framebuffer)
 
 // GL extensions equivalents
 // Either promoted extensions from EXT to ARB, or
@@ -824,18 +872,28 @@ enum VendorCheckEnum
   VendorCheck_AMD_copy_compressed_cubemaps,
   VendorCheck_AMD_vertex_array_elem_buffer_query,
   VendorCheck_Qualcomm_avoid_glCopyImageSubData,
+  VendorCheck_Qualcomm_emulate_cube_reads,
   VendorCheck_Count,
 };
 extern bool VendorCheck[VendorCheck_Count];
 
+enum class ShaderType;
+
 // fills out the extension supported array and the version-specific checks above
 void DoVendorChecks(GLPlatform &platform, GLWindowingData context);
 void GetContextVersion(bool &ctxGLES, int &ctxVersion);
-void FetchEnabledExtensions();
+bool FetchEnabledExtensions();
+void GetGLSLVersions(ShaderType &shaderType, int &glslVersion, int &glslBaseVer, int &glslCSVer);
+
+GLuint CreateShader(GLenum shaderType, const rdcstr &src);
+GLuint CreateSPIRVShader(GLenum shaderType, const rdcstr &src);
+GLuint CreateShaderProgram(const rdcstr &vs, const rdcstr &fs, const rdcstr &gs = "");
+GLuint CreateShaderProgram(GLuint vs, GLuint fs, GLuint gs = 0);
+GLuint CreateCShaderProgram(const rdcstr &cs);
 
 // verify that we got a replay context that we can work with
-bool CheckReplayContext();
-bool ValidateFunctionPointers();
+RDResult CheckReplayContext();
+RDResult ValidateFunctionPointers();
 
 #include "core/core.h"
 #include "serialise/serialiser.h"
@@ -844,12 +902,13 @@ struct ShaderReflection;
 
 struct PerStageReflections
 {
-  const ShaderReflection *refls[6] = {};
-  const ShaderBindpointMapping *mappings[6] = {};
+  const ShaderReflection *refls[NumShaderStages] = {};
+  const ShaderBindpointMapping *mappings[NumShaderStages] = {};
 };
 
 void CopyProgramUniforms(const PerStageReflections &srcStages, GLuint progSrc,
-                         const PerStageReflections &dstStages, GLuint progDst);
+                         const PerStageReflections &dstStages, GLuint progDst,
+                         std::map<GLint, GLint> *locTranslate = NULL);
 template <typename SerialiserType>
 void SerialiseProgramUniforms(SerialiserType &ser, CaptureState state,
                               const PerStageReflections &stages, GLuint prog,
@@ -2165,6 +2224,20 @@ enum class GLChunk : uint32_t
 
   glBlendEquationARB,
   glPrimitiveBoundingBoxARB,
+
+  SwapBuffers,
+  wglSwapBuffers,
+  glXSwapBuffers,
+  CGLFlushDrawable,
+  eglSwapBuffers,
+  eglPostSubBufferNV,
+  eglSwapBuffersWithDamageEXT,
+  eglSwapBuffersWithDamageKHR,
+
+  ImplicitThreadSwitch,
+
+  glMapBufferRangeEXT,
+  glFlushMappedBufferRangeEXT,
 
   Max,
 };

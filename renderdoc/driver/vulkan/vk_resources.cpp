@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -23,6 +23,7 @@
  ******************************************************************************/
 
 #include "vk_resources.h"
+#include "maths/vec.h"
 #include "vk_info.h"
 
 WRAPPED_POOL_INST(WrappedVkInstance)
@@ -64,6 +65,20 @@ bool IsDispatchableRes(WrappedVkRes *ptr)
   return (WrappedVkPhysicalDevice::IsAlloc(ptr) || WrappedVkInstance::IsAlloc(ptr) ||
           WrappedVkDevice::IsAlloc(ptr) || WrappedVkQueue::IsAlloc(ptr) ||
           WrappedVkCommandBuffer::IsAlloc(ptr));
+}
+
+bool IsPostponableRes(const WrappedVkRes *ptr)
+{
+  // only memory and images are postponed
+  if(WrappedVkDeviceMemory::IsAlloc(ptr) || WrappedVkImage::IsAlloc(ptr))
+  {
+    // and only if they're not storable. If they are storable they may have been written recently in
+    // a descriptor set binding and we didn't track it (since descriptor updates can be too
+    // high-frequency to be worth tracking), so pessimistically we don't postpone.
+    return !((WrappedVkNonDispRes *)ptr)->record->storable;
+  }
+
+  return false;
 }
 
 VkResourceType IdentifyTypeByPtr(WrappedVkRes *ptr)
@@ -190,6 +205,20 @@ bool IsBlockFormat(VkFormat f)
     case VK_FORMAT_ASTC_12x10_SRGB_BLOCK:
     case VK_FORMAT_ASTC_12x12_UNORM_BLOCK:
     case VK_FORMAT_ASTC_12x12_SRGB_BLOCK:
+    case VK_FORMAT_ASTC_4x4_SFLOAT_BLOCK:
+    case VK_FORMAT_ASTC_5x4_SFLOAT_BLOCK:
+    case VK_FORMAT_ASTC_5x5_SFLOAT_BLOCK:
+    case VK_FORMAT_ASTC_6x5_SFLOAT_BLOCK:
+    case VK_FORMAT_ASTC_6x6_SFLOAT_BLOCK:
+    case VK_FORMAT_ASTC_8x5_SFLOAT_BLOCK:
+    case VK_FORMAT_ASTC_8x6_SFLOAT_BLOCK:
+    case VK_FORMAT_ASTC_8x8_SFLOAT_BLOCK:
+    case VK_FORMAT_ASTC_10x5_SFLOAT_BLOCK:
+    case VK_FORMAT_ASTC_10x6_SFLOAT_BLOCK:
+    case VK_FORMAT_ASTC_10x8_SFLOAT_BLOCK:
+    case VK_FORMAT_ASTC_10x10_SFLOAT_BLOCK:
+    case VK_FORMAT_ASTC_12x10_SFLOAT_BLOCK:
+    case VK_FORMAT_ASTC_12x12_SFLOAT_BLOCK:
     case VK_FORMAT_PVRTC1_2BPP_UNORM_BLOCK_IMG:
     case VK_FORMAT_PVRTC1_2BPP_SRGB_BLOCK_IMG:
     case VK_FORMAT_PVRTC1_4BPP_UNORM_BLOCK_IMG:
@@ -315,7 +344,7 @@ bool IsSRGBFormat(VkFormat f)
   return false;
 }
 
-bool IsDoubleFormat(VkFormat f)
+bool Is64BitFormat(VkFormat f)
 {
   switch(f)
   {
@@ -436,7 +465,11 @@ bool IsYUVFormat(VkFormat f)
     case VK_FORMAT_G16_B16R16_2PLANE_420_UNORM:
     case VK_FORMAT_G16_B16_R16_3PLANE_422_UNORM:
     case VK_FORMAT_G16_B16R16_2PLANE_422_UNORM:
-    case VK_FORMAT_G16_B16_R16_3PLANE_444_UNORM: return true;
+    case VK_FORMAT_G16_B16_R16_3PLANE_444_UNORM:
+    case VK_FORMAT_G8_B8R8_2PLANE_444_UNORM:
+    case VK_FORMAT_G10X6_B10X6R10X6_2PLANE_444_UNORM_3PACK16:
+    case VK_FORMAT_G12X4_B12X4R12X4_2PLANE_444_UNORM_3PACK16:
+    case VK_FORMAT_G16_B16R16_2PLANE_444_UNORM: return true;
     default: break;
   }
 
@@ -454,7 +487,11 @@ uint32_t GetYUVPlaneCount(VkFormat f)
     case VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16:
     case VK_FORMAT_G10X6_B10X6R10X6_2PLANE_422_UNORM_3PACK16:
     case VK_FORMAT_G12X4_B12X4R12X4_2PLANE_420_UNORM_3PACK16:
-    case VK_FORMAT_G12X4_B12X4R12X4_2PLANE_422_UNORM_3PACK16: return 2;
+    case VK_FORMAT_G12X4_B12X4R12X4_2PLANE_422_UNORM_3PACK16:
+    case VK_FORMAT_G8_B8R8_2PLANE_444_UNORM:
+    case VK_FORMAT_G10X6_B10X6R10X6_2PLANE_444_UNORM_3PACK16:
+    case VK_FORMAT_G12X4_B12X4R12X4_2PLANE_444_UNORM_3PACK16:
+    case VK_FORMAT_G16_B16R16_2PLANE_444_UNORM: return 2;
     case VK_FORMAT_G8_B8_R8_3PLANE_420_UNORM:
     case VK_FORMAT_G8_B8_R8_3PLANE_422_UNORM:
     case VK_FORMAT_G8_B8_R8_3PLANE_444_UNORM:
@@ -467,6 +504,7 @@ uint32_t GetYUVPlaneCount(VkFormat f)
     case VK_FORMAT_G16_B16_R16_3PLANE_420_UNORM:
     case VK_FORMAT_G16_B16_R16_3PLANE_422_UNORM:
     case VK_FORMAT_G16_B16_R16_3PLANE_444_UNORM: return 3;
+
     default: break;
   }
 
@@ -516,25 +554,30 @@ VkFormat GetYUVViewPlaneFormat(VkFormat f, uint32_t plane)
     case VK_FORMAT_G8_B8_R8_3PLANE_444_UNORM: return VK_FORMAT_R8_UNORM;
     case VK_FORMAT_G8_B8R8_2PLANE_420_UNORM:
     case VK_FORMAT_G8_B8R8_2PLANE_422_UNORM:
+    case VK_FORMAT_G8_B8R8_2PLANE_444_UNORM:
       return plane == 0 ? VK_FORMAT_R8_UNORM : VK_FORMAT_R8G8_UNORM;
     case VK_FORMAT_G10X6_B10X6_R10X6_3PLANE_420_UNORM_3PACK16:
     case VK_FORMAT_G10X6_B10X6_R10X6_3PLANE_422_UNORM_3PACK16:
     case VK_FORMAT_G10X6_B10X6_R10X6_3PLANE_444_UNORM_3PACK16: return VK_FORMAT_R10X6_UNORM_PACK16;
     case VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16:
     case VK_FORMAT_G10X6_B10X6R10X6_2PLANE_422_UNORM_3PACK16:
+    case VK_FORMAT_G10X6_B10X6R10X6_2PLANE_444_UNORM_3PACK16:
       return plane == 0 ? VK_FORMAT_R10X6_UNORM_PACK16 : VK_FORMAT_R10X6G10X6_UNORM_2PACK16;
     case VK_FORMAT_G12X4_B12X4_R12X4_3PLANE_420_UNORM_3PACK16:
     case VK_FORMAT_G12X4_B12X4_R12X4_3PLANE_422_UNORM_3PACK16:
     case VK_FORMAT_G12X4_B12X4_R12X4_3PLANE_444_UNORM_3PACK16: return VK_FORMAT_R12X4_UNORM_PACK16;
     case VK_FORMAT_G12X4_B12X4R12X4_2PLANE_420_UNORM_3PACK16:
     case VK_FORMAT_G12X4_B12X4R12X4_2PLANE_422_UNORM_3PACK16:
+    case VK_FORMAT_G12X4_B12X4R12X4_2PLANE_444_UNORM_3PACK16:
       return plane == 0 ? VK_FORMAT_R12X4_UNORM_PACK16 : VK_FORMAT_R12X4G12X4_UNORM_2PACK16;
     case VK_FORMAT_G16_B16_R16_3PLANE_420_UNORM:
     case VK_FORMAT_G16_B16_R16_3PLANE_422_UNORM:
     case VK_FORMAT_G16_B16_R16_3PLANE_444_UNORM: return VK_FORMAT_R16_UNORM;
     case VK_FORMAT_G16_B16R16_2PLANE_420_UNORM:
     case VK_FORMAT_G16_B16R16_2PLANE_422_UNORM:
+    case VK_FORMAT_G16_B16R16_2PLANE_444_UNORM:
       return plane == 0 ? VK_FORMAT_R16_UNORM : VK_FORMAT_R16G16_UNORM;
+
     default: break;
   }
 
@@ -576,11 +619,12 @@ void GetYUVShaderParameters(VkFormat f, Vec4u &YUVDownsampleRate, Vec4u &YUVACha
     {
       case VK_FORMAT_G8B8G8R8_422_UNORM: YUVAChannels = {0, 2, 1, 0xff}; break;
       case VK_FORMAT_B8G8R8G8_422_UNORM: YUVAChannels = {0, 2, 1, 0xff}; break;
-      case VK_FORMAT_G8_B8_R8_3PLANE_420_UNORM: YUVAChannels = {0, 2, 1, 0xff}; break;
+      case VK_FORMAT_G8_B8_R8_3PLANE_420_UNORM: YUVAChannels = {0, 4, 8, 0xff}; break;
       case VK_FORMAT_G8_B8R8_2PLANE_420_UNORM: YUVAChannels = {0, 4, 5, 0xff}; break;
       case VK_FORMAT_G8_B8_R8_3PLANE_422_UNORM: YUVAChannels = {0, 4, 8, 0xff}; break;
       case VK_FORMAT_G8_B8R8_2PLANE_422_UNORM: YUVAChannels = {0, 4, 5, 0xff}; break;
       case VK_FORMAT_G8_B8_R8_3PLANE_444_UNORM: YUVAChannels = {0, 4, 8, 0xff}; break;
+      case VK_FORMAT_G8_B8R8_2PLANE_444_UNORM: YUVAChannels = {0, 4, 5, 0xff}; break;
       case VK_FORMAT_R10X6_UNORM_PACK16: YUVAChannels = {0, 0xff, 0xff, 0xff}; break;
       case VK_FORMAT_R10X6G10X6_UNORM_2PACK16: YUVAChannels = {0xff, 0, 1, 0xff}; break;
       case VK_FORMAT_R10X6G10X6B10X6A10X6_UNORM_4PACK16: YUVAChannels = {1, 2, 0, 3}; break;
@@ -600,6 +644,9 @@ void GetYUVShaderParameters(VkFormat f, Vec4u &YUVDownsampleRate, Vec4u &YUVACha
         break;
       case VK_FORMAT_G10X6_B10X6_R10X6_3PLANE_444_UNORM_3PACK16:
         YUVAChannels = {0, 4, 8, 0xff};
+        break;
+      case VK_FORMAT_G10X6_B10X6R10X6_2PLANE_444_UNORM_3PACK16:
+        YUVAChannels = {0, 4, 5, 0xff};
         break;
       case VK_FORMAT_R12X4_UNORM_PACK16: YUVAChannels = {0, 0xff, 0xff, 0xff}; break;
       case VK_FORMAT_R12X4G12X4_UNORM_2PACK16: YUVAChannels = {0xff, 0, 1, 0xff}; break;
@@ -621,6 +668,9 @@ void GetYUVShaderParameters(VkFormat f, Vec4u &YUVDownsampleRate, Vec4u &YUVACha
       case VK_FORMAT_G12X4_B12X4_R12X4_3PLANE_444_UNORM_3PACK16:
         YUVAChannels = {0, 4, 8, 0xff};
         break;
+      case VK_FORMAT_G12X4_B12X4R12X4_2PLANE_444_UNORM_3PACK16:
+        YUVAChannels = {0, 4, 5, 0xff};
+        break;
       case VK_FORMAT_G16B16G16R16_422_UNORM: YUVAChannels = {0, 2, 1, 0xff}; break;
       case VK_FORMAT_B16G16R16G16_422_UNORM: YUVAChannels = {0, 2, 1, 0xff}; break;
       case VK_FORMAT_G16_B16_R16_3PLANE_420_UNORM: YUVAChannels = {0, 4, 8, 0xff}; break;
@@ -628,6 +678,7 @@ void GetYUVShaderParameters(VkFormat f, Vec4u &YUVDownsampleRate, Vec4u &YUVACha
       case VK_FORMAT_G16_B16_R16_3PLANE_422_UNORM: YUVAChannels = {0, 4, 8, 0xff}; break;
       case VK_FORMAT_G16_B16R16_2PLANE_422_UNORM: YUVAChannels = {0, 4, 5, 0xff}; break;
       case VK_FORMAT_G16_B16_R16_3PLANE_444_UNORM: YUVAChannels = {0, 4, 8, 0xff}; break;
+      case VK_FORMAT_G16_B16R16_2PLANE_444_UNORM: YUVAChannels = {0, 4, 5, 0xff}; break;
       default: break;
     }
   }
@@ -646,9 +697,9 @@ VkFormat GetDepthOnlyFormat(VkFormat f)
   return f;
 }
 
-VkFormat GetViewCastedFormat(VkFormat f, CompType typeHint)
+VkFormat GetViewCastedFormat(VkFormat f, CompType typeCast)
 {
-  if(typeHint == CompType::Typeless)
+  if(typeCast == CompType::Typeless)
     return f;
 
   switch(f)
@@ -657,9 +708,9 @@ VkFormat GetViewCastedFormat(VkFormat f, CompType typeHint)
     case VK_FORMAT_R64G64B64A64_SINT:
     case VK_FORMAT_R64G64B64A64_SFLOAT:
     {
-      if(typeHint == CompType::UInt)
+      if(typeCast == CompType::UInt)
         return VK_FORMAT_R64G64B64A64_UINT;
-      else if(typeHint == CompType::SInt)
+      else if(typeCast == CompType::SInt)
         return VK_FORMAT_R64G64B64A64_SINT;
       else
         return VK_FORMAT_R64G64B64A64_SFLOAT;
@@ -668,9 +719,9 @@ VkFormat GetViewCastedFormat(VkFormat f, CompType typeHint)
     case VK_FORMAT_R64G64B64_SINT:
     case VK_FORMAT_R64G64B64_SFLOAT:
     {
-      if(typeHint == CompType::UInt)
+      if(typeCast == CompType::UInt)
         return VK_FORMAT_R64G64B64_UINT;
-      else if(typeHint == CompType::SInt)
+      else if(typeCast == CompType::SInt)
         return VK_FORMAT_R64G64B64_SINT;
       else
         return VK_FORMAT_R64G64B64_SFLOAT;
@@ -679,9 +730,9 @@ VkFormat GetViewCastedFormat(VkFormat f, CompType typeHint)
     case VK_FORMAT_R64G64_SINT:
     case VK_FORMAT_R64G64_SFLOAT:
     {
-      if(typeHint == CompType::UInt)
+      if(typeCast == CompType::UInt)
         return VK_FORMAT_R64G64_UINT;
-      else if(typeHint == CompType::SInt)
+      else if(typeCast == CompType::SInt)
         return VK_FORMAT_R64G64_SINT;
       else
         return VK_FORMAT_R64G64_SFLOAT;
@@ -690,9 +741,9 @@ VkFormat GetViewCastedFormat(VkFormat f, CompType typeHint)
     case VK_FORMAT_R64_SINT:
     case VK_FORMAT_R64_SFLOAT:
     {
-      if(typeHint == CompType::UInt)
+      if(typeCast == CompType::UInt)
         return VK_FORMAT_R64_UINT;
-      else if(typeHint == CompType::SInt)
+      else if(typeCast == CompType::SInt)
         return VK_FORMAT_R64_SINT;
       else
         return VK_FORMAT_R64_SFLOAT;
@@ -701,9 +752,9 @@ VkFormat GetViewCastedFormat(VkFormat f, CompType typeHint)
     case VK_FORMAT_R32G32B32A32_SINT:
     case VK_FORMAT_R32G32B32A32_SFLOAT:
     {
-      if(typeHint == CompType::UInt)
+      if(typeCast == CompType::UInt)
         return VK_FORMAT_R32G32B32A32_UINT;
-      else if(typeHint == CompType::SInt)
+      else if(typeCast == CompType::SInt)
         return VK_FORMAT_R32G32B32A32_SINT;
       else
         return VK_FORMAT_R32G32B32A32_SFLOAT;
@@ -712,9 +763,9 @@ VkFormat GetViewCastedFormat(VkFormat f, CompType typeHint)
     case VK_FORMAT_R32G32B32_SINT:
     case VK_FORMAT_R32G32B32_SFLOAT:
     {
-      if(typeHint == CompType::UInt)
+      if(typeCast == CompType::UInt)
         return VK_FORMAT_R32G32B32_UINT;
-      else if(typeHint == CompType::SInt)
+      else if(typeCast == CompType::SInt)
         return VK_FORMAT_R32G32B32_SINT;
       else
         return VK_FORMAT_R32G32B32_SFLOAT;
@@ -723,9 +774,9 @@ VkFormat GetViewCastedFormat(VkFormat f, CompType typeHint)
     case VK_FORMAT_R32G32_SINT:
     case VK_FORMAT_R32G32_SFLOAT:
     {
-      if(typeHint == CompType::UInt)
+      if(typeCast == CompType::UInt)
         return VK_FORMAT_R32G32_UINT;
-      else if(typeHint == CompType::SInt)
+      else if(typeCast == CompType::SInt)
         return VK_FORMAT_R32G32_SINT;
       else
         return VK_FORMAT_R32G32_SFLOAT;
@@ -735,11 +786,11 @@ VkFormat GetViewCastedFormat(VkFormat f, CompType typeHint)
     case VK_FORMAT_R32_SFLOAT:
     case VK_FORMAT_D32_SFLOAT:
     {
-      if(typeHint == CompType::UInt)
+      if(typeCast == CompType::UInt)
         return VK_FORMAT_R32_UINT;
-      else if(typeHint == CompType::SInt)
+      else if(typeCast == CompType::SInt)
         return VK_FORMAT_R32_SINT;
-      else if(typeHint == CompType::Depth)
+      else if(typeCast == CompType::Depth)
         return VK_FORMAT_D32_SFLOAT;
       else
         return VK_FORMAT_R32_SFLOAT;
@@ -752,17 +803,17 @@ VkFormat GetViewCastedFormat(VkFormat f, CompType typeHint)
     case VK_FORMAT_R16G16B16A16_SINT:
     case VK_FORMAT_R16G16B16A16_SFLOAT:
     {
-      if(typeHint == CompType::UNorm || typeHint == CompType::UNormSRGB)
+      if(typeCast == CompType::UNorm || typeCast == CompType::UNormSRGB)
         return VK_FORMAT_R16G16B16A16_UNORM;
-      else if(typeHint == CompType::SNorm)
+      else if(typeCast == CompType::SNorm)
         return VK_FORMAT_R16G16B16A16_SNORM;
-      else if(typeHint == CompType::UScaled)
+      else if(typeCast == CompType::UScaled)
         return VK_FORMAT_R16G16B16A16_USCALED;
-      else if(typeHint == CompType::SScaled)
+      else if(typeCast == CompType::SScaled)
         return VK_FORMAT_R16G16B16A16_SSCALED;
-      else if(typeHint == CompType::UInt)
+      else if(typeCast == CompType::UInt)
         return VK_FORMAT_R16G16B16A16_UINT;
-      else if(typeHint == CompType::SInt)
+      else if(typeCast == CompType::SInt)
         return VK_FORMAT_R16G16B16A16_SINT;
       else
         return VK_FORMAT_R16G16B16A16_SFLOAT;
@@ -775,17 +826,17 @@ VkFormat GetViewCastedFormat(VkFormat f, CompType typeHint)
     case VK_FORMAT_R16G16B16_SINT:
     case VK_FORMAT_R16G16B16_SFLOAT:
     {
-      if(typeHint == CompType::UNorm || typeHint == CompType::UNormSRGB)
+      if(typeCast == CompType::UNorm || typeCast == CompType::UNormSRGB)
         return VK_FORMAT_R16G16B16_UNORM;
-      else if(typeHint == CompType::SNorm)
+      else if(typeCast == CompType::SNorm)
         return VK_FORMAT_R16G16B16_SNORM;
-      else if(typeHint == CompType::UScaled)
+      else if(typeCast == CompType::UScaled)
         return VK_FORMAT_R16G16B16_USCALED;
-      else if(typeHint == CompType::SScaled)
+      else if(typeCast == CompType::SScaled)
         return VK_FORMAT_R16G16B16_SSCALED;
-      else if(typeHint == CompType::UInt)
+      else if(typeCast == CompType::UInt)
         return VK_FORMAT_R16G16B16_UINT;
-      else if(typeHint == CompType::SInt)
+      else if(typeCast == CompType::SInt)
         return VK_FORMAT_R16G16B16_SINT;
       else
         return VK_FORMAT_R16G16B16_SFLOAT;
@@ -798,17 +849,17 @@ VkFormat GetViewCastedFormat(VkFormat f, CompType typeHint)
     case VK_FORMAT_R16G16_SINT:
     case VK_FORMAT_R16G16_SFLOAT:
     {
-      if(typeHint == CompType::UNorm || typeHint == CompType::UNormSRGB)
+      if(typeCast == CompType::UNorm || typeCast == CompType::UNormSRGB)
         return VK_FORMAT_R16G16_UNORM;
-      else if(typeHint == CompType::SNorm)
+      else if(typeCast == CompType::SNorm)
         return VK_FORMAT_R16G16_SNORM;
-      else if(typeHint == CompType::UScaled)
+      else if(typeCast == CompType::UScaled)
         return VK_FORMAT_R16G16_USCALED;
-      else if(typeHint == CompType::SScaled)
+      else if(typeCast == CompType::SScaled)
         return VK_FORMAT_R16G16_SSCALED;
-      else if(typeHint == CompType::UInt)
+      else if(typeCast == CompType::UInt)
         return VK_FORMAT_R16G16_UINT;
-      else if(typeHint == CompType::SInt)
+      else if(typeCast == CompType::SInt)
         return VK_FORMAT_R16G16_SINT;
       else
         return VK_FORMAT_R16G16_SFLOAT;
@@ -822,19 +873,19 @@ VkFormat GetViewCastedFormat(VkFormat f, CompType typeHint)
     case VK_FORMAT_R16_SFLOAT:
     case VK_FORMAT_D16_UNORM:
     {
-      if(typeHint == CompType::UNorm || typeHint == CompType::UNormSRGB)
+      if(typeCast == CompType::UNorm || typeCast == CompType::UNormSRGB)
         return VK_FORMAT_R16_UNORM;
-      else if(typeHint == CompType::SNorm)
+      else if(typeCast == CompType::SNorm)
         return VK_FORMAT_R16_SNORM;
-      else if(typeHint == CompType::UScaled)
+      else if(typeCast == CompType::UScaled)
         return VK_FORMAT_R16_USCALED;
-      else if(typeHint == CompType::SScaled)
+      else if(typeCast == CompType::SScaled)
         return VK_FORMAT_R16_SSCALED;
-      else if(typeHint == CompType::UInt)
+      else if(typeCast == CompType::UInt)
         return VK_FORMAT_R16_UINT;
-      else if(typeHint == CompType::SInt)
+      else if(typeCast == CompType::SInt)
         return VK_FORMAT_R16_SINT;
-      else if(typeHint == CompType::Depth)
+      else if(typeCast == CompType::Depth)
         return VK_FORMAT_D16_UNORM;
       else
         return VK_FORMAT_R16_SFLOAT;
@@ -847,19 +898,19 @@ VkFormat GetViewCastedFormat(VkFormat f, CompType typeHint)
     case VK_FORMAT_R8G8B8A8_SINT:
     case VK_FORMAT_R8G8B8A8_SRGB:
     {
-      if(typeHint == CompType::UNorm)
+      if(typeCast == CompType::UNorm)
         return VK_FORMAT_R8G8B8A8_UNORM;
-      else if(typeHint == CompType::SNorm)
+      else if(typeCast == CompType::SNorm)
         return VK_FORMAT_R8G8B8A8_SNORM;
-      else if(typeHint == CompType::UScaled)
+      else if(typeCast == CompType::UScaled)
         return VK_FORMAT_R8G8B8A8_USCALED;
-      else if(typeHint == CompType::SScaled)
+      else if(typeCast == CompType::SScaled)
         return VK_FORMAT_R8G8B8A8_SSCALED;
-      else if(typeHint == CompType::UInt)
+      else if(typeCast == CompType::UInt)
         return VK_FORMAT_R8G8B8A8_UINT;
-      else if(typeHint == CompType::SInt)
+      else if(typeCast == CompType::SInt)
         return VK_FORMAT_R8G8B8A8_SINT;
-      else if(typeHint == CompType::UNormSRGB)
+      else if(typeCast == CompType::UNormSRGB)
         return VK_FORMAT_R8G8B8A8_SRGB;
       else
         return VK_FORMAT_R8G8B8A8_UNORM;
@@ -872,19 +923,19 @@ VkFormat GetViewCastedFormat(VkFormat f, CompType typeHint)
     case VK_FORMAT_B8G8R8A8_SINT:
     case VK_FORMAT_B8G8R8A8_SRGB:
     {
-      if(typeHint == CompType::UNorm)
+      if(typeCast == CompType::UNorm)
         return VK_FORMAT_B8G8R8A8_UNORM;
-      else if(typeHint == CompType::SNorm)
+      else if(typeCast == CompType::SNorm)
         return VK_FORMAT_B8G8R8A8_SNORM;
-      else if(typeHint == CompType::UScaled)
+      else if(typeCast == CompType::UScaled)
         return VK_FORMAT_B8G8R8A8_USCALED;
-      else if(typeHint == CompType::SScaled)
+      else if(typeCast == CompType::SScaled)
         return VK_FORMAT_B8G8R8A8_SSCALED;
-      else if(typeHint == CompType::UInt)
+      else if(typeCast == CompType::UInt)
         return VK_FORMAT_B8G8R8A8_UINT;
-      else if(typeHint == CompType::SInt)
+      else if(typeCast == CompType::SInt)
         return VK_FORMAT_B8G8R8A8_SINT;
-      else if(typeHint == CompType::UNormSRGB)
+      else if(typeCast == CompType::UNormSRGB)
         return VK_FORMAT_B8G8R8A8_SRGB;
       else
         return VK_FORMAT_B8G8R8A8_UNORM;
@@ -897,19 +948,19 @@ VkFormat GetViewCastedFormat(VkFormat f, CompType typeHint)
     case VK_FORMAT_A8B8G8R8_SINT_PACK32:
     case VK_FORMAT_A8B8G8R8_SRGB_PACK32:
     {
-      if(typeHint == CompType::UNorm)
+      if(typeCast == CompType::UNorm)
         return VK_FORMAT_A8B8G8R8_UNORM_PACK32;
-      else if(typeHint == CompType::SNorm)
+      else if(typeCast == CompType::SNorm)
         return VK_FORMAT_A8B8G8R8_SNORM_PACK32;
-      else if(typeHint == CompType::UScaled)
+      else if(typeCast == CompType::UScaled)
         return VK_FORMAT_A8B8G8R8_USCALED_PACK32;
-      else if(typeHint == CompType::SScaled)
+      else if(typeCast == CompType::SScaled)
         return VK_FORMAT_A8B8G8R8_SSCALED_PACK32;
-      else if(typeHint == CompType::UInt)
+      else if(typeCast == CompType::UInt)
         return VK_FORMAT_A8B8G8R8_UINT_PACK32;
-      else if(typeHint == CompType::SInt)
+      else if(typeCast == CompType::SInt)
         return VK_FORMAT_A8B8G8R8_SINT_PACK32;
-      else if(typeHint == CompType::UNormSRGB)
+      else if(typeCast == CompType::UNormSRGB)
         return VK_FORMAT_A8B8G8R8_SRGB_PACK32;
       else
         return VK_FORMAT_A8B8G8R8_UNORM_PACK32;
@@ -922,19 +973,19 @@ VkFormat GetViewCastedFormat(VkFormat f, CompType typeHint)
     case VK_FORMAT_R8G8B8_SINT:
     case VK_FORMAT_R8G8B8_SRGB:
     {
-      if(typeHint == CompType::UNorm)
+      if(typeCast == CompType::UNorm)
         return VK_FORMAT_R8G8B8_UNORM;
-      else if(typeHint == CompType::SNorm)
+      else if(typeCast == CompType::SNorm)
         return VK_FORMAT_R8G8B8_SNORM;
-      else if(typeHint == CompType::UScaled)
+      else if(typeCast == CompType::UScaled)
         return VK_FORMAT_R8G8B8_USCALED;
-      else if(typeHint == CompType::SScaled)
+      else if(typeCast == CompType::SScaled)
         return VK_FORMAT_R8G8B8_SSCALED;
-      else if(typeHint == CompType::UInt)
+      else if(typeCast == CompType::UInt)
         return VK_FORMAT_R8G8B8_UINT;
-      else if(typeHint == CompType::SInt)
+      else if(typeCast == CompType::SInt)
         return VK_FORMAT_R8G8B8_SINT;
-      else if(typeHint == CompType::UNormSRGB)
+      else if(typeCast == CompType::UNormSRGB)
         return VK_FORMAT_R8G8B8_SRGB;
       else
         return VK_FORMAT_R8G8B8_UNORM;
@@ -947,19 +998,19 @@ VkFormat GetViewCastedFormat(VkFormat f, CompType typeHint)
     case VK_FORMAT_B8G8R8_SINT:
     case VK_FORMAT_B8G8R8_SRGB:
     {
-      if(typeHint == CompType::UNorm)
+      if(typeCast == CompType::UNorm)
         return VK_FORMAT_B8G8R8_UNORM;
-      else if(typeHint == CompType::SNorm)
+      else if(typeCast == CompType::SNorm)
         return VK_FORMAT_B8G8R8_SNORM;
-      else if(typeHint == CompType::UScaled)
+      else if(typeCast == CompType::UScaled)
         return VK_FORMAT_B8G8R8_USCALED;
-      else if(typeHint == CompType::SScaled)
+      else if(typeCast == CompType::SScaled)
         return VK_FORMAT_B8G8R8_SSCALED;
-      else if(typeHint == CompType::UInt)
+      else if(typeCast == CompType::UInt)
         return VK_FORMAT_B8G8R8_UINT;
-      else if(typeHint == CompType::SInt)
+      else if(typeCast == CompType::SInt)
         return VK_FORMAT_B8G8R8_SINT;
-      else if(typeHint == CompType::UNormSRGB)
+      else if(typeCast == CompType::UNormSRGB)
         return VK_FORMAT_B8G8R8_SRGB;
       else
         return VK_FORMAT_B8G8R8_UNORM;
@@ -972,19 +1023,19 @@ VkFormat GetViewCastedFormat(VkFormat f, CompType typeHint)
     case VK_FORMAT_R8G8_SINT:
     case VK_FORMAT_R8G8_SRGB:
     {
-      if(typeHint == CompType::UNorm)
+      if(typeCast == CompType::UNorm)
         return VK_FORMAT_R8G8_UNORM;
-      else if(typeHint == CompType::SNorm)
+      else if(typeCast == CompType::SNorm)
         return VK_FORMAT_R8G8_SNORM;
-      else if(typeHint == CompType::UScaled)
+      else if(typeCast == CompType::UScaled)
         return VK_FORMAT_R8G8_USCALED;
-      else if(typeHint == CompType::SScaled)
+      else if(typeCast == CompType::SScaled)
         return VK_FORMAT_R8G8_SSCALED;
-      else if(typeHint == CompType::UInt)
+      else if(typeCast == CompType::UInt)
         return VK_FORMAT_R8G8_UINT;
-      else if(typeHint == CompType::SInt)
+      else if(typeCast == CompType::SInt)
         return VK_FORMAT_R8G8_SINT;
-      else if(typeHint == CompType::UNormSRGB)
+      else if(typeCast == CompType::UNormSRGB)
         return VK_FORMAT_R8G8_SRGB;
       else
         return VK_FORMAT_R8G8_UNORM;
@@ -998,21 +1049,21 @@ VkFormat GetViewCastedFormat(VkFormat f, CompType typeHint)
     case VK_FORMAT_R8_SRGB:
     case VK_FORMAT_S8_UINT:
     {
-      if(typeHint == CompType::UNorm)
+      if(typeCast == CompType::UNorm)
         return VK_FORMAT_R8_UNORM;
-      else if(typeHint == CompType::SNorm)
+      else if(typeCast == CompType::SNorm)
         return VK_FORMAT_R8_SNORM;
-      else if(typeHint == CompType::UScaled)
+      else if(typeCast == CompType::UScaled)
         return VK_FORMAT_R8_USCALED;
-      else if(typeHint == CompType::SScaled)
+      else if(typeCast == CompType::SScaled)
         return VK_FORMAT_R8_SSCALED;
-      else if(typeHint == CompType::UInt)
+      else if(typeCast == CompType::UInt)
         return VK_FORMAT_R8_UINT;
-      else if(typeHint == CompType::SInt)
+      else if(typeCast == CompType::SInt)
         return VK_FORMAT_R8_SINT;
-      else if(typeHint == CompType::UNormSRGB)
+      else if(typeCast == CompType::UNormSRGB)
         return VK_FORMAT_R8_SRGB;
-      else if(typeHint == CompType::Depth)
+      else if(typeCast == CompType::Depth)
         return VK_FORMAT_S8_UINT;
       else
         return VK_FORMAT_R8_UNORM;
@@ -1024,17 +1075,17 @@ VkFormat GetViewCastedFormat(VkFormat f, CompType typeHint)
     case VK_FORMAT_A2B10G10R10_UINT_PACK32:
     case VK_FORMAT_A2B10G10R10_SINT_PACK32:
     {
-      if(typeHint == CompType::UNorm || typeHint == CompType::UNormSRGB)
+      if(typeCast == CompType::UNorm || typeCast == CompType::UNormSRGB)
         return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
-      else if(typeHint == CompType::SNorm)
+      else if(typeCast == CompType::SNorm)
         return VK_FORMAT_A2B10G10R10_SNORM_PACK32;
-      else if(typeHint == CompType::UScaled)
+      else if(typeCast == CompType::UScaled)
         return VK_FORMAT_A2B10G10R10_USCALED_PACK32;
-      else if(typeHint == CompType::SScaled)
+      else if(typeCast == CompType::SScaled)
         return VK_FORMAT_A2B10G10R10_SSCALED_PACK32;
-      else if(typeHint == CompType::UInt)
+      else if(typeCast == CompType::UInt)
         return VK_FORMAT_A2B10G10R10_UINT_PACK32;
-      else if(typeHint == CompType::SInt)
+      else if(typeCast == CompType::SInt)
         return VK_FORMAT_A2B10G10R10_SINT_PACK32;
       else
         return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
@@ -1046,139 +1097,237 @@ VkFormat GetViewCastedFormat(VkFormat f, CompType typeHint)
     case VK_FORMAT_A2R10G10B10_UINT_PACK32:
     case VK_FORMAT_A2R10G10B10_SINT_PACK32:
     {
-      if(typeHint == CompType::UNorm || typeHint == CompType::UNormSRGB)
+      if(typeCast == CompType::UNorm || typeCast == CompType::UNormSRGB)
         return VK_FORMAT_A2R10G10B10_UNORM_PACK32;
-      else if(typeHint == CompType::SNorm)
+      else if(typeCast == CompType::SNorm)
         return VK_FORMAT_A2R10G10B10_SNORM_PACK32;
-      else if(typeHint == CompType::UScaled)
+      else if(typeCast == CompType::UScaled)
         return VK_FORMAT_A2R10G10B10_USCALED_PACK32;
-      else if(typeHint == CompType::SScaled)
+      else if(typeCast == CompType::SScaled)
         return VK_FORMAT_A2R10G10B10_SSCALED_PACK32;
-      else if(typeHint == CompType::UInt)
+      else if(typeCast == CompType::UInt)
         return VK_FORMAT_A2R10G10B10_UINT_PACK32;
-      else if(typeHint == CompType::SInt)
+      else if(typeCast == CompType::SInt)
         return VK_FORMAT_A2R10G10B10_SINT_PACK32;
       else
         return VK_FORMAT_A2R10G10B10_UNORM_PACK32;
     }
     case VK_FORMAT_BC1_RGB_UNORM_BLOCK:
     case VK_FORMAT_BC1_RGB_SRGB_BLOCK:
-      return (typeHint == CompType::UNormSRGB) ? VK_FORMAT_BC1_RGB_SRGB_BLOCK
+      return (typeCast == CompType::UNormSRGB) ? VK_FORMAT_BC1_RGB_SRGB_BLOCK
                                                : VK_FORMAT_BC1_RGB_UNORM_BLOCK;
     case VK_FORMAT_BC1_RGBA_UNORM_BLOCK:
     case VK_FORMAT_BC1_RGBA_SRGB_BLOCK:
-      return (typeHint == CompType::UNormSRGB) ? VK_FORMAT_BC1_RGBA_SRGB_BLOCK
+      return (typeCast == CompType::UNormSRGB) ? VK_FORMAT_BC1_RGBA_SRGB_BLOCK
                                                : VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
     case VK_FORMAT_BC4_UNORM_BLOCK:
     case VK_FORMAT_BC4_SNORM_BLOCK:
-      return (typeHint == CompType::SNorm) ? VK_FORMAT_BC4_SNORM_BLOCK : VK_FORMAT_BC4_UNORM_BLOCK;
+      return (typeCast == CompType::SNorm) ? VK_FORMAT_BC4_SNORM_BLOCK : VK_FORMAT_BC4_UNORM_BLOCK;
     case VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK:
     case VK_FORMAT_ETC2_R8G8B8_SRGB_BLOCK:
-      return (typeHint == CompType::UNormSRGB) ? VK_FORMAT_ETC2_R8G8B8_SRGB_BLOCK
+      return (typeCast == CompType::UNormSRGB) ? VK_FORMAT_ETC2_R8G8B8_SRGB_BLOCK
                                                : VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK;
     case VK_FORMAT_ETC2_R8G8B8A1_UNORM_BLOCK:
     case VK_FORMAT_ETC2_R8G8B8A1_SRGB_BLOCK:
-      return (typeHint == CompType::UNormSRGB) ? VK_FORMAT_ETC2_R8G8B8A1_SRGB_BLOCK
+      return (typeCast == CompType::UNormSRGB) ? VK_FORMAT_ETC2_R8G8B8A1_SRGB_BLOCK
                                                : VK_FORMAT_ETC2_R8G8B8A1_UNORM_BLOCK;
     case VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK:
     case VK_FORMAT_ETC2_R8G8B8A8_SRGB_BLOCK:
-      return (typeHint == CompType::UNormSRGB) ? VK_FORMAT_ETC2_R8G8B8A8_SRGB_BLOCK
+      return (typeCast == CompType::UNormSRGB) ? VK_FORMAT_ETC2_R8G8B8A8_SRGB_BLOCK
                                                : VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK;
     case VK_FORMAT_EAC_R11_UNORM_BLOCK:
     case VK_FORMAT_EAC_R11_SNORM_BLOCK:
-      return (typeHint == CompType::SNorm) ? VK_FORMAT_EAC_R11_SNORM_BLOCK
+      return (typeCast == CompType::SNorm) ? VK_FORMAT_EAC_R11_SNORM_BLOCK
                                            : VK_FORMAT_EAC_R11_UNORM_BLOCK;
+    case VK_FORMAT_EAC_R11G11_UNORM_BLOCK:
+    case VK_FORMAT_EAC_R11G11_SNORM_BLOCK:
+      return (typeCast == CompType::SNorm) ? VK_FORMAT_EAC_R11G11_SNORM_BLOCK
+                                           : VK_FORMAT_EAC_R11G11_UNORM_BLOCK;
     case VK_FORMAT_BC2_UNORM_BLOCK:
     case VK_FORMAT_BC2_SRGB_BLOCK:
-      return (typeHint == CompType::UNormSRGB) ? VK_FORMAT_BC2_SRGB_BLOCK : VK_FORMAT_BC2_UNORM_BLOCK;
+      return (typeCast == CompType::UNormSRGB) ? VK_FORMAT_BC2_SRGB_BLOCK : VK_FORMAT_BC2_UNORM_BLOCK;
     case VK_FORMAT_BC3_UNORM_BLOCK:
     case VK_FORMAT_BC3_SRGB_BLOCK:
-      return (typeHint == CompType::UNormSRGB) ? VK_FORMAT_BC3_SRGB_BLOCK : VK_FORMAT_BC3_UNORM_BLOCK;
+      return (typeCast == CompType::UNormSRGB) ? VK_FORMAT_BC3_SRGB_BLOCK : VK_FORMAT_BC3_UNORM_BLOCK;
     case VK_FORMAT_BC5_UNORM_BLOCK:
     case VK_FORMAT_BC5_SNORM_BLOCK:
-      return (typeHint == CompType::SNorm) ? VK_FORMAT_BC5_SNORM_BLOCK : VK_FORMAT_BC5_UNORM_BLOCK;
+      return (typeCast == CompType::SNorm) ? VK_FORMAT_BC5_SNORM_BLOCK : VK_FORMAT_BC5_UNORM_BLOCK;
     case VK_FORMAT_BC6H_UFLOAT_BLOCK:
     case VK_FORMAT_BC6H_SFLOAT_BLOCK:
-      return (typeHint == CompType::SNorm) ? VK_FORMAT_BC6H_SFLOAT_BLOCK
+      return (typeCast == CompType::SNorm) ? VK_FORMAT_BC6H_SFLOAT_BLOCK
                                            : VK_FORMAT_BC6H_UFLOAT_BLOCK;
     case VK_FORMAT_BC7_UNORM_BLOCK:
     case VK_FORMAT_BC7_SRGB_BLOCK:
-      return (typeHint == CompType::UNormSRGB) ? VK_FORMAT_BC7_SRGB_BLOCK : VK_FORMAT_BC7_UNORM_BLOCK;
-    case VK_FORMAT_EAC_R11G11_UNORM_BLOCK:
-    case VK_FORMAT_EAC_R11G11_SNORM_BLOCK:
-      return (typeHint == CompType::SNorm) ? VK_FORMAT_EAC_R11G11_SNORM_BLOCK
-                                           : VK_FORMAT_EAC_R11G11_UNORM_BLOCK;
+      return (typeCast == CompType::UNormSRGB) ? VK_FORMAT_BC7_SRGB_BLOCK : VK_FORMAT_BC7_UNORM_BLOCK;
     case VK_FORMAT_ASTC_4x4_UNORM_BLOCK:
     case VK_FORMAT_ASTC_4x4_SRGB_BLOCK:
-      return (typeHint == CompType::UNormSRGB) ? VK_FORMAT_ASTC_4x4_SRGB_BLOCK
-                                               : VK_FORMAT_ASTC_4x4_UNORM_BLOCK;
+    case VK_FORMAT_ASTC_4x4_SFLOAT_BLOCK:
+    {
+      if(typeCast == CompType::UNormSRGB)
+        return VK_FORMAT_ASTC_4x4_SRGB_BLOCK;
+      else if(typeCast == CompType::Float)
+        return VK_FORMAT_ASTC_4x4_SFLOAT_BLOCK;
+      else
+        return VK_FORMAT_ASTC_4x4_UNORM_BLOCK;
+    }
     case VK_FORMAT_ASTC_5x4_UNORM_BLOCK:
     case VK_FORMAT_ASTC_5x4_SRGB_BLOCK:
-      return (typeHint == CompType::UNormSRGB) ? VK_FORMAT_ASTC_5x4_SRGB_BLOCK
-                                               : VK_FORMAT_ASTC_5x4_UNORM_BLOCK;
+    case VK_FORMAT_ASTC_5x4_SFLOAT_BLOCK:
+    {
+      if(typeCast == CompType::UNormSRGB)
+        return VK_FORMAT_ASTC_5x4_SRGB_BLOCK;
+      else if(typeCast == CompType::Float)
+        return VK_FORMAT_ASTC_5x4_SFLOAT_BLOCK;
+      else
+        return VK_FORMAT_ASTC_5x4_UNORM_BLOCK;
+    }
     case VK_FORMAT_ASTC_5x5_UNORM_BLOCK:
     case VK_FORMAT_ASTC_5x5_SRGB_BLOCK:
-      return (typeHint == CompType::UNormSRGB) ? VK_FORMAT_ASTC_5x5_SRGB_BLOCK
-                                               : VK_FORMAT_ASTC_5x5_UNORM_BLOCK;
+    case VK_FORMAT_ASTC_5x5_SFLOAT_BLOCK:
+    {
+      if(typeCast == CompType::UNormSRGB)
+        return VK_FORMAT_ASTC_5x5_SRGB_BLOCK;
+      else if(typeCast == CompType::Float)
+        return VK_FORMAT_ASTC_5x5_SFLOAT_BLOCK;
+      else
+        return VK_FORMAT_ASTC_5x5_UNORM_BLOCK;
+    }
     case VK_FORMAT_ASTC_6x5_UNORM_BLOCK:
     case VK_FORMAT_ASTC_6x5_SRGB_BLOCK:
-      return (typeHint == CompType::UNormSRGB) ? VK_FORMAT_ASTC_6x5_SRGB_BLOCK
-                                               : VK_FORMAT_ASTC_6x5_UNORM_BLOCK;
+    case VK_FORMAT_ASTC_6x5_SFLOAT_BLOCK:
+    {
+      if(typeCast == CompType::UNormSRGB)
+        return VK_FORMAT_ASTC_6x5_SRGB_BLOCK;
+      else if(typeCast == CompType::Float)
+        return VK_FORMAT_ASTC_6x5_SFLOAT_BLOCK;
+      else
+        return VK_FORMAT_ASTC_6x5_UNORM_BLOCK;
+    }
     case VK_FORMAT_ASTC_6x6_UNORM_BLOCK:
     case VK_FORMAT_ASTC_6x6_SRGB_BLOCK:
-      return (typeHint == CompType::UNormSRGB) ? VK_FORMAT_ASTC_6x6_SRGB_BLOCK
-                                               : VK_FORMAT_ASTC_6x6_UNORM_BLOCK;
+    case VK_FORMAT_ASTC_6x6_SFLOAT_BLOCK:
+    {
+      if(typeCast == CompType::UNormSRGB)
+        return VK_FORMAT_ASTC_6x6_SRGB_BLOCK;
+      else if(typeCast == CompType::Float)
+        return VK_FORMAT_ASTC_6x6_SFLOAT_BLOCK;
+      else
+        return VK_FORMAT_ASTC_6x6_UNORM_BLOCK;
+    }
     case VK_FORMAT_ASTC_8x5_UNORM_BLOCK:
     case VK_FORMAT_ASTC_8x5_SRGB_BLOCK:
-      return (typeHint == CompType::UNormSRGB) ? VK_FORMAT_ASTC_8x5_SRGB_BLOCK
-                                               : VK_FORMAT_ASTC_8x5_UNORM_BLOCK;
+    case VK_FORMAT_ASTC_8x5_SFLOAT_BLOCK:
+    {
+      if(typeCast == CompType::UNormSRGB)
+        return VK_FORMAT_ASTC_8x5_SRGB_BLOCK;
+      else if(typeCast == CompType::Float)
+        return VK_FORMAT_ASTC_8x5_SFLOAT_BLOCK;
+      else
+        return VK_FORMAT_ASTC_8x5_UNORM_BLOCK;
+    }
     case VK_FORMAT_ASTC_8x6_UNORM_BLOCK:
     case VK_FORMAT_ASTC_8x6_SRGB_BLOCK:
-      return (typeHint == CompType::UNormSRGB) ? VK_FORMAT_ASTC_8x6_SRGB_BLOCK
-                                               : VK_FORMAT_ASTC_8x6_UNORM_BLOCK;
+    case VK_FORMAT_ASTC_8x6_SFLOAT_BLOCK:
+    {
+      if(typeCast == CompType::UNormSRGB)
+        return VK_FORMAT_ASTC_8x6_SRGB_BLOCK;
+      else if(typeCast == CompType::Float)
+        return VK_FORMAT_ASTC_8x6_SFLOAT_BLOCK;
+      else
+        return VK_FORMAT_ASTC_8x6_UNORM_BLOCK;
+    }
     case VK_FORMAT_ASTC_8x8_UNORM_BLOCK:
     case VK_FORMAT_ASTC_8x8_SRGB_BLOCK:
-      return (typeHint == CompType::UNormSRGB) ? VK_FORMAT_ASTC_8x8_SRGB_BLOCK
-                                               : VK_FORMAT_ASTC_8x8_UNORM_BLOCK;
+    case VK_FORMAT_ASTC_8x8_SFLOAT_BLOCK:
+    {
+      if(typeCast == CompType::UNormSRGB)
+        return VK_FORMAT_ASTC_8x8_SRGB_BLOCK;
+      else if(typeCast == CompType::Float)
+        return VK_FORMAT_ASTC_8x8_SFLOAT_BLOCK;
+      else
+        return VK_FORMAT_ASTC_8x8_UNORM_BLOCK;
+    }
     case VK_FORMAT_ASTC_10x5_UNORM_BLOCK:
     case VK_FORMAT_ASTC_10x5_SRGB_BLOCK:
-      return (typeHint == CompType::UNormSRGB) ? VK_FORMAT_ASTC_10x5_SRGB_BLOCK
-                                               : VK_FORMAT_ASTC_10x5_UNORM_BLOCK;
+    case VK_FORMAT_ASTC_10x5_SFLOAT_BLOCK:
+    {
+      if(typeCast == CompType::UNormSRGB)
+        return VK_FORMAT_ASTC_10x5_SRGB_BLOCK;
+      else if(typeCast == CompType::Float)
+        return VK_FORMAT_ASTC_10x5_SFLOAT_BLOCK;
+      else
+        return VK_FORMAT_ASTC_10x5_UNORM_BLOCK;
+    }
     case VK_FORMAT_ASTC_10x6_UNORM_BLOCK:
     case VK_FORMAT_ASTC_10x6_SRGB_BLOCK:
-      return (typeHint == CompType::UNormSRGB) ? VK_FORMAT_ASTC_10x6_SRGB_BLOCK
-                                               : VK_FORMAT_ASTC_10x6_UNORM_BLOCK;
+    case VK_FORMAT_ASTC_10x6_SFLOAT_BLOCK:
+    {
+      if(typeCast == CompType::UNormSRGB)
+        return VK_FORMAT_ASTC_10x6_SRGB_BLOCK;
+      else if(typeCast == CompType::Float)
+        return VK_FORMAT_ASTC_10x6_SFLOAT_BLOCK;
+      else
+        return VK_FORMAT_ASTC_10x6_UNORM_BLOCK;
+    }
     case VK_FORMAT_ASTC_10x8_UNORM_BLOCK:
     case VK_FORMAT_ASTC_10x8_SRGB_BLOCK:
-      return (typeHint == CompType::UNormSRGB) ? VK_FORMAT_ASTC_10x8_SRGB_BLOCK
-                                               : VK_FORMAT_ASTC_10x8_UNORM_BLOCK;
+    case VK_FORMAT_ASTC_10x8_SFLOAT_BLOCK:
+    {
+      if(typeCast == CompType::UNormSRGB)
+        return VK_FORMAT_ASTC_10x8_SRGB_BLOCK;
+      else if(typeCast == CompType::Float)
+        return VK_FORMAT_ASTC_10x8_SFLOAT_BLOCK;
+      else
+        return VK_FORMAT_ASTC_10x8_UNORM_BLOCK;
+    }
     case VK_FORMAT_ASTC_10x10_UNORM_BLOCK:
     case VK_FORMAT_ASTC_10x10_SRGB_BLOCK:
-      return (typeHint == CompType::UNormSRGB) ? VK_FORMAT_ASTC_10x10_SRGB_BLOCK
-                                               : VK_FORMAT_ASTC_10x10_UNORM_BLOCK;
+    case VK_FORMAT_ASTC_10x10_SFLOAT_BLOCK:
+    {
+      if(typeCast == CompType::UNormSRGB)
+        return VK_FORMAT_ASTC_10x10_SRGB_BLOCK;
+      else if(typeCast == CompType::Float)
+        return VK_FORMAT_ASTC_10x10_SFLOAT_BLOCK;
+      else
+        return VK_FORMAT_ASTC_10x10_UNORM_BLOCK;
+    }
     case VK_FORMAT_ASTC_12x10_UNORM_BLOCK:
     case VK_FORMAT_ASTC_12x10_SRGB_BLOCK:
-      return (typeHint == CompType::UNormSRGB) ? VK_FORMAT_ASTC_12x10_SRGB_BLOCK
-                                               : VK_FORMAT_ASTC_12x10_UNORM_BLOCK;
+    case VK_FORMAT_ASTC_12x10_SFLOAT_BLOCK:
+    {
+      if(typeCast == CompType::UNormSRGB)
+        return VK_FORMAT_ASTC_12x10_SRGB_BLOCK;
+      else if(typeCast == CompType::Float)
+        return VK_FORMAT_ASTC_12x10_SFLOAT_BLOCK;
+      else
+        return VK_FORMAT_ASTC_12x10_UNORM_BLOCK;
+    }
     case VK_FORMAT_ASTC_12x12_UNORM_BLOCK:
     case VK_FORMAT_ASTC_12x12_SRGB_BLOCK:
-      return (typeHint == CompType::UNormSRGB) ? VK_FORMAT_ASTC_12x12_SRGB_BLOCK
-                                               : VK_FORMAT_ASTC_12x12_UNORM_BLOCK;
+    case VK_FORMAT_ASTC_12x12_SFLOAT_BLOCK:
+    {
+      if(typeCast == CompType::UNormSRGB)
+        return VK_FORMAT_ASTC_12x12_SRGB_BLOCK;
+      else if(typeCast == CompType::Float)
+        return VK_FORMAT_ASTC_12x12_SFLOAT_BLOCK;
+      else
+        return VK_FORMAT_ASTC_12x12_UNORM_BLOCK;
+    }
     case VK_FORMAT_PVRTC1_2BPP_UNORM_BLOCK_IMG:
     case VK_FORMAT_PVRTC1_2BPP_SRGB_BLOCK_IMG:
-      return (typeHint == CompType::UNormSRGB) ? VK_FORMAT_PVRTC1_2BPP_SRGB_BLOCK_IMG
+      return (typeCast == CompType::UNormSRGB) ? VK_FORMAT_PVRTC1_2BPP_SRGB_BLOCK_IMG
                                                : VK_FORMAT_PVRTC1_2BPP_UNORM_BLOCK_IMG;
     case VK_FORMAT_PVRTC2_2BPP_UNORM_BLOCK_IMG:
     case VK_FORMAT_PVRTC2_2BPP_SRGB_BLOCK_IMG:
-      return (typeHint == CompType::UNormSRGB) ? VK_FORMAT_PVRTC2_2BPP_SRGB_BLOCK_IMG
+      return (typeCast == CompType::UNormSRGB) ? VK_FORMAT_PVRTC2_2BPP_SRGB_BLOCK_IMG
                                                : VK_FORMAT_PVRTC2_2BPP_UNORM_BLOCK_IMG;
     case VK_FORMAT_PVRTC1_4BPP_UNORM_BLOCK_IMG:
     case VK_FORMAT_PVRTC1_4BPP_SRGB_BLOCK_IMG:
-      return (typeHint == CompType::UNormSRGB) ? VK_FORMAT_PVRTC1_4BPP_SRGB_BLOCK_IMG
+      return (typeCast == CompType::UNormSRGB) ? VK_FORMAT_PVRTC1_4BPP_SRGB_BLOCK_IMG
                                                : VK_FORMAT_PVRTC1_4BPP_UNORM_BLOCK_IMG;
     case VK_FORMAT_PVRTC2_4BPP_UNORM_BLOCK_IMG:
     case VK_FORMAT_PVRTC2_4BPP_SRGB_BLOCK_IMG:
-      return (typeHint == CompType::UNormSRGB) ? VK_FORMAT_PVRTC2_4BPP_SRGB_BLOCK_IMG
+      return (typeCast == CompType::UNormSRGB) ? VK_FORMAT_PVRTC2_4BPP_SRGB_BLOCK_IMG
                                                : VK_FORMAT_PVRTC2_4BPP_UNORM_BLOCK_IMG;
 
     // all other formats have no aliases so nothing to typecast
@@ -1187,23 +1336,6 @@ VkFormat GetViewCastedFormat(VkFormat f, CompType typeHint)
 
   return f;
 }
-
-// The shape of blocks in (a plane of) an image format.
-// Non-block formats are considered to have 1x1 blocks.
-// For some planar formats, the block shape depends on the plane--
-// e.g. VK_FORMAT_G8_B8R8_2PLANE_422_UNORM has 8 bits per 1x1 block in plane 0, but 16 bits per 1x1
-// block in plane 1.
-struct BlockShape
-{
-  // the width of a block, in texels (or 1 for non-block formats)
-  uint32_t width;
-
-  // the height of a block, in texels (or 1 for non-block formats)
-  uint32_t height;
-
-  // the number of bytes used to encode the block
-  uint32_t bytes;
-};
 
 BlockShape GetBlockShape(VkFormat Format, uint32_t plane)
 {
@@ -1328,6 +1460,8 @@ BlockShape GetBlockShape(VkFormat Format, uint32_t plane)
     case VK_FORMAT_B5G5R5A1_UNORM_PACK16:
     case VK_FORMAT_A1R5G5B5_UNORM_PACK16:
     case VK_FORMAT_B5G6R5_UNORM_PACK16:
+    case VK_FORMAT_A4R4G4B4_UNORM_PACK16:
+    case VK_FORMAT_A4B4G4R4_UNORM_PACK16:
     case VK_FORMAT_R4G4B4A4_UNORM_PACK16:
     case VK_FORMAT_B4G4R4A4_UNORM_PACK16: return {1, 1, 2};
     case VK_FORMAT_R4G4_UNORM_PACK8:
@@ -1349,8 +1483,6 @@ BlockShape GetBlockShape(VkFormat Format, uint32_t plane)
     case VK_FORMAT_ETC2_R8G8B8_SRGB_BLOCK:
     case VK_FORMAT_ETC2_R8G8B8A1_UNORM_BLOCK:
     case VK_FORMAT_ETC2_R8G8B8A1_SRGB_BLOCK:
-    case VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK:
-    case VK_FORMAT_ETC2_R8G8B8A8_SRGB_BLOCK:
     case VK_FORMAT_EAC_R11_UNORM_BLOCK:
     case VK_FORMAT_EAC_R11_SNORM_BLOCK: return {4, 4, 8};
     case VK_FORMAT_BC2_UNORM_BLOCK:
@@ -1363,36 +1495,53 @@ BlockShape GetBlockShape(VkFormat Format, uint32_t plane)
     case VK_FORMAT_BC6H_SFLOAT_BLOCK:
     case VK_FORMAT_BC7_UNORM_BLOCK:
     case VK_FORMAT_BC7_SRGB_BLOCK:
+    case VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK:
+    case VK_FORMAT_ETC2_R8G8B8A8_SRGB_BLOCK:
     case VK_FORMAT_EAC_R11G11_UNORM_BLOCK:
     case VK_FORMAT_EAC_R11G11_SNORM_BLOCK: return {4, 4, 16};
     case VK_FORMAT_ASTC_4x4_UNORM_BLOCK:
-    case VK_FORMAT_ASTC_4x4_SRGB_BLOCK: return {4, 4, 16};
+    case VK_FORMAT_ASTC_4x4_SRGB_BLOCK:
+    case VK_FORMAT_ASTC_4x4_SFLOAT_BLOCK: return {4, 4, 16};
     case VK_FORMAT_ASTC_5x4_UNORM_BLOCK:
-    case VK_FORMAT_ASTC_5x4_SRGB_BLOCK: return {5, 4, 16};
+    case VK_FORMAT_ASTC_5x4_SRGB_BLOCK:
+    case VK_FORMAT_ASTC_5x4_SFLOAT_BLOCK: return {5, 4, 16};
     case VK_FORMAT_ASTC_5x5_UNORM_BLOCK:
-    case VK_FORMAT_ASTC_5x5_SRGB_BLOCK: return {5, 5, 16};
+    case VK_FORMAT_ASTC_5x5_SRGB_BLOCK:
+    case VK_FORMAT_ASTC_5x5_SFLOAT_BLOCK: return {5, 5, 16};
     case VK_FORMAT_ASTC_6x5_UNORM_BLOCK:
-    case VK_FORMAT_ASTC_6x5_SRGB_BLOCK: return {6, 5, 16};
+    case VK_FORMAT_ASTC_6x5_SRGB_BLOCK:
+    case VK_FORMAT_ASTC_6x5_SFLOAT_BLOCK: return {6, 5, 16};
     case VK_FORMAT_ASTC_6x6_UNORM_BLOCK:
-    case VK_FORMAT_ASTC_6x6_SRGB_BLOCK: return {6, 6, 16};
+    case VK_FORMAT_ASTC_6x6_SRGB_BLOCK:
+    case VK_FORMAT_ASTC_6x6_SFLOAT_BLOCK: return {6, 6, 16};
     case VK_FORMAT_ASTC_8x5_UNORM_BLOCK:
-    case VK_FORMAT_ASTC_8x5_SRGB_BLOCK: return {8, 5, 16};
+    case VK_FORMAT_ASTC_8x5_SRGB_BLOCK:
+    case VK_FORMAT_ASTC_8x5_SFLOAT_BLOCK: return {8, 5, 16};
     case VK_FORMAT_ASTC_8x6_UNORM_BLOCK:
-    case VK_FORMAT_ASTC_8x6_SRGB_BLOCK: return {8, 6, 16};
+    case VK_FORMAT_ASTC_8x6_SRGB_BLOCK:
+    case VK_FORMAT_ASTC_8x6_SFLOAT_BLOCK: return {8, 6, 16};
     case VK_FORMAT_ASTC_8x8_UNORM_BLOCK:
-    case VK_FORMAT_ASTC_8x8_SRGB_BLOCK: return {8, 8, 16};
+    case VK_FORMAT_ASTC_8x8_SRGB_BLOCK:
+    case VK_FORMAT_ASTC_8x8_SFLOAT_BLOCK: return {8, 8, 16};
     case VK_FORMAT_ASTC_10x5_UNORM_BLOCK:
-    case VK_FORMAT_ASTC_10x5_SRGB_BLOCK: return {10, 5, 16};
+    case VK_FORMAT_ASTC_10x5_SRGB_BLOCK:
+    case VK_FORMAT_ASTC_10x5_SFLOAT_BLOCK: return {10, 5, 16};
     case VK_FORMAT_ASTC_10x6_UNORM_BLOCK:
-    case VK_FORMAT_ASTC_10x6_SRGB_BLOCK: return {10, 6, 16};
+    case VK_FORMAT_ASTC_10x6_SRGB_BLOCK:
+    case VK_FORMAT_ASTC_10x6_SFLOAT_BLOCK: return {10, 6, 16};
     case VK_FORMAT_ASTC_10x8_UNORM_BLOCK:
-    case VK_FORMAT_ASTC_10x8_SRGB_BLOCK: return {10, 8, 16};
+    case VK_FORMAT_ASTC_10x8_SRGB_BLOCK:
+    case VK_FORMAT_ASTC_10x8_SFLOAT_BLOCK: return {10, 8, 16};
     case VK_FORMAT_ASTC_10x10_UNORM_BLOCK:
-    case VK_FORMAT_ASTC_10x10_SRGB_BLOCK: return {10, 10, 16};
+    case VK_FORMAT_ASTC_10x10_SRGB_BLOCK:
+    case VK_FORMAT_ASTC_10x10_SFLOAT_BLOCK: return {10, 10, 16};
     case VK_FORMAT_ASTC_12x10_UNORM_BLOCK:
-    case VK_FORMAT_ASTC_12x10_SRGB_BLOCK: return {12, 10, 16};
+    case VK_FORMAT_ASTC_12x10_SRGB_BLOCK:
+    case VK_FORMAT_ASTC_12x10_SFLOAT_BLOCK: return {12, 10, 16};
     case VK_FORMAT_ASTC_12x12_UNORM_BLOCK:
-    case VK_FORMAT_ASTC_12x12_SRGB_BLOCK: return {12, 12, 16};
+    case VK_FORMAT_ASTC_12x12_SRGB_BLOCK:
+    case VK_FORMAT_ASTC_12x12_SFLOAT_BLOCK: return {12, 12, 16};
+
     case VK_FORMAT_PVRTC1_2BPP_UNORM_BLOCK_IMG:
     case VK_FORMAT_PVRTC1_2BPP_SRGB_BLOCK_IMG:
     case VK_FORMAT_PVRTC2_2BPP_UNORM_BLOCK_IMG:
@@ -1400,8 +1549,7 @@ BlockShape GetBlockShape(VkFormat Format, uint32_t plane)
     case VK_FORMAT_PVRTC1_4BPP_UNORM_BLOCK_IMG:
     case VK_FORMAT_PVRTC1_4BPP_SRGB_BLOCK_IMG:
     case VK_FORMAT_PVRTC2_4BPP_UNORM_BLOCK_IMG:
-    case VK_FORMAT_PVRTC2_4BPP_SRGB_BLOCK_IMG:
-      return {4, 4, 8};
+    case VK_FORMAT_PVRTC2_4BPP_SRGB_BLOCK_IMG: return {4, 4, 8};
 
     /*
      * YUV planar/packed subsampled textures.
@@ -1489,6 +1637,7 @@ BlockShape GetBlockShape(VkFormat Format, uint32_t plane)
     case VK_FORMAT_G8_B8_R8_3PLANE_444_UNORM: return {1, 1, 1};
     case VK_FORMAT_G8_B8R8_2PLANE_420_UNORM:
     case VK_FORMAT_G8_B8R8_2PLANE_422_UNORM:
+    case VK_FORMAT_G8_B8R8_2PLANE_444_UNORM:
       if(plane == 0)
       {
         return {1, 1, 1};
@@ -1541,6 +1690,9 @@ BlockShape GetBlockShape(VkFormat Format, uint32_t plane)
     case VK_FORMAT_G10X6_B10X6R10X6_2PLANE_422_UNORM_3PACK16:
     case VK_FORMAT_G12X4_B12X4R12X4_2PLANE_422_UNORM_3PACK16:
     case VK_FORMAT_G16_B16R16_2PLANE_422_UNORM:
+    case VK_FORMAT_G10X6_B10X6R10X6_2PLANE_444_UNORM_3PACK16:
+    case VK_FORMAT_G12X4_B12X4R12X4_2PLANE_444_UNORM_3PACK16:
+    case VK_FORMAT_G16_B16R16_2PLANE_444_UNORM:
       if(plane == 0)
       {
         return {1, 1, 2};
@@ -1639,7 +1791,9 @@ ResourceFormat MakeResourceFormat(VkFormat fmt)
   {
     case VK_FORMAT_R4G4_UNORM_PACK8: ret.type = ResourceFormatType::R4G4; break;
     case VK_FORMAT_R4G4B4A4_UNORM_PACK16:
-    case VK_FORMAT_B4G4R4A4_UNORM_PACK16: ret.type = ResourceFormatType::R4G4B4A4; break;
+    case VK_FORMAT_B4G4R4A4_UNORM_PACK16:
+    case VK_FORMAT_A4R4G4B4_UNORM_PACK16:
+    case VK_FORMAT_A4B4G4R4_UNORM_PACK16: ret.type = ResourceFormatType::R4G4B4A4; break;
     case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
     case VK_FORMAT_A2R10G10B10_UNORM_PACK32:
     case VK_FORMAT_A2B10G10R10_SNORM_PACK32:
@@ -1660,9 +1814,9 @@ ResourceFormat MakeResourceFormat(VkFormat fmt)
     case VK_FORMAT_B5G5R5A1_UNORM_PACK16:
     case VK_FORMAT_A1R5G5B5_UNORM_PACK16: ret.type = ResourceFormatType::R5G5B5A1; break;
     case VK_FORMAT_D16_UNORM_S8_UINT: ret.type = ResourceFormatType::D16S8; break;
-    case VK_FORMAT_X8_D24_UNORM_PACK32:
     case VK_FORMAT_D24_UNORM_S8_UINT: ret.type = ResourceFormatType::D24S8; break;
     case VK_FORMAT_D32_SFLOAT_S8_UINT: ret.type = ResourceFormatType::D32S8; break;
+    case VK_FORMAT_S8_UINT: ret.type = ResourceFormatType::S8; break;
     case VK_FORMAT_BC1_RGB_UNORM_BLOCK:
     case VK_FORMAT_BC1_RGB_SRGB_BLOCK:
     case VK_FORMAT_BC1_RGBA_UNORM_BLOCK:
@@ -1682,9 +1836,9 @@ ResourceFormat MakeResourceFormat(VkFormat fmt)
     case VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK:
     case VK_FORMAT_ETC2_R8G8B8_SRGB_BLOCK:
     case VK_FORMAT_ETC2_R8G8B8A1_UNORM_BLOCK:
-    case VK_FORMAT_ETC2_R8G8B8A1_SRGB_BLOCK:
+    case VK_FORMAT_ETC2_R8G8B8A1_SRGB_BLOCK: ret.type = ResourceFormatType::ETC2; break;
     case VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK:
-    case VK_FORMAT_ETC2_R8G8B8A8_SRGB_BLOCK: ret.type = ResourceFormatType::ETC2; break;
+    case VK_FORMAT_ETC2_R8G8B8A8_SRGB_BLOCK:
     case VK_FORMAT_EAC_R11_UNORM_BLOCK:
     case VK_FORMAT_EAC_R11_SNORM_BLOCK:
     case VK_FORMAT_EAC_R11G11_UNORM_BLOCK:
@@ -1716,7 +1870,21 @@ ResourceFormat MakeResourceFormat(VkFormat fmt)
     case VK_FORMAT_ASTC_12x10_UNORM_BLOCK:
     case VK_FORMAT_ASTC_12x10_SRGB_BLOCK:
     case VK_FORMAT_ASTC_12x12_UNORM_BLOCK:
-    case VK_FORMAT_ASTC_12x12_SRGB_BLOCK: ret.type = ResourceFormatType::ASTC; break;
+    case VK_FORMAT_ASTC_12x12_SRGB_BLOCK:
+    case VK_FORMAT_ASTC_4x4_SFLOAT_BLOCK:
+    case VK_FORMAT_ASTC_5x4_SFLOAT_BLOCK:
+    case VK_FORMAT_ASTC_5x5_SFLOAT_BLOCK:
+    case VK_FORMAT_ASTC_6x5_SFLOAT_BLOCK:
+    case VK_FORMAT_ASTC_6x6_SFLOAT_BLOCK:
+    case VK_FORMAT_ASTC_8x5_SFLOAT_BLOCK:
+    case VK_FORMAT_ASTC_8x6_SFLOAT_BLOCK:
+    case VK_FORMAT_ASTC_8x8_SFLOAT_BLOCK:
+    case VK_FORMAT_ASTC_10x5_SFLOAT_BLOCK:
+    case VK_FORMAT_ASTC_10x6_SFLOAT_BLOCK:
+    case VK_FORMAT_ASTC_10x8_SFLOAT_BLOCK:
+    case VK_FORMAT_ASTC_10x10_SFLOAT_BLOCK:
+    case VK_FORMAT_ASTC_12x10_SFLOAT_BLOCK:
+    case VK_FORMAT_ASTC_12x12_SFLOAT_BLOCK: ret.type = ResourceFormatType::ASTC; break;
     case VK_FORMAT_PVRTC1_2BPP_UNORM_BLOCK_IMG:
     case VK_FORMAT_PVRTC1_4BPP_UNORM_BLOCK_IMG:
     case VK_FORMAT_PVRTC2_2BPP_UNORM_BLOCK_IMG:
@@ -1731,7 +1899,8 @@ ResourceFormat MakeResourceFormat(VkFormat fmt)
     case VK_FORMAT_G8_B8R8_2PLANE_420_UNORM:
     case VK_FORMAT_G8_B8_R8_3PLANE_422_UNORM:
     case VK_FORMAT_G8_B8R8_2PLANE_422_UNORM:
-    case VK_FORMAT_G8_B8_R8_3PLANE_444_UNORM: ret.type = ResourceFormatType::YUV8; break;
+    case VK_FORMAT_G8_B8_R8_3PLANE_444_UNORM:
+    case VK_FORMAT_G8_B8R8_2PLANE_444_UNORM: ret.type = ResourceFormatType::YUV8; break;
     case VK_FORMAT_R10X6_UNORM_PACK16:
     case VK_FORMAT_R10X6G10X6_UNORM_2PACK16:
     case VK_FORMAT_R10X6G10X6B10X6A10X6_UNORM_4PACK16:
@@ -1742,6 +1911,7 @@ ResourceFormat MakeResourceFormat(VkFormat fmt)
     case VK_FORMAT_G10X6_B10X6_R10X6_3PLANE_422_UNORM_3PACK16:
     case VK_FORMAT_G10X6_B10X6R10X6_2PLANE_422_UNORM_3PACK16:
     case VK_FORMAT_G10X6_B10X6_R10X6_3PLANE_444_UNORM_3PACK16:
+    case VK_FORMAT_G10X6_B10X6R10X6_2PLANE_444_UNORM_3PACK16:
       ret.type = ResourceFormatType::YUV10;
       break;
     case VK_FORMAT_R12X4_UNORM_PACK16:
@@ -1754,6 +1924,7 @@ ResourceFormat MakeResourceFormat(VkFormat fmt)
     case VK_FORMAT_G12X4_B12X4_R12X4_3PLANE_422_UNORM_3PACK16:
     case VK_FORMAT_G12X4_B12X4R12X4_2PLANE_422_UNORM_3PACK16:
     case VK_FORMAT_G12X4_B12X4_R12X4_3PLANE_444_UNORM_3PACK16:
+    case VK_FORMAT_G12X4_B12X4R12X4_2PLANE_444_UNORM_3PACK16:
       ret.type = ResourceFormatType::YUV12;
       break;
     case VK_FORMAT_G16B16G16R16_422_UNORM:
@@ -1762,15 +1933,18 @@ ResourceFormat MakeResourceFormat(VkFormat fmt)
     case VK_FORMAT_G16_B16R16_2PLANE_420_UNORM:
     case VK_FORMAT_G16_B16_R16_3PLANE_422_UNORM:
     case VK_FORMAT_G16_B16R16_2PLANE_422_UNORM:
-    case VK_FORMAT_G16_B16_R16_3PLANE_444_UNORM: ret.type = ResourceFormatType::YUV16; break;
+    case VK_FORMAT_G16_B16_R16_3PLANE_444_UNORM:
+    case VK_FORMAT_G16_B16R16_2PLANE_444_UNORM: ret.type = ResourceFormatType::YUV16; break;
     default: break;
   }
 
   switch(fmt)
   {
-    case VK_FORMAT_B4G4R4A4_UNORM_PACK16:
-    case VK_FORMAT_B5G6R5_UNORM_PACK16:
-    case VK_FORMAT_B5G5R5A1_UNORM_PACK16:
+    case VK_FORMAT_A4R4G4B4_UNORM_PACK16:
+    case VK_FORMAT_R4G4B4A4_UNORM_PACK16:
+    case VK_FORMAT_R5G6B5_UNORM_PACK16:
+    case VK_FORMAT_R5G5B5A1_UNORM_PACK16:
+    case VK_FORMAT_A1R5G5B5_UNORM_PACK16:
     case VK_FORMAT_B8G8R8A8_UNORM:
     case VK_FORMAT_B8G8R8A8_SNORM:
     case VK_FORMAT_B8G8R8A8_USCALED:
@@ -1822,6 +1996,7 @@ ResourceFormat MakeResourceFormat(VkFormat fmt)
     case VK_FORMAT_R64_SFLOAT:
     case VK_FORMAT_D16_UNORM:
     case VK_FORMAT_D32_SFLOAT:
+    case VK_FORMAT_X8_D24_UNORM_PACK32:
     case VK_FORMAT_S8_UINT:
     case VK_FORMAT_BC4_UNORM_BLOCK:
     case VK_FORMAT_BC4_SNORM_BLOCK:
@@ -1858,7 +2033,8 @@ ResourceFormat MakeResourceFormat(VkFormat fmt)
     case VK_FORMAT_EAC_R11G11_UNORM_BLOCK:
     case VK_FORMAT_EAC_R11G11_SNORM_BLOCK:
     case VK_FORMAT_R10X6G10X6_UNORM_2PACK16:
-    case VK_FORMAT_R12X4G12X4_UNORM_2PACK16: ret.compCount = 2; break;
+    case VK_FORMAT_R12X4G12X4_UNORM_2PACK16:
+    case VK_FORMAT_R16G16_S10_5_NV: ret.compCount = 2; break;
     case VK_FORMAT_R5G6B5_UNORM_PACK16:
     case VK_FORMAT_R8G8B8_UNORM:
     case VK_FORMAT_R8G8B8_SNORM:
@@ -1903,6 +2079,7 @@ ResourceFormat MakeResourceFormat(VkFormat fmt)
     case VK_FORMAT_G8_B8_R8_3PLANE_422_UNORM:
     case VK_FORMAT_G8_B8R8_2PLANE_422_UNORM:
     case VK_FORMAT_G8_B8_R8_3PLANE_444_UNORM:
+    case VK_FORMAT_G8_B8R8_2PLANE_444_UNORM:
     case VK_FORMAT_G10X6B10X6G10X6R10X6_422_UNORM_4PACK16:
     case VK_FORMAT_B10X6G10X6R10X6G10X6_422_UNORM_4PACK16:
     case VK_FORMAT_G10X6_B10X6_R10X6_3PLANE_420_UNORM_3PACK16:
@@ -1910,6 +2087,7 @@ ResourceFormat MakeResourceFormat(VkFormat fmt)
     case VK_FORMAT_G10X6_B10X6_R10X6_3PLANE_422_UNORM_3PACK16:
     case VK_FORMAT_G10X6_B10X6R10X6_2PLANE_422_UNORM_3PACK16:
     case VK_FORMAT_G10X6_B10X6_R10X6_3PLANE_444_UNORM_3PACK16:
+    case VK_FORMAT_G10X6_B10X6R10X6_2PLANE_444_UNORM_3PACK16:
     case VK_FORMAT_G12X4B12X4G12X4R12X4_422_UNORM_4PACK16:
     case VK_FORMAT_B12X4G12X4R12X4G12X4_422_UNORM_4PACK16:
     case VK_FORMAT_G12X4_B12X4_R12X4_3PLANE_420_UNORM_3PACK16:
@@ -1917,13 +2095,16 @@ ResourceFormat MakeResourceFormat(VkFormat fmt)
     case VK_FORMAT_G12X4_B12X4_R12X4_3PLANE_422_UNORM_3PACK16:
     case VK_FORMAT_G12X4_B12X4R12X4_2PLANE_422_UNORM_3PACK16:
     case VK_FORMAT_G12X4_B12X4_R12X4_3PLANE_444_UNORM_3PACK16:
+    case VK_FORMAT_G12X4_B12X4R12X4_2PLANE_444_UNORM_3PACK16:
     case VK_FORMAT_G16B16G16R16_422_UNORM:
     case VK_FORMAT_B16G16R16G16_422_UNORM:
     case VK_FORMAT_G16_B16_R16_3PLANE_420_UNORM:
     case VK_FORMAT_G16_B16R16_2PLANE_420_UNORM:
     case VK_FORMAT_G16_B16_R16_3PLANE_422_UNORM:
     case VK_FORMAT_G16_B16R16_2PLANE_422_UNORM:
-    case VK_FORMAT_G16_B16_R16_3PLANE_444_UNORM: ret.compCount = 3; break;
+    case VK_FORMAT_G16_B16_R16_3PLANE_444_UNORM:
+    case VK_FORMAT_G16_B16R16_2PLANE_444_UNORM: ret.compCount = 3; break;
+    case VK_FORMAT_A4R4G4B4_UNORM_PACK16:
     case VK_FORMAT_R4G4B4A4_UNORM_PACK16:
     case VK_FORMAT_R5G5B5A1_UNORM_PACK16:
     case VK_FORMAT_R8G8B8A8_UNORM:
@@ -1964,6 +2145,7 @@ ResourceFormat MakeResourceFormat(VkFormat fmt)
     case VK_FORMAT_ETC2_R8G8B8A1_SRGB_BLOCK:
     case VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK:
     case VK_FORMAT_ETC2_R8G8B8A8_SRGB_BLOCK:
+    case VK_FORMAT_A4B4G4R4_UNORM_PACK16:
     case VK_FORMAT_B4G4R4A4_UNORM_PACK16:
     case VK_FORMAT_B5G5R5A1_UNORM_PACK16:
     case VK_FORMAT_A1R5G5B5_UNORM_PACK16:
@@ -1989,13 +2171,66 @@ ResourceFormat MakeResourceFormat(VkFormat fmt)
     case VK_FORMAT_A2B10G10R10_SINT_PACK32:
     case VK_FORMAT_R10X6G10X6B10X6A10X6_UNORM_4PACK16:
     case VK_FORMAT_R12X4G12X4B12X4A12X4_UNORM_4PACK16: ret.compCount = 4; break;
-    default: break;
+    case VK_FORMAT_ASTC_4x4_UNORM_BLOCK:
+    case VK_FORMAT_ASTC_4x4_SRGB_BLOCK:
+    case VK_FORMAT_ASTC_5x4_UNORM_BLOCK:
+    case VK_FORMAT_ASTC_5x4_SRGB_BLOCK:
+    case VK_FORMAT_ASTC_5x5_UNORM_BLOCK:
+    case VK_FORMAT_ASTC_5x5_SRGB_BLOCK:
+    case VK_FORMAT_ASTC_6x5_UNORM_BLOCK:
+    case VK_FORMAT_ASTC_6x5_SRGB_BLOCK:
+    case VK_FORMAT_ASTC_6x6_UNORM_BLOCK:
+    case VK_FORMAT_ASTC_6x6_SRGB_BLOCK:
+    case VK_FORMAT_ASTC_8x5_UNORM_BLOCK:
+    case VK_FORMAT_ASTC_8x5_SRGB_BLOCK:
+    case VK_FORMAT_ASTC_8x6_UNORM_BLOCK:
+    case VK_FORMAT_ASTC_8x6_SRGB_BLOCK:
+    case VK_FORMAT_ASTC_8x8_UNORM_BLOCK:
+    case VK_FORMAT_ASTC_8x8_SRGB_BLOCK:
+    case VK_FORMAT_ASTC_10x5_UNORM_BLOCK:
+    case VK_FORMAT_ASTC_10x5_SRGB_BLOCK:
+    case VK_FORMAT_ASTC_10x6_UNORM_BLOCK:
+    case VK_FORMAT_ASTC_10x6_SRGB_BLOCK:
+    case VK_FORMAT_ASTC_10x8_UNORM_BLOCK:
+    case VK_FORMAT_ASTC_10x8_SRGB_BLOCK:
+    case VK_FORMAT_ASTC_10x10_UNORM_BLOCK:
+    case VK_FORMAT_ASTC_10x10_SRGB_BLOCK:
+    case VK_FORMAT_ASTC_12x10_UNORM_BLOCK:
+    case VK_FORMAT_ASTC_12x10_SRGB_BLOCK:
+    case VK_FORMAT_ASTC_12x12_UNORM_BLOCK:
+    case VK_FORMAT_ASTC_12x12_SRGB_BLOCK:
+    case VK_FORMAT_ASTC_4x4_SFLOAT_BLOCK:
+    case VK_FORMAT_ASTC_5x4_SFLOAT_BLOCK:
+    case VK_FORMAT_ASTC_5x5_SFLOAT_BLOCK:
+    case VK_FORMAT_ASTC_6x5_SFLOAT_BLOCK:
+    case VK_FORMAT_ASTC_6x6_SFLOAT_BLOCK:
+    case VK_FORMAT_ASTC_8x5_SFLOAT_BLOCK:
+    case VK_FORMAT_ASTC_8x6_SFLOAT_BLOCK:
+    case VK_FORMAT_ASTC_8x8_SFLOAT_BLOCK:
+    case VK_FORMAT_ASTC_10x5_SFLOAT_BLOCK:
+    case VK_FORMAT_ASTC_10x6_SFLOAT_BLOCK:
+    case VK_FORMAT_ASTC_10x8_SFLOAT_BLOCK:
+    case VK_FORMAT_ASTC_10x10_SFLOAT_BLOCK:
+    case VK_FORMAT_ASTC_12x10_SFLOAT_BLOCK:
+    case VK_FORMAT_ASTC_12x12_SFLOAT_BLOCK: ret.compCount = 4; break;
+    case VK_FORMAT_PVRTC1_2BPP_UNORM_BLOCK_IMG:
+    case VK_FORMAT_PVRTC1_2BPP_SRGB_BLOCK_IMG:
+    case VK_FORMAT_PVRTC1_4BPP_UNORM_BLOCK_IMG:
+    case VK_FORMAT_PVRTC1_4BPP_SRGB_BLOCK_IMG:
+    case VK_FORMAT_PVRTC2_2BPP_UNORM_BLOCK_IMG:
+    case VK_FORMAT_PVRTC2_2BPP_SRGB_BLOCK_IMG:
+    case VK_FORMAT_PVRTC2_4BPP_UNORM_BLOCK_IMG:
+    case VK_FORMAT_PVRTC2_4BPP_SRGB_BLOCK_IMG: ret.compCount = 4; break;
+    case VK_FORMAT_UNDEFINED:
+    case VK_FORMAT_MAX_ENUM: ret.compCount = 1; break;
   }
 
   switch(fmt)
   {
     case VK_FORMAT_R4G4_UNORM_PACK8:
     case VK_FORMAT_R4G4B4A4_UNORM_PACK16:
+    case VK_FORMAT_A4R4G4B4_UNORM_PACK16:
+    case VK_FORMAT_A4B4G4R4_UNORM_PACK16:
     case VK_FORMAT_R5G6B5_UNORM_PACK16:
     case VK_FORMAT_R5G5B5A1_UNORM_PACK16:
     case VK_FORMAT_R8_UNORM:
@@ -2037,6 +2272,7 @@ ResourceFormat MakeResourceFormat(VkFormat fmt)
     case VK_FORMAT_B4G4R4A4_UNORM_PACK16:
     case VK_FORMAT_B5G5R5A1_UNORM_PACK16:
     case VK_FORMAT_B5G6R5_UNORM_PACK16:
+    case VK_FORMAT_A1R5G5B5_UNORM_PACK16:
     case VK_FORMAT_B8G8R8_UNORM:
     case VK_FORMAT_B8G8R8A8_UNORM:
     case VK_FORMAT_A8B8G8R8_UNORM_PACK32:
@@ -2173,11 +2409,26 @@ ResourceFormat MakeResourceFormat(VkFormat fmt)
     case VK_FORMAT_R32G32B32_SFLOAT:
     case VK_FORMAT_R32G32B32A32_SFLOAT:
     case VK_FORMAT_B10G11R11_UFLOAT_PACK32:
-    case VK_FORMAT_E5B9G9R9_UFLOAT_PACK32: ret.compType = CompType::Float; break;
+    case VK_FORMAT_E5B9G9R9_UFLOAT_PACK32:
+    case VK_FORMAT_R16G16_S10_5_NV:
+    case VK_FORMAT_ASTC_4x4_SFLOAT_BLOCK:
+    case VK_FORMAT_ASTC_5x4_SFLOAT_BLOCK:
+    case VK_FORMAT_ASTC_5x5_SFLOAT_BLOCK:
+    case VK_FORMAT_ASTC_6x5_SFLOAT_BLOCK:
+    case VK_FORMAT_ASTC_6x6_SFLOAT_BLOCK:
+    case VK_FORMAT_ASTC_8x5_SFLOAT_BLOCK:
+    case VK_FORMAT_ASTC_8x6_SFLOAT_BLOCK:
+    case VK_FORMAT_ASTC_8x8_SFLOAT_BLOCK:
+    case VK_FORMAT_ASTC_10x5_SFLOAT_BLOCK:
+    case VK_FORMAT_ASTC_10x6_SFLOAT_BLOCK:
+    case VK_FORMAT_ASTC_10x8_SFLOAT_BLOCK:
+    case VK_FORMAT_ASTC_10x10_SFLOAT_BLOCK:
+    case VK_FORMAT_ASTC_12x10_SFLOAT_BLOCK:
+    case VK_FORMAT_ASTC_12x12_SFLOAT_BLOCK:
     case VK_FORMAT_R64_SFLOAT:
     case VK_FORMAT_R64G64_SFLOAT:
     case VK_FORMAT_R64G64B64_SFLOAT:
-    case VK_FORMAT_R64G64B64A64_SFLOAT: ret.compType = CompType::Double; break;
+    case VK_FORMAT_R64G64B64A64_SFLOAT: ret.compType = CompType::Float; break;
     case VK_FORMAT_S8_UINT:
     case VK_FORMAT_D16_UNORM:
     case VK_FORMAT_X8_D24_UNORM_PACK32:
@@ -2185,7 +2436,46 @@ ResourceFormat MakeResourceFormat(VkFormat fmt)
     case VK_FORMAT_D16_UNORM_S8_UINT:
     case VK_FORMAT_D24_UNORM_S8_UINT:
     case VK_FORMAT_D32_SFLOAT_S8_UINT: ret.compType = CompType::Depth; break;
-    default: break;
+    case VK_FORMAT_G8B8G8R8_422_UNORM:
+    case VK_FORMAT_B8G8R8G8_422_UNORM:
+    case VK_FORMAT_G8_B8_R8_3PLANE_420_UNORM:
+    case VK_FORMAT_G8_B8R8_2PLANE_420_UNORM:
+    case VK_FORMAT_G8_B8_R8_3PLANE_422_UNORM:
+    case VK_FORMAT_G8_B8R8_2PLANE_422_UNORM:
+    case VK_FORMAT_G8_B8_R8_3PLANE_444_UNORM:
+    case VK_FORMAT_G8_B8R8_2PLANE_444_UNORM:
+    case VK_FORMAT_R10X6_UNORM_PACK16:
+    case VK_FORMAT_R10X6G10X6_UNORM_2PACK16:
+    case VK_FORMAT_R10X6G10X6B10X6A10X6_UNORM_4PACK16:
+    case VK_FORMAT_G10X6B10X6G10X6R10X6_422_UNORM_4PACK16:
+    case VK_FORMAT_B10X6G10X6R10X6G10X6_422_UNORM_4PACK16:
+    case VK_FORMAT_G10X6_B10X6_R10X6_3PLANE_420_UNORM_3PACK16:
+    case VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16:
+    case VK_FORMAT_G10X6_B10X6_R10X6_3PLANE_422_UNORM_3PACK16:
+    case VK_FORMAT_G10X6_B10X6R10X6_2PLANE_422_UNORM_3PACK16:
+    case VK_FORMAT_G10X6_B10X6_R10X6_3PLANE_444_UNORM_3PACK16:
+    case VK_FORMAT_G10X6_B10X6R10X6_2PLANE_444_UNORM_3PACK16:
+    case VK_FORMAT_R12X4_UNORM_PACK16:
+    case VK_FORMAT_R12X4G12X4_UNORM_2PACK16:
+    case VK_FORMAT_R12X4G12X4B12X4A12X4_UNORM_4PACK16:
+    case VK_FORMAT_G12X4B12X4G12X4R12X4_422_UNORM_4PACK16:
+    case VK_FORMAT_B12X4G12X4R12X4G12X4_422_UNORM_4PACK16:
+    case VK_FORMAT_G12X4_B12X4_R12X4_3PLANE_420_UNORM_3PACK16:
+    case VK_FORMAT_G12X4_B12X4R12X4_2PLANE_420_UNORM_3PACK16:
+    case VK_FORMAT_G12X4_B12X4_R12X4_3PLANE_422_UNORM_3PACK16:
+    case VK_FORMAT_G12X4_B12X4R12X4_2PLANE_422_UNORM_3PACK16:
+    case VK_FORMAT_G12X4_B12X4_R12X4_3PLANE_444_UNORM_3PACK16:
+    case VK_FORMAT_G12X4_B12X4R12X4_2PLANE_444_UNORM_3PACK16:
+    case VK_FORMAT_G16B16G16R16_422_UNORM:
+    case VK_FORMAT_B16G16R16G16_422_UNORM:
+    case VK_FORMAT_G16_B16_R16_3PLANE_420_UNORM:
+    case VK_FORMAT_G16_B16R16_2PLANE_420_UNORM:
+    case VK_FORMAT_G16_B16_R16_3PLANE_422_UNORM:
+    case VK_FORMAT_G16_B16R16_2PLANE_422_UNORM:
+    case VK_FORMAT_G16_B16_R16_3PLANE_444_UNORM:
+    case VK_FORMAT_G16_B16R16_2PLANE_444_UNORM: ret.compType = CompType::UNorm; break;
+    case VK_FORMAT_UNDEFINED:
+    case VK_FORMAT_MAX_ENUM: ret.compType = CompType::Typeless; break;
   }
 
   switch(fmt)
@@ -2295,7 +2585,150 @@ ResourceFormat MakeResourceFormat(VkFormat fmt)
     case VK_FORMAT_R64G64_SFLOAT:
     case VK_FORMAT_R64G64B64_SFLOAT:
     case VK_FORMAT_R64G64B64A64_SFLOAT: ret.compByteWidth = 8; break;
-    default: break;
+    case VK_FORMAT_R4G4_UNORM_PACK8:
+    case VK_FORMAT_A4R4G4B4_UNORM_PACK16:
+    case VK_FORMAT_A4B4G4R4_UNORM_PACK16:
+    case VK_FORMAT_R4G4B4A4_UNORM_PACK16:
+    case VK_FORMAT_B4G4R4A4_UNORM_PACK16:
+    case VK_FORMAT_R5G6B5_UNORM_PACK16:
+    case VK_FORMAT_B5G6R5_UNORM_PACK16:
+    case VK_FORMAT_R5G5B5A1_UNORM_PACK16:
+    case VK_FORMAT_B5G5R5A1_UNORM_PACK16:
+    case VK_FORMAT_A1R5G5B5_UNORM_PACK16:
+    case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
+    case VK_FORMAT_A2R10G10B10_UNORM_PACK32:
+    case VK_FORMAT_A2B10G10R10_SNORM_PACK32:
+    case VK_FORMAT_A2R10G10B10_SNORM_PACK32:
+    case VK_FORMAT_A2B10G10R10_USCALED_PACK32:
+    case VK_FORMAT_A2R10G10B10_USCALED_PACK32:
+    case VK_FORMAT_A2B10G10R10_SSCALED_PACK32:
+    case VK_FORMAT_A2R10G10B10_SSCALED_PACK32:
+    case VK_FORMAT_A2B10G10R10_UINT_PACK32:
+    case VK_FORMAT_A2R10G10B10_UINT_PACK32:
+    case VK_FORMAT_A2B10G10R10_SINT_PACK32:
+    case VK_FORMAT_A2R10G10B10_SINT_PACK32:
+    case VK_FORMAT_B10G11R11_UFLOAT_PACK32:
+    case VK_FORMAT_E5B9G9R9_UFLOAT_PACK32:
+    case VK_FORMAT_D16_UNORM_S8_UINT:
+    case VK_FORMAT_D24_UNORM_S8_UINT:
+    case VK_FORMAT_D32_SFLOAT_S8_UINT:
+    case VK_FORMAT_BC1_RGB_UNORM_BLOCK:
+    case VK_FORMAT_BC1_RGB_SRGB_BLOCK:
+    case VK_FORMAT_BC1_RGBA_UNORM_BLOCK:
+    case VK_FORMAT_BC1_RGBA_SRGB_BLOCK:
+    case VK_FORMAT_BC2_UNORM_BLOCK:
+    case VK_FORMAT_BC2_SRGB_BLOCK:
+    case VK_FORMAT_BC3_UNORM_BLOCK:
+    case VK_FORMAT_BC3_SRGB_BLOCK:
+    case VK_FORMAT_BC4_UNORM_BLOCK:
+    case VK_FORMAT_BC4_SNORM_BLOCK:
+    case VK_FORMAT_BC5_UNORM_BLOCK:
+    case VK_FORMAT_BC5_SNORM_BLOCK:
+    case VK_FORMAT_BC6H_UFLOAT_BLOCK:
+    case VK_FORMAT_BC6H_SFLOAT_BLOCK:
+    case VK_FORMAT_BC7_UNORM_BLOCK:
+    case VK_FORMAT_BC7_SRGB_BLOCK:
+    case VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK:
+    case VK_FORMAT_ETC2_R8G8B8_SRGB_BLOCK:
+    case VK_FORMAT_ETC2_R8G8B8A1_UNORM_BLOCK:
+    case VK_FORMAT_ETC2_R8G8B8A1_SRGB_BLOCK:
+    case VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK:
+    case VK_FORMAT_ETC2_R8G8B8A8_SRGB_BLOCK:
+    case VK_FORMAT_EAC_R11_UNORM_BLOCK:
+    case VK_FORMAT_EAC_R11_SNORM_BLOCK:
+    case VK_FORMAT_EAC_R11G11_UNORM_BLOCK:
+    case VK_FORMAT_EAC_R11G11_SNORM_BLOCK:
+    case VK_FORMAT_ASTC_4x4_UNORM_BLOCK:
+    case VK_FORMAT_ASTC_4x4_SRGB_BLOCK:
+    case VK_FORMAT_ASTC_5x4_UNORM_BLOCK:
+    case VK_FORMAT_ASTC_5x4_SRGB_BLOCK:
+    case VK_FORMAT_ASTC_5x5_UNORM_BLOCK:
+    case VK_FORMAT_ASTC_5x5_SRGB_BLOCK:
+    case VK_FORMAT_ASTC_6x5_UNORM_BLOCK:
+    case VK_FORMAT_ASTC_6x5_SRGB_BLOCK:
+    case VK_FORMAT_ASTC_6x6_UNORM_BLOCK:
+    case VK_FORMAT_ASTC_6x6_SRGB_BLOCK:
+    case VK_FORMAT_ASTC_8x5_UNORM_BLOCK:
+    case VK_FORMAT_ASTC_8x5_SRGB_BLOCK:
+    case VK_FORMAT_ASTC_8x6_UNORM_BLOCK:
+    case VK_FORMAT_ASTC_8x6_SRGB_BLOCK:
+    case VK_FORMAT_ASTC_8x8_UNORM_BLOCK:
+    case VK_FORMAT_ASTC_8x8_SRGB_BLOCK:
+    case VK_FORMAT_ASTC_10x5_UNORM_BLOCK:
+    case VK_FORMAT_ASTC_10x5_SRGB_BLOCK:
+    case VK_FORMAT_ASTC_10x6_UNORM_BLOCK:
+    case VK_FORMAT_ASTC_10x6_SRGB_BLOCK:
+    case VK_FORMAT_ASTC_10x8_UNORM_BLOCK:
+    case VK_FORMAT_ASTC_10x8_SRGB_BLOCK:
+    case VK_FORMAT_ASTC_10x10_UNORM_BLOCK:
+    case VK_FORMAT_ASTC_10x10_SRGB_BLOCK:
+    case VK_FORMAT_ASTC_12x10_UNORM_BLOCK:
+    case VK_FORMAT_ASTC_12x10_SRGB_BLOCK:
+    case VK_FORMAT_ASTC_12x12_UNORM_BLOCK:
+    case VK_FORMAT_ASTC_12x12_SRGB_BLOCK:
+    case VK_FORMAT_ASTC_4x4_SFLOAT_BLOCK:
+    case VK_FORMAT_ASTC_5x4_SFLOAT_BLOCK:
+    case VK_FORMAT_ASTC_5x5_SFLOAT_BLOCK:
+    case VK_FORMAT_ASTC_6x5_SFLOAT_BLOCK:
+    case VK_FORMAT_ASTC_6x6_SFLOAT_BLOCK:
+    case VK_FORMAT_ASTC_8x5_SFLOAT_BLOCK:
+    case VK_FORMAT_ASTC_8x6_SFLOAT_BLOCK:
+    case VK_FORMAT_ASTC_8x8_SFLOAT_BLOCK:
+    case VK_FORMAT_ASTC_10x5_SFLOAT_BLOCK:
+    case VK_FORMAT_ASTC_10x6_SFLOAT_BLOCK:
+    case VK_FORMAT_ASTC_10x8_SFLOAT_BLOCK:
+    case VK_FORMAT_ASTC_10x10_SFLOAT_BLOCK:
+    case VK_FORMAT_ASTC_12x10_SFLOAT_BLOCK:
+    case VK_FORMAT_ASTC_12x12_SFLOAT_BLOCK:
+    case VK_FORMAT_PVRTC1_2BPP_UNORM_BLOCK_IMG:
+    case VK_FORMAT_PVRTC1_2BPP_SRGB_BLOCK_IMG:
+    case VK_FORMAT_PVRTC1_4BPP_UNORM_BLOCK_IMG:
+    case VK_FORMAT_PVRTC1_4BPP_SRGB_BLOCK_IMG:
+    case VK_FORMAT_PVRTC2_2BPP_UNORM_BLOCK_IMG:
+    case VK_FORMAT_PVRTC2_2BPP_SRGB_BLOCK_IMG:
+    case VK_FORMAT_PVRTC2_4BPP_UNORM_BLOCK_IMG:
+    case VK_FORMAT_PVRTC2_4BPP_SRGB_BLOCK_IMG: ret.compByteWidth = 1; break;
+    case VK_FORMAT_G8B8G8R8_422_UNORM:
+    case VK_FORMAT_B8G8R8G8_422_UNORM:
+    case VK_FORMAT_G8_B8_R8_3PLANE_420_UNORM:
+    case VK_FORMAT_G8_B8R8_2PLANE_420_UNORM:
+    case VK_FORMAT_G8_B8_R8_3PLANE_422_UNORM:
+    case VK_FORMAT_G8_B8R8_2PLANE_422_UNORM:
+    case VK_FORMAT_G8_B8_R8_3PLANE_444_UNORM:
+    case VK_FORMAT_G8_B8R8_2PLANE_444_UNORM: ret.compByteWidth = 1; break;
+    case VK_FORMAT_R10X6_UNORM_PACK16:
+    case VK_FORMAT_R10X6G10X6_UNORM_2PACK16:
+    case VK_FORMAT_R10X6G10X6B10X6A10X6_UNORM_4PACK16:
+    case VK_FORMAT_G10X6B10X6G10X6R10X6_422_UNORM_4PACK16:
+    case VK_FORMAT_B10X6G10X6R10X6G10X6_422_UNORM_4PACK16:
+    case VK_FORMAT_G10X6_B10X6_R10X6_3PLANE_420_UNORM_3PACK16:
+    case VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16:
+    case VK_FORMAT_G10X6_B10X6_R10X6_3PLANE_422_UNORM_3PACK16:
+    case VK_FORMAT_G10X6_B10X6R10X6_2PLANE_422_UNORM_3PACK16:
+    case VK_FORMAT_G10X6_B10X6_R10X6_3PLANE_444_UNORM_3PACK16:
+    case VK_FORMAT_G10X6_B10X6R10X6_2PLANE_444_UNORM_3PACK16:
+    case VK_FORMAT_R12X4_UNORM_PACK16:
+    case VK_FORMAT_R12X4G12X4_UNORM_2PACK16:
+    case VK_FORMAT_R12X4G12X4B12X4A12X4_UNORM_4PACK16:
+    case VK_FORMAT_G12X4B12X4G12X4R12X4_422_UNORM_4PACK16:
+    case VK_FORMAT_B12X4G12X4R12X4G12X4_422_UNORM_4PACK16:
+    case VK_FORMAT_G12X4_B12X4_R12X4_3PLANE_420_UNORM_3PACK16:
+    case VK_FORMAT_G12X4_B12X4R12X4_2PLANE_420_UNORM_3PACK16:
+    case VK_FORMAT_G12X4_B12X4_R12X4_3PLANE_422_UNORM_3PACK16:
+    case VK_FORMAT_G12X4_B12X4R12X4_2PLANE_422_UNORM_3PACK16:
+    case VK_FORMAT_G12X4_B12X4_R12X4_3PLANE_444_UNORM_3PACK16:
+    case VK_FORMAT_G12X4_B12X4R12X4_2PLANE_444_UNORM_3PACK16:
+    case VK_FORMAT_G16B16G16R16_422_UNORM:
+    case VK_FORMAT_B16G16R16G16_422_UNORM:
+    case VK_FORMAT_G16_B16_R16_3PLANE_420_UNORM:
+    case VK_FORMAT_G16_B16R16_2PLANE_420_UNORM:
+    case VK_FORMAT_G16_B16_R16_3PLANE_422_UNORM:
+    case VK_FORMAT_G16_B16R16_2PLANE_422_UNORM:
+    case VK_FORMAT_G16_B16_R16_3PLANE_444_UNORM:
+    case VK_FORMAT_G16_B16R16_2PLANE_444_UNORM:
+    case VK_FORMAT_R16G16_S10_5_NV: ret.compByteWidth = 2; break;
+    case VK_FORMAT_UNDEFINED:
+    case VK_FORMAT_MAX_ENUM: ret.compByteWidth = 1; break;
   }
 
   if(IsYUVFormat(fmt))
@@ -2329,9 +2762,13 @@ ResourceFormat MakeResourceFormat(VkFormat fmt)
       case VK_FORMAT_G16_B16_R16_3PLANE_422_UNORM:
       case VK_FORMAT_G16_B16R16_2PLANE_422_UNORM: ret.SetYUVSubsampling(422); break;
       case VK_FORMAT_G8_B8_R8_3PLANE_444_UNORM:
+      case VK_FORMAT_G8_B8R8_2PLANE_444_UNORM:
       case VK_FORMAT_G10X6_B10X6_R10X6_3PLANE_444_UNORM_3PACK16:
+      case VK_FORMAT_G10X6_B10X6R10X6_2PLANE_444_UNORM_3PACK16:
       case VK_FORMAT_G12X4_B12X4_R12X4_3PLANE_444_UNORM_3PACK16:
+      case VK_FORMAT_G12X4_B12X4R12X4_2PLANE_444_UNORM_3PACK16:
       case VK_FORMAT_G16_B16_R16_3PLANE_444_UNORM:
+      case VK_FORMAT_G16_B16R16_2PLANE_444_UNORM:
       case VK_FORMAT_R10X6_UNORM_PACK16:
       case VK_FORMAT_R10X6G10X6_UNORM_2PACK16:
       case VK_FORMAT_R10X6G10X6B10X6A10X6_UNORM_4PACK16:
@@ -2387,8 +2824,8 @@ VkFormat MakeVkFormat(ResourceFormat fmt)
           ret = fmt.SRGBCorrected() ? VK_FORMAT_ETC2_R8G8B8_SRGB_BLOCK
                                     : VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK;
         else
-          ret = fmt.SRGBCorrected() ? VK_FORMAT_ETC2_R8G8B8A8_SRGB_BLOCK
-                                    : VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK;
+          ret = fmt.SRGBCorrected() ? VK_FORMAT_ETC2_R8G8B8A1_SRGB_BLOCK
+                                    : VK_FORMAT_ETC2_R8G8B8A1_UNORM_BLOCK;
         break;
       }
       case ResourceFormatType::EAC:
@@ -2399,6 +2836,9 @@ VkFormat MakeVkFormat(ResourceFormat fmt)
         else if(fmt.compCount == 2)
           ret = fmt.compType == CompType::SNorm ? VK_FORMAT_EAC_R11G11_SNORM_BLOCK
                                                 : VK_FORMAT_EAC_R11G11_UNORM_BLOCK;
+        else
+          ret = fmt.SRGBCorrected() ? VK_FORMAT_ETC2_R8G8B8A8_SRGB_BLOCK
+                                    : VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK;
         break;
       }
       case ResourceFormatType::R10G10B10A2:
@@ -2423,19 +2863,20 @@ VkFormat MakeVkFormat(ResourceFormat fmt)
         break;
       case ResourceFormatType::R11G11B10: ret = VK_FORMAT_B10G11R11_UFLOAT_PACK32; break;
       case ResourceFormatType::R5G6B5:
-        ret = fmt.BGRAOrder() ? VK_FORMAT_B5G6R5_UNORM_PACK16 : VK_FORMAT_R5G6B5_UNORM_PACK16;
+        ret = fmt.BGRAOrder() ? VK_FORMAT_R5G6B5_UNORM_PACK16 : VK_FORMAT_B5G6R5_UNORM_PACK16;
         break;
       case ResourceFormatType::R5G5B5A1:
-        ret = fmt.BGRAOrder() ? VK_FORMAT_B5G5R5A1_UNORM_PACK16 : VK_FORMAT_R5G5B5A1_UNORM_PACK16;
+        ret = fmt.BGRAOrder() ? VK_FORMAT_R5G5B5A1_UNORM_PACK16 : VK_FORMAT_B5G5R5A1_UNORM_PACK16;
         break;
       case ResourceFormatType::R9G9B9E5: ret = VK_FORMAT_E5B9G9R9_UFLOAT_PACK32; break;
       case ResourceFormatType::R4G4B4A4:
-        ret = fmt.BGRAOrder() ? VK_FORMAT_B4G4R4A4_UNORM_PACK16 : VK_FORMAT_R4G4B4A4_UNORM_PACK16;
+        ret = fmt.BGRAOrder() ? VK_FORMAT_R4G4B4A4_UNORM_PACK16 : VK_FORMAT_B4G4R4A4_UNORM_PACK16;
         break;
       case ResourceFormatType::R4G4: ret = VK_FORMAT_R4G4_UNORM_PACK8; break;
       case ResourceFormatType::D16S8: ret = VK_FORMAT_D16_UNORM_S8_UINT; break;
       case ResourceFormatType::D24S8: ret = VK_FORMAT_D24_UNORM_S8_UINT; break;
       case ResourceFormatType::D32S8: ret = VK_FORMAT_D32_SFLOAT_S8_UINT; break;
+      case ResourceFormatType::S8: ret = VK_FORMAT_S8_UINT; break;
       case ResourceFormatType::YUV8:
       {
         int subsampling = fmt.YUVSubsampling();
@@ -2447,8 +2888,12 @@ VkFormat MakeVkFormat(ResourceFormat fmt)
 
         if(subsampling == 444)
         {
-          // only support 3-plane
-          return planeCount == 3 ? VK_FORMAT_G8_B8_R8_3PLANE_444_UNORM : VK_FORMAT_UNDEFINED;
+          if(planeCount == 3)
+            return VK_FORMAT_G8_B8_R8_3PLANE_444_UNORM;
+          else if(planeCount == 2)
+            return VK_FORMAT_G8_B8R8_2PLANE_444_UNORM;
+
+          return VK_FORMAT_UNDEFINED;
         }
         else if(subsampling == 422)
         {
@@ -2497,9 +2942,11 @@ VkFormat MakeVkFormat(ResourceFormat fmt)
 
         if(subsampling == 444)
         {
-          // only support 3-plane
-          return planeCount == 3 ? VK_FORMAT_G10X6_B10X6_R10X6_3PLANE_444_UNORM_3PACK16
-                                 : VK_FORMAT_UNDEFINED;
+          if(planeCount == 3)
+            return VK_FORMAT_G10X6_B10X6_R10X6_3PLANE_444_UNORM_3PACK16;
+          else if(planeCount == 2)
+            return VK_FORMAT_G10X6_B10X6R10X6_2PLANE_444_UNORM_3PACK16;
+          return VK_FORMAT_UNDEFINED;
         }
         else if(subsampling == 422)
         {
@@ -2549,9 +2996,11 @@ VkFormat MakeVkFormat(ResourceFormat fmt)
 
         if(subsampling == 444)
         {
-          // only support 3-plane
-          return planeCount == 3 ? VK_FORMAT_G12X4_B12X4_R12X4_3PLANE_444_UNORM_3PACK16
-                                 : VK_FORMAT_UNDEFINED;
+          if(planeCount == 3)
+            return VK_FORMAT_G12X4_B12X4_R12X4_3PLANE_444_UNORM_3PACK16;
+          else if(planeCount == 2)
+            return VK_FORMAT_G12X4_B12X4R12X4_2PLANE_444_UNORM_3PACK16;
+          return VK_FORMAT_UNDEFINED;
         }
         else if(subsampling == 422)
         {
@@ -2582,8 +3031,11 @@ VkFormat MakeVkFormat(ResourceFormat fmt)
 
         if(subsampling == 444)
         {
-          // only support 3-plane
-          return planeCount == 3 ? VK_FORMAT_G16_B16_R16_3PLANE_444_UNORM : VK_FORMAT_UNDEFINED;
+          if(planeCount == 3)
+            return VK_FORMAT_G16_B16_R16_3PLANE_444_UNORM;
+          else if(planeCount == 2)
+            return VK_FORMAT_G16_B16R16_2PLANE_444_UNORM;
+          return VK_FORMAT_UNDEFINED;
         }
         else if(subsampling == 422)
         {
@@ -2618,7 +3070,7 @@ VkFormat MakeVkFormat(ResourceFormat fmt)
     }
     else if(fmt.compByteWidth == 8)
     {
-      if(fmt.compType == CompType::Float || fmt.compType == CompType::Double)
+      if(fmt.compType == CompType::Float)
         ret = VK_FORMAT_R64G64B64A64_SFLOAT;
       else if(fmt.compType == CompType::SInt)
         ret = VK_FORMAT_R64G64B64A64_SINT;
@@ -2687,7 +3139,7 @@ VkFormat MakeVkFormat(ResourceFormat fmt)
     }
     else if(fmt.compByteWidth == 8)
     {
-      if(fmt.compType == CompType::Float || fmt.compType == CompType::Double)
+      if(fmt.compType == CompType::Float)
         ret = VK_FORMAT_R64G64B64_SFLOAT;
       else if(fmt.compType == CompType::SInt)
         ret = VK_FORMAT_R64G64B64_SINT;
@@ -2756,7 +3208,7 @@ VkFormat MakeVkFormat(ResourceFormat fmt)
     }
     else if(fmt.compByteWidth == 8)
     {
-      if(fmt.compType == CompType::Float || fmt.compType == CompType::Double)
+      if(fmt.compType == CompType::Float)
         ret = VK_FORMAT_R64G64_SFLOAT;
       else if(fmt.compType == CompType::SInt)
         ret = VK_FORMAT_R64G64_SINT;
@@ -2825,7 +3277,7 @@ VkFormat MakeVkFormat(ResourceFormat fmt)
     }
     else if(fmt.compByteWidth == 8)
     {
-      if(fmt.compType == CompType::Float || fmt.compType == CompType::Double)
+      if(fmt.compType == CompType::Float)
         ret = VK_FORMAT_R64_SFLOAT;
       else if(fmt.compType == CompType::SInt)
         ret = VK_FORMAT_R64_SINT;
@@ -2844,6 +3296,13 @@ VkFormat MakeVkFormat(ResourceFormat fmt)
         ret = VK_FORMAT_R32_UINT;
       else if(fmt.compType == CompType::Depth)
         ret = VK_FORMAT_D32_SFLOAT;
+      else
+        RDCERR("Unrecognised component type");
+    }
+    else if(fmt.compByteWidth == 3)
+    {
+      if(fmt.compType == CompType::Depth)
+        ret = VK_FORMAT_X8_D24_UNORM_PACK32;
       else
         RDCERR("Unrecognised component type");
     }
@@ -2919,6 +3378,369 @@ VkImageAspectFlags FormatImageAspects(VkFormat fmt)
     return VK_IMAGE_ASPECT_COLOR_BIT;
 }
 
+RenderPassInfo::RenderPassInfo(const VkRenderPassCreateInfo &ci)
+{
+  // *2 in case we need separate barriers for depth and stencil, +1 for the terminating null
+  // attachment info (though separate depth/stencil buffers aren't needed here, we keep the
+  // array size the same)
+  uint32_t arrayCount = ci.attachmentCount * 2 + 1;
+  imageAttachments = new AttachmentInfo[arrayCount];
+  RDCEraseMem(imageAttachments, arrayCount * sizeof(imageAttachments[0]));
+
+  for(uint32_t i = 0; i < ci.attachmentCount; ++i)
+  {
+    imageAttachments[i].record = NULL;
+    imageAttachments[i].barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    imageAttachments[i].barrier.oldLayout = ci.pAttachments[i].initialLayout;
+    imageAttachments[i].barrier.newLayout = ci.pAttachments[i].finalLayout;
+    imageAttachments[i].barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    imageAttachments[i].barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    imageAttachments[i].format = ci.pAttachments[i].format;
+    imageAttachments[i].samples = ci.pAttachments[i].samples;
+  }
+
+  // VK_KHR_multiview
+  const VkRenderPassMultiviewCreateInfo *multiview =
+      (const VkRenderPassMultiviewCreateInfo *)FindNextStruct(
+          &ci, VK_STRUCTURE_TYPE_RENDER_PASS_MULTIVIEW_CREATE_INFO);
+
+  if(multiview && multiview->subpassCount > 0)
+  {
+    multiviewViewMaskTable = new uint32_t[arrayCount];
+    RDCEraseMem(multiviewViewMaskTable, arrayCount * sizeof(multiviewViewMaskTable[0]));
+  }
+  else
+  {
+    multiviewViewMaskTable = NULL;
+  }
+
+  loadOpTable = new VkAttachmentLoadOp[arrayCount];
+  storeOpTable = new VkAttachmentStoreOp[arrayCount];
+
+  // we only care about which attachment doesn't have LOAD specificed, so we
+  // assume all attachments have VK_ATTACHMENT_LOAD_OP_LOAD until proven otherwise.
+  // similarly for store
+  for(uint32_t a = 0; a < arrayCount; ++a)
+  {
+    loadOpTable[a] = VK_ATTACHMENT_LOAD_OP_LOAD;
+    storeOpTable[a] = VK_ATTACHMENT_STORE_OP_STORE;
+  }
+
+  for(uint32_t s = 0; s < ci.subpassCount; ++s)
+  {
+    const VkAttachmentReference *pColorAttachments = ci.pSubpasses[s].pColorAttachments;
+    const VkAttachmentReference *pResolveAttachments = ci.pSubpasses[s].pResolveAttachments;
+    const VkAttachmentReference *pDepthStencilAttachment = ci.pSubpasses[s].pDepthStencilAttachment;
+
+    if(pColorAttachments)
+    {
+      const VkAttachmentReference *pColorRunner = pColorAttachments;
+      const VkAttachmentReference *pColorEnd = pColorRunner + ci.pSubpasses[s].colorAttachmentCount;
+
+      while(pColorRunner != pColorEnd)
+      {
+        uint32_t index = pColorRunner->attachment;
+        if(index < ci.attachmentCount)
+        {
+          loadOpTable[index] = ci.pAttachments[index].loadOp;
+          storeOpTable[index] = ci.pAttachments[index].storeOp;
+
+          if(multiviewViewMaskTable)
+          {
+            multiviewViewMaskTable[index] |= multiview->pViewMasks[s];
+          }
+        }
+        ++pColorRunner;
+      }
+    }
+    if(pResolveAttachments)
+    {
+      const VkAttachmentReference *pResolveRunner = pResolveAttachments;
+      const VkAttachmentReference *pResolveEnd =
+          pResolveRunner + ci.pSubpasses[s].colorAttachmentCount;
+
+      while(pResolveRunner != pResolveEnd)
+      {
+        uint32_t index = pResolveRunner->attachment;
+        if(index < ci.attachmentCount)
+        {
+          loadOpTable[index] = ci.pAttachments[index].loadOp;
+          storeOpTable[index] = ci.pAttachments[index].storeOp;
+
+          if(multiviewViewMaskTable)
+          {
+            multiviewViewMaskTable[index] |= multiview->pViewMasks[s];
+          }
+        }
+        ++pResolveRunner;
+      }
+    }
+    if(pDepthStencilAttachment)
+    {
+      uint32_t index = pDepthStencilAttachment->attachment;
+
+      if(index < ci.attachmentCount)
+      {
+        VkAttachmentLoadOp depthStencilLoadOp = ci.pAttachments[index].loadOp;
+        VkAttachmentStoreOp depthStencilStoreOp = ci.pAttachments[index].storeOp;
+
+        // make depthstencil VK_ATTACHMENT_LOAD_OP_LOAD if either depth or stencil is
+        // VK_ATTACHMENT_LOAD_OP_LOAD
+        if(depthStencilLoadOp != VK_ATTACHMENT_LOAD_OP_LOAD &&
+           IsStencilFormat(ci.pAttachments[index].format))
+        {
+          depthStencilLoadOp = ci.pAttachments[index].stencilLoadOp;
+        }
+        // similarly for store
+        if(depthStencilStoreOp != VK_ATTACHMENT_STORE_OP_STORE &&
+           IsStencilFormat(ci.pAttachments[index].format))
+        {
+          depthStencilStoreOp = ci.pAttachments[index].stencilStoreOp;
+        }
+
+        loadOpTable[index] = depthStencilLoadOp;
+        storeOpTable[index] = depthStencilStoreOp;
+
+        if(multiviewViewMaskTable)
+        {
+          multiviewViewMaskTable[index] |= multiview->pViewMasks[s];
+        }
+      }
+    }
+  }
+}
+
+RenderPassInfo::RenderPassInfo(const VkRenderPassCreateInfo2 &ci)
+{
+  // *2 in case we need separate barriers for depth and stencil, +1 for the terminating null
+  // attachment info
+  uint32_t arrayCount = ci.attachmentCount * 2 + 1;
+  imageAttachments = new AttachmentInfo[arrayCount];
+  RDCEraseMem(imageAttachments, arrayCount * sizeof(imageAttachments[0]));
+
+  // need to keep a table for the index remap, because imageAttachments won't have the same
+  // order as ci.pAttachments
+  rdcarray<uint32_t> indexRemapTable;
+  indexRemapTable.fill(ci.attachmentCount, 0xFFFFFFFF);
+
+  for(uint32_t i = 0, a = 0; i < ci.attachmentCount; i++, a++)
+  {
+    imageAttachments[a].record = NULL;
+    imageAttachments[a].barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    imageAttachments[a].barrier.oldLayout = ci.pAttachments[i].initialLayout;
+    imageAttachments[a].barrier.newLayout = ci.pAttachments[i].finalLayout;
+    imageAttachments[a].barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    imageAttachments[a].barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    imageAttachments[a].format = ci.pAttachments[i].format;
+    imageAttachments[a].samples = ci.pAttachments[i].samples;
+
+    indexRemapTable[i] = a;
+
+    // VK_KHR_separate_depth_stencil_layouts
+    VkAttachmentDescriptionStencilLayout *separateStencil =
+        (VkAttachmentDescriptionStencilLayout *)FindNextStruct(
+            &ci.pAttachments[i], VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_STENCIL_LAYOUT);
+
+    if(separateStencil)
+    {
+      imageAttachments[a].barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+
+      // add a separate barrier for stencil
+      a++;
+
+      imageAttachments[a].barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+      imageAttachments[a].barrier.oldLayout = separateStencil->stencilInitialLayout;
+      imageAttachments[a].barrier.newLayout = separateStencil->stencilFinalLayout;
+      imageAttachments[a].barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      imageAttachments[a].barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      imageAttachments[a].barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
+    }
+  }
+
+  // if any subpass' viewMask is non-zero, then multiview is enabled
+  multiviewViewMaskTable = NULL;
+  for(uint32_t s = 0; s < ci.subpassCount; ++s)
+  {
+    if(ci.pSubpasses[s].viewMask)
+    {
+      multiviewViewMaskTable = new uint32_t[arrayCount];
+      RDCEraseMem(multiviewViewMaskTable, arrayCount * sizeof(multiviewViewMaskTable[0]));
+      break;
+    }
+  }
+
+  loadOpTable = new VkAttachmentLoadOp[arrayCount];
+  storeOpTable = new VkAttachmentStoreOp[arrayCount];
+
+  // we only care about which attachment doesn't have LOAD specificed, so we
+  // assume all attachments have VK_ATTACHMENT_LOAD_OP_LOAD until proven otherwise.
+  // similarly for store
+  for(uint32_t a = 0; a < arrayCount; ++a)
+  {
+    loadOpTable[a] = VK_ATTACHMENT_LOAD_OP_LOAD;
+    storeOpTable[a] = VK_ATTACHMENT_STORE_OP_STORE;
+  }
+
+  for(uint32_t s = 0; s < ci.subpassCount; ++s)
+  {
+    const VkAttachmentReference2 *pColorAttachments = ci.pSubpasses[s].pColorAttachments;
+    const VkAttachmentReference2 *pResolveAttachments = ci.pSubpasses[s].pResolveAttachments;
+    const VkAttachmentReference2 *pDepthStencilAttachment = ci.pSubpasses[s].pDepthStencilAttachment;
+
+    if(pColorAttachments)
+    {
+      const VkAttachmentReference2 *pColorRunner = pColorAttachments;
+      const VkAttachmentReference2 *pColorEnd = pColorRunner + ci.pSubpasses[s].colorAttachmentCount;
+
+      while(pColorRunner != pColorEnd)
+      {
+        uint32_t index = pColorRunner->attachment;
+        if(index < ci.attachmentCount)
+        {
+          uint32_t remappedIndex = indexRemapTable[index];
+          RDCASSERT(remappedIndex < arrayCount);
+
+          loadOpTable[remappedIndex] = ci.pAttachments[index].loadOp;
+          storeOpTable[remappedIndex] = ci.pAttachments[index].storeOp;
+
+          if(multiviewViewMaskTable)
+          {
+            multiviewViewMaskTable[remappedIndex] |= ci.pSubpasses[s].viewMask;
+          }
+        }
+        ++pColorRunner;
+      }
+    }
+    if(pResolveAttachments)
+    {
+      const VkAttachmentReference2 *pResolveRunner = pResolveAttachments;
+      const VkAttachmentReference2 *pResolveEnd =
+          pResolveRunner + ci.pSubpasses[s].colorAttachmentCount;
+
+      while(pResolveRunner != pResolveEnd)
+      {
+        uint32_t index = pResolveRunner->attachment;
+        if(index < ci.attachmentCount)
+        {
+          uint32_t remappedIndex = indexRemapTable[index];
+          RDCASSERT(remappedIndex < arrayCount);
+
+          loadOpTable[remappedIndex] = ci.pAttachments[index].loadOp;
+          storeOpTable[remappedIndex] = ci.pAttachments[index].storeOp;
+
+          if(multiviewViewMaskTable)
+          {
+            multiviewViewMaskTable[remappedIndex] |= ci.pSubpasses[s].viewMask;
+          }
+        }
+        ++pResolveRunner;
+      }
+    }
+    if(pDepthStencilAttachment)
+    {
+      uint32_t index = pDepthStencilAttachment->attachment;
+
+      if(index < ci.attachmentCount)
+      {
+        VkAttachmentLoadOp depthStencilLoadOp = ci.pAttachments[index].loadOp;
+        VkAttachmentStoreOp depthStencilStoreOp = ci.pAttachments[index].storeOp;
+        VkAttachmentLoadOp stencilLoadOp = ci.pAttachments[index].stencilLoadOp;
+        VkAttachmentStoreOp stencilStoreOp = ci.pAttachments[index].stencilStoreOp;
+
+        uint32_t remappedIndex = indexRemapTable[index];
+        RDCASSERT(remappedIndex < arrayCount);
+
+        if(IsStencilFormat(ci.pAttachments[index].format))
+        {
+          // VK_KHR_separate_depth_stencil_layouts
+          VkAttachmentDescriptionStencilLayout *separateStencil =
+              (VkAttachmentDescriptionStencilLayout *)FindNextStruct(
+                  &ci.pAttachments[index], VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_STENCIL_LAYOUT);
+
+          if(separateStencil)
+          {
+            loadOpTable[remappedIndex + 1] = stencilLoadOp;
+            storeOpTable[remappedIndex + 1] = stencilStoreOp;
+          }
+          else
+          {
+            // make depthstencil VK_ATTACHMENT_LOAD_OP_LOAD if either depth or stencil is
+            // VK_ATTACHMENT_LOAD_OP_LOAD
+            if(depthStencilLoadOp != VK_ATTACHMENT_LOAD_OP_LOAD)
+            {
+              depthStencilLoadOp = stencilLoadOp;
+            }
+            if(depthStencilStoreOp != VK_ATTACHMENT_STORE_OP_STORE)
+            {
+              depthStencilStoreOp = stencilStoreOp;
+            }
+          }
+        }
+
+        loadOpTable[remappedIndex] = depthStencilLoadOp;
+        storeOpTable[remappedIndex] = depthStencilStoreOp;
+
+        if(multiviewViewMaskTable)
+        {
+          multiviewViewMaskTable[remappedIndex] |= ci.pSubpasses[s].viewMask;
+        }
+      }
+    }
+  }
+}
+
+RenderPassInfo::~RenderPassInfo()
+{
+  delete[] imageAttachments;
+  delete[] loadOpTable;
+  delete[] storeOpTable;
+  delete[] multiviewViewMaskTable;
+}
+
+FramebufferInfo::FramebufferInfo(const VkFramebufferCreateInfo &ci)
+{
+  // *2 in case we need separate barriers for depth and stencil, +1 for the terminating null
+  // attachment info
+  uint32_t arrayCount = ci.attachmentCount * 2 + 1;
+
+  imageAttachments = new AttachmentInfo[arrayCount];
+  RDCEraseMem(imageAttachments, arrayCount * sizeof(imageAttachments[0]));
+
+  width = ci.width;
+  height = ci.height;
+  layers = ci.layers;
+}
+FramebufferInfo::~FramebufferInfo()
+{
+  delete[] imageAttachments;
+}
+
+bool FramebufferInfo::AttachmentFullyReferenced(size_t attachmentIndex, VkResourceRecord *att,
+                                                VkImageSubresourceRange viewRange,
+                                                const RenderPassInfo *rpi)
+{
+  // if framebuffer doesn't reference the entire image
+  if(att->resInfo->imageInfo.extent.width != width || att->resInfo->imageInfo.extent.height != height)
+  {
+    return false;
+  }
+  // if view doesn't reference the entire image
+  if(att->viewRange.baseArrayLayer != 0 ||
+     att->viewRange.layerCount() != (uint32_t)att->resInfo->imageInfo.layerCount ||
+     att->viewRange.baseMipLevel != 0 ||
+     att->viewRange.levelCount() != (uint32_t)att->resInfo->imageInfo.levelCount)
+  {
+    return false;
+  }
+  if(rpi->multiviewViewMaskTable)
+  {
+    // check and make sure all views are referenced by the renderpass
+    uint32_t renderpass_viewmask = rpi->multiviewViewMaskTable[attachmentIndex];
+    return Bits::CountOnes(renderpass_viewmask) == att->resInfo->imageInfo.layerCount;
+  }
+  return viewRange.layerCount == layers;
+}
+
 int ImgRefs::GetAspectCount() const
 {
   int aspectCount = 0;
@@ -2963,23 +3785,70 @@ int ImgRefs::SubresourceIndex(int aspectIndex, int level, int layer) const
   return (aspectIndex * splitLevelCount + level) * splitLayerCount + layer;
 }
 
-std::vector<rdcpair<VkImageSubresourceRange, InitReqType> > ImgRefs::SubresourceRangeInitReqs(
-    VkImageSubresourceRange range, InitPolicy policy, bool initialized) const
+InitReqType ImgRefs::SubresourceRangeMaxInitReq(VkImageSubresourceRange range, InitPolicy policy,
+                                                bool initialized) const
 {
-  VkImageSubresourceRange out(range);
-  std::vector<rdcpair<VkImageSubresourceRange, InitReqType> > res;
-  std::vector<VkImageAspectFlags> splitAspects;
+  InitReqType initReq = eInitReq_None;
+  rdcarray<int> splitAspectIndices;
   if(areAspectsSplit)
   {
-    for(auto aspectIt = ImageAspectFlagIter::begin(aspectMask & range.aspectMask);
-        aspectIt != ImageAspectFlagIter::end(); ++aspectIt)
+    int aspectIndex = 0;
+    for(auto aspectIt = ImageAspectFlagIter::begin(aspectMask);
+        aspectIt != ImageAspectFlagIter::end(); ++aspectIt, ++aspectIndex)
     {
-      splitAspects.push_back(*aspectIt);
+      if(((*aspectIt) & range.aspectMask) != 0)
+        splitAspectIndices.push_back(aspectIndex);
     }
   }
   else
   {
-    splitAspects.push_back(range.aspectMask);
+    splitAspectIndices.push_back(0);
+  }
+
+  int splitLevelCount = 1;
+  if(areLevelsSplit || range.baseMipLevel != 0 || range.levelCount < (uint32_t)imageInfo.levelCount)
+  {
+    splitLevelCount = range.levelCount;
+  }
+  int splitLayerCount = 1;
+  if(areLayersSplit || range.baseArrayLayer != 0 || range.layerCount < (uint32_t)imageInfo.layerCount)
+  {
+    splitLayerCount = range.layerCount;
+  }
+  for(auto aspectIndexIt = splitAspectIndices.begin(); aspectIndexIt != splitAspectIndices.end();
+      ++aspectIndexIt)
+  {
+    for(int level = range.baseMipLevel; level < splitLevelCount; ++level)
+    {
+      for(int layer = range.baseArrayLayer; layer < splitLayerCount; ++layer)
+      {
+        initReq =
+            RDCMAX(initReq, SubresourceInitReq(*aspectIndexIt, level, layer, policy, initialized));
+      }
+    }
+  }
+  return initReq;
+}
+
+rdcarray<rdcpair<VkImageSubresourceRange, InitReqType> > ImgRefs::SubresourceRangeInitReqs(
+    VkImageSubresourceRange range, InitPolicy policy, bool initialized) const
+{
+  VkImageSubresourceRange out(range);
+  rdcarray<rdcpair<VkImageSubresourceRange, InitReqType> > res;
+  rdcarray<rdcpair<int, VkImageAspectFlags> > splitAspects;
+  if(areAspectsSplit)
+  {
+    int aspectIndex = 0;
+    for(auto aspectIt = ImageAspectFlagIter::begin(aspectMask);
+        aspectIt != ImageAspectFlagIter::end(); ++aspectIt, ++aspectIndex)
+    {
+      if(((*aspectIt) & range.aspectMask) != 0)
+        splitAspects.push_back({aspectIndex, (VkImageAspectFlags)*aspectIt});
+    }
+  }
+  else
+  {
+    splitAspects.push_back({0, aspectMask});
   }
 
   int splitLevelCount = 1;
@@ -2994,10 +3863,10 @@ std::vector<rdcpair<VkImageSubresourceRange, InitReqType> > ImgRefs::Subresource
     splitLayerCount = range.layerCount;
     out.layerCount = 1;
   }
-  int aspectIndex = 0;
-  for(auto aspectIt = splitAspects.begin(); aspectIt != splitAspects.end(); ++aspectIt, ++aspectIndex)
+  for(auto aspectIt = splitAspects.begin(); aspectIt != splitAspects.end(); ++aspectIt)
   {
-    out.aspectMask = *aspectIt;
+    int aspectIndex = aspectIt->first;
+    out.aspectMask = aspectIt->second;
     for(int level = range.baseMipLevel; level < splitLevelCount; ++level)
     {
       out.baseMipLevel = level;
@@ -3055,16 +3924,11 @@ void ImgRefs::Split(bool splitAspects, bool splitLevels, bool splitLayers)
 
 VkResourceRecord::~VkResourceRecord()
 {
-  VkResourceType resType = Resource != NULL ? IdentifyTypeByPtr(Resource) : eResUnknown;
-
-  if(resType == eResPhysicalDevice)
-    SAFE_DELETE(memProps);
-
   // bufferviews and imageviews have non-owning pointers to the sparseinfo struct
   if(resType == eResBuffer || resType == eResImage)
     SAFE_DELETE(resInfo);
 
-  if(resType == eResInstance || resType == eResDevice)
+  if(resType == eResInstance || resType == eResDevice || resType == eResPhysicalDevice)
     SAFE_DELETE(instDevInfo);
 
   if(resType == eResSwapchain)
@@ -3080,8 +3944,11 @@ VkResourceRecord::~VkResourceRecord()
   if(resType == eResCommandBuffer)
     SAFE_DELETE(cmdInfo);
 
-  if(resType == eResFramebuffer || resType == eResRenderPass)
-    SAFE_DELETE_ARRAY(imageAttachments);
+  if(resType == eResFramebuffer)
+    SAFE_DELETE(framebufferInfo);
+
+  if(resType == eResRenderPass)
+    SAFE_DELETE(renderPassInfo);
 
   // only the descriptor set layout actually owns this pointer, descriptor sets
   // have a pointer to it but don't own it
@@ -3094,24 +3961,35 @@ VkResourceRecord::~VkResourceRecord()
   if(resType == eResPipelineLayout)
     SAFE_DELETE(pipeLayoutInfo);
 
+  if(resType == eResDescriptorPool)
+    SAFE_DELETE(descPoolInfo);
+
   if(resType == eResDescUpdateTemplate)
     SAFE_DELETE(descTemplateInfo);
+
+  if(resType == eResCommandPool)
+    SAFE_DELETE(cmdPoolInfo);
 }
 
 void VkResourceRecord::MarkImageFrameReferenced(VkResourceRecord *img, const ImageRange &range,
                                                 FrameRefType refType)
 {
-  // mark backing memory as read
-  MarkResourceFrameReferenced(img->baseResource, eFrameRef_Read);
-
   ResourceId id = img->GetResourceID();
-  if(refType != eFrameRef_Read && refType != eFrameRef_None)
-    cmdInfo->dirtied.insert(id);
+
+  // mark backing memory. For dedicated images we always treat the memory as read only so
+  // we don't try and include its initial contents.
+  if(img->dedicated)
+    MarkResourceFrameReferenced(img->baseResource, eFrameRef_Read);
+  else
+    MarkResourceFrameReferenced(img->baseResource, refType);
+
   if(img->resInfo && img->resInfo->IsSparse())
     cmdInfo->sparse.insert(img->resInfo);
 
-  FrameRefType maxRef =
-      MarkImageReferenced(cmdInfo->imgFrameRefs, id, img->resInfo->imageInfo, range, refType);
+  ImageSubresourceRange range2(range);
+
+  FrameRefType maxRef = MarkImageReferenced(cmdInfo->imageStates, id, img->resInfo->imageInfo,
+                                            range2, VK_QUEUE_FAMILY_IGNORED, refType);
 
   // maintain the reference type of the image itself as the maximum reference type of any
   // subresource
@@ -3127,24 +4005,37 @@ void VkResourceRecord::MarkImageViewFrameReferenced(VkResourceRecord *view, cons
   // mark image view as read
   MarkResourceFrameReferenced(view->GetResourceID(), eFrameRef_Read);
 
-  // mark memory backing image as read
+  // mark memory backing image as read only so we don't try and include its initial contents just
+  // because of an image's writes
   MarkResourceFrameReferenced(mem, eFrameRef_Read);
 
-  if(refType != eFrameRef_Read && refType != eFrameRef_None)
-    cmdInfo->dirtied.insert(img);
-
-  ImageRange imgRange;
+  ImageSubresourceRange imgRange;
   imgRange.aspectMask = view->viewRange.aspectMask;
-  imgRange.baseMipLevel = view->viewRange.baseMipLevel + range.baseMipLevel;
-  imgRange.levelCount = range.levelCount;
-  imgRange.baseArrayLayer = view->viewRange.baseArrayLayer + range.baseArrayLayer;
-  imgRange.layerCount = range.layerCount;
-  imgRange.offset = range.offset;
-  imgRange.extent = range.extent;
-  imgRange.viewType = view->viewRange.viewType();
 
-  FrameRefType maxRef =
-      MarkImageReferenced(cmdInfo->imgFrameRefs, img, view->resInfo->imageInfo, imgRange, refType);
+  imgRange.baseMipLevel = range.baseMipLevel;
+  imgRange.levelCount = range.levelCount;
+  SanitiseLevelRange(imgRange.baseMipLevel, imgRange.levelCount, view->viewRange.levelCount());
+  imgRange.baseMipLevel += view->viewRange.baseMipLevel;
+
+  if(view->resInfo->imageInfo.imageType == VK_IMAGE_TYPE_3D &&
+     view->viewRange.viewType() != VK_IMAGE_VIEW_TYPE_3D)
+  {
+    imgRange.baseDepthSlice = range.baseArrayLayer;
+    imgRange.sliceCount = range.layerCount;
+    SanitiseLayerRange(imgRange.baseDepthSlice, imgRange.sliceCount, view->viewRange.layerCount());
+    imgRange.baseDepthSlice += view->viewRange.baseArrayLayer;
+  }
+  else
+  {
+    imgRange.baseArrayLayer = range.baseArrayLayer;
+    imgRange.layerCount = range.layerCount;
+    SanitiseLayerRange(imgRange.baseArrayLayer, imgRange.layerCount, view->viewRange.layerCount());
+    imgRange.baseArrayLayer += view->viewRange.baseArrayLayer;
+  }
+  imgRange.Sanitise(view->resInfo->imageInfo);
+
+  FrameRefType maxRef = MarkImageReferenced(cmdInfo->imageStates, img, view->resInfo->imageInfo,
+                                            imgRange, VK_QUEUE_FAMILY_IGNORED, refType);
 
   // maintain the reference type of the image itself as the maximum reference type of any
   // subresource
@@ -3154,8 +4045,6 @@ void VkResourceRecord::MarkImageViewFrameReferenced(VkResourceRecord *view, cons
 void VkResourceRecord::MarkMemoryFrameReferenced(ResourceId mem, VkDeviceSize offset,
                                                  VkDeviceSize size, FrameRefType refType)
 {
-  if(refType != eFrameRef_Read && refType != eFrameRef_None)
-    cmdInfo->dirtied.insert(mem);
   FrameRefType maxRef = MarkMemoryReferenced(cmdInfo->memFrameRefs, mem, offset, size, refType);
   MarkResourceFrameReferenced(mem, maxRef, ComposeFrameRefsDisjoint);
 }
@@ -3182,9 +4071,6 @@ void VkResourceRecord::MarkBufferImageCopyFrameReferenced(VkResourceRecord *buf,
                                                           FrameRefType bufRefType,
                                                           FrameRefType imgRefType)
 {
-  if(IsDirtyFrameRef(imgRefType))
-    cmdInfo->dirtied.insert(img->GetResourceID());
-
   // mark buffer just as read
   MarkResourceFrameReferenced(buf->GetResourceID(), eFrameRef_Read);
 
@@ -3294,232 +4180,93 @@ void VkResourceRecord::MarkBufferViewFrameReferenced(VkResourceRecord *bufView, 
                               refType);
 }
 
-void ResourceInfo::Update(uint32_t numBindings, const VkSparseImageMemoryBind *pBindings)
+void ResourceInfo::Update(uint32_t numBindings, const VkSparseImageMemoryBind *pBindings,
+                          std::set<ResourceId> &memories)
 {
-  // update image page table mappings
-
-  for(uint32_t b = 0; b < numBindings; b++)
+  // update texel mappings
+  for(uint32_t i = 0; i < numBindings; i++)
   {
-    const VkSparseImageMemoryBind &newBind = pBindings[b];
+    const VkSparseImageMemoryBind &bind = pBindings[i];
 
-    // VKTODOMED handle sparse image arrays or sparse images with mips
-    RDCASSERT(newBind.subresource.arrayLayer == 0 && newBind.subresource.mipLevel == 0);
+    Sparse::PageTable &table = getSparseTableForAspect(bind.subresource.aspectMask);
 
-    rdcpair<VkDeviceMemory, VkDeviceSize> *pageTable = pages[newBind.subresource.aspectMask];
+    const uint32_t sub =
+        table.calcSubresource(bind.subresource.arrayLayer, bind.subresource.mipLevel);
 
-    VkOffset3D offsInPages = newBind.offset;
-    offsInPages.x /= pagedim.width;
-    offsInPages.y /= pagedim.height;
-    offsInPages.z /= pagedim.depth;
+    table.setImageBoxRange(
+        sub, {(uint32_t)bind.offset.x, (uint32_t)bind.offset.y, (uint32_t)bind.offset.z},
+        {bind.extent.width, bind.extent.height, bind.extent.depth}, GetResID(bind.memory),
+        bind.memoryOffset, false);
 
-    VkExtent3D extInPages = newBind.extent;
-    extInPages.width /= pagedim.width;
-    extInPages.height /= pagedim.height;
-    extInPages.depth /= pagedim.depth;
+    memories.insert(GetResID(bind.memory));
+  }
+}
 
-    rdcpair<VkDeviceMemory, VkDeviceSize> mempair =
-        make_rdcpair(newBind.memory, newBind.memoryOffset);
+void ResourceInfo::Update(uint32_t numBindings, const VkSparseMemoryBind *pBindings,
+                          std::set<ResourceId> &memories)
+{
+  // update mip tail mappings
+  const bool isBuffer = (imageInfo.extent.width == 0);
 
-    for(uint32_t z = offsInPages.z; z < offsInPages.z + extInPages.depth; z++)
+  for(uint32_t i = 0; i < numBindings; i++)
+  {
+    const VkSparseMemoryBind &bind = pBindings[i];
+
+    memories.insert(GetResID(bind.memory));
+
+    // don't need to figure out which aspect we're in if we only have one table
+    if(isBuffer || altSparseAspects.empty())
     {
-      for(uint32_t y = offsInPages.y; y < offsInPages.y + extInPages.height; y++)
+      sparseTable.setMipTailRange(bind.resourceOffset, GetResID(bind.memory), bind.memoryOffset,
+                                  bind.size, false);
+    }
+    else
+    {
+      bool found = false;
+
+      // ask each table if this offset is within its range
+      for(size_t a = 0; a <= altSparseAspects.size(); a++)
       {
-        for(uint32_t x = offsInPages.x; x < offsInPages.x + extInPages.width; x++)
+        Sparse::PageTable &table =
+            a < altSparseAspects.size() ? altSparseAspects[a].table : sparseTable;
+
+        if(table.isByteOffsetInResource(bind.resourceOffset))
         {
-          pageTable[z * imgdim.width * imgdim.height + y * imgdim.width + x] = mempair;
+          found = true;
+          table.setMipTailRange(bind.resourceOffset, GetResID(bind.memory), bind.memoryOffset,
+                                bind.size, false);
         }
       }
+
+      // just in case, if we don't find it in any then assume it's metadata
+      if(!found)
+        getSparseTableForAspect(VK_IMAGE_ASPECT_METADATA_BIT)
+            .setMipTailRange(bind.resourceOffset, GetResID(bind.memory), bind.memoryOffset,
+                             bind.size, false);
     }
   }
 }
 
-void ResourceInfo::Update(uint32_t numBindings, const VkSparseMemoryBind *pBindings)
+FrameRefType MarkImageReferenced(rdcflatmap<ResourceId, ImageState> &imageStates, ResourceId img,
+                                 const ImageInfo &imageInfo, const ImageSubresourceRange &range,
+                                 uint32_t queueFamilyIndex, FrameRefType refType)
 {
-  // update opaque mappings
-
-  for(uint32_t b = 0; b < numBindings; b++)
-  {
-    const VkSparseMemoryBind &curRange = pBindings[b];
-
-    bool found = false;
-
-    // this could be improved to do a binary search since the vector is sorted.
-    for(auto it = opaquemappings.begin(); it != opaquemappings.end(); ++it)
-    {
-      VkSparseMemoryBind &newRange = *it;
-
-      // the binding we're applying is after this item in the list,
-      // keep searching
-      if(curRange.resourceOffset + curRange.size <= newRange.resourceOffset)
-        continue;
-
-      // the binding we're applying is before this item, but doesn't
-      // overlap. Insert before us in the list
-      if(curRange.resourceOffset >= newRange.resourceOffset + newRange.size)
-      {
-        opaquemappings.insert(it, newRange);
-        found = true;
-        break;
-      }
-
-      // with sparse mappings it will be reasonably common to update an exact
-      // existing range, so check that first
-      if(curRange.resourceOffset == newRange.resourceOffset && curRange.size == newRange.size)
-      {
-        *it = curRange;
-        found = true;
-        break;
-      }
-
-      // handle subranges within the current range
-      if(curRange.resourceOffset <= newRange.resourceOffset &&
-         curRange.resourceOffset + curRange.size >= newRange.resourceOffset + newRange.size)
-      {
-        // they start in the same place
-        if(curRange.resourceOffset == newRange.resourceOffset)
-        {
-          // change the current range to be the leftover second half
-          it->resourceOffset += curRange.size;
-
-          // insert the new mapping before our current one
-          opaquemappings.insert(it, newRange);
-          found = true;
-          break;
-        }
-        // they end in the same place
-        else if(curRange.resourceOffset + curRange.size == newRange.resourceOffset + newRange.size)
-        {
-          // save a copy
-          VkSparseMemoryBind cur = curRange;
-
-          // set the new size of the first half
-          cur.size = newRange.resourceOffset - curRange.resourceOffset;
-
-          // add the new range where the current iterator was
-          *it = newRange;
-
-          // insert the old truncated mapping before our current position
-          opaquemappings.insert(it, cur);
-          found = true;
-          break;
-        }
-        // the new range is a subsection
-        else
-        {
-          // save a copy
-          VkSparseMemoryBind first = curRange;
-
-          // set the new size of the first part
-          first.size = newRange.resourceOffset - curRange.resourceOffset;
-
-          // set the current range (third part) to start after the new range ends
-          it->resourceOffset = newRange.resourceOffset + newRange.size;
-
-          // first insert the new range before our current range
-          it = opaquemappings.insert(it, newRange);
-
-          // now insert the remaining first part before that
-          opaquemappings.insert(it, first);
-
-          found = true;
-          break;
-        }
-      }
-
-      // this new range overlaps the current one and some subsequent ranges. Merge together
-
-      // find where this new range stops overlapping
-      auto endit = it;
-      for(; endit != opaquemappings.end(); ++endit)
-      {
-        if(newRange.resourceOffset + newRange.size <= endit->resourceOffset + endit->size)
-          break;
-      }
-
-      // see if there are any leftovers of the overlapped ranges at the start or end
-      bool leftoverstart = (curRange.resourceOffset < newRange.resourceOffset);
-      bool leftoverend =
-          (endit != opaquemappings.end() &&
-           (endit->resourceOffset + endit->size > newRange.resourceOffset + newRange.size));
-
-      // no leftovers, the new range entirely covers the current and last (if there is one)
-      if(!leftoverstart && !leftoverend)
-      {
-        // erase all of the ranges. If endit points to a valid range,
-        // it won't be erased, so we overwrite it. Otherwise it pointed
-        // to end() so we just push_back()
-        auto last = opaquemappings.erase(it, endit);
-        if(last != opaquemappings.end())
-          *last = newRange;
-        else
-          opaquemappings.push_back(newRange);
-      }
-      // leftover at the start, but not the end
-      else if(leftoverstart && !leftoverend)
-      {
-        // save the current range
-        VkSparseMemoryBind cur = curRange;
-
-        // modify the size to reflect what's left over
-        cur.size = newRange.resourceOffset - cur.resourceOffset;
-
-        // as above, erase and either re-insert or push_back()
-        auto last = opaquemappings.erase(it, endit);
-        if(last != opaquemappings.end())
-        {
-          *last = newRange;
-          opaquemappings.insert(last, cur);
-        }
-        else
-        {
-          opaquemappings.push_back(cur);
-          opaquemappings.push_back(newRange);
-        }
-      }
-      // leftover at the end, but not the start
-      else if(!leftoverstart && leftoverend)
-      {
-        // erase up to but not including endit
-        auto last = opaquemappings.erase(it, endit);
-        // modify the leftovers at the end
-        last->resourceOffset = newRange.resourceOffset + newRange.size;
-        // insert the new range before
-        opaquemappings.insert(last, newRange);
-      }
-      // leftovers at both ends
-      else
-      {
-        // save the current range
-        VkSparseMemoryBind cur = curRange;
-
-        // modify the size to reflect what's left over
-        cur.size = newRange.resourceOffset - cur.resourceOffset;
-
-        // erase up to but not including endit
-        auto last = opaquemappings.erase(it, endit);
-        // modify the leftovers at the end
-        last->resourceOffset = newRange.resourceOffset + newRange.size;
-        // insert the new range before
-        auto newit = opaquemappings.insert(last, newRange);
-        // insert the modified leftovers before that
-        opaquemappings.insert(newit, cur);
-      }
-
-      found = true;
-      break;
-    }
-
-    // if it wasn't found, this binding is after all mappings in our list
-    if(!found)
-      opaquemappings.push_back(curRange);
-  }
+  if(refType == eFrameRef_None)
+    return refType;
+  auto it = imageStates.find(img);
+  if(it == imageStates.end())
+    it = imageStates.insert({img, ImageState(VK_NULL_HANDLE, imageInfo, refType)}).first;
+  it->second.Update(range, ImageSubresourceState(queueFamilyIndex, UNKNOWN_PREV_IMG_LAYOUT, refType),
+                    ComposeFrameRefs);
+  return it->second.maxRefType;
 }
 
 #if ENABLED(ENABLE_UNIT_TESTS)
 
 #undef None
+#undef Always
 
-#include "3rdparty/catch/catch.hpp"
+#include "catch/catch.hpp"
 
 TEST_CASE("Vulkan formats", "[format][vulkan]")
 {
@@ -3717,6 +4464,7 @@ TEST_CASE("Vulkan formats", "[format][vulkan]")
       VK_FORMAT_G8_B8_R8_3PLANE_422_UNORM,
       VK_FORMAT_G8_B8R8_2PLANE_422_UNORM,
       VK_FORMAT_G8_B8_R8_3PLANE_444_UNORM,
+      VK_FORMAT_G8_B8R8_2PLANE_444_UNORM,
       VK_FORMAT_R10X6_UNORM_PACK16,
       VK_FORMAT_R10X6G10X6_UNORM_2PACK16,
       VK_FORMAT_R10X6G10X6B10X6A10X6_UNORM_4PACK16,
@@ -3727,6 +4475,7 @@ TEST_CASE("Vulkan formats", "[format][vulkan]")
       VK_FORMAT_G10X6_B10X6_R10X6_3PLANE_422_UNORM_3PACK16,
       VK_FORMAT_G10X6_B10X6R10X6_2PLANE_422_UNORM_3PACK16,
       VK_FORMAT_G10X6_B10X6_R10X6_3PLANE_444_UNORM_3PACK16,
+      VK_FORMAT_G10X6_B10X6R10X6_2PLANE_444_UNORM_3PACK16,
       VK_FORMAT_R12X4_UNORM_PACK16,
       VK_FORMAT_R12X4G12X4_UNORM_2PACK16,
       VK_FORMAT_R12X4G12X4B12X4A12X4_UNORM_4PACK16,
@@ -3737,6 +4486,7 @@ TEST_CASE("Vulkan formats", "[format][vulkan]")
       VK_FORMAT_G12X4_B12X4_R12X4_3PLANE_422_UNORM_3PACK16,
       VK_FORMAT_G12X4_B12X4R12X4_2PLANE_422_UNORM_3PACK16,
       VK_FORMAT_G12X4_B12X4_R12X4_3PLANE_444_UNORM_3PACK16,
+      VK_FORMAT_G12X4_B12X4R12X4_2PLANE_444_UNORM_3PACK16,
       VK_FORMAT_G16B16G16R16_422_UNORM,
       VK_FORMAT_B16G16R16G16_422_UNORM,
       VK_FORMAT_G16_B16_R16_3PLANE_420_UNORM,
@@ -3744,6 +4494,7 @@ TEST_CASE("Vulkan formats", "[format][vulkan]")
       VK_FORMAT_G16_B16_R16_3PLANE_422_UNORM,
       VK_FORMAT_G16_B16R16_2PLANE_422_UNORM,
       VK_FORMAT_G16_B16_R16_3PLANE_444_UNORM,
+      VK_FORMAT_G16_B16R16_2PLANE_444_UNORM,
       VK_FORMAT_PVRTC1_2BPP_UNORM_BLOCK_IMG,
       VK_FORMAT_PVRTC1_4BPP_UNORM_BLOCK_IMG,
       VK_FORMAT_PVRTC2_2BPP_UNORM_BLOCK_IMG,
@@ -3752,6 +4503,20 @@ TEST_CASE("Vulkan formats", "[format][vulkan]")
       VK_FORMAT_PVRTC1_4BPP_SRGB_BLOCK_IMG,
       VK_FORMAT_PVRTC2_2BPP_SRGB_BLOCK_IMG,
       VK_FORMAT_PVRTC2_4BPP_SRGB_BLOCK_IMG,
+      VK_FORMAT_ASTC_4x4_SFLOAT_BLOCK,
+      VK_FORMAT_ASTC_5x4_SFLOAT_BLOCK,
+      VK_FORMAT_ASTC_5x5_SFLOAT_BLOCK,
+      VK_FORMAT_ASTC_6x5_SFLOAT_BLOCK,
+      VK_FORMAT_ASTC_6x6_SFLOAT_BLOCK,
+      VK_FORMAT_ASTC_8x5_SFLOAT_BLOCK,
+      VK_FORMAT_ASTC_8x6_SFLOAT_BLOCK,
+      VK_FORMAT_ASTC_8x8_SFLOAT_BLOCK,
+      VK_FORMAT_ASTC_10x5_SFLOAT_BLOCK,
+      VK_FORMAT_ASTC_10x6_SFLOAT_BLOCK,
+      VK_FORMAT_ASTC_10x8_SFLOAT_BLOCK,
+      VK_FORMAT_ASTC_10x10_SFLOAT_BLOCK,
+      VK_FORMAT_ASTC_12x10_SFLOAT_BLOCK,
+      VK_FORMAT_ASTC_12x12_SFLOAT_BLOCK,
   };
 
   SECTION("Only VK_FORMAT_UNDEFINED is ResourceFormatType::Undefined")
@@ -3775,7 +4540,8 @@ TEST_CASE("Vulkan formats", "[format][vulkan]")
       ResourceFormat fmt = MakeResourceFormat(f);
 
       // astc and pvrtc are not properly supported, collapse to a single type
-      if(f >= VK_FORMAT_ASTC_4x4_UNORM_BLOCK && f <= VK_FORMAT_ASTC_12x12_SRGB_BLOCK)
+      if((f >= VK_FORMAT_ASTC_4x4_UNORM_BLOCK && f <= VK_FORMAT_ASTC_12x12_SRGB_BLOCK) ||
+         (f >= VK_FORMAT_ASTC_4x4_SFLOAT_BLOCK && f <= VK_FORMAT_ASTC_12x12_SFLOAT_BLOCK))
       {
         CHECK(fmt.type == ResourceFormatType::ASTC);
         continue;
@@ -3822,18 +4588,6 @@ TEST_CASE("Vulkan formats", "[format][vulkan]")
       else if(f == VK_FORMAT_A8B8G8R8_SRGB_PACK32)
       {
         CHECK(reconstructed == VK_FORMAT_R8G8B8A8_SRGB);
-      }
-      else if(f == VK_FORMAT_X8_D24_UNORM_PACK32)
-      {
-        CHECK(reconstructed == VK_FORMAT_D24_UNORM_S8_UINT);
-      }
-      else if(f == VK_FORMAT_ETC2_R8G8B8A1_SRGB_BLOCK)
-      {
-        CHECK(reconstructed == VK_FORMAT_ETC2_R8G8B8A8_SRGB_BLOCK);
-      }
-      else if(f == VK_FORMAT_ETC2_R8G8B8A1_UNORM_BLOCK)
-      {
-        CHECK(reconstructed == VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK);
       }
       else
       {
@@ -3897,6 +4651,10 @@ TEST_CASE("Vulkan formats", "[format][vulkan]")
 
       INFO("Format is " << ToStr(f));
 
+      // byte size for D24X8 is the same as D24S8!
+      if(fmt.compByteWidth == 3)
+        fmt.compByteWidth = 4;
+
       uint32_t size = fmt.compCount * fmt.compByteWidth * 123 * 456;
 
       CHECK(size == GetByteSize(123, 456, 1, f, 0));
@@ -3930,12 +4688,22 @@ TEST_CASE("Vulkan formats", "[format][vulkan]")
 
     int i = 0;
     for(VkFormat f : {
-            VK_FORMAT_BC1_RGB_UNORM_BLOCK, VK_FORMAT_BC1_RGB_SRGB_BLOCK,
-            VK_FORMAT_BC1_RGBA_UNORM_BLOCK, VK_FORMAT_BC1_RGBA_SRGB_BLOCK,
-            VK_FORMAT_BC2_UNORM_BLOCK, VK_FORMAT_BC2_SRGB_BLOCK, VK_FORMAT_BC3_UNORM_BLOCK,
-            VK_FORMAT_BC3_SRGB_BLOCK, VK_FORMAT_BC4_UNORM_BLOCK, VK_FORMAT_BC4_SNORM_BLOCK,
-            VK_FORMAT_BC5_UNORM_BLOCK, VK_FORMAT_BC5_SNORM_BLOCK, VK_FORMAT_BC6H_UFLOAT_BLOCK,
-            VK_FORMAT_BC6H_SFLOAT_BLOCK, VK_FORMAT_BC7_UNORM_BLOCK, VK_FORMAT_BC7_SRGB_BLOCK,
+            VK_FORMAT_BC1_RGB_UNORM_BLOCK,
+            VK_FORMAT_BC1_RGB_SRGB_BLOCK,
+            VK_FORMAT_BC1_RGBA_UNORM_BLOCK,
+            VK_FORMAT_BC1_RGBA_SRGB_BLOCK,
+            VK_FORMAT_BC2_UNORM_BLOCK,
+            VK_FORMAT_BC2_SRGB_BLOCK,
+            VK_FORMAT_BC3_UNORM_BLOCK,
+            VK_FORMAT_BC3_SRGB_BLOCK,
+            VK_FORMAT_BC4_UNORM_BLOCK,
+            VK_FORMAT_BC4_SNORM_BLOCK,
+            VK_FORMAT_BC5_UNORM_BLOCK,
+            VK_FORMAT_BC5_SNORM_BLOCK,
+            VK_FORMAT_BC6H_UFLOAT_BLOCK,
+            VK_FORMAT_BC6H_SFLOAT_BLOCK,
+            VK_FORMAT_BC7_UNORM_BLOCK,
+            VK_FORMAT_BC7_SRGB_BLOCK,
         })
     {
       INFO("Format is " << ToStr(f));
@@ -3956,6 +4724,7 @@ TEST_CASE("Vulkan formats", "[format][vulkan]")
         1152,    // VK_FORMAT_G8_B8_R8_3PLANE_422_UNORM (4:2:2 8-bit 3-plane)
         1152,    // VK_FORMAT_G8_B8R8_2PLANE_422_UNORM (4:2:2 8-bit 2-plane)
         1728,    // VK_FORMAT_G8_B8_R8_3PLANE_444_UNORM (4:4:4 8-bit 3-plane)
+        1728,    // VK_FORMAT_G8_B8R8_2PLANE_444_UNORM (4:4:4 8-bit 2-plane)
         1152,    // VK_FORMAT_R10X6_UNORM_PACK16 (4:4:4 10-bit packed)
         2304,    // VK_FORMAT_R10X6G10X6_UNORM_2PACK16 (4:4:4 10-bit packed)
         4608,    // VK_FORMAT_R10X6G10X6B10X6A10X6_UNORM_4PACK16 (4:4:4 10-bit packed)
@@ -3966,6 +4735,7 @@ TEST_CASE("Vulkan formats", "[format][vulkan]")
         2304,    // VK_FORMAT_G10X6_B10X6_R10X6_3PLANE_422_UNORM_3PACK16 (4:2:2 10-bit 3-plane)
         2304,    // VK_FORMAT_G10X6_B10X6R10X6_2PLANE_422_UNORM_3PACK16 (4:2:2 10-bit 2-plane)
         3456,    // VK_FORMAT_G10X6_B10X6_R10X6_3PLANE_444_UNORM_3PACK16 (4:4:4 10-bit 3-plane)
+        3456,    // VK_FORMAT_G10X6_B10X6R10X6_2PLANE_444_UNORM_3PACK16 (4:4:4 10-bit 2-plane)
         1152,    // VK_FORMAT_R12X4_UNORM_PACK16 (4:4:4 12-bit packed)
         2304,    // VK_FORMAT_R12X4G12X4_UNORM_2PACK16 (4:4:4 12-bit packed)
         4608,    // VK_FORMAT_R12X4G12X4B12X4A12X4_UNORM_4PACK16 (4:4:4 12-bit packed)
@@ -3976,6 +4746,7 @@ TEST_CASE("Vulkan formats", "[format][vulkan]")
         2304,    // VK_FORMAT_G12X4_B12X4_R12X4_3PLANE_422_UNORM_3PACK16 (4:2:2 12-bit 3-plane)
         2304,    // VK_FORMAT_G12X4_B12X4R12X4_2PLANE_422_UNORM_3PACK16 (4:2:2 12-bit 2-plane)
         3456,    // VK_FORMAT_G12X4_B12X4_R12X4_3PLANE_444_UNORM_3PACK16 (4:4:4 12-bit 3-plane)
+        3456,    // VK_FORMAT_G12X4_B12X4R12X4_2PLANE_444_UNORM_3PACK16 (4:4:4 12-bit 2-plane)
         2304,    // VK_FORMAT_G16B16G16R16_422_UNORM (4:2:2 16-bit packed)
         2304,    // VK_FORMAT_B16G16R16G16_422_UNORM (4:2:2 16-bit packed)
         1728,    // VK_FORMAT_G16_B16_R16_3PLANE_420_UNORM (4:2:0 16-bit 3-plane)
@@ -3983,6 +4754,7 @@ TEST_CASE("Vulkan formats", "[format][vulkan]")
         2304,    // VK_FORMAT_G16_B16_R16_3PLANE_422_UNORM (4:2:2 16-bit 3-plane)
         2304,    // VK_FORMAT_G16_B16R16_2PLANE_422_UNORM (4:2:2 16-bit 2-plane)
         3456,    // VK_FORMAT_G16_B16_R16_3PLANE_444_UNORM (4:4:4 16-bit 3-plane)
+        3456,    // VK_FORMAT_G16_B16R16_2PLANE_444_UNORM (4:4:4 16-bit 2-plane)
     };
 
     int i = 0;
@@ -3994,6 +4766,7 @@ TEST_CASE("Vulkan formats", "[format][vulkan]")
             VK_FORMAT_G8_B8_R8_3PLANE_422_UNORM,
             VK_FORMAT_G8_B8R8_2PLANE_422_UNORM,
             VK_FORMAT_G8_B8_R8_3PLANE_444_UNORM,
+            VK_FORMAT_G8_B8R8_2PLANE_444_UNORM,
             VK_FORMAT_R10X6_UNORM_PACK16,
             VK_FORMAT_R10X6G10X6_UNORM_2PACK16,
             VK_FORMAT_R10X6G10X6B10X6A10X6_UNORM_4PACK16,
@@ -4004,6 +4777,7 @@ TEST_CASE("Vulkan formats", "[format][vulkan]")
             VK_FORMAT_G10X6_B10X6_R10X6_3PLANE_422_UNORM_3PACK16,
             VK_FORMAT_G10X6_B10X6R10X6_2PLANE_422_UNORM_3PACK16,
             VK_FORMAT_G10X6_B10X6_R10X6_3PLANE_444_UNORM_3PACK16,
+            VK_FORMAT_G10X6_B10X6R10X6_2PLANE_444_UNORM_3PACK16,
             VK_FORMAT_R12X4_UNORM_PACK16,
             VK_FORMAT_R12X4G12X4_UNORM_2PACK16,
             VK_FORMAT_R12X4G12X4B12X4A12X4_UNORM_4PACK16,
@@ -4014,6 +4788,7 @@ TEST_CASE("Vulkan formats", "[format][vulkan]")
             VK_FORMAT_G12X4_B12X4_R12X4_3PLANE_422_UNORM_3PACK16,
             VK_FORMAT_G12X4_B12X4R12X4_2PLANE_422_UNORM_3PACK16,
             VK_FORMAT_G12X4_B12X4_R12X4_3PLANE_444_UNORM_3PACK16,
+            VK_FORMAT_G12X4_B12X4R12X4_2PLANE_444_UNORM_3PACK16,
             VK_FORMAT_G16B16G16R16_422_UNORM,
             VK_FORMAT_B16G16R16G16_422_UNORM,
             VK_FORMAT_G16_B16_R16_3PLANE_420_UNORM,
@@ -4021,6 +4796,7 @@ TEST_CASE("Vulkan formats", "[format][vulkan]")
             VK_FORMAT_G16_B16_R16_3PLANE_422_UNORM,
             VK_FORMAT_G16_B16R16_2PLANE_422_UNORM,
             VK_FORMAT_G16_B16_R16_3PLANE_444_UNORM,
+            VK_FORMAT_G16_B16R16_2PLANE_444_UNORM,
         })
     {
       INFO("Format is " << ToStr(f));
@@ -4033,30 +4809,34 @@ TEST_CASE("Vulkan formats", "[format][vulkan]")
   {
     const uint32_t width = 24, height = 24;
 
-    std::vector<rdcpair<VkFormat, std::vector<uint32_t> > > tests = {
+    rdcarray<rdcpair<VkFormat, rdcarray<uint32_t> > > tests = {
         {VK_FORMAT_G8_B8_R8_3PLANE_420_UNORM, {576, 144, 144}},
         {VK_FORMAT_G8_B8R8_2PLANE_420_UNORM, {576, 288}},
         {VK_FORMAT_G8_B8_R8_3PLANE_422_UNORM, {576, 288, 288}},
         {VK_FORMAT_G8_B8R8_2PLANE_422_UNORM, {576, 576}},
         {VK_FORMAT_G8_B8_R8_3PLANE_444_UNORM, {576, 576, 576}},
+        {VK_FORMAT_G8_B8R8_2PLANE_444_UNORM, {576, 1152}},
         {VK_FORMAT_G10X6_B10X6_R10X6_3PLANE_420_UNORM_3PACK16, {1152, 288, 288}},
         {VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16, {1152, 576}},
         {VK_FORMAT_G10X6_B10X6_R10X6_3PLANE_422_UNORM_3PACK16, {1152, 576, 576}},
         {VK_FORMAT_G10X6_B10X6R10X6_2PLANE_422_UNORM_3PACK16, {1152, 1152}},
         {VK_FORMAT_G10X6_B10X6_R10X6_3PLANE_444_UNORM_3PACK16, {1152, 1152, 1152}},
+        {VK_FORMAT_G10X6_B10X6R10X6_2PLANE_444_UNORM_3PACK16, {1152, 2304}},
         {VK_FORMAT_G12X4_B12X4_R12X4_3PLANE_420_UNORM_3PACK16, {1152, 288, 288}},
         {VK_FORMAT_G12X4_B12X4R12X4_2PLANE_420_UNORM_3PACK16, {1152, 576}},
         {VK_FORMAT_G12X4_B12X4_R12X4_3PLANE_422_UNORM_3PACK16, {1152, 576, 576}},
         {VK_FORMAT_G12X4_B12X4R12X4_2PLANE_422_UNORM_3PACK16, {1152, 1152}},
         {VK_FORMAT_G12X4_B12X4_R12X4_3PLANE_444_UNORM_3PACK16, {1152, 1152, 1152}},
+        {VK_FORMAT_G12X4_B12X4R12X4_2PLANE_444_UNORM_3PACK16, {1152, 2304}},
         {VK_FORMAT_G16_B16_R16_3PLANE_420_UNORM, {1152, 288, 288}},
         {VK_FORMAT_G16_B16R16_2PLANE_420_UNORM, {1152, 576}},
         {VK_FORMAT_G16_B16_R16_3PLANE_422_UNORM, {1152, 576, 576}},
         {VK_FORMAT_G16_B16R16_2PLANE_422_UNORM, {1152, 1152}},
         {VK_FORMAT_G16_B16_R16_3PLANE_444_UNORM, {1152, 1152, 1152}},
+        {VK_FORMAT_G16_B16R16_2PLANE_444_UNORM, {1152, 2304}},
     };
 
-    for(rdcpair<VkFormat, std::vector<uint32_t> > e : tests)
+    for(rdcpair<VkFormat, rdcarray<uint32_t> > e : tests)
     {
       INFO("Format is " << ToStr(e.first));
       for(uint32_t p = 0; p < e.second.size(); p++)

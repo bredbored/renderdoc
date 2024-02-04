@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2017-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -34,6 +34,7 @@ class SettingsDialog;
 class QTableWidgetItem;
 class QListWidgetItem;
 struct ShaderProcessingTool;
+class ReplayOptionsSelector;
 
 struct ICaptureContext;
 
@@ -55,11 +56,16 @@ private slots:
   void on_okButton_accepted();
 
   // general
+  void on_Font_Family_currentIndexChanged(int index);
+  void on_Font_MonoFamily_currentIndexChanged(int index);
+  void on_Font_GlobalScale_currentIndexChanged(int index);
+  void Font_GlobalScale_returnPressed();
   void on_UIStyle_currentIndexChanged(int index);
   void on_tempDirectory_textEdited(const QString &temp);
   void on_saveDirectory_textEdited(const QString &save);
   void on_browseSaveCaptureDirectory_clicked();
   void on_AllowGlobalHook_toggled(bool checked);
+  void on_AllowProcessInject_toggled(bool checked);
   void on_CheckUpdate_AllowChecks_toggled(bool checked);
   void on_Font_PreferMonospaced_toggled(bool checked);
   void on_AlwaysReplayLocally_toggled(bool checked);
@@ -68,6 +74,7 @@ private slots:
   void on_analyticsOptOut_toggled(bool checked);
 
   // core
+  void on_configEditor_clicked();
   void on_chooseSearchPaths_clicked();
   void on_ExternalTool_RGPIntegration_toggled(bool checked);
   void on_ExternalTool_RadeonGPUProfiler_textEdited(const QString &rgp);
@@ -77,6 +84,7 @@ private slots:
   void on_TextureViewer_PerTexSettings_toggled(bool checked);
   void on_TextureViewer_ResetRange_toggled(bool checked);
   void on_TextureViewer_PerTexYFlip_toggled(bool checked);
+  void on_TextureViewer_ChooseShaderDirectories_clicked();
 
   // shader viewer
   void on_ShaderViewer_FriendlyNaming_toggled(bool checked);
@@ -92,8 +100,6 @@ private slots:
   // event browser
   void on_EventBrowser_TimeUnit_currentIndexChanged(int index);
   void on_EventBrowser_AddFake_toggled(bool checked);
-  void on_EventBrowser_HideEmpty_toggled(bool checked);
-  void on_EventBrowser_HideAPICalls_toggled(bool checked);
   void on_EventBrowser_ApplyColors_toggled(bool checked);
   void on_EventBrowser_ColorEventRow_toggled(bool checked);
 
@@ -105,11 +111,12 @@ private slots:
   void on_browseAndroidSDKPath_clicked();
   void on_browseJDKPath_clicked();
   void on_Android_MaxConnectTimeout_valueChanged(double timeout);
-  void on_Android_SDKPath_textEdited(const QString &path);
-  void on_Android_JDKPath_textEdited(const QString &path);
+  void on_Android_SDKPath_textEdited(const QString &sdk);
+  void on_Android_JDKPath_textEdited(const QString &jdk);
 
   // manual slots
   void formatter_valueChanged(int value);
+  void on_Formatter_OffsetSizeDisplayMode_currentIndexChanged(int index);
 
   void on_analyticsDescribeLabel_linkActivated(const QString &link);
 
@@ -119,6 +126,9 @@ private:
   void addProcessor(const ShaderProcessingTool &disasm);
   bool editTool(int existing, ShaderProcessingTool &disasm);
 
+  ReplayOptionsSelector *m_ReplayOptions;
+
   ICaptureContext &m_Ctx;
+  bool m_NeedRefresh = false;
   bool m_Init = false;
 };

@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2018-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -24,12 +24,11 @@
 
 #pragma once
 
-#include "api/replay/renderdoc_replay.h"
 #include "core/core.h"
 #include "driver/shaders/spirv/spirv_compile.h"
 #include "vk_core.h"
 
-typedef std::vector<uint32_t> *SPIRVBlob;
+typedef rdcarray<uint32_t> *SPIRVBlob;
 
 enum class BuiltinShader
 {
@@ -48,14 +47,48 @@ enum class BuiltinShader
   QuadWriteFS,
   TrisizeGS,
   TrisizeFS,
-  MS2ArrayCS,
-  Array2MSCS,
-  DepthMS2ArrayFS,
-  DepthArray2MSFS,
+  TexRemap,
+  PixelHistoryMSCopyCS,
+  PixelHistoryMSCopyDepthCS,
+  PixelHistoryPrimIDFS,
+  ShaderDebugSampleVS,
+  DiscardFS,
+  HistogramCS,
+  MinMaxTileCS,
+  MinMaxResultCS,
+  MS2BufferCS,
+  DepthMS2BufferCS,
+  Buffer2MSCS,
+  DepthBuf2MSFS,
+  DepthCopyFS,
+  DepthCopyMSFS,
   Count,
 };
 
 ITERABLE_OPERATORS(BuiltinShader);
+
+enum class BuiltinShaderBaseType
+{
+  Float = 0,
+  First = Float,
+  UInt,
+  SInt,
+  Count,
+};
+
+ITERABLE_OPERATORS(BuiltinShaderBaseType);
+
+enum class BuiltinShaderTextureType
+{
+  Tex1D = 1,
+  First = Tex1D,
+  Tex2D,
+  Tex3D,
+  Tex2DMS,
+  Count,
+};
+
+ITERABLE_OPERATORS(BuiltinShaderTextureType);
 
 class VulkanShaderCache
 {
@@ -63,32 +96,50 @@ public:
   VulkanShaderCache(WrappedVulkan *driver);
   ~VulkanShaderCache();
 
-  std::string GetSPIRVBlob(const SPIRVCompilationSettings &settings, const std::string &src,
-                           SPIRVBlob &outBlob);
+  rdcstr GetSPIRVBlob(const rdcspv::CompilationSettings &settings, const rdcstr &src,
+                      SPIRVBlob &outBlob);
 
-  SPIRVBlob GetBuiltinBlob(BuiltinShader builtin) { return m_BuiltinShaderBlobs[(size_t)builtin]; }
-  VkShaderModule GetBuiltinModule(BuiltinShader builtin)
+  SPIRVBlob GetBuiltinBlob(BuiltinShader builtin)
   {
-    return m_BuiltinShaderModules[(size_t)builtin];
+    return m_BuiltinShaderBlobs[(size_t)builtin][(size_t)BuiltinShaderBaseType::First]
+                               [(size_t)BuiltinShaderTextureType::First];
   }
-
+  VkShaderModule GetBuiltinModule(BuiltinShader builtin,
+                                  BuiltinShaderBaseType baseType = BuiltinShaderBaseType::First,
+                                  BuiltinShaderTextureType texType = BuiltinShaderTextureType::First)
+  {
+    return m_BuiltinShaderModules[(size_t)builtin][(size_t)baseType][(size_t)texType];
+  }
+  VkPipelineCache GetPipeCache() { return m_PipelineCache; }
   void MakeGraphicsPipelineInfo(VkGraphicsPipelineCreateInfo &pipeCreateInfo, ResourceId pipeline);
   void MakeComputePipelineInfo(VkComputePipelineCreateInfo &pipeCreateInfo, ResourceId pipeline);
 
-  std::string GetGlobalDefines() { return m_GlobalDefines; }
+  bool IsBuffer2MSSupported() { return m_Buffer2MSSupported; }
   void SetCaching(bool enabled) { m_CacheShaders = enabled; }
 private:
   static const uint32_t m_ShaderCacheMagic = 0xf00d00d5;
   static const uint32_t m_ShaderCacheVersion = 1;
 
+  void GetPipeCacheBlob();
+  void SetPipeCacheBlob(bytebuf &blob);
+
   WrappedVulkan *m_pDriver = NULL;
   VkDevice m_Device = VK_NULL_HANDLE;
 
-  std::string m_GlobalDefines;
+  // combined pipeline layouts constructed out of independent set pipeline layouts, for use in a
+  // single combined graphics pipeline create info
+  std::map<ResourceId, VkPipelineLayout> m_CombinedPipeLayouts;
+
+  bytebuf m_PipeCacheBlob;
+  VkPipelineCache m_PipelineCache = VK_NULL_HANDLE;
+
+  bool m_Buffer2MSSupported = false;
 
   bool m_ShaderCacheDirty = false, m_CacheShaders = false;
   std::map<uint32_t, SPIRVBlob> m_ShaderCache;
 
-  SPIRVBlob m_BuiltinShaderBlobs[arraydim<BuiltinShader>()] = {NULL};
-  VkShaderModule m_BuiltinShaderModules[arraydim<BuiltinShader>()] = {VK_NULL_HANDLE};
+  SPIRVBlob m_BuiltinShaderBlobs[arraydim<BuiltinShader>()][arraydim<BuiltinShaderBaseType>()]
+                                [arraydim<BuiltinShaderTextureType>()] = {};
+  VkShaderModule m_BuiltinShaderModules[arraydim<BuiltinShader>()][arraydim<BuiltinShaderBaseType>()]
+                                       [arraydim<BuiltinShaderTextureType>()] = {};
 };

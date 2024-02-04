@@ -1,30 +1,32 @@
 /******************************************************************************
-* The MIT License (MIT)
-*
-* Copyright (c) 2018-2019 Baldur Karlsson
-*
-* Permission is hereby granted, free of charge, to any person obtaining a copy
-* of this software and associated documentation files (the "Software"), to deal
-* in the Software without restriction, including without limitation the rights
-* to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-* copies of the Software, and to permit persons to whom the Software is
-* furnished to do so, subject to the following conditions:
-*
-* The above copyright notice and this permission notice shall be included in
-* all copies or substantial portions of the Software.
-*
-* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-* AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-* OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-* THE SOFTWARE.
-******************************************************************************/
+ * The MIT License (MIT)
+ *
+ * Copyright (c) 2019-2023 Baldur Karlsson
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ ******************************************************************************/
 
 #include "nv_counters.h"
+
 #include "common/common.h"
 #include "core/plugins.h"
+#include "os/os_specific.h"
 
 #define NVPM_INITGUID
 #include "official/PerfKit/include/NvPmApi.h"
@@ -32,11 +34,11 @@
 
 struct EnumCountersCtx
 {
-  std::vector<GPUCounter> m_ExternalIds;
-  std::vector<uint32_t> m_InternalIds;
-  std::vector<CounterDescription> m_ExternalDescriptors;
-  std::vector<uint32_t> m_InternalDescriptors;
-  std::vector<char> m_TmpStr;
+  rdcarray<GPUCounter> m_ExternalIds;
+  rdcarray<uint32_t> m_InternalIds;
+  rdcarray<CounterDescription> m_ExternalDescriptors;
+  rdcarray<uint32_t> m_InternalDescriptors;
+  rdcarray<char> m_TmpStr;
 
   NvPmApi *m_NvPmApi;
 
@@ -110,7 +112,7 @@ int NvPmGatherCounters(NVPMCounterID unCounterID, const char *pcCounterName, voi
       // because sometimes they could be `percents` and sometimes 'ratios' (avg. instructions per
       // shader invocation, for example)
       desc.unit = CounterUnit::Ratio;
-      desc.resultType = CompType::Double;
+      desc.resultType = CompType::Float;
       desc.resultByteWidth = sizeof(double);
     }
     else
@@ -131,7 +133,7 @@ int NvPmGatherCounters(NVPMCounterID unCounterID, const char *pcCounterName, voi
     // Same problem as for counters with 'ratio' display type but:
     // don't know for sure if a counter should be displayed as is or annotated with `%` symbol
     desc.unit = CounterUnit::Ratio;
-    desc.resultType = CompType::Double;
+    desc.resultType = CompType::Float;
     desc.resultByteWidth = sizeof(double);
   }
 
@@ -192,14 +194,14 @@ bool NVCounters::Init()
 #if ENABLED(RDOC_WIN32)
 
 #if ENABLED(RDOC_X64)
-  std::string dllPath = LocatePluginFile("nv/counters/x64", "NvPmApi.Core.dll");
+  rdcstr dllPath = LocatePluginFile("nv/counters/x64", "NvPmApi.Core.dll");
 #else
-  std::string dllPath = LocatePluginFile("nv/counters/x86", "NvPmApi.Core.dll");
+  rdcstr dllPath = LocatePluginFile("nv/counters/x86", "NvPmApi.Core.dll");
 #endif
 
 #endif
 
-  m_NvPmLib = Process::LoadModule(dllPath.c_str());
+  m_NvPmLib = Process::LoadModule(dllPath);
   if(m_NvPmLib == NULL)
   {
     RDCWARN("NV GPU performance counters could not locate 'NvPmApi.Core.dll'");
@@ -262,7 +264,7 @@ bool NVCounters::Init(ID3D11Device *pDevice)
   return true;
 }
 
-bool NVCounters::PrepareExperiment(const std::vector<GPUCounter> &counters, uint32_t objectsCount)
+bool NVCounters::PrepareExperiment(const rdcarray<GPUCounter> &counters, uint32_t objectsCount)
 {
   if(NvPmResultFails(m_NvPmApi->RemoveAllCounters(m_NvPmCtx),
                      "call to 'NvPmApi::RemoveAllCounters'"))
@@ -318,8 +320,7 @@ uint32_t NVCounters::BeginExperiment() const
   return NumPasses;
 }
 
-void NVCounters::EndExperiment(const std::vector<uint32_t> &eventIds,
-                               std::vector<CounterResult> &Result) const
+void NVCounters::EndExperiment(const rdcarray<uint32_t> &eventIds, rdcarray<CounterResult> &Result) const
 {
   NvPmResultFails(m_NvPmApi->EndExperiment(m_NvPmCtx), "call to 'NvPmApi::EndExperiment'");
 

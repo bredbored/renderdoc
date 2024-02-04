@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2017-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -36,14 +36,25 @@ rdcstr DoStringise(const GLChunk &el)
     STRINGISE_ENUM_CLASS_NAMED(MakeContextCurrent, "MakeContextCurrent");
 
     STRINGISE_ENUM_CLASS_NAMED(glIndirectSubCommand, "Indirect sub-command");
-    STRINGISE_ENUM_CLASS_NAMED(glContextInit, "Internal: Context Initialisation");
+    STRINGISE_ENUM_CLASS_NAMED(glContextInit, "Internal::Context Initialisation");
 
     STRINGISE_ENUM_CLASS(vrapi_CreateTextureSwapChain);
     STRINGISE_ENUM_CLASS(vrapi_CreateTextureSwapChain2);
 
-    STRINGISE_ENUM_CLASS_NAMED(ContextConfiguration, "Internal: Context Configuration");
+    STRINGISE_ENUM_CLASS_NAMED(ContextConfiguration, "Internal::Context Configuration");
 
-    STRINGISE_ENUM_CLASS_NAMED(CoherentMapWrite, "Internal: Coherent Mapped Memory Write");
+    STRINGISE_ENUM_CLASS_NAMED(CoherentMapWrite, "Internal::Coherent Mapped Memory Write");
+
+    STRINGISE_ENUM_CLASS(SwapBuffers);
+    STRINGISE_ENUM_CLASS(wglSwapBuffers);
+    STRINGISE_ENUM_CLASS(glXSwapBuffers);
+    STRINGISE_ENUM_CLASS(CGLFlushDrawable);
+    STRINGISE_ENUM_CLASS(eglSwapBuffers);
+    STRINGISE_ENUM_CLASS(eglPostSubBufferNV);
+    STRINGISE_ENUM_CLASS(eglSwapBuffersWithDamageEXT);
+    STRINGISE_ENUM_CLASS(eglSwapBuffersWithDamageKHR);
+
+    STRINGISE_ENUM_CLASS_NAMED(ImplicitThreadSwitch, "Internal::Implicit thread context-switch");
 
 // re-use list of GL functions as chunks. Many of these will be aliased. This may not appear in the
 // same order as the definition, but that's OK.
@@ -57,7 +68,7 @@ rdcstr DoStringise(const GLChunk &el)
 template <>
 rdcstr DoStringise(const AttribType &el)
 {
-  std::string suffix;
+  rdcstr suffix;
 
   switch(el & Attrib_typemask)
   {
@@ -135,10 +146,7 @@ rdcstr DoStringise(const UniformType &el)
     default: break;
   }
 
-  char tostrBuf[256] = {0};
-  StringFormat::snprintf(tostrBuf, 255, "WrappedOpenGL::UniformType<%d>", el);
-
-  return tostrBuf;
+  return StringFormat::Fmt("UniformType(%d)", el);
 }
 
 template <>
@@ -4109,10 +4117,7 @@ rdcstr DoStringise(const RDCGLenum &el)
     default: break;
   }
 
-  char tostrBuf[256] = {0};
-  StringFormat::snprintf(tostrBuf, 255, "GLenum<%x>", (uint32_t)el);
-
-  return tostrBuf;
+  return StringFormat::Fmt("GLenum(%x)", el);
 
 #define GLenum RDCGLenum
 }

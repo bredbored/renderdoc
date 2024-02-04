@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2018-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -32,7 +32,7 @@ bool WrappedID3D12GraphicsCommandList::Serialise_WriteBufferImmediate(
   ID3D12GraphicsCommandList2 *pCommandList = this;
   SERIALISE_ELEMENT(pCommandList);
   SERIALISE_ELEMENT(Count);
-  SERIALISE_ELEMENT_ARRAY(pParams, Count);
+  SERIALISE_ELEMENT_ARRAY(pParams, Count).Important();
   SERIALISE_ELEMENT_ARRAY(pModes, Count);
 
   SERIALISE_CHECK_READ_ERRORS();
@@ -41,7 +41,8 @@ bool WrappedID3D12GraphicsCommandList::Serialise_WriteBufferImmediate(
   {
     if(GetWrapped(pCommandList)->GetReal2() == NULL)
     {
-      RDCERR("Can't replay ID3D12GraphicsCommandList2 command");
+      SET_ERROR_RESULT(m_Cmd->m_FailedReplayResult, ResultCode::APIHardwareUnsupported,
+                       "Capture requires ID3D12GraphicsCommandList2 which isn't available");
       return false;
     }
 
@@ -58,7 +59,6 @@ bool WrappedID3D12GraphicsCommandList::Serialise_WriteBufferImmediate(
     else
     {
       Unwrap2(pCommandList)->WriteBufferImmediate(Count, pParams, pModes);
-      GetCrackedList2()->WriteBufferImmediate(Count, pParams, pModes);
     }
   }
 
@@ -77,10 +77,10 @@ void WrappedID3D12GraphicsCommandList::WriteBufferImmediate(
     SCOPED_SERIALISE_CHUNK(D3D12Chunk::List_WriteBufferImmediate);
     Serialise_WriteBufferImmediate(ser, Count, pParams, pModes);
 
-    m_ListRecord->AddChunk(scope.Get());
+    m_ListRecord->AddChunk(scope.Get(m_ListRecord->cmdInfo->alloc));
     for(UINT i = 0; i < Count; i++)
       m_ListRecord->MarkResourceFrameReferenced(
-          WrappedID3D12Resource1::GetResIDFromAddr(pParams[i].Dest), eFrameRef_PartialWrite);
+          WrappedID3D12Resource::GetResIDFromAddr(pParams[i].Dest), eFrameRef_PartialWrite);
   }
 }
 

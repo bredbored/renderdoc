@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -26,7 +26,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <map>
-#include <vector>
+#include "common/common.h"
+#include "common/formatting.h"
 #include "os/os_specific.h"
 
 void *renderdocBase = NULL;
@@ -46,11 +47,11 @@ public:
   void Set(uint64_t *calls, size_t num)
   {
     numLevels = num;
-    for(int i = 0; i < numLevels; i++)
+    for(size_t i = 0; i < numLevels; i++)
       addrs[i] = calls[i];
   }
 
-  size_t NumLevels() const { return size_t(numLevels); }
+  size_t NumLevels() const { return numLevels; }
   const uint64_t *GetAddrs() const { return addrs; }
 private:
   GgpCallstack(const Callstack::Stackwalk &other);
@@ -70,12 +71,12 @@ private:
       numLevels--;
     }
 
-    for(int i = 0; i < numLevels; i++)
+    for(size_t i = 0; i < numLevels; i++)
       addrs[i] = (uint64_t)addrs_ptr[i + offs];
   }
 
   uint64_t addrs[128];
-  int numLevels;
+  size_t numLevels;
 };
 
 namespace Callstack
@@ -83,7 +84,7 @@ namespace Callstack
 void Init()
 {
   // look for our own line
-  FILE *f = FileIO::fopen("/proc/self/maps", "r");
+  FILE *f = FileIO::fopen("/proc/self/maps", FileIO::ReadText);
 
   if(f)
   {
@@ -92,7 +93,7 @@ void Init()
       char line[512] = {0};
       if(fgets(line, 511, f))
       {
-        if(strstr(line, "librenderdoc") && strstr(line, "r-xp"))
+        if(strstr(line, "lib" STRINGIZE(RDOC_BASE_NAME)) && strstr(line, "r-xp"))
         {
           sscanf(line, "%p-%p", &renderdocBase, &renderdocEnd);
           break;
@@ -118,24 +119,31 @@ bool GetLoadedModules(byte *buf, size_t &size)
 {
   // we just dump the whole file rather than pre-parsing, that way we can improve
   // parsing without needing to recapture
-  FILE *f = FileIO::fopen("/proc/self/maps", "r");
+  FILE *f = FileIO::fopen("/proc/self/maps", FileIO::ReadText);
 
-  size = 0;
-
-  if(buf)
-    memcpy(buf, "LNUXCALL", 8);
-
-  size += 8;
-
-  byte dummy[512];
-
-  while(!feof(f))
+  if(f == NULL)
   {
-    byte *readbuf = buf ? buf + size : dummy;
-    size += FileIO::fread(readbuf, 1, 512, f);
+    RDCWARN("Opening %s failed", "/proc/self/maps");
   }
+  else
+  {
+    size = 0;
 
-  FileIO::fclose(f);
+    if(buf)
+      memcpy(buf, "LNUXCALL", 8);
+
+    size += 8;
+
+    byte dummy[512];
+
+    while(!feof(f))
+    {
+      byte *readbuf = buf ? buf + size : dummy;
+      size += FileIO::fread(readbuf, 1, 512, f);
+    }
+
+    FileIO::fclose(f);
+  }
 
   return true;
 }
@@ -151,7 +159,7 @@ struct LookupModule
 class GgpResolver : public Callstack::StackResolver
 {
 public:
-  GgpResolver(std::vector<LookupModule> modules) { m_Modules = modules; }
+  GgpResolver(rdcarray<LookupModule> modules) { m_Modules = modules; }
   Callstack::AddressDetails GetAddr(uint64_t addr)
   {
     EnsureCached(addr);
@@ -178,8 +186,7 @@ private:
       if(addr >= m_Modules[i].base && addr < m_Modules[i].end)
       {
         uint64_t relative = addr - m_Modules[i].base + m_Modules[i].offset;
-        std::string cmd =
-            StringFormat::Fmt("addr2line -fCe \"%s\" 0x%llx", m_Modules[i].path, relative);
+        rdcstr cmd = StringFormat::Fmt("addr2line -fCe \"%s\" 0x%llx", m_Modules[i].path, relative);
 
         FILE *f = ::popen(cmd.c_str(), "r");
 
@@ -226,11 +233,12 @@ private:
     }
   }
 
-  std::vector<LookupModule> m_Modules;
+  rdcarray<LookupModule> m_Modules;
   std::map<uint64_t, Callstack::AddressDetails> m_Cache;
 };
 
-StackResolver *MakeResolver(byte *moduleDB, size_t DBSize, RENDERDOC_ProgressCallback progress)
+StackResolver *MakeResolver(bool interactive, byte *moduleDB, size_t DBSize,
+                            RENDERDOC_ProgressCallback progress)
 {
   // we look in the original locations for the files, we don't prompt if we can't
   // find the file, or the file doesn't have symbols (and we don't validate that
@@ -247,7 +255,7 @@ StackResolver *MakeResolver(byte *moduleDB, size_t DBSize, RENDERDOC_ProgressCal
   char *search = start;
   char *dbend = (char *)(moduleDB + DBSize);
 
-  std::vector<LookupModule> modules;
+  rdcarray<LookupModule> modules;
 
   while(search && search < dbend)
   {

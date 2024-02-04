@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2018-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -23,8 +23,9 @@
  ******************************************************************************/
 
 #include "vk_rendertext.h"
-#include "3rdparty/stb/stb_truetype.h"
 #include "maths/matrix.h"
+#include "stb/stb_truetype.h"
+#include "strings/string_utils.h"
 #include "vk_shader_cache.h"
 
 #define VULKAN 1
@@ -184,7 +185,8 @@ VulkanTextRenderer::VulkanTextRenderer(WrappedVulkan *driver)
       VK_LOGIC_OP_NO_OP,
       1,
       &attState,
-      {1.0f, 1.0f, 1.0f, 1.0f}};
+      {1.0f, 1.0f, 1.0f, 1.0f},
+  };
 
   VkDynamicState dynstates[] = {VK_DYNAMIC_STATE_VIEWPORT};
 
@@ -222,10 +224,10 @@ VulkanTextRenderer::VulkanTextRenderer(WrappedVulkan *driver)
                                         VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
 
   VkDescriptorSetLayoutBinding layoutBinding[] = {
-      {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1, VK_SHADER_STAGE_ALL, NULL},
-      {1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_ALL, NULL},
-      {2, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1, VK_SHADER_STAGE_ALL, NULL},
-      {3, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_ALL, NULL},
+      {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1, VK_SHADER_STAGE_VERTEX_BIT, NULL},
+      {1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, NULL},
+      {2, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1, VK_SHADER_STAGE_VERTEX_BIT, NULL},
+      {3, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL},
   };
 
   VkDescriptorSetLayoutCreateInfo descsetLayoutInfo = {
@@ -317,7 +319,7 @@ VulkanTextRenderer::VulkanTextRenderer(WrappedVulkan *driver)
         VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
     };
 
-    std::string font = GetEmbeddedResource(sourcecodepro_ttf);
+    rdcstr font = GetEmbeddedResource(sourcecodepro_ttf);
     byte *ttfdata = (byte *)font.c_str();
 
     const int firstChar = FONT_FIRST_CHAR;
@@ -338,7 +340,7 @@ VulkanTextRenderer::VulkanTextRenderer(WrappedVulkan *driver)
     m_FontCharSize *= 2.0f;
 #endif
 
-    m_FontCharAspect = chardata->xadvance / pixelHeight;
+    m_FontCharAspect = chardata[0].xadvance / pixelHeight;
 
     stbtt_fontinfo f = {0};
     stbtt_InitFont(&f, ttfdata, 0);
@@ -353,6 +355,8 @@ VulkanTextRenderer::VulkanTextRenderer(WrappedVulkan *driver)
       vkr = m_pDriver->vkCreateImage(dev, &imInfo, NULL, &m_TextAtlas);
       RDCASSERTEQUAL(vkr, VK_SUCCESS);
 
+      NameVulkanObject(m_TextAtlas, "m_TextAtlas");
+
       rm->SetInternalResource(GetResID(m_TextAtlas));
 
       VkMemoryRequirements mrq = {0};
@@ -360,7 +364,9 @@ VulkanTextRenderer::VulkanTextRenderer(WrappedVulkan *driver)
 
       // allocate readback memory
       VkMemoryAllocateInfo allocInfo = {
-          VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, mrq.size,
+          VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+          NULL,
+          mrq.size,
           driver->GetGPULocalMemoryIndex(mrq.memoryTypeBits),
       };
 
@@ -477,7 +483,9 @@ VulkanTextRenderer::VulkanTextRenderer(WrappedVulkan *driver)
         0,
         {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
         {
-            0, 0, 0,
+            0,
+            0,
+            0,
         },
         {FONT_TEX_WIDTH, FONT_TEX_HEIGHT, 1},
     };
@@ -570,7 +578,8 @@ void VulkanTextRenderer::BeginText(const TextPrintState &textstate)
       Unwrap(textstate.rp),
       Unwrap(textstate.fb),
       {{
-           0, 0,
+           0,
+           0,
        },
        {textstate.w, textstate.h}},
       1,
@@ -597,32 +606,22 @@ void VulkanTextRenderer::BeginText(const TextPrintState &textstate)
 }
 
 void VulkanTextRenderer::RenderText(const TextPrintState &textstate, float x, float y,
-                                    const char *textfmt, ...)
+                                    const rdcstr &text)
 {
-  static char tmpBuf[4096];
+  rdcarray<rdcstr> lines;
+  split(text, lines, '\n');
 
-  va_list args;
-  va_start(args, textfmt);
-  StringFormat::vsnprintf(tmpBuf, 4095, textfmt, args);
-  tmpBuf[4095] = '\0';
-  va_end(args);
-
-  RenderTextInternal(textstate, x, y, tmpBuf);
+  for(const rdcstr &line : lines)
+  {
+    RenderTextInternal(textstate, x, y, line);
+    y += 1.0f;
+  }
 }
 
 void VulkanTextRenderer::RenderTextInternal(const TextPrintState &textstate, float x, float y,
-                                            const char *text)
+                                            const rdcstr &text)
 {
-  if(char *t = strchr((char *)text, '\n'))
-  {
-    *t = 0;
-    RenderTextInternal(textstate, x, y, text);
-    RenderTextInternal(textstate, x, y + 1.0f, t + 1);
-    *t = '\n';
-    return;
-  }
-
-  if(strlen(text) == 0)
+  if(text.empty())
     return;
 
   uint32_t offsets[2] = {0};
@@ -643,14 +642,14 @@ void VulkanTextRenderer::RenderTextInternal(const TextPrintState &textstate, flo
 
   m_TextGeneralUBO.Unmap();
 
-  size_t len = strlen(text);
+  size_t len = text.size();
 
   RDCASSERT(len <= MAX_SINGLE_LINE_LENGTH);
 
   // only map enough for our string
   StringUBOData *stringData = (StringUBOData *)m_TextStringUBO.Map(&offsets[1], len * sizeof(Vec4u));
 
-  for(size_t i = 0; i < strlen(text); i++)
+  for(size_t i = 0; i < len; i++)
     stringData->chars[i].x = uint32_t(text[i] - ' ');
 
   m_TextStringUBO.Unmap();
@@ -659,7 +658,7 @@ void VulkanTextRenderer::RenderTextInternal(const TextPrintState &textstate, flo
       ->CmdBindDescriptorSets(Unwrap(textstate.cmd), VK_PIPELINE_BIND_POINT_GRAPHICS,
                               Unwrap(m_TextPipeLayout), 0, 1, UnwrapPtr(m_TextDescSet), 2, offsets);
 
-  ObjDisp(textstate.cmd)->CmdDraw(Unwrap(textstate.cmd), 6 * (uint32_t)strlen(text), 1, 0, 0);
+  ObjDisp(textstate.cmd)->CmdDraw(Unwrap(textstate.cmd), 6 * (uint32_t)len, 1, 0, 0);
 }
 
 void VulkanTextRenderer::EndText(const TextPrintState &textstate)

@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2018-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -41,16 +41,24 @@ void GLReplay::CreateOutputWindowBackbuffer(OutputWindow &outwin, bool depth)
   drv.glGenFramebuffers(1, &outwin.BlitData.windowFBO);
   drv.glBindFramebuffer(eGL_FRAMEBUFFER, outwin.BlitData.windowFBO);
 
+  drv.glObjectLabel(eGL_FRAMEBUFFER, outwin.BlitData.windowFBO, -1, "FBO for output window");
+
   drv.glGenTextures(1, &outwin.BlitData.backbuffer);
   drv.glBindTexture(eGL_TEXTURE_2D, outwin.BlitData.backbuffer);
 
+  drv.glObjectLabel(eGL_TEXTURE, outwin.BlitData.backbuffer, -1, "Colour for output window");
+
   drv.glTextureImage2DEXT(outwin.BlitData.backbuffer, eGL_TEXTURE_2D, 0, eGL_SRGB8_ALPHA8,
                           outwin.width, outwin.height, 0, eGL_RGBA, eGL_UNSIGNED_BYTE, NULL);
-  drv.glTexParameteri(eGL_TEXTURE_2D, eGL_TEXTURE_MAX_LEVEL, 0);
-  drv.glTexParameteri(eGL_TEXTURE_2D, eGL_TEXTURE_MIN_FILTER, eGL_NEAREST);
-  drv.glTexParameteri(eGL_TEXTURE_2D, eGL_TEXTURE_MAG_FILTER, eGL_NEAREST);
-  drv.glTexParameteri(eGL_TEXTURE_2D, eGL_TEXTURE_WRAP_S, eGL_CLAMP_TO_EDGE);
-  drv.glTexParameteri(eGL_TEXTURE_2D, eGL_TEXTURE_WRAP_T, eGL_CLAMP_TO_EDGE);
+  drv.glTextureParameteriEXT(outwin.BlitData.backbuffer, eGL_TEXTURE_2D, eGL_TEXTURE_MAX_LEVEL, 0);
+  drv.glTextureParameteriEXT(outwin.BlitData.backbuffer, eGL_TEXTURE_2D, eGL_TEXTURE_MIN_FILTER,
+                             eGL_NEAREST);
+  drv.glTextureParameteriEXT(outwin.BlitData.backbuffer, eGL_TEXTURE_2D, eGL_TEXTURE_MAG_FILTER,
+                             eGL_NEAREST);
+  drv.glTextureParameteriEXT(outwin.BlitData.backbuffer, eGL_TEXTURE_2D, eGL_TEXTURE_WRAP_S,
+                             eGL_CLAMP_TO_EDGE);
+  drv.glTextureParameteriEXT(outwin.BlitData.backbuffer, eGL_TEXTURE_2D, eGL_TEXTURE_WRAP_T,
+                             eGL_CLAMP_TO_EDGE);
   drv.glFramebufferTexture2D(eGL_FRAMEBUFFER, eGL_COLOR_ATTACHMENT0, eGL_TEXTURE_2D,
                              outwin.BlitData.backbuffer, 0);
 
@@ -59,14 +67,22 @@ void GLReplay::CreateOutputWindowBackbuffer(OutputWindow &outwin, bool depth)
     drv.glGenTextures(1, &outwin.BlitData.depthstencil);
     drv.glBindTexture(eGL_TEXTURE_2D, outwin.BlitData.depthstencil);
 
+    drv.glObjectLabel(eGL_TEXTURE, outwin.BlitData.depthstencil, -1,
+                      "Depth-stencil for output window");
+
     drv.glTextureImage2DEXT(outwin.BlitData.depthstencil, eGL_TEXTURE_2D, 0, eGL_DEPTH_COMPONENT24,
                             outwin.width, outwin.height, 0, eGL_DEPTH_COMPONENT, eGL_UNSIGNED_INT,
                             NULL);
-    drv.glTexParameteri(eGL_TEXTURE_2D, eGL_TEXTURE_MAX_LEVEL, 0);
-    drv.glTexParameteri(eGL_TEXTURE_2D, eGL_TEXTURE_MIN_FILTER, eGL_NEAREST);
-    drv.glTexParameteri(eGL_TEXTURE_2D, eGL_TEXTURE_MAG_FILTER, eGL_NEAREST);
-    drv.glTexParameteri(eGL_TEXTURE_2D, eGL_TEXTURE_WRAP_S, eGL_CLAMP_TO_EDGE);
-    drv.glTexParameteri(eGL_TEXTURE_2D, eGL_TEXTURE_WRAP_T, eGL_CLAMP_TO_EDGE);
+    drv.glTextureParameteriEXT(outwin.BlitData.depthstencil, eGL_TEXTURE_2D, eGL_TEXTURE_MAX_LEVEL,
+                               0);
+    drv.glTextureParameteriEXT(outwin.BlitData.depthstencil, eGL_TEXTURE_2D, eGL_TEXTURE_MIN_FILTER,
+                               eGL_NEAREST);
+    drv.glTextureParameteriEXT(outwin.BlitData.depthstencil, eGL_TEXTURE_2D, eGL_TEXTURE_MAG_FILTER,
+                               eGL_NEAREST);
+    drv.glTextureParameteriEXT(outwin.BlitData.depthstencil, eGL_TEXTURE_2D, eGL_TEXTURE_WRAP_S,
+                               eGL_CLAMP_TO_EDGE);
+    drv.glTextureParameteriEXT(outwin.BlitData.depthstencil, eGL_TEXTURE_2D, eGL_TEXTURE_WRAP_T,
+                               eGL_CLAMP_TO_EDGE);
   }
   else
   {
@@ -88,9 +104,16 @@ void GLReplay::InitOutputWindow(OutputWindow &outwin)
   drv.glGenVertexArrays(1, &outwin.BlitData.emptyVAO);
   drv.glBindVertexArray(outwin.BlitData.emptyVAO);
 
+  drv.glObjectLabel(eGL_VERTEX_ARRAY, outwin.BlitData.emptyVAO, -1, "Empty VAO for output window");
+
   drv.glGenFramebuffers(1, &outwin.BlitData.readFBO);
   drv.glBindFramebuffer(eGL_READ_FRAMEBUFFER, outwin.BlitData.readFBO);
   drv.glReadBuffer(eGL_COLOR_ATTACHMENT0);
+
+  drv.glObjectLabel(eGL_FRAMEBUFFER, outwin.BlitData.readFBO, -1, "Read FBO for output window");
+
+  if(HasExt[EXT_framebuffer_sRGB])
+    drv.glEnable(eGL_FRAMEBUFFER_SRGB);
 }
 
 bool GLReplay::CheckResizeOutputWindow(uint64_t id)
@@ -201,9 +224,6 @@ void GLReplay::FlipOutputWindow(uint64_t id)
                              outw.BlitData.backbuffer, 0);
   drv.glReadBuffer(eGL_COLOR_ATTACHMENT0);
 
-  if(HasExt[EXT_framebuffer_sRGB])
-    drv.glEnable(eGL_FRAMEBUFFER_SRGB);
-
   drv.glBlitFramebuffer(0, 0, outw.width, outw.height, 0, 0, outw.width, outw.height,
                         GL_COLOR_BUFFER_BIT, eGL_NEAREST);
 
@@ -254,7 +274,7 @@ void GLReplay::DestroyOutputWindow(uint64_t id)
 
   m_pDriver->glDeleteFramebuffers(1, &outw.BlitData.readFBO);
 
-  m_pDriver->m_Platform.DeleteReplayContext(outw);
+  m_pDriver->UnregisterReplayContext(outw);
 
   m_OutputWindows.erase(it);
 }
@@ -317,7 +337,7 @@ void GLReplay::GetOutputWindowData(uint64_t id, bytebuf &retData)
   MakeCurrentReplayContext(m_DebugCtx);
 
   m_pDriver->glBindFramebuffer(eGL_READ_FRAMEBUFFER, outw.BlitData.windowFBO);
-  m_pDriver->glReadBuffer(eGL_BACK);
+  m_pDriver->glReadBuffer(eGL_COLOR_ATTACHMENT0);
   m_pDriver->glBindBuffer(eGL_PIXEL_PACK_BUFFER, 0);
   m_pDriver->glPixelStorei(eGL_PACK_ROW_LENGTH, 0);
   m_pDriver->glPixelStorei(eGL_PACK_SKIP_ROWS, 0);

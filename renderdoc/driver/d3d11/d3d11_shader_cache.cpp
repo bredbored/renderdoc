@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2018-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -25,7 +25,8 @@
 #include "d3d11_shader_cache.h"
 #include "common/shader_cache.h"
 #include "driver/dx/official/d3dcompiler.h"
-#include "driver/shaders/dxbc/dxbc_inspect.h"
+#include "driver/dxgi/dxgi_common.h"
+#include "driver/shaders/dxbc/dxbc_container.h"
 #include "strings/string_utils.h"
 #include "d3d11_device.h"
 #include "d3d11_resources.h"
@@ -80,33 +81,6 @@ struct D3DBlobShaderCallbacks
   pD3DCreateBlob m_BlobCreate = NULL;
 } D3D11ShaderCacheCallbacks;
 
-struct EmbeddedD3D11Includer : public ID3DInclude
-{
-  std::string texsample = GetEmbeddedResource(hlsl_texsample_h);
-  std::string cbuffers = GetEmbeddedResource(hlsl_cbuffers_h);
-
-  virtual HRESULT STDMETHODCALLTYPE Open(D3D_INCLUDE_TYPE IncludeType, LPCSTR pFileName,
-                                         LPCVOID pParentData, LPCVOID *ppData, UINT *pBytes) override
-  {
-    std::string *str;
-
-    if(!strcmp(pFileName, "hlsl_texsample.h"))
-      str = &texsample;
-    else if(!strcmp(pFileName, "hlsl_cbuffers.h"))
-      str = &cbuffers;
-    else
-      return E_FAIL;
-
-    if(ppData)
-      *ppData = str->c_str();
-    if(pBytes)
-      *pBytes = (uint32_t)str->size();
-
-    return S_OK;
-  }
-  virtual HRESULT STDMETHODCALLTYPE Close(LPCVOID pData) override { return S_OK; }
-};
-
 D3D11ShaderCache::D3D11ShaderCache(WrappedID3D11Device *wrapper)
 {
   m_pDevice = wrapper;
@@ -116,6 +90,24 @@ D3D11ShaderCache::D3D11ShaderCache(WrappedID3D11Device *wrapper)
 
   // if we failed to load from the cache
   m_ShaderCacheDirty = !success;
+
+  m_CompileFlags = D3DCOMPILE_WARNINGS_ARE_ERRORS;
+
+  static const GUID IRenderDoc_uuid = {
+      0xa7aa6116, 0x9c8d, 0x4bba, {0x90, 0x83, 0xb4, 0xd8, 0x16, 0xb7, 0x1b, 0x78}};
+
+  // if we're being self-captured, the 'real' device will respond to renderdoc's UUID. Enable debug
+  // shaders
+  IUnknown *dummy = NULL;
+  if(wrapper->GetReal())
+    wrapper->GetReal()->QueryInterface(IRenderDoc_uuid, (void **)&dummy);
+
+  if(dummy)
+  {
+    m_CompileFlags |=
+        D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION | D3DCOMPILE_OPTIMIZATION_LEVEL0;
+    SAFE_RELEASE(dummy);
+  }
 }
 
 D3D11ShaderCache::~D3D11ShaderCache()
@@ -132,17 +124,24 @@ D3D11ShaderCache::~D3D11ShaderCache()
   }
 }
 
-std::string D3D11ShaderCache::GetShaderBlob(const char *source, const char *entry,
-                                            const uint32_t compileFlags, const char *profile,
-                                            ID3DBlob **srcblob)
+rdcstr D3D11ShaderCache::GetShaderBlob(const char *source, const char *entry,
+                                       const uint32_t compileFlags,
+                                       const rdcarray<rdcstr> &includeDirs, const char *profile,
+                                       ID3DBlob **srcblob)
 {
-  EmbeddedD3D11Includer includer;
+  rdcstr cbuffers = GetEmbeddedResource(hlsl_cbuffers_h);
+  rdcstr texsample = GetEmbeddedResource(hlsl_texsample_h);
+
+  EmbeddedD3DIncluder includer(includeDirs, {
+                                                {"hlsl_texsample.h", texsample},
+                                                {"hlsl_cbuffers.h", cbuffers},
+                                            });
 
   uint32_t hash = strhash(source);
   hash = strhash(entry, hash);
   hash = strhash(profile, hash);
-  hash = strhash(includer.cbuffers.c_str(), hash);
-  hash = strhash(includer.texsample.c_str(), hash);
+  hash = strhash(cbuffers.c_str(), hash);
+  hash = strhash(texsample.c_str(), hash);
   hash ^= compileFlags;
 
   if(m_ShaderCache.find(hash) != m_ShaderCache.end())
@@ -176,13 +175,13 @@ std::string D3D11ShaderCache::GetShaderBlob(const char *source, const char *entr
   hr = compileFunc(source, strlen(source), entry, NULL, &includer, entry, profile, flags, 0,
                    &byteBlob, &errBlob);
 
-  std::string errors = "";
+  rdcstr errors = "";
 
   if(errBlob)
   {
     errors = (char *)errBlob->GetBufferPointer();
 
-    std::string logerror = errors;
+    rdcstr logerror = errors;
     if(logerror.length() > 1024)
       logerror = logerror.substr(0, 1024) + "...";
 
@@ -213,11 +212,11 @@ std::string D3D11ShaderCache::GetShaderBlob(const char *source, const char *entr
 ID3D11VertexShader *D3D11ShaderCache::MakeVShader(const char *source, const char *entry,
                                                   const char *profile, int numInputDescs,
                                                   D3D11_INPUT_ELEMENT_DESC *inputs,
-                                                  ID3D11InputLayout **ret, std::vector<byte> *blob)
+                                                  ID3D11InputLayout **ret, rdcarray<byte> *blob)
 {
   ID3DBlob *byteBlob = NULL;
 
-  if(GetShaderBlob(source, entry, D3DCOMPILE_WARNINGS_ARE_ERRORS, profile, &byteBlob) != "")
+  if(GetShaderBlob(source, entry, m_CompileFlags, {}, profile, &byteBlob) != "")
   {
     RDCERR("Couldn't get shader blob for %s", entry);
     return NULL;
@@ -265,7 +264,7 @@ ID3D11GeometryShader *D3D11ShaderCache::MakeGShader(const char *source, const ch
 {
   ID3DBlob *byteBlob = NULL;
 
-  if(GetShaderBlob(source, entry, D3DCOMPILE_WARNINGS_ARE_ERRORS, profile, &byteBlob) != "")
+  if(GetShaderBlob(source, entry, m_CompileFlags, {}, profile, &byteBlob) != "")
   {
     return NULL;
   }
@@ -293,7 +292,7 @@ ID3D11PixelShader *D3D11ShaderCache::MakePShader(const char *source, const char 
 {
   ID3DBlob *byteBlob = NULL;
 
-  if(GetShaderBlob(source, entry, D3DCOMPILE_WARNINGS_ARE_ERRORS, profile, &byteBlob) != "")
+  if(GetShaderBlob(source, entry, m_CompileFlags, {}, profile, &byteBlob) != "")
   {
     return NULL;
   }
@@ -321,7 +320,7 @@ ID3D11ComputeShader *D3D11ShaderCache::MakeCShader(const char *source, const cha
 {
   ID3DBlob *byteBlob = NULL;
 
-  if(GetShaderBlob(source, entry, D3DCOMPILE_WARNINGS_ARE_ERRORS, profile, &byteBlob) != "")
+  if(GetShaderBlob(source, entry, m_CompileFlags, {}, profile, &byteBlob) != "")
   {
     return NULL;
   }

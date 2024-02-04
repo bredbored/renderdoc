@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  * Copyright (c) 2014 Crytek
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -62,7 +62,7 @@ static std::wstring conv(const std::string &str)
 
 HINSTANCE hInstance = NULL;
 
-#if defined(RELEASE)
+#if defined(RELEASE) && RENDERDOC_OFFICIAL_BUILD
 #define CRASH_HANDLER 1
 #else
 #define CRASH_HANDLER 0
@@ -241,15 +241,23 @@ void DisplayRendererPreview(IReplayController *renderer, TextureDisplay &display
 
 struct UpgradeCommand : public Command
 {
-  UpgradeCommand(const GlobalEnvironment &env) : Command(env) {}
+private:
+  std::wstring wide_path;
+
+public:
+  UpgradeCommand() {}
   virtual void AddOptions(cmdline::parser &parser) { parser.add<std::string>("path", 0, ""); }
   virtual const char *Description() { return "Internal use only!"; }
   virtual bool IsInternalOnly() { return true; }
   virtual bool IsCaptureCommand() { return false; }
-  virtual int Execute(cmdline::parser &parser, const CaptureOptions &)
+  virtual bool Parse(cmdline::parser &parser, GlobalEnvironment &)
   {
-    std::wstring wide_path = conv(parser.get<std::string>("path"));
+    wide_path = conv(parser.get<std::string>("path"));
+    return true;
+  }
 
+  virtual int Execute(const CaptureOptions &)
+  {
     if(wide_path.back() != '\\' && wide_path.back() != '/')
       wide_path += L'\\';
 
@@ -393,7 +401,13 @@ struct UpgradeCommand : public Command
                 *wfn = L'\\';
             }
 
-            mz_zip_reader_extract_to_wfile(&zip, i, target.c_str(), 0);
+            FILE *target_file = NULL;
+            _wfopen_s(&target_file, target.c_str(), L"wb");
+            if(target_file)
+            {
+              mz_zip_reader_extract_to_cfile(&zip, i, target_file, 0);
+              fclose(target_file);
+            }
           }
         }
       }
@@ -416,7 +430,7 @@ struct UpgradeCommand : public Command
 
     ZeroMemory(paramsAlloc, sizeof(wchar_t) * 512);
 
-    wcscpy_s(paramsAlloc, sizeof(wchar_t) * 511, cmdline.c_str());
+    wcscpy_s(paramsAlloc, 511, cmdline.c_str());
 
     PROCESS_INFORMATION pi;
     STARTUPINFOW si;
@@ -440,23 +454,36 @@ struct UpgradeCommand : public Command
 #if CRASH_HANDLER
 struct CrashHandlerCommand : public Command
 {
-  CrashHandlerCommand(const GlobalEnvironment &env) : Command(env) {}
+private:
+  std::wstring pipe;
+
+public:
+  CrashHandlerCommand() {}
   virtual void AddOptions(cmdline::parser &parser) { parser.add<std::string>("pipe", 0, ""); }
   virtual const char *Description() { return "Internal use only!"; }
   virtual bool IsInternalOnly() { return true; }
   virtual bool IsCaptureCommand() { return false; }
-  virtual int Execute(cmdline::parser &parser, const CaptureOptions &)
+  virtual bool Parse(cmdline::parser &parser, GlobalEnvironment &)
   {
-    std::wstring pipe = conv(parser.get<std::string>("pipe"));
-
+    pipe = conv(parser.get<std::string>("pipe"));
+    return true;
+  }
+  virtual rdcarray<rdcstr> ReplayArgs() { return {"--crash"}; }
+  virtual int Execute(const CaptureOptions &)
+  {
     CrashGenerationServer *crashServer = NULL;
 
     wchar_t tempPath[MAX_PATH] = {0};
     GetTempPathW(MAX_PATH - 1, tempPath);
 
     std::wstring dumpFolder = tempPath;
-    dumpFolder += L"RenderDoc/dumps";
 
+    // create each parent directory separately, and use \\s
+
+    dumpFolder += L"RenderDoc";
+    CreateDirectoryW(dumpFolder.c_str(), NULL);
+
+    dumpFolder += L"\\dumps";
     CreateDirectoryW(dumpFolder.c_str(), NULL);
 
     crashServer =
@@ -530,69 +557,101 @@ struct CrashHandlerCommand : public Command
         }
         else
         {
-          report += "  \"" + std::string(name.begin(), name.end()) + "\": \"" +
-                    std::string(val.begin(), val.end()) + "\",\n";
+          report += "  \"" + conv(name) + "\": \"" + conv(val) + "\",\n";
         }
       }
 
-      rdcstr reportPath;
+      FILETIME filetime = {};
+      SYSTEMTIME systime = {};
+      GetSystemTimeAsFileTime(&filetime);
+      FileTimeToSystemTime(&filetime, &systime);
 
-      RENDERDOC_CreateBugReport(conv(wlogpath).c_str(), conv(wdump).c_str(), reportPath);
+      uint32_t milliseconds = 0;
+      milliseconds += systime.wHour;
+      milliseconds *= 60;
+      milliseconds += systime.wMinute;
+      milliseconds *= 60;
+      milliseconds += systime.wSecond;
+      milliseconds *= 1000;
+      milliseconds += systime.wMilliseconds;
+
+      std::string dumpId;
+
+      char base62[63] = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+      while(milliseconds > 0)
+      {
+        char c = base62[milliseconds % 63];
+        dumpId.push_back(base62[milliseconds % 62]);
+        milliseconds /= 62;
+      }
+
+      std::string reportPath = conv(dumpFolder) + "\\" + dumpId + ".zip";
+
+      RENDERDOC_CreateBugReport(rdcstr(conv(wlogpath).c_str()), rdcstr(conv(wdump).c_str()),
+                                rdcstr(reportPath.c_str()));
 
       for(size_t i = 0; i < reportPath.size(); i++)
         if(reportPath[i] == '\\')
           reportPath[i] = '/';
 
-      report += "  \n\"report\": \"" + std::string(reportPath) + "\"\n";
+      report += "  \n\"report\": \"" + reportPath + "\"\n";
       report += "}\n";
 
       {
-        std::wstring destjson = dumpFolder + L"\\report.json";
+        std::wstring destjson = dumpFolder + L"\\" + conv(dumpId) + L".json";
 
         FILE *f = NULL;
         _wfopen_s(&f, destjson.c_str(), L"w");
-        fputs(report.c_str(), f);
-        fclose(f);
-
-        wchar_t *paramsAlloc = new wchar_t[512];
-
-        ZeroMemory(paramsAlloc, sizeof(wchar_t) * 512);
-
-        GetModuleFileNameW(NULL, paramsAlloc, 511);
-
-        wchar_t *lastSlash = wcsrchr(paramsAlloc, '\\');
-
-        if(lastSlash)
-          *lastSlash = 0;
-
-        std::wstring exepath = paramsAlloc;
-
-        ZeroMemory(paramsAlloc, sizeof(wchar_t) * 512);
-
-        _snwprintf_s(paramsAlloc, 511, 511, L"%s/qrenderdoc.exe --crash %s", exepath.c_str(),
-                     destjson.c_str());
-
-        PROCESS_INFORMATION pi;
-        STARTUPINFOW si;
-        ZeroMemory(&pi, sizeof(pi));
-        ZeroMemory(&si, sizeof(si));
-
-        BOOL success =
-            CreateProcessW(NULL, paramsAlloc, NULL, NULL, FALSE, 0, NULL, exepath.c_str(), &si, &pi);
-
-        if(success && pi.hProcess)
+        if(!f)
         {
-          WaitForSingleObject(pi.hProcess, INFINITE);
+          OutputDebugStringA("Coudln't open report json");
         }
+        else
+        {
+          fputs(report.c_str(), f);
+          fclose(f);
 
-        if(pi.hProcess)
-          CloseHandle(pi.hProcess);
-        if(pi.hThread)
-          CloseHandle(pi.hThread);
+          wchar_t *paramsAlloc = new wchar_t[512];
 
-        std::wstring wreport = conv(std::string(report));
+          ZeroMemory(paramsAlloc, sizeof(wchar_t) * 512);
 
-        DeleteFileW(wreport.c_str());
+          GetModuleFileNameW(NULL, paramsAlloc, 511);
+
+          wchar_t *lastSlash = wcsrchr(paramsAlloc, '\\');
+
+          if(lastSlash)
+            *lastSlash = 0;
+
+          std::wstring exepath = paramsAlloc;
+
+          ZeroMemory(paramsAlloc, sizeof(wchar_t) * 512);
+
+          _snwprintf_s(paramsAlloc, 511, 511, L"%s/qrenderdoc.exe --crash %s", exepath.c_str(),
+                       destjson.c_str());
+
+          PROCESS_INFORMATION pi;
+          STARTUPINFOW si;
+          ZeroMemory(&pi, sizeof(pi));
+          ZeroMemory(&si, sizeof(si));
+
+          BOOL success = CreateProcessW(NULL, paramsAlloc, NULL, NULL, FALSE, 0, NULL,
+                                        exepath.c_str(), &si, &pi);
+
+          if(success && pi.hProcess)
+          {
+            WaitForSingleObject(pi.hProcess, INFINITE);
+          }
+
+          if(pi.hProcess)
+            CloseHandle(pi.hProcess);
+          if(pi.hThread)
+            CloseHandle(pi.hThread);
+
+          std::wstring wreport = conv(reportPath);
+
+          DeleteFileW(wreport.c_str());
+          DeleteFileW(destjson.c_str());
+        }
       }
     }
 
@@ -609,7 +668,14 @@ struct CrashHandlerCommand : public Command
 
 struct GlobalHookCommand : public Command
 {
-  GlobalHookCommand(const GlobalEnvironment &env) : Command(env) {}
+private:
+  std::wstring wpathmatch;
+  std::string capfile;
+  std::string debuglog;
+  std::string opts;
+
+public:
+  GlobalHookCommand() {}
   virtual void AddOptions(cmdline::parser &parser)
   {
     parser.add<std::string>("match", 0, "");
@@ -620,14 +686,18 @@ struct GlobalHookCommand : public Command
   virtual const char *Description() { return "Internal use only!"; }
   virtual bool IsInternalOnly() { return true; }
   virtual bool IsCaptureCommand() { return false; }
-  virtual int Execute(cmdline::parser &parser, const CaptureOptions &)
+  virtual bool Parse(cmdline::parser &parser, GlobalEnvironment &)
   {
-    std::wstring wpathmatch = conv(parser.get<std::string>("match"));
-    std::string capfile = parser.get<std::string>("capfile");
-    std::string debuglog = parser.get<std::string>("debuglog");
-
+    wpathmatch = conv(parser.get<std::string>("match"));
+    capfile = parser.get<std::string>("capfile");
+    debuglog = parser.get<std::string>("debuglog");
+    opts = parser.get<std::string>("capopts");
+    return true;
+  }
+  virtual int Execute(const CaptureOptions &)
+  {
     CaptureOptions cmdopts;
-    cmdopts.DecodeFromString(parser.get<std::string>("capopts"));
+    cmdopts.DecodeFromString(rdcstr(opts.c_str(), opts.size()));
 
     // make sure the user doesn't accidentally run this with 'a' as a parameter or something.
     // "a.exe" is over 4 characters so this limit should not be a problem.
@@ -697,7 +767,7 @@ struct GlobalHookCommand : public Command
         // wait until a write comes in over the pipe
         char buf[16] = {0};
         DWORD read = 0;
-        ReadFile(pipe, buf, 16, &read, NULL);
+        ReadFile(pipe, buf, sizeof(buf), &read, NULL);
 
         UnmapViewOfFile(shimdata);
       }
@@ -762,17 +832,17 @@ int main(int, char *)
   GlobalEnvironment env;
 
   // perform an upgrade of the UI
-  add_command("upgrade", new UpgradeCommand(env));
+  add_command("upgrade", new UpgradeCommand());
 
 #if CRASH_HANDLER
   // special WIN32 option for launching the crash handler
-  add_command("crashhandle", new CrashHandlerCommand(env));
+  add_command("crashhandle", new CrashHandlerCommand());
 #endif
 
   // this installs a global windows hook pointing at renderdocshim*.dll that filters all running
   // processes and loads renderdoc.dll in the target one. In any other process it unloads as soon as
   // possible
-  add_command("globalhook", new GlobalHookCommand(env));
+  add_command("globalhook", new GlobalHookCommand());
 
   return renderdoccmd(env, argv);
 }

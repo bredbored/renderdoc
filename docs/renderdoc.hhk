@@ -41,12 +41,12 @@
 </OBJECT>
 	<UL>
 		<LI> <OBJECT type="text/sitemap">
-			<param name="Keyword" value="Annotating textures">
-			<param name="Local" value="how/how_view_texture.html#annotating-resources-with-names">
+			<param name="Keyword" value="Naming resources">
+			<param name="Local" value="how/how_annotate_capture.html#application-provided-object-names">
 		</OBJECT>
 		<LI> <OBJECT type="text/sitemap">
-			<param name="Keyword" value="Creating Event Hierarchy">
-			<param name="Local" value="window/event_browser.html#annotating-your-frame">
+			<param name="Keyword" value="Event marker annotations">
+			<param name="Local" value="how/how_annotate_capture.html#application-provided-marker-regions">
 		</OBJECT>
 		<LI> <OBJECT type="text/sitemap">
 			<param name="Keyword" value="Integrating RenderDoc functionality">
@@ -82,12 +82,12 @@
     <param name="Local" value="behind_scenes/d3d12_support.html">
 </OBJECT>
 <LI> <OBJECT type="text/sitemap">
-    <param name="Keyword" value="Drawcall Timings">
-    <param name="Local" value="window/event_browser.html#timing-drawcalls">
+    <param name="Keyword" value="Action Timings">
+    <param name="Local" value="window/event_browser.html#timing-actions">
 </OBJECT>
 <LI> <OBJECT type="text/sitemap">
     <param name="Keyword" value="Event Hierarchy">
-    <param name="Local" value="window/event_browser.html#timing-drawcalls">
+    <param name="Local" value="window/event_browser.html#timing-actions">
 </OBJECT>
 <LI> <OBJECT type="text/sitemap">
     <param name="Keyword" value="FAQ">
@@ -252,10 +252,6 @@
     <param name="Local" value="how/how_inspect_pixel.html">
 </OBJECT>
 <LI> <OBJECT type="text/sitemap">
-    <param name="Keyword" value="Planned Features">
-    <param name="Local" value="behind_scenes/planned_features.html">
-</OBJECT>
-<LI> <OBJECT type="text/sitemap">
     <param name="Keyword" value="Preferences">
     <param name="Local" value="window/settings_window.html">
 </OBJECT>
@@ -273,7 +269,7 @@
 </OBJECT>
 <LI> <OBJECT type="text/sitemap">
     <param name="Keyword" value="Raw Buffer View">
-    <param name="Local" value="window/buffer_viewer.html#raw-buffer-viewer">
+    <param name="Local" value="window/buffer_viewer.html">
 </OBJECT>
 <LI> <OBJECT type="text/sitemap">
     <param name="Keyword" value="RenderDoc API">
@@ -339,7 +335,7 @@
 </OBJECT>
 <LI> <OBJECT type="text/sitemap">
     <param name="Keyword" value="SSBO Contents">
-    <param name="Local" value="window/buffer_viewer.html#raw-buffer-viewer">
+    <param name="Local" value="window/buffer_viewer.html">
 </OBJECT>
 <LI> <OBJECT type="text/sitemap">
     <param name="Keyword" value="Texture List">
@@ -350,8 +346,8 @@
     <param name="Local" value="html/credits_acknowledgements.html">
 </OBJECT>
 <LI> <OBJECT type="text/sitemap">
-    <param name="Keyword" value="Timing drawcalls">
-    <param name="Local" value="window/event_browser.html#timing-drawcalls">
+    <param name="Keyword" value="Timing actions">
+    <param name="Local" value="window/event_browser.html#timing-actions">
 </OBJECT>
 <LI> <OBJECT type="text/sitemap">
     <param name="Keyword" value="Tips &amp; Tricks">
@@ -359,7 +355,7 @@
 </OBJECT>
 <LI> <OBJECT type="text/sitemap">
     <param name="Keyword" value="UAV Contents">
-    <param name="Local" value="window/buffer_viewer.html#raw-buffer-viewer">
+    <param name="Local" value="window/buffer_viewer.html">
 </OBJECT>
 <LI> <OBJECT type="text/sitemap">
     <param name="Keyword" value="Vulkan">
@@ -404,11 +400,11 @@
 		</OBJECT>
 		<LI> <OBJECT type="text/sitemap">
 				<param name="Keyword" value="Mesh Output">
-				<param name="Local" value="window/buffer_viewer.html#mesh-viewer">
+				<param name="Local" value="window/mesh_viewer.html">
 		</OBJECT>
 		<LI> <OBJECT type="text/sitemap">
 				<param name="Keyword" value="Mesh Viewer">
-				<param name="Local" value="window/buffer_viewer.html#mesh-viewer">
+				<param name="Local" value="window/mesh_viewer.html">
 		</OBJECT>
 		<LI> <OBJECT type="text/sitemap">
 				<param name="Keyword" value="Performance Counter Viewer">
@@ -424,7 +420,7 @@
 		</OBJECT>
 		<LI> <OBJECT type="text/sitemap">
 				<param name="Keyword" value="Raw Buffer Viewer">
-				<param name="Local" value="window/buffer_viewer.html#raw-buffer-viewer">
+				<param name="Local" value="window/buffer_viewer.html">
 		</OBJECT>
 		<LI> <OBJECT type="text/sitemap">
 				<param name="Keyword" value="Resource Inspector">

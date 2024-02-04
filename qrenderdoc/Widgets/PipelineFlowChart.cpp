@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2017-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -25,6 +25,7 @@
 #include "PipelineFlowChart.h"
 #include <QMouseEvent>
 #include <QPainter>
+#include "Code/QRDUtils.h"
 
 PipelineFlowChart::PipelineFlowChart(QWidget *parent) : QFrame(parent)
 {
@@ -40,7 +41,9 @@ void PipelineFlowChart::setStages(const QStringList &abbrevs, const QStringList 
   m_StageNames = names;
   m_StageAbbrevs = abbrevs;
   m_StageFlows.reserve(m_StageNames.count());
+  m_StageFlows.clear();
   m_StagesEnabled.reserve(m_StageNames.count());
+  m_StagesEnabled.clear();
   for(int i = 0; i < m_StageNames.count(); i++)
   {
     m_StageFlows.push_back(true);
@@ -48,6 +51,7 @@ void PipelineFlowChart::setStages(const QStringList &abbrevs, const QStringList 
   }
 
   update();
+  setSelectedStage(selectedStage());
 }
 
 void PipelineFlowChart::setStageName(int index, const QString &abbrev, const QString &name)
@@ -182,6 +186,12 @@ void PipelineFlowChart::paintEvent(QPaintEvent *e)
     return;
 
   QPainter p(this);
+
+  QFont f = Formatter::PreferredFont();
+
+  f.setPointSizeF(1.5f * f.pointSizeF());
+
+  p.setFont(f);
 
   p.fillRect(rect(), Qt::transparent);
 

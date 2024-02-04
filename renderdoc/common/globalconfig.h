@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  * Copyright (c) 2014 Crytek
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -36,8 +36,9 @@
 
 /////////////////////////////////////////////////
 // Build/machine configuration
-#if defined(__LP64__) || defined(_WIN64) || defined(__x86_64__) || defined(_M_X64) || \
-    defined(__ia64) || defined(_M_IA64) || defined(__aarch64__) || defined(__powerpc64__)
+#if defined(__LP64__) || defined(_WIN64) || defined(__x86_64__) || defined(_M_X64) ||        \
+    defined(__ia64) || defined(_M_IA64) || defined(__aarch64__) || defined(__powerpc64__) || \
+    (defined(__riscv64) && __riscv_xlen == 64)
 #define RDOC_X64 OPTION_ON
 #else
 #define RDOC_X64 OPTION_OFF
@@ -67,6 +68,7 @@
 #define RDOC_APPLE OPTION_OFF
 #define RDOC_POSIX OPTION_OFF
 #define RDOC_GGP OPTION_OFF
+#define RDOC_SWITCH OPTION_OFF
 
 #elif defined(RENDERDOC_PLATFORM_ANDROID)
 
@@ -76,6 +78,7 @@
 #define RDOC_APPLE OPTION_OFF
 #define RDOC_POSIX OPTION_ON
 #define RDOC_GGP OPTION_OFF
+#define RDOC_SWITCH OPTION_OFF
 
 #elif defined(RENDERDOC_PLATFORM_LINUX)
 
@@ -85,6 +88,7 @@
 #define RDOC_APPLE OPTION_OFF
 #define RDOC_POSIX OPTION_ON
 #define RDOC_GGP OPTION_OFF
+#define RDOC_SWITCH OPTION_OFF
 
 #elif defined(RENDERDOC_PLATFORM_APPLE)
 
@@ -94,6 +98,7 @@
 #define RDOC_APPLE OPTION_ON
 #define RDOC_POSIX OPTION_ON
 #define RDOC_GGP OPTION_OFF
+#define RDOC_SWITCH OPTION_OFF
 
 #elif defined(RENDERDOC_PLATFORM_GGP)
 
@@ -103,6 +108,17 @@
 #define RDOC_APPLE OPTION_OFF
 #define RDOC_POSIX OPTION_ON
 #define RDOC_GGP OPTION_ON
+#define RDOC_SWITCH OPTION_OFF
+
+#elif defined(RENDERDOC_PLATFORM_SWITCH)
+
+#define RDOC_WIN32 OPTION_OFF
+#define RDOC_ANDROID OPTION_OFF
+#define RDOC_LINUX OPTION_OFF
+#define RDOC_APPLE OPTION_OFF
+#define RDOC_POSIX OPTION_ON
+#define RDOC_GGP OPTION_OFF
+#define RDOC_SWITCH OPTION_ON
 
 #else
 
@@ -129,6 +145,12 @@
 #define RDOC_XCB OPTION_OFF
 #endif
 
+#if defined(RENDERDOC_WINDOWING_WAYLAND)
+#define RDOC_WAYLAND OPTION_ON
+#else
+#define RDOC_WAYLAND OPTION_OFF
+#endif
+
 /////////////////////////////////////////////////
 // Global constants
 enum
@@ -136,10 +158,15 @@ enum
   RenderDoc_FirstTargetControlPort = 38920,
   RenderDoc_LastTargetControlPort = RenderDoc_FirstTargetControlPort + 7,
   RenderDoc_RemoteServerPort = 39920,
-  RenderDoc_AndroidPortOffset = 50,
+
+  RenderDoc_ForwardPortBase = 38950,
+  RenderDoc_ForwardTargetControlOffset = 0,
+  RenderDoc_ForwardRemoteServerOffset = 9,
+  RenderDoc_ForwardPortStride = 10,
 };
 
 #define RENDERDOC_VULKAN_LAYER_NAME "VK_LAYER_RENDERDOC_Capture"
+#define RENDERDOC_VULKAN_LAYER_VAR "ENABLE_VULKAN_RENDERDOC_CAPTURE"
 
 #define RENDERDOC_ANDROID_LIBRARY "libVkLayer_GLES_RenderDoc.so"
 
@@ -182,7 +209,7 @@ enum
 
 #else
 
-#define OUTPUT_LOG_TO_STDOUT OPTION_ON
+#define OUTPUT_LOG_TO_STDOUT OPTION_OFF
 #define OUTPUT_LOG_TO_STDERR OPTION_OFF
 
 #endif
@@ -199,8 +226,8 @@ enum
 // this strips them completely
 #define STRIP_DEBUG_LOGS OPTION_OFF
 
-// disable unit tests on android
-#if ENABLED(RDOC_ANDROID)
+// disable unit tests on android and *BSD
+#if ENABLED(RDOC_ANDROID) || defined(__FreeBSD__)
 
 #define ENABLE_UNIT_TESTS OPTION_OFF
 

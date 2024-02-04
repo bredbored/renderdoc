@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2017-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -47,7 +47,7 @@ inline SDChunk *MakeFromArgsTuple<SDChunk>(PyObject *args)
   if(!SWIG_IsOK(res))
     SWIG_exception_fail(SWIG_ArgError(res), "invalid name used to create SDChunk, expected string");
 
-  result = new SDChunk(name.c_str());
+  result = new SDChunk(name);
 
   return result;
 fail:
@@ -77,7 +77,7 @@ inline SDObject *MakeFromArgsTuple<SDObject>(PyObject *args)
     SWIG_exception_fail(SWIG_ArgError(res),
                         "invalid type name used to create SDObject, expected string");
 
-  result = new SDObject(name.c_str(), typeName);
+  result = new SDObject(name, typeName);
 
   return result;
 fail:

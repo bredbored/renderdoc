@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  * Copyright (c) 2014 Crytek
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -23,10 +23,10 @@
  * THE SOFTWARE.
  ******************************************************************************/
 
-#include "driver/d3d11/d3d11_renderstate.h"
-#include "driver/d3d11/d3d11_context.h"
-#include "driver/d3d11/d3d11_device.h"
-#include "driver/d3d11/d3d11_resources.h"
+#include "d3d11_renderstate.h"
+#include "d3d11_context.h"
+#include "d3d11_device.h"
+#include "d3d11_resources.h"
 
 D3D11RenderState::D3D11RenderState(D3D11RenderState::EmptyInit)
 {
@@ -100,54 +100,54 @@ D3D11RenderState::~D3D11RenderState()
 
 void D3D11RenderState::ReleaseRefs()
 {
-  ReleaseRef(IA.IndexBuffer);
-  ReleaseRef(IA.Layout);
+  IntRelease(IA.IndexBuffer);
+  IntRelease(IA.Layout);
 
   for(UINT i = 0; i < D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT; i++)
-    ReleaseRef(IA.VBs[i]);
+    IntRelease(IA.VBs[i]);
 
   Shader *stages[] = {&VS, &HS, &DS, &GS, &PS, &CS};
-  for(int s = 0; s < 6; s++)
+  for(int s = 0; s < ARRAY_COUNT(stages); s++)
   {
     Shader *sh = stages[s];
 
-    ReleaseRef(sh->Object);
+    IntRelease(sh->Object);
 
     for(UINT i = 0; i < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT; i++)
-      ReleaseRef(sh->ConstantBuffers[i]);
+      IntRelease(sh->ConstantBuffers[i]);
 
     for(UINT i = 0; i < D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT; i++)
-      ReleaseRef(sh->Samplers[i]);
+      IntRelease(sh->Samplers[i]);
 
     for(UINT i = 0; i < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT; i++)
-      ReleaseRef(sh->SRVs[i]);
+      IntRelease(sh->SRVs[i]);
 
     for(UINT i = 0; i < D3D11_SHADER_MAX_INTERFACES; i++)
-      ReleaseRef(sh->Instances[i]);
+      IntRelease(sh->Instances[i]);
 
     sh++;
   }
 
   for(UINT i = 0; i < D3D11_1_UAV_SLOT_COUNT; i++)
-    ReleaseRef(CSUAVs[i]);
+    IntRelease(CSUAVs[i]);
 
   for(UINT i = 0; i < D3D11_SO_BUFFER_SLOT_COUNT; i++)
-    ReleaseRef(SO.Buffers[i]);
+    IntRelease(SO.Buffers[i]);
 
-  ReleaseRef(RS.State);
+  IntRelease(RS.State);
 
-  ReleaseRef(OM.BlendState);
-  ReleaseRef(OM.DepthStencilState);
+  IntRelease(OM.BlendState);
+  IntRelease(OM.DepthStencilState);
 
   for(UINT i = 0; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; i++)
-    ReleaseRef(OM.RenderTargets[i]);
+    IntRelease(OM.RenderTargets[i]);
 
   for(UINT i = 0; i < D3D11_1_UAV_SLOT_COUNT; i++)
-    ReleaseRef(OM.UAVs[i]);
+    IntRelease(OM.UAVs[i]);
 
-  ReleaseRef(OM.DepthView);
+  IntRelease(OM.DepthView);
 
-  ReleaseRef(Predicate);
+  IntRelease(Predicate);
 
   RDCEraseEl(IA);
   RDCEraseEl(VS);
@@ -165,36 +165,37 @@ void D3D11RenderState::ReleaseRefs()
 
 void D3D11RenderState::MarkReferenced(WrappedID3D11DeviceContext *ctx, bool initial) const
 {
-  ctx->MarkResourceReferenced(GetIDForResource(IA.Layout), initial ? eFrameRef_None : eFrameRef_Read);
+  ctx->MarkResourceReferenced(GetIDForDeviceChild(IA.Layout),
+                              initial ? eFrameRef_None : eFrameRef_Read);
 
-  ctx->MarkResourceReferenced(GetIDForResource(IA.IndexBuffer),
+  ctx->MarkResourceReferenced(GetIDForDeviceChild(IA.IndexBuffer),
                               initial ? eFrameRef_None : eFrameRef_Read);
 
   for(UINT i = 0; i < D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT; i++)
-    ctx->MarkResourceReferenced(GetIDForResource(IA.VBs[i]),
+    ctx->MarkResourceReferenced(GetIDForDeviceChild(IA.VBs[i]),
                                 initial ? eFrameRef_None : eFrameRef_Read);
 
   const Shader *stages[] = {&VS, &HS, &DS, &GS, &PS, &CS};
-  for(int s = 0; s < 6; s++)
+  for(int s = 0; s < ARRAY_COUNT(stages); s++)
   {
     const Shader *sh = stages[s];
 
-    ctx->MarkResourceReferenced(GetIDForResource(sh->Object),
+    ctx->MarkResourceReferenced(GetIDForDeviceChild(sh->Object),
                                 initial ? eFrameRef_None : eFrameRef_Read);
 
     for(UINT i = 0; i < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT; i++)
-      ctx->MarkResourceReferenced(GetIDForResource(sh->ConstantBuffers[i]),
+      ctx->MarkResourceReferenced(GetIDForDeviceChild(sh->ConstantBuffers[i]),
                                   initial ? eFrameRef_None : eFrameRef_Read);
 
     for(UINT i = 0; i < D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT; i++)
-      ctx->MarkResourceReferenced(GetIDForResource(sh->Samplers[i]),
+      ctx->MarkResourceReferenced(GetIDForDeviceChild(sh->Samplers[i]),
                                   initial ? eFrameRef_None : eFrameRef_Read);
 
     for(UINT i = 0; i < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT; i++)
     {
       if(sh->SRVs[i])
       {
-        ctx->MarkResourceReferenced(GetIDForResource(sh->SRVs[i]),
+        ctx->MarkResourceReferenced(GetIDForDeviceChild(sh->SRVs[i]),
                                     initial ? eFrameRef_None : eFrameRef_Read);
         ctx->MarkResourceReferenced(GetViewResourceResID(sh->SRVs[i]),
                                     initial ? eFrameRef_None : eFrameRef_Read);
@@ -209,9 +210,9 @@ void D3D11RenderState::MarkReferenced(WrappedID3D11DeviceContext *ctx, bool init
     if(CSUAVs[i])
     {
       // UAVs we always assume to be partial updates
-      ctx->MarkResourceReferenced(GetIDForResource(CSUAVs[i]),
+      ctx->MarkResourceReferenced(GetIDForDeviceChild(CSUAVs[i]),
                                   initial ? eFrameRef_None : eFrameRef_Read);
-      ctx->MarkResourceReferenced(GetIDForResource(CSUAVs[i]),
+      ctx->MarkResourceReferenced(GetIDForDeviceChild(CSUAVs[i]),
                                   initial ? eFrameRef_None : eFrameRef_PartialWrite);
       ctx->MarkResourceReferenced(GetViewResourceResID(CSUAVs[i]),
                                   initial ? eFrameRef_None : eFrameRef_Read);
@@ -221,22 +222,23 @@ void D3D11RenderState::MarkReferenced(WrappedID3D11DeviceContext *ctx, bool init
   }
 
   for(UINT i = 0; i < D3D11_SO_BUFFER_SLOT_COUNT; i++)
-    ctx->MarkResourceReferenced(GetIDForResource(SO.Buffers[i]),
+    ctx->MarkResourceReferenced(GetIDForDeviceChild(SO.Buffers[i]),
                                 initial ? eFrameRef_None : eFrameRef_PartialWrite);
 
-  ctx->MarkResourceReferenced(GetIDForResource(RS.State), initial ? eFrameRef_None : eFrameRef_Read);
-
-  ctx->MarkResourceReferenced(GetIDForResource(OM.BlendState),
+  ctx->MarkResourceReferenced(GetIDForDeviceChild(RS.State),
                               initial ? eFrameRef_None : eFrameRef_Read);
 
-  ctx->MarkResourceReferenced(GetIDForResource(OM.DepthStencilState),
+  ctx->MarkResourceReferenced(GetIDForDeviceChild(OM.BlendState),
+                              initial ? eFrameRef_None : eFrameRef_Read);
+
+  ctx->MarkResourceReferenced(GetIDForDeviceChild(OM.DepthStencilState),
                               initial ? eFrameRef_None : eFrameRef_Read);
 
   for(UINT i = 0; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; i++)
   {
     if(OM.RenderTargets[i])
     {
-      ctx->MarkResourceReferenced(GetIDForResource(OM.RenderTargets[i]),
+      ctx->MarkResourceReferenced(GetIDForDeviceChild(OM.RenderTargets[i]),
                                   initial ? eFrameRef_None : eFrameRef_Read);
       ctx->MarkResourceReferenced(GetViewResourceResID(OM.RenderTargets[i]),
                                   initial ? eFrameRef_None : eFrameRef_PartialWrite);
@@ -248,9 +250,9 @@ void D3D11RenderState::MarkReferenced(WrappedID3D11DeviceContext *ctx, bool init
     if(OM.UAVs[i])
     {
       // UAVs we always assume to be partial updates
-      ctx->MarkResourceReferenced(GetIDForResource(OM.UAVs[i]),
+      ctx->MarkResourceReferenced(GetIDForDeviceChild(OM.UAVs[i]),
                                   initial ? eFrameRef_None : eFrameRef_Read);
-      ctx->MarkResourceReferenced(GetIDForResource(OM.UAVs[i]),
+      ctx->MarkResourceReferenced(GetIDForDeviceChild(OM.UAVs[i]),
                                   initial ? eFrameRef_None : eFrameRef_PartialWrite);
       ctx->MarkResourceReferenced(GetViewResourceResID(OM.UAVs[i]),
                                   initial ? eFrameRef_None : eFrameRef_Read);
@@ -261,7 +263,7 @@ void D3D11RenderState::MarkReferenced(WrappedID3D11DeviceContext *ctx, bool init
 
   if(OM.DepthView)
   {
-    ctx->MarkResourceReferenced(GetIDForResource(OM.DepthView),
+    ctx->MarkResourceReferenced(GetIDForDeviceChild(OM.DepthView),
                                 initial ? eFrameRef_None : eFrameRef_Read);
     ctx->MarkResourceReferenced(GetViewResourceResID(OM.DepthView),
                                 initial ? eFrameRef_None : eFrameRef_PartialWrite);
@@ -269,159 +271,68 @@ void D3D11RenderState::MarkReferenced(WrappedID3D11DeviceContext *ctx, bool init
 
   if(Predicate)
   {
-    ctx->MarkResourceReferenced(GetIDForResource(Predicate),
+    ctx->MarkResourceReferenced(GetIDForDeviceChild(Predicate),
                                 initial ? eFrameRef_None : eFrameRef_Read);
   }
 }
 
 void D3D11RenderState::AddRefs()
 {
-  TakeRef(IA.IndexBuffer);
-  TakeRef(IA.Layout);
+  IntAddRef(IA.IndexBuffer);
+  IntAddRef(IA.Layout);
 
   for(UINT i = 0; i < D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT; i++)
-    TakeRef(IA.VBs[i]);
+    IntAddRef(IA.VBs[i]);
 
   Shader *stages[] = {&VS, &HS, &DS, &GS, &PS, &CS};
-  for(int s = 0; s < 6; s++)
+  for(int s = 0; s < ARRAY_COUNT(stages); s++)
   {
     Shader *sh = stages[s];
 
-    TakeRef(sh->Object);
+    IntAddRef(sh->Object);
 
     for(UINT i = 0; i < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT; i++)
-      TakeRef(sh->ConstantBuffers[i]);
+      IntAddRef(sh->ConstantBuffers[i]);
 
     for(UINT i = 0; i < D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT; i++)
-      TakeRef(sh->Samplers[i]);
+      IntAddRef(sh->Samplers[i]);
 
     for(UINT i = 0; i < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT; i++)
-      TakeRef(sh->SRVs[i]);
+      IntAddRef(sh->SRVs[i]);
 
     for(UINT i = 0; i < D3D11_SHADER_MAX_INTERFACES; i++)
-      TakeRef(sh->Instances[i]);
+      IntAddRef(sh->Instances[i]);
 
     sh++;
   }
 
   for(UINT i = 0; i < D3D11_1_UAV_SLOT_COUNT; i++)
-    TakeRef(CSUAVs[i]);
+    IntAddRef(CSUAVs[i]);
 
   for(UINT i = 0; i < D3D11_SO_BUFFER_SLOT_COUNT; i++)
-    TakeRef(SO.Buffers[i]);
+    IntAddRef(SO.Buffers[i]);
 
-  TakeRef(RS.State);
+  IntAddRef(RS.State);
 
-  TakeRef(OM.BlendState);
-  TakeRef(OM.DepthStencilState);
+  IntAddRef(OM.BlendState);
+  IntAddRef(OM.DepthStencilState);
 
   for(UINT i = 0; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; i++)
-    TakeRef(OM.RenderTargets[i]);
+    IntAddRef(OM.RenderTargets[i]);
 
   for(UINT i = 0; i < D3D11_1_UAV_SLOT_COUNT; i++)
-    TakeRef(OM.UAVs[i]);
+    IntAddRef(OM.UAVs[i]);
 
-  TakeRef(OM.DepthView);
+  IntAddRef(OM.DepthView);
 
-  TakeRef(Predicate);
+  IntAddRef(Predicate);
 }
 
 D3D11RenderState::D3D11RenderState(WrappedID3D11DeviceContext *context)
 {
   RDCEraseMem(this, sizeof(D3D11RenderState));
 
-  // IA
-  context->IAGetInputLayout(&IA.Layout);
-  context->IAGetPrimitiveTopology(&IA.Topo);
-  context->IAGetVertexBuffers(0, D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT, IA.VBs,
-                              (UINT *)IA.Strides, (UINT *)IA.Offsets);
-  context->IAGetIndexBuffer(&IA.IndexBuffer, &IA.IndexFormat, &IA.IndexOffset);
-
-  // VS
-  context->VSGetShaderResources(0, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT, VS.SRVs);
-  context->VSGetSamplers(0, D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT, VS.Samplers);
-  context->VSGetShader((ID3D11VertexShader **)&VS.Object, VS.Instances, &VS.NumInstances);
-
-  // DS
-  context->DSGetShaderResources(0, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT, DS.SRVs);
-  context->DSGetSamplers(0, D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT, DS.Samplers);
-  context->DSGetShader((ID3D11DomainShader **)&DS.Object, DS.Instances, &DS.NumInstances);
-
-  // HS
-  context->HSGetShaderResources(0, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT, HS.SRVs);
-  context->HSGetSamplers(0, D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT, HS.Samplers);
-  context->HSGetShader((ID3D11HullShader **)&HS.Object, HS.Instances, &HS.NumInstances);
-
-  // GS
-  context->GSGetShaderResources(0, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT, GS.SRVs);
-  context->GSGetSamplers(0, D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT, GS.Samplers);
-  context->GSGetShader((ID3D11GeometryShader **)&GS.Object, GS.Instances, &GS.NumInstances);
-
-  context->SOGetTargets(D3D11_SO_BUFFER_SLOT_COUNT, SO.Buffers);
-
-  // RS
-  context->RSGetState(&RS.State);
-  RDCEraseEl(RS.Viewports);
-  RS.NumViews = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
-  context->RSGetViewports(&RS.NumViews, RS.Viewports);
-  RDCEraseEl(RS.Scissors);
-  RS.NumScissors = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
-  context->RSGetScissorRects(&RS.NumScissors, RS.Scissors);
-
-  // CS
-  context->CSGetShaderResources(0, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT, CS.SRVs);
-  if(context->IsFL11_1())
-    context->CSGetUnorderedAccessViews(0, D3D11_1_UAV_SLOT_COUNT, CSUAVs);
-  else
-    context->CSGetUnorderedAccessViews(0, D3D11_PS_CS_UAV_REGISTER_COUNT, CSUAVs);
-  context->CSGetSamplers(0, D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT, CS.Samplers);
-  context->CSGetShader((ID3D11ComputeShader **)&CS.Object, CS.Instances, &CS.NumInstances);
-
-  // PS
-  context->PSGetShaderResources(0, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT, PS.SRVs);
-  context->PSGetSamplers(0, D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT, PS.Samplers);
-  context->PSGetShader((ID3D11PixelShader **)&PS.Object, PS.Instances, &PS.NumInstances);
-
-  context->VSGetConstantBuffers1(0, D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT,
-                                 VS.ConstantBuffers, VS.CBOffsets, VS.CBCounts);
-  context->DSGetConstantBuffers1(0, D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT,
-                                 DS.ConstantBuffers, DS.CBOffsets, DS.CBCounts);
-  context->HSGetConstantBuffers1(0, D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT,
-                                 HS.ConstantBuffers, HS.CBOffsets, HS.CBCounts);
-  context->GSGetConstantBuffers1(0, D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT,
-                                 GS.ConstantBuffers, GS.CBOffsets, GS.CBCounts);
-  context->CSGetConstantBuffers1(0, D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT,
-                                 CS.ConstantBuffers, CS.CBOffsets, CS.CBCounts);
-  context->PSGetConstantBuffers1(0, D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT,
-                                 PS.ConstantBuffers, PS.CBOffsets, PS.CBCounts);
-
-  // OM
-  context->OMGetBlendState(&OM.BlendState, OM.BlendFactor, &OM.SampleMask);
-  context->OMGetDepthStencilState(&OM.DepthStencilState, &OM.StencRef);
-
-  ID3D11RenderTargetView *tmpViews[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT];
-  context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, tmpViews, NULL);
-
-  OM.UAVStartSlot = 0;
-  for(int i = 0; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; i++)
-  {
-    if(tmpViews[i] != NULL)
-    {
-      OM.UAVStartSlot = i + 1;
-      SAFE_RELEASE(tmpViews[i]);
-    }
-  }
-
-  if(context->IsFL11_1())
-    context->OMGetRenderTargetsAndUnorderedAccessViews(
-        OM.UAVStartSlot, OM.RenderTargets, &OM.DepthView, OM.UAVStartSlot,
-        D3D11_1_UAV_SLOT_COUNT - OM.UAVStartSlot, OM.UAVs);
-  else
-    context->OMGetRenderTargetsAndUnorderedAccessViews(
-        OM.UAVStartSlot, OM.RenderTargets, &OM.DepthView, OM.UAVStartSlot,
-        D3D11_PS_CS_UAV_REGISTER_COUNT - OM.UAVStartSlot, OM.UAVs);
-
-  context->GetPredication(&Predicate, &PredicateValue);
+  CopyState(*context->GetCurrentPipelineState());
 }
 
 void D3D11RenderState::Clear()
@@ -539,57 +450,26 @@ void D3D11RenderState::ApplyState(WrappedID3D11DeviceContext *context) const
   context->OMSetDepthStencilState(OM.DepthStencilState, OM.StencRef);
 
   if(context->IsFL11_1())
+  {
     context->OMSetRenderTargetsAndUnorderedAccessViews(
         RDCMIN(OM.UAVStartSlot, (UINT)D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT), OM.RenderTargets,
         OM.DepthView, OM.UAVStartSlot, D3D11_1_UAV_SLOT_COUNT - OM.UAVStartSlot, OM.UAVs,
         UAV_keepcounts);
+  }
   else
-    context->OMSetRenderTargetsAndUnorderedAccessViews(
-        RDCMIN(OM.UAVStartSlot, (UINT)D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT), OM.RenderTargets,
-        OM.DepthView, OM.UAVStartSlot, D3D11_PS_CS_UAV_REGISTER_COUNT - OM.UAVStartSlot, OM.UAVs,
-        UAV_keepcounts);
+  {
+    if(OM.UAVStartSlot == D3D11_PS_CS_UAV_REGISTER_COUNT)
+      context->OMSetRenderTargets(
+          RDCMIN(OM.UAVStartSlot, (UINT)D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT), OM.RenderTargets,
+          OM.DepthView);
+    else
+      context->OMSetRenderTargetsAndUnorderedAccessViews(
+          RDCMIN(OM.UAVStartSlot, (UINT)D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT), OM.RenderTargets,
+          OM.DepthView, OM.UAVStartSlot, D3D11_PS_CS_UAV_REGISTER_COUNT - OM.UAVStartSlot, OM.UAVs,
+          UAV_keepcounts);
+  }
 
   context->SetPredication(Predicate, PredicateValue);
-}
-
-void D3D11RenderState::TakeRef(ID3D11DeviceChild *p)
-{
-  if(p)
-  {
-    p->AddRef();
-    if(m_ImmediatePipeline)
-    {
-      if(WrappedID3D11RenderTargetView1::IsAlloc(p) || WrappedID3D11ShaderResourceView1::IsAlloc(p) ||
-         WrappedID3D11DepthStencilView::IsAlloc(p) || WrappedID3D11UnorderedAccessView1::IsAlloc(p))
-        m_pDevice->InternalRef();
-
-      m_pDevice->InternalRef();
-
-      // we can use any specialisation of device child here, as all that is templated
-      // is the nested pointer type. Saves having another class in the inheritance
-      // heirarchy :(
-      ((WrappedDeviceChild11<ID3D11Buffer> *)p)->PipelineAddRef();
-    }
-  }
-}
-
-void D3D11RenderState::ReleaseRef(ID3D11DeviceChild *p)
-{
-  if(p)
-  {
-    p->Release();
-    if(m_ImmediatePipeline)
-    {
-      if(WrappedID3D11RenderTargetView1::IsAlloc(p) || WrappedID3D11ShaderResourceView1::IsAlloc(p) ||
-         WrappedID3D11DepthStencilView::IsAlloc(p) || WrappedID3D11UnorderedAccessView1::IsAlloc(p))
-        m_pDevice->InternalRelease();
-
-      m_pDevice->InternalRelease();
-
-      // see above
-      ((WrappedDeviceChild11<ID3D11Buffer> *)p)->PipelineRelease();
-    }
-  }
 }
 
 bool D3D11RenderState::IsRangeBoundForWrite(const ResourceRange &range)
@@ -666,7 +546,7 @@ void D3D11RenderState::UnbindRangeForWrite(const ResourceRange &range)
   {
     if(CSUAVs[i] && range.Intersects(GetResourceRange(CSUAVs[i])))
     {
-      ReleaseRef(CSUAVs[i]);
+      IntRelease(CSUAVs[i]);
       CSUAVs[i] = NULL;
     }
   }
@@ -675,7 +555,7 @@ void D3D11RenderState::UnbindRangeForWrite(const ResourceRange &range)
   {
     if(SO.Buffers[i] && range.Intersects(ResourceRange(SO.Buffers[i])))
     {
-      ReleaseRef(SO.Buffers[i]);
+      IntRelease(SO.Buffers[i]);
       SO.Buffers[i] = NULL;
     }
   }
@@ -684,7 +564,7 @@ void D3D11RenderState::UnbindRangeForWrite(const ResourceRange &range)
   {
     if(OM.RenderTargets[i] && range.Intersects(GetResourceRange(OM.RenderTargets[i])))
     {
-      ReleaseRef(OM.RenderTargets[i]);
+      IntRelease(OM.RenderTargets[i]);
       OM.RenderTargets[i] = NULL;
     }
   }
@@ -693,14 +573,14 @@ void D3D11RenderState::UnbindRangeForWrite(const ResourceRange &range)
   {
     if(OM.UAVs[i] && range.Intersects(GetResourceRange(OM.UAVs[i])))
     {
-      ReleaseRef(OM.UAVs[i]);
+      IntRelease(OM.UAVs[i]);
       OM.UAVs[i] = NULL;
     }
   }
 
   if(OM.DepthView && range.Intersects(GetResourceRange(OM.DepthView)))
   {
-    ReleaseRef(OM.DepthView);
+    IntRelease(OM.DepthView);
     OM.DepthView = NULL;
   }
 }
@@ -712,7 +592,7 @@ void D3D11RenderState::UnbindRangeForRead(const ResourceRange &range)
     if(IA.VBs[i] && range.Intersects(ResourceRange(IA.VBs[i])))
     {
       // RDCDEBUG("Resource was bound on IA VB %u", i);
-      ReleaseRef(IA.VBs[i]);
+      IntRelease(IA.VBs[i]);
       IA.VBs[i] = NULL;
     }
   }
@@ -720,13 +600,13 @@ void D3D11RenderState::UnbindRangeForRead(const ResourceRange &range)
   if(IA.IndexBuffer && range.Intersects(ResourceRange(IA.IndexBuffer)))
   {
     // RDCDEBUG("Resource was bound on IA IB");
-    ReleaseRef(IA.IndexBuffer);
+    IntRelease(IA.IndexBuffer);
     IA.IndexBuffer = NULL;
   }
 
   // const char *names[] = { "VS", "DS", "HS", "GS", "PS", "CS" };
   Shader *stages[] = {&VS, &HS, &DS, &GS, &PS, &CS};
-  for(int s = 0; s < 6; s++)
+  for(int s = 0; s < ARRAY_COUNT(stages); s++)
   {
     Shader *sh = stages[s];
 
@@ -735,7 +615,7 @@ void D3D11RenderState::UnbindRangeForRead(const ResourceRange &range)
       if(sh->ConstantBuffers[i] && range.Intersects(ResourceRange(sh->ConstantBuffers[i])))
       {
         // RDCDEBUG("Resource was bound on %s CB %u", names[s], i);
-        ReleaseRef(sh->ConstantBuffers[i]);
+        IntRelease(sh->ConstantBuffers[i]);
         sh->ConstantBuffers[i] = NULL;
       }
     }
@@ -762,7 +642,7 @@ void D3D11RenderState::UnbindRangeForRead(const ResourceRange &range)
         else
         {
           // RDCDEBUG("Unbinding.");
-          ReleaseRef(sh->SRVs[i]);
+          IntRelease(sh->SRVs[i]);
           sh->SRVs[i] = NULL;
         }
       }
@@ -1154,7 +1034,7 @@ bool D3D11RenderState::InputAssembler::Used_VB(WrappedID3D11Device *device, uint
   if(Layout == NULL)
     return false;
 
-  const std::vector<D3D11_INPUT_ELEMENT_DESC> &vec = device->GetLayoutDesc(Layout);
+  const rdcarray<D3D11_INPUT_ELEMENT_DESC> &vec = device->GetLayoutDesc(Layout);
 
   for(size_t i = 0; i < vec.size(); i++)
     if(vec[i].InputSlot == slot)
@@ -1173,14 +1053,14 @@ bool D3D11RenderState::Shader::Used_CB(uint32_t slot) const
   if(shad == NULL)
     return false;
 
-  DXBC::DXBCFile *dxbc = shad->GetDXBC();
+  DXBC::DXBCContainer *dxbc = shad->GetDXBC();
 
   // have to assume it's used if there's no DXBC
   if(dxbc == NULL)
     return true;
 
-  for(size_t i = 0; i < dxbc->m_CBuffers.size(); i++)
-    if(dxbc->m_CBuffers[i].reg == slot)
+  for(size_t i = 0; i < dxbc->GetReflection()->CBuffers.size(); i++)
+    if(dxbc->GetReflection()->CBuffers[i].reg == slot)
       return true;
 
   return false;
@@ -1196,13 +1076,13 @@ bool D3D11RenderState::Shader::Used_SRV(uint32_t slot) const
   if(shad == NULL)
     return false;
 
-  DXBC::DXBCFile *dxbc = shad->GetDXBC();
+  DXBC::DXBCContainer *dxbc = shad->GetDXBC();
 
   // have to assume it's used if there's no DXBC
   if(dxbc == NULL)
     return true;
 
-  for(const DXBC::ShaderInputBind &bind : dxbc->m_SRVs)
+  for(const DXBC::ShaderInputBind &bind : dxbc->GetReflection()->SRVs)
     if(bind.reg == slot)
       return true;
 
@@ -1216,13 +1096,13 @@ bool D3D11RenderState::Shader::Used_UAV(uint32_t slot) const
   if(shad == NULL)
     return false;
 
-  DXBC::DXBCFile *dxbc = shad->GetDXBC();
+  DXBC::DXBCContainer *dxbc = shad->GetDXBC();
 
   // have to assume it's used if there's no DXBC
   if(dxbc == NULL)
     return true;
 
-  for(const DXBC::ShaderInputBind &bind : dxbc->m_UAVs)
+  for(const DXBC::ShaderInputBind &bind : dxbc->GetReflection()->UAVs)
     if(bind.reg == slot)
       return true;
 
@@ -1281,6 +1161,9 @@ template <>
 bool D3D11RenderState::IsBoundForWrite(ID3D11Buffer *buffer)
 {
   if(buffer == NULL)
+    return false;
+
+  if(((WrappedID3D11Buffer *)buffer)->ReadOnly())
     return false;
 
   return IsRangeBoundForWrite(ResourceRange(buffer));
@@ -1380,11 +1263,11 @@ void DoSerialise(SerialiserType &ser, D3D11RenderState::InputAssembler &el)
   SERIALISE_MEMBER(Layout);
   SERIALISE_MEMBER(Topo);
   SERIALISE_MEMBER(VBs);
-  SERIALISE_MEMBER(Strides);
-  SERIALISE_MEMBER(Offsets);
+  SERIALISE_MEMBER(Strides).OffsetOrSize();
+  SERIALISE_MEMBER(Offsets).OffsetOrSize();
   SERIALISE_MEMBER(IndexBuffer);
   SERIALISE_MEMBER(IndexFormat);
-  SERIALISE_MEMBER(IndexOffset);
+  SERIALISE_MEMBER(IndexOffset).OffsetOrSize();
 }
 
 template <class SerialiserType>
@@ -1404,7 +1287,7 @@ template <class SerialiserType>
 void DoSerialise(SerialiserType &ser, D3D11RenderState::StreamOut &el)
 {
   SERIALISE_MEMBER(Buffers);
-  SERIALISE_MEMBER(Offsets);
+  SERIALISE_MEMBER(Offsets).OffsetOrSize();
 }
 
 template <class SerialiserType>

@@ -22,7 +22,7 @@ To load a capture programmatically, we can use the ``pyrenderdoc`` global variab
     filename = 'test.rdc'
 
     # Load a file, with the same 'original' name, that's not temporary, and is local
-    pyrenderdoc.LoadCapture(filename, filename, False, True)
+    pyrenderdoc.LoadCapture(filename, renderdoc.ReplayOptions(), filename, False, True)
 
 This will close any capture that is already loaded, but to just close an open capture you can use :py:meth:`~qrenderdoc.CaptureContext.CloseCapture`.
 
@@ -45,7 +45,7 @@ To invoke onto the right thread, you can use :py:meth:`~qrenderdoc.ReplayManager
 .. code:: python
 
     def myCallback(controller):
-        print("%d top-level drawcalls" % len(controller.GetDrawcalls()))
+        print("%d top-level actions" % len(controller.GetRootActions()))
 
     pyrenderdoc.Replay().BlockInvoke(myCallback)
 

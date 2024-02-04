@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -65,7 +65,7 @@ vec4 SampleTextureFloat4(int type, vec2 pos, float slice, int mipLevel, int samp
   }
   else if(type == RESTYPE_TEX3D)
   {
-    col = textureLod(tex3D, vec3(pos, (slice + 0.001f) / texRes.z), float(mipLevel));
+    col = textureLod(tex3D, vec3(pos, slice / texRes.z), float(mipLevel));
   }
   else if(type == RESTYPE_TEX2DMS)
   {
@@ -125,11 +125,20 @@ vec4 SampleTextureFloat4(int type, vec2 pos, float slice, int mipLevel, int samp
 
     float data[] = {
         // plane 0
-        col.x, col.y, col.z, col.w,
+        col.x,
+        col.y,
+        col.z,
+        col.w,
         // plane 1
-        col2.x, col2.y, col2.z, col2.w,
+        col2.x,
+        col2.y,
+        col2.z,
+        col2.w,
         // plane 3
-        col3.x, col3.y, col3.z, col3.w,
+        col3.x,
+        col3.y,
+        col3.z,
+        col3.w,
     };
 
     col = vec4(0, 0, 0, 1);
@@ -196,7 +205,7 @@ uvec4 SampleTextureUInt4(int type, vec2 pos, float slice, int mipLevel, int samp
   }
   else if(type == RESTYPE_TEX3D)
   {
-    col = texelFetch(texUInt3D, ivec3(pos * texRes.xy, slice + 0.001f), mipLevel);
+    col = texelFetch(texUInt3D, ivec3(pos * texRes.xy, slice), mipLevel);
   }
   else if(type == RESTYPE_TEX2DMS)
   {
@@ -251,7 +260,7 @@ ivec4 SampleTextureSInt4(int type, vec2 pos, float slice, int mipLevel, int samp
   }
   else if(type == RESTYPE_TEX3D)
   {
-    col = texelFetch(texSInt3D, ivec3(pos * texRes.xy, slice + 0.001f), mipLevel);
+    col = texelFetch(texSInt3D, ivec3(pos * texRes.xy, slice), mipLevel);
   }
   else if(type == RESTYPE_TEX2DMS)
   {

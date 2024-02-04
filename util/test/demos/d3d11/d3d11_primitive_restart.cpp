@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -24,7 +24,7 @@
 
 #include "d3d11_test.h"
 
-TEST(D3D11_Primitive_Restart, D3D11GraphicsTest)
+RD_TEST(D3D11_Primitive_Restart, D3D11GraphicsTest)
 {
   static constexpr const char *Description =
       "Test of primitive restart in triangle strips with -1 index";
@@ -44,56 +44,84 @@ TEST(D3D11_Primitive_Restart, D3D11GraphicsTest)
     ID3D11PixelShaderPtr ps = CreatePS(psblob);
 
     DefaultA2V strip[] = {
-        {Vec3f(-0.8f, 0.2f, 0.0f), Vec4f(1.0f, 0.0f, 0.0f, 1.0f), Vec2f(0.0f, 0.0f)},
+        {Vec3f(-0.8f, 0.2f, 0.0f), Vec4f(0.0f, 1.0f, 0.0f, 1.0f), Vec2f(0.0f, 0.0f)},
         {Vec3f(-0.8f, 0.7f, 0.0f), Vec4f(0.0f, 1.0f, 0.0f, 1.0f), Vec2f(0.0f, 0.0f)},
-        {Vec3f(-0.4f, 0.2f, 0.0f), Vec4f(0.0f, 0.0f, 1.0f, 1.0f), Vec2f(0.0f, 0.0f)},
-        {Vec3f(-0.4f, 0.7f, 0.0f), Vec4f(1.0f, 0.0f, 0.0f, 1.0f), Vec2f(0.0f, 0.0f)},
+        {Vec3f(-0.4f, 0.2f, 0.0f), Vec4f(0.0f, 1.0f, 0.0f, 1.0f), Vec2f(0.0f, 0.0f)},
+        {Vec3f(-0.4f, 0.7f, 0.0f), Vec4f(0.0f, 1.0f, 0.0f, 1.0f), Vec2f(0.0f, 0.0f)},
         {Vec3f(0.0f, 0.2f, 0.0f), Vec4f(0.0f, 1.0f, 0.0f, 1.0f), Vec2f(0.0f, 0.0f)},
-        {Vec3f(0.0f, 0.7f, 0.0f), Vec4f(0.0f, 0.0f, 1.0f, 1.0f), Vec2f(0.0f, 0.0f)},
-        {Vec3f(0.4f, 0.2f, 0.0f), Vec4f(1.0f, 0.0f, 1.0f, 1.0f), Vec2f(0.0f, 0.0f)},
-        {Vec3f(0.4f, 0.7f, 0.0f), Vec4f(1.0f, 1.0f, 0.0f, 1.0f), Vec2f(0.0f, 0.0f)},
+        {Vec3f(0.0f, 0.7f, 0.0f), Vec4f(0.0f, 1.0f, 0.0f, 1.0f), Vec2f(0.0f, 0.0f)},
+        {Vec3f(0.4f, 0.2f, 0.0f), Vec4f(0.0f, 1.0f, 0.0f, 1.0f), Vec2f(0.0f, 0.0f)},
+        {Vec3f(0.4f, 0.7f, 0.0f), Vec4f(0.0f, 1.0f, 0.0f, 1.0f), Vec2f(0.0f, 0.0f)},
 
-        {Vec3f(-0.8f, -0.7f, 0.0f), Vec4f(1.0f, 0.0f, 0.0f, 1.0f), Vec2f(0.0f, 0.0f)},
-        {Vec3f(-0.8f, -0.2f, 0.0f), Vec4f(0.0f, 1.0f, 0.0f, 1.0f), Vec2f(0.0f, 0.0f)},
+        {Vec3f(-0.8f, -0.7f, 0.0f), Vec4f(0.0f, 0.0f, 1.0f, 1.0f), Vec2f(0.0f, 0.0f)},
+        {Vec3f(-0.8f, -0.2f, 0.0f), Vec4f(0.0f, 0.0f, 1.0f, 1.0f), Vec2f(0.0f, 0.0f)},
         {Vec3f(-0.4f, -0.7f, 0.0f), Vec4f(0.0f, 0.0f, 1.0f, 1.0f), Vec2f(0.0f, 0.0f)},
-        {Vec3f(-0.4f, -0.2f, 0.0f), Vec4f(1.0f, 0.0f, 0.0f, 1.0f), Vec2f(0.0f, 0.0f)},
-        {Vec3f(0.0f, -0.7f, 0.0f), Vec4f(0.0f, 1.0f, 0.0f, 1.0f), Vec2f(0.0f, 0.0f)},
+        {Vec3f(-0.4f, -0.2f, 0.0f), Vec4f(0.0f, 0.0f, 1.0f, 1.0f), Vec2f(0.0f, 0.0f)},
+        {Vec3f(0.0f, -0.7f, 0.0f), Vec4f(0.0f, 0.0f, 1.0f, 1.0f), Vec2f(0.0f, 0.0f)},
         {Vec3f(0.0f, -0.2f, 0.0f), Vec4f(0.0f, 0.0f, 1.0f, 1.0f), Vec2f(0.0f, 0.0f)},
-        {Vec3f(0.4f, -0.7f, 0.0f), Vec4f(1.0f, 0.0f, 1.0f, 1.0f), Vec2f(0.0f, 0.0f)},
-        {Vec3f(0.4f, -0.2f, 0.0f), Vec4f(1.0f, 1.0f, 0.0f, 1.0f), Vec2f(0.0f, 0.0f)},
+        {Vec3f(0.4f, -0.7f, 0.0f), Vec4f(0.0f, 0.0f, 1.0f, 1.0f), Vec2f(0.0f, 0.0f)},
+        {Vec3f(0.4f, -0.2f, 0.0f), Vec4f(0.0f, 0.0f, 1.0f, 1.0f), Vec2f(0.0f, 0.0f)},
     };
 
     ID3D11BufferPtr vb = MakeBuffer().Vertex().Data(strip);
 
     uint16_t idx[] = {
         // strip 0
-        0, 1, 2, 3, 4, 5, 6, 7,
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
 
         // restart
         0xffff,
 
         // strip 1
-        8, 9, 10, 11, 12, 13, 14, 15,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
     };
 
     ID3D11BufferPtr ib = MakeBuffer().Index().Data(idx);
 
     uint16_t idx2[] = {
         // strip 0
-        10, 11, 12, 13, 14, 15, 16, 17,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
 
         // restart
         0xffff,
 
         // strip 1
-        18, 19, 20, 21, 22, 23, 24, 25,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
     };
 
     ID3D11BufferPtr ib2 = MakeBuffer().Index().Data(idx2);
 
     while(Running())
     {
-      ClearRenderTargetView(bbRTV, {0.4f, 0.5f, 0.6f, 1.0f});
+      ClearRenderTargetView(bbRTV, {0.2f, 0.2f, 0.2f, 1.0f});
 
       IASetVertexBuffer(vb, sizeof(DefaultA2V), 0);
       ctx->IASetIndexBuffer(ib, DXGI_FORMAT_R16_UINT, 0);
@@ -109,7 +137,7 @@ TEST(D3D11_Primitive_Restart, D3D11GraphicsTest)
 
       ctx->DrawIndexed(17, 0, 0);
 
-      ClearRenderTargetView(bbRTV, {0.4f, 0.5f, 0.6f, 1.0f});
+      ClearRenderTargetView(bbRTV, {0.2f, 0.2f, 0.2f, 1.0f});
 
       ctx->IASetIndexBuffer(ib2, DXGI_FORMAT_R16_UINT, 0);
 

@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  * Copyright (c) 2014 Crytek
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -25,14 +25,14 @@
 
 #include "d3d11_common.h"
 #include "core/core.h"
-#include "driver/d3d11/d3d11_renderstate.h"
-#include "driver/d3d11/d3d11_resources.h"
 #include "serialise/serialiser.h"
 #include "strings/string_utils.h"
+#include "d3d11_renderstate.h"
+#include "d3d11_resources.h"
 
 WrappedID3D11Device *D3D11MarkerRegion::device;
 
-D3D11MarkerRegion::D3D11MarkerRegion(const std::string &marker)
+D3D11MarkerRegion::D3D11MarkerRegion(const rdcstr &marker)
 {
   D3D11MarkerRegion::Begin(marker);
 }
@@ -42,7 +42,7 @@ D3D11MarkerRegion::~D3D11MarkerRegion()
   D3D11MarkerRegion::End();
 }
 
-void D3D11MarkerRegion::Set(const std::string &marker)
+void D3D11MarkerRegion::Set(const rdcstr &marker)
 {
   if(device == NULL)
     return;
@@ -53,7 +53,7 @@ void D3D11MarkerRegion::Set(const std::string &marker)
     annot->SetMarker(StringFormat::UTF82Wide(marker).c_str());
 }
 
-void D3D11MarkerRegion::Begin(const std::string &marker)
+void D3D11MarkerRegion::Begin(const rdcstr &marker)
 {
   if(device == NULL)
     return;
@@ -102,7 +102,7 @@ ResourceRange::ResourceRange(ID3D11ShaderResourceView *srv)
   ID3D11Resource *res = NULL;
   srv->GetResource(&res);
   res->Release();
-  resource = (IUnknown *)res;
+  resource = res;
 
   UINT numMips = allMip, numSlices = allSlice;
 
@@ -162,6 +162,8 @@ ResourceRange::ResourceRange(ID3D11ShaderResourceView *srv)
     case D3D11_SRV_DIMENSION_TEXTURE1D:
       minMip = srvd.Texture1D.MostDetailedMip;
       numMips = srvd.Texture1D.MipLevels;
+      minSlice = 0;
+      numSlices = 1;
       break;
     case D3D11_SRV_DIMENSION_TEXTURE1DARRAY:
       minMip = srvd.Texture1DArray.MostDetailedMip;
@@ -172,6 +174,8 @@ ResourceRange::ResourceRange(ID3D11ShaderResourceView *srv)
     case D3D11_SRV_DIMENSION_TEXTURE2D:
       minMip = srvd.Texture2D.MostDetailedMip;
       numMips = srvd.Texture2D.MipLevels;
+      minSlice = 0;
+      numSlices = 1;
       break;
     case D3D11_SRV_DIMENSION_TEXTURE2DARRAY:
       minMip = srvd.Texture2DArray.MostDetailedMip;
@@ -179,18 +183,29 @@ ResourceRange::ResourceRange(ID3D11ShaderResourceView *srv)
       minSlice = srvd.Texture2DArray.FirstArraySlice;
       numSlices = srvd.Texture2DArray.ArraySize;
       break;
-    case D3D11_SRV_DIMENSION_TEXTURE2DMS: break;
+    case D3D11_SRV_DIMENSION_TEXTURE2DMS:
+      minMip = 0;
+      numMips = 1;
+      minSlice = 0;
+      numSlices = 1;
+      break;
     case D3D11_SRV_DIMENSION_TEXTURE2DMSARRAY:
+      minMip = 0;
+      numMips = 1;
       minSlice = srvd.Texture2DMSArray.FirstArraySlice;
       numSlices = srvd.Texture2DMSArray.ArraySize;
       break;
     case D3D11_SRV_DIMENSION_TEXTURE3D:
       minMip = srvd.Texture3D.MostDetailedMip;
       numMips = srvd.Texture3D.MipLevels;
+      minSlice = 0;
+      numSlices = 1;
       break;
     case D3D11_SRV_DIMENSION_TEXTURECUBE:
       minMip = srvd.TextureCube.MostDetailedMip;
       numMips = srvd.TextureCube.MipLevels;
+      minSlice = 0;
+      numSlices = 1;
       break;
     case D3D11_SRV_DIMENSION_TEXTURECUBEARRAY:
       minMip = srvd.TextureCubeArray.MostDetailedMip;
@@ -200,7 +215,10 @@ ResourceRange::ResourceRange(ID3D11ShaderResourceView *srv)
       break;
     case D3D11_SRV_DIMENSION_UNKNOWN:
     case D3D11_SRV_DIMENSION_BUFFER:
-    case D3D11_SRV_DIMENSION_BUFFEREX: break;
+    case D3D11_SRV_DIMENSION_BUFFEREX:
+      minMip = minSlice = 0;
+      numMips = numSlices = 1;
+      break;
   }
 
   SetMaxes(numMips, numSlices);
@@ -228,7 +246,7 @@ ResourceRange::ResourceRange(ID3D11UnorderedAccessView *uav)
   ID3D11Resource *res = NULL;
   uav->GetResource(&res);
   res->Release();
-  resource = (IUnknown *)res;
+  resource = res;
 
   UINT numMips = allMip, numSlices = allSlice;
 
@@ -240,6 +258,8 @@ ResourceRange::ResourceRange(ID3D11UnorderedAccessView *uav)
     case D3D11_UAV_DIMENSION_TEXTURE1D:
       minMip = desc.Texture1D.MipSlice;
       numMips = 1;
+      minSlice = 0;
+      numSlices = 1;
       break;
     case D3D11_UAV_DIMENSION_TEXTURE1DARRAY:
       minMip = desc.Texture1DArray.MipSlice;
@@ -250,6 +270,8 @@ ResourceRange::ResourceRange(ID3D11UnorderedAccessView *uav)
     case D3D11_UAV_DIMENSION_TEXTURE2D:
       minMip = desc.Texture2D.MipSlice;
       numMips = 1;
+      minSlice = 0;
+      numSlices = 1;
       break;
     case D3D11_UAV_DIMENSION_TEXTURE2DARRAY:
       minMip = desc.Texture2DArray.MipSlice;
@@ -264,7 +286,10 @@ ResourceRange::ResourceRange(ID3D11UnorderedAccessView *uav)
       numSlices = desc.Texture3D.WSize;
       break;
     case D3D11_UAV_DIMENSION_UNKNOWN:
-    case D3D11_UAV_DIMENSION_BUFFER: break;
+    case D3D11_UAV_DIMENSION_BUFFER:
+      minMip = minSlice = 0;
+      numMips = numSlices = 1;
+      break;
   }
 
   SetMaxes(numMips, numSlices);
@@ -292,7 +317,7 @@ ResourceRange::ResourceRange(ID3D11RenderTargetView *rtv)
   ID3D11Resource *res = NULL;
   rtv->GetResource(&res);
   res->Release();
-  resource = (IUnknown *)res;
+  resource = res;
 
   UINT numMips = allMip, numSlices = allSlice;
 
@@ -304,6 +329,8 @@ ResourceRange::ResourceRange(ID3D11RenderTargetView *rtv)
     case D3D11_RTV_DIMENSION_TEXTURE1D:
       minMip = desc.Texture1D.MipSlice;
       numMips = 1;
+      minSlice = 0;
+      numSlices = 1;
       break;
     case D3D11_RTV_DIMENSION_TEXTURE1DARRAY:
       minMip = desc.Texture1DArray.MipSlice;
@@ -314,6 +341,8 @@ ResourceRange::ResourceRange(ID3D11RenderTargetView *rtv)
     case D3D11_RTV_DIMENSION_TEXTURE2D:
       minMip = desc.Texture2D.MipSlice;
       numMips = 1;
+      minSlice = 0;
+      numSlices = 1;
       break;
     case D3D11_RTV_DIMENSION_TEXTURE2DARRAY:
       minMip = desc.Texture2DArray.MipSlice;
@@ -321,8 +350,15 @@ ResourceRange::ResourceRange(ID3D11RenderTargetView *rtv)
       minSlice = desc.Texture2DArray.FirstArraySlice;
       numSlices = desc.Texture2DArray.ArraySize;
       break;
-    case D3D11_RTV_DIMENSION_TEXTURE2DMS: break;
+    case D3D11_RTV_DIMENSION_TEXTURE2DMS:
+      minMip = 0;
+      numMips = 1;
+      minSlice = 0;
+      numSlices = 1;
+      break;
     case D3D11_RTV_DIMENSION_TEXTURE2DMSARRAY:
+      minMip = 0;
+      numMips = 1;
       minSlice = desc.Texture2DMSArray.FirstArraySlice;
       numSlices = desc.Texture2DMSArray.ArraySize;
       break;
@@ -333,7 +369,10 @@ ResourceRange::ResourceRange(ID3D11RenderTargetView *rtv)
       numSlices = desc.Texture3D.WSize;
       break;
     case D3D11_RTV_DIMENSION_UNKNOWN:
-    case D3D11_RTV_DIMENSION_BUFFER: break;
+    case D3D11_RTV_DIMENSION_BUFFER:
+      minMip = minSlice = 0;
+      numMips = numSlices = 1;
+      break;
   }
 
   SetMaxes(numMips, numSlices);
@@ -361,7 +400,7 @@ ResourceRange::ResourceRange(ID3D11DepthStencilView *dsv)
   ID3D11Resource *res = NULL;
   dsv->GetResource(&res);
   res->Release();
-  resource = (IUnknown *)res;
+  resource = res;
 
   UINT numMips = allMip, numSlices = allSlice;
 
@@ -378,6 +417,8 @@ ResourceRange::ResourceRange(ID3D11DepthStencilView *dsv)
     case D3D11_DSV_DIMENSION_TEXTURE1D:
       minMip = desc.Texture1D.MipSlice;
       numMips = 1;
+      minSlice = 0;
+      numSlices = 1;
       break;
     case D3D11_DSV_DIMENSION_TEXTURE1DARRAY:
       minMip = desc.Texture1DArray.MipSlice;
@@ -388,6 +429,8 @@ ResourceRange::ResourceRange(ID3D11DepthStencilView *dsv)
     case D3D11_DSV_DIMENSION_TEXTURE2D:
       minMip = desc.Texture2D.MipSlice;
       numMips = 1;
+      minSlice = 0;
+      numSlices = 1;
       break;
     case D3D11_DSV_DIMENSION_TEXTURE2DARRAY:
       minMip = desc.Texture2DArray.MipSlice;
@@ -395,12 +438,22 @@ ResourceRange::ResourceRange(ID3D11DepthStencilView *dsv)
       minSlice = desc.Texture2DArray.FirstArraySlice;
       numSlices = desc.Texture2DArray.ArraySize;
       break;
-    case D3D11_DSV_DIMENSION_TEXTURE2DMS: break;
+    case D3D11_DSV_DIMENSION_TEXTURE2DMS:
+      minMip = 0;
+      numMips = 1;
+      minSlice = 0;
+      numSlices = 1;
+      break;
     case D3D11_DSV_DIMENSION_TEXTURE2DMSARRAY:
+      minMip = 0;
+      numMips = 1;
       minSlice = desc.Texture2DMSArray.FirstArraySlice;
       numSlices = desc.Texture2DMSArray.ArraySize;
       break;
-    case D3D11_DSV_DIMENSION_UNKNOWN: break;
+    case D3D11_DSV_DIMENSION_UNKNOWN:
+      minMip = minSlice = 0;
+      numMips = numSlices = 1;
+      break;
   }
 
   SetMaxes(numMips, numSlices);
@@ -414,8 +467,8 @@ ResourceRange::ResourceRange(ID3D11Buffer *res)
 
   resource = res;
   minMip = minSlice = 0;
-  maxMip = allMip;
-  maxSlice = allSlice;
+  maxMip = 0;
+  maxSlice = 0;
   fullRange = true;
   depthReadOnly = false;
   stencilReadOnly = false;
@@ -453,15 +506,6 @@ ResourceRange::ResourceRange(ID3D11Resource *res, UINT mip, UINT slice)
   stencilReadOnly = false;
 }
 
-D3D11InitParams::D3D11InitParams()
-{
-  DriverType = D3D_DRIVER_TYPE_UNKNOWN;
-  Flags = 0;
-  SDKVersion = D3D11_SDK_VERSION;
-  NumFeatureLevels = 0;
-  RDCEraseEl(FeatureLevels);
-}
-
 bool D3D11InitParams::IsSupportedVersion(uint64_t ver)
 {
   if(ver == CurrentVersion)
@@ -470,6 +514,18 @@ bool D3D11InitParams::IsSupportedVersion(uint64_t ver)
   // 0x0F -> 0x10 - serialised the number of subresources in resource initial states after
   // multiplying on sample count rather than before
   if(ver == 0x0F)
+    return true;
+
+  // 0x10 -> 0x11 - added serialisation of adapter descriptor in D3D11InitParams
+  if(ver == 0x10)
+    return true;
+
+  // 0x11 -> 0x12 - added serialisation of vendor extension use in D3D11InitParams
+  if(ver == 0x11)
+    return true;
+
+  // 0x12 -> 0x13 - added stride from stream-out to hidden counter data
+  if(ver == 0x12)
     return true;
 
   return false;
@@ -483,6 +539,24 @@ void DoSerialise(SerialiserType &ser, D3D11InitParams &el)
   SERIALISE_MEMBER(SDKVersion);
   SERIALISE_MEMBER(NumFeatureLevels);
   SERIALISE_MEMBER(FeatureLevels);
+  if(ser.VersionAtLeast(0x11))
+  {
+    SERIALISE_MEMBER(AdapterDesc);
+  }
+  else
+  {
+    RDCEraseEl(el.AdapterDesc);
+  }
+  if(ser.VersionAtLeast(0x12))
+  {
+    SERIALISE_MEMBER(VendorExtensions);
+    SERIALISE_MEMBER(VendorUAV);
+  }
+  else
+  {
+    el.VendorExtensions = GPUVendor::Unknown;
+    el.VendorUAV = ~0U;
+  }
 }
 
 INSTANTIATE_SERIALISE_TYPE(D3D11InitParams);
@@ -619,47 +693,44 @@ TextureFilter MakeFilter(D3D11_FILTER filter)
     filter = D3D11_FILTER(filter & 0x7f);
   }
 
-  if(filter == D3D11_FILTER_ANISOTROPIC)
+  switch(filter)
   {
-    ret.minify = ret.magnify = ret.mip = FilterMode::Anisotropic;
-  }
-  else
-  {
-    switch(filter)
-    {
-      case D3D11_FILTER_MIN_MAG_MIP_POINT:
-        ret.minify = ret.magnify = ret.mip = FilterMode::Point;
-        break;
-      case D3D11_FILTER_MIN_MAG_POINT_MIP_LINEAR:
-        ret.minify = ret.magnify = FilterMode::Point;
-        ret.mip = FilterMode::Linear;
-        break;
-      case D3D11_FILTER_MIN_POINT_MAG_LINEAR_MIP_POINT:
-        ret.minify = FilterMode::Point;
-        ret.magnify = FilterMode::Linear;
-        ret.mip = FilterMode::Point;
-        break;
-      case D3D11_FILTER_MIN_POINT_MAG_MIP_LINEAR:
-        ret.minify = FilterMode::Point;
-        ret.magnify = ret.mip = FilterMode::Linear;
-        break;
-      case D3D11_FILTER_MIN_LINEAR_MAG_MIP_POINT:
-        ret.minify = FilterMode::Linear;
-        ret.magnify = ret.mip = FilterMode::Point;
-        break;
-      case D3D11_FILTER_MIN_LINEAR_MAG_POINT_MIP_LINEAR:
-        ret.minify = FilterMode::Linear;
-        ret.magnify = FilterMode::Point;
-        ret.mip = FilterMode::Linear;
-        break;
-      case D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT:
-        ret.minify = ret.magnify = FilterMode::Linear;
-        ret.mip = FilterMode::Point;
-        break;
-      case D3D11_FILTER_MIN_MAG_MIP_LINEAR:
-        ret.minify = ret.magnify = ret.mip = FilterMode::Linear;
-        break;
-    }
+    case D3D11_FILTER_ANISOTROPIC:
+      ret.minify = ret.magnify = ret.mip = FilterMode::Anisotropic;
+      break;
+    case D3D11_FILTER_MIN_MAG_MIP_POINT:
+      ret.minify = ret.magnify = ret.mip = FilterMode::Point;
+      break;
+    case D3D11_FILTER_MIN_MAG_POINT_MIP_LINEAR:
+      ret.minify = ret.magnify = FilterMode::Point;
+      ret.mip = FilterMode::Linear;
+      break;
+    case D3D11_FILTER_MIN_POINT_MAG_LINEAR_MIP_POINT:
+      ret.minify = FilterMode::Point;
+      ret.magnify = FilterMode::Linear;
+      ret.mip = FilterMode::Point;
+      break;
+    case D3D11_FILTER_MIN_POINT_MAG_MIP_LINEAR:
+      ret.minify = FilterMode::Point;
+      ret.magnify = ret.mip = FilterMode::Linear;
+      break;
+    case D3D11_FILTER_MIN_LINEAR_MAG_MIP_POINT:
+      ret.minify = FilterMode::Linear;
+      ret.magnify = ret.mip = FilterMode::Point;
+      break;
+    case D3D11_FILTER_MIN_LINEAR_MAG_POINT_MIP_LINEAR:
+      ret.minify = FilterMode::Linear;
+      ret.magnify = FilterMode::Point;
+      ret.mip = FilterMode::Linear;
+      break;
+    case D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT:
+      ret.minify = ret.magnify = FilterMode::Linear;
+      ret.mip = FilterMode::Point;
+      break;
+    case D3D11_FILTER_MIN_MAG_MIP_LINEAR:
+      ret.minify = ret.magnify = ret.mip = FilterMode::Linear;
+      break;
+    default: break;
   }
 
   return ret;

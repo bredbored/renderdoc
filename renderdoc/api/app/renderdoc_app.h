@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -35,7 +35,7 @@
 
 #if defined(WIN32) || defined(__WIN32__) || defined(_WIN32) || defined(_MSC_VER)
 #define RENDERDOC_CC __cdecl
-#elif defined(__linux__)
+#elif defined(__linux__) || defined(__FreeBSD__)
 #define RENDERDOC_CC
 #elif defined(__APPLE__)
 #define RENDERDOC_CC
@@ -72,7 +72,8 @@ extern "C" {
 // RenderDoc capture options
 //
 
-typedef enum RENDERDOC_CaptureOption {
+typedef enum RENDERDOC_CaptureOption
+{
   // Allow the application to enable vsync
   //
   // Default - enabled
@@ -107,15 +108,16 @@ typedef enum RENDERDOC_CaptureOption {
   // 0 - no callstacks are captured
   eRENDERDOC_Option_CaptureCallstacks = 3,
 
-  // When capturing CPU callstacks, only capture them from drawcalls.
+  // When capturing CPU callstacks, only capture them from actions.
   // This option does nothing without the above option being enabled
   //
   // Default - disabled
   //
-  // 1 - Only captures callstacks for drawcall type API events.
+  // 1 - Only captures callstacks for actions.
   //     Ignored if CaptureCallstacks is disabled
   // 0 - Callstacks, if enabled, are captured for every event.
   eRENDERDOC_Option_CaptureCallstacksOnlyDraws = 4,
+  eRENDERDOC_Option_CaptureCallstacksOnlyActions = 4,
 
   // Specify a delay in seconds to wait for a debugger to attach, after
   // creating or injecting into a process, before continuing to allow it to run.
@@ -213,6 +215,19 @@ typedef enum RENDERDOC_CaptureOption {
   // necessary as directed by a RenderDoc developer.
   eRENDERDOC_Option_AllowUnsupportedVendorExtensions = 12,
 
+  // Define a soft memory limit which some APIs may aim to keep overhead under where
+  // possible. Anything above this limit will where possible be saved directly to disk during
+  // capture.
+  // This will cause increased disk space use (which may cause a capture to fail if disk space is
+  // exhausted) as well as slower capture times.
+  //
+  // Not all memory allocations may be deferred like this so it is not a guarantee of a memory
+  // limit.
+  //
+  // Units are in MBs, suggested values would range from 200MB to 1000MB.
+  //
+  // Default - 0 Megabytes
+  eRENDERDOC_Option_SoftMemoryLimit = 13,
 } RENDERDOC_CaptureOption;
 
 // Sets an option that controls how RenderDoc behaves on capture.
@@ -232,7 +247,8 @@ typedef uint32_t(RENDERDOC_CC *pRENDERDOC_GetCaptureOptionU32)(RENDERDOC_Capture
 // If the option is invalid, -FLT_MAX is returned
 typedef float(RENDERDOC_CC *pRENDERDOC_GetCaptureOptionF32)(RENDERDOC_CaptureOption opt);
 
-typedef enum RENDERDOC_InputButton {
+typedef enum RENDERDOC_InputButton
+{
   // '0' - '9' matches ASCII values
   eRENDERDOC_Key_0 = 0x30,
   eRENDERDOC_Key_1 = 0x31,
@@ -320,7 +336,8 @@ typedef void(RENDERDOC_CC *pRENDERDOC_SetFocusToggleKeys)(RENDERDOC_InputButton 
 // If keys is NULL or num is 0, captures keys will be disabled
 typedef void(RENDERDOC_CC *pRENDERDOC_SetCaptureKeys)(RENDERDOC_InputButton *keys, int num);
 
-typedef enum RENDERDOC_OverlayBits {
+typedef enum RENDERDOC_OverlayBits
+{
   // This single bit controls whether the overlay is enabled or disabled globally
   eRENDERDOC_Overlay_Enabled = 0x1,
 
@@ -349,13 +366,17 @@ typedef uint32_t(RENDERDOC_CC *pRENDERDOC_GetOverlayBits)();
 // sets the overlay bits with an and & or mask
 typedef void(RENDERDOC_CC *pRENDERDOC_MaskOverlayBits)(uint32_t And, uint32_t Or);
 
-// this function will attempt to shut down RenderDoc.
+// this function will attempt to remove RenderDoc's hooks in the application.
 //
-// Note: that this will only work correctly if done immediately after
-// the dll is loaded, before any API work happens. RenderDoc will remove its
+// Note: that this can only work correctly if done immediately after
+// the module is loaded, before any API work happens. RenderDoc will remove its
 // injected hooks and shut down. Behaviour is undefined if this is called
-// after any API functions have been called.
-typedef void(RENDERDOC_CC *pRENDERDOC_Shutdown)();
+// after any API functions have been called, and there is still no guarantee of
+// success.
+typedef void(RENDERDOC_CC *pRENDERDOC_RemoveHooks)();
+
+// DEPRECATED: compatibility for code compiled against pre-1.4.1 headers.
+typedef pRENDERDOC_RemoveHooks pRENDERDOC_Shutdown;
 
 // This function will unload RenderDoc's crash handler.
 //
@@ -447,6 +468,15 @@ typedef uint32_t(RENDERDOC_CC *pRENDERDOC_LaunchReplayUI)(uint32_t connectTarget
 // ignored and the others will be filled out.
 typedef void(RENDERDOC_CC *pRENDERDOC_GetAPIVersion)(int *major, int *minor, int *patch);
 
+// Requests that the replay UI show itself (if hidden or not the current top window). This can be
+// used in conjunction with IsTargetControlConnected and LaunchReplayUI to intelligently handle
+// showing the UI after making a capture.
+//
+// This will return 1 if the request was successfully passed on, though it's not guaranteed that
+// the UI will be on top in all cases depending on OS rules. It will return 0 if there is no current
+// target control connection to make such a request, or if there was another error
+typedef uint32_t(RENDERDOC_CC *pRENDERDOC_ShowReplayUI)();
+
 //////////////////////////////////////////////////////////////////////////
 // Capturing functions
 //
@@ -520,6 +550,16 @@ typedef uint32_t(RENDERDOC_CC *pRENDERDOC_EndFrameCapture)(RENDERDOC_DevicePoint
 typedef uint32_t(RENDERDOC_CC *pRENDERDOC_DiscardFrameCapture)(RENDERDOC_DevicePointer device,
                                                                RENDERDOC_WindowHandle wndHandle);
 
+// Only valid to be called between a call to StartFrameCapture and EndFrameCapture. Gives a custom
+// title to the capture produced which will be displayed in the UI.
+//
+// If multiple captures are ongoing, this title will be applied to the first capture to end after
+// this call. The second capture to end will have no title, unless this function is called again.
+//
+// Calling this function has no effect if no capture is currently running, and if it is called
+// multiple times only the last title will be used.
+typedef void(RENDERDOC_CC *pRENDERDOC_SetCaptureTitle)(const char *title);
+
 //////////////////////////////////////////////////////////////////////////////////////////////////
 // RenderDoc API versions
 //
@@ -533,7 +573,8 @@ typedef uint32_t(RENDERDOC_CC *pRENDERDOC_DiscardFrameCapture)(RENDERDOC_DeviceP
 // Note that this means the API returned can be higher than the one you might have requested.
 // e.g. if you are running against a newer RenderDoc that supports 1.0.1, it will be returned
 // instead of 1.0.0. You can check this with the GetAPIVersion entry point
-typedef enum RENDERDOC_Version {
+typedef enum RENDERDOC_Version
+{
   eRENDERDOC_API_Version_1_0_0 = 10000,    // RENDERDOC_API_1_0_0 = 1 00 00
   eRENDERDOC_API_Version_1_0_1 = 10001,    // RENDERDOC_API_1_0_1 = 1 00 01
   eRENDERDOC_API_Version_1_0_2 = 10002,    // RENDERDOC_API_1_0_2 = 1 00 02
@@ -543,6 +584,10 @@ typedef enum RENDERDOC_Version {
   eRENDERDOC_API_Version_1_2_0 = 10200,    // RENDERDOC_API_1_2_0 = 1 02 00
   eRENDERDOC_API_Version_1_3_0 = 10300,    // RENDERDOC_API_1_3_0 = 1 03 00
   eRENDERDOC_API_Version_1_4_0 = 10400,    // RENDERDOC_API_1_4_0 = 1 04 00
+  eRENDERDOC_API_Version_1_4_1 = 10401,    // RENDERDOC_API_1_4_1 = 1 04 01
+  eRENDERDOC_API_Version_1_4_2 = 10402,    // RENDERDOC_API_1_4_2 = 1 04 02
+  eRENDERDOC_API_Version_1_5_0 = 10500,    // RENDERDOC_API_1_5_0 = 1 05 00
+  eRENDERDOC_API_Version_1_6_0 = 10600,    // RENDERDOC_API_1_6_0 = 1 06 00
 } RENDERDOC_Version;
 
 // API version changelog:
@@ -568,8 +613,13 @@ typedef enum RENDERDOC_Version {
 //         0xdddddddd of uninitialised buffer contents.
 // 1.4.0 - Added feature: DiscardFrameCapture() to discard a frame capture in progress and stop
 //         capturing without saving anything to disk.
+// 1.4.1 - Refactor: Renamed Shutdown to RemoveHooks to better clarify what is happening
+// 1.4.2 - Refactor: Renamed 'draws' to 'actions' in callstack capture option.
+// 1.5.0 - Added feature: ShowReplayUI() to request that the replay UI show itself if connected
+// 1.6.0 - Added feature: SetCaptureTitle() which can be used to set a title for a
+//         capture made with StartFrameCapture() or EndFrameCapture()
 
-typedef struct RENDERDOC_API_1_4_0
+typedef struct RENDERDOC_API_1_6_0
 {
   pRENDERDOC_GetAPIVersion GetAPIVersion;
 
@@ -585,7 +635,13 @@ typedef struct RENDERDOC_API_1_4_0
   pRENDERDOC_GetOverlayBits GetOverlayBits;
   pRENDERDOC_MaskOverlayBits MaskOverlayBits;
 
-  pRENDERDOC_Shutdown Shutdown;
+  // Shutdown was renamed to RemoveHooks in 1.4.1.
+  // These unions allow old code to continue compiling without changes
+  union
+  {
+    pRENDERDOC_Shutdown Shutdown;
+    pRENDERDOC_RemoveHooks RemoveHooks;
+  };
   pRENDERDOC_UnloadCrashHandler UnloadCrashHandler;
 
   // Get/SetLogFilePathTemplate was renamed to Get/SetCaptureFilePathTemplate in 1.1.2.
@@ -635,16 +691,26 @@ typedef struct RENDERDOC_API_1_4_0
 
   // new function in 1.4.0
   pRENDERDOC_DiscardFrameCapture DiscardFrameCapture;
-} RENDERDOC_API_1_4_0;
 
-typedef RENDERDOC_API_1_4_0 RENDERDOC_API_1_0_0;
-typedef RENDERDOC_API_1_4_0 RENDERDOC_API_1_0_1;
-typedef RENDERDOC_API_1_4_0 RENDERDOC_API_1_0_2;
-typedef RENDERDOC_API_1_4_0 RENDERDOC_API_1_1_0;
-typedef RENDERDOC_API_1_4_0 RENDERDOC_API_1_1_1;
-typedef RENDERDOC_API_1_4_0 RENDERDOC_API_1_1_2;
-typedef RENDERDOC_API_1_4_0 RENDERDOC_API_1_2_0;
-typedef RENDERDOC_API_1_4_0 RENDERDOC_API_1_3_0;
+  // new function in 1.5.0
+  pRENDERDOC_ShowReplayUI ShowReplayUI;
+
+  // new function in 1.6.0
+  pRENDERDOC_SetCaptureTitle SetCaptureTitle;
+} RENDERDOC_API_1_6_0;
+
+typedef RENDERDOC_API_1_6_0 RENDERDOC_API_1_0_0;
+typedef RENDERDOC_API_1_6_0 RENDERDOC_API_1_0_1;
+typedef RENDERDOC_API_1_6_0 RENDERDOC_API_1_0_2;
+typedef RENDERDOC_API_1_6_0 RENDERDOC_API_1_1_0;
+typedef RENDERDOC_API_1_6_0 RENDERDOC_API_1_1_1;
+typedef RENDERDOC_API_1_6_0 RENDERDOC_API_1_1_2;
+typedef RENDERDOC_API_1_6_0 RENDERDOC_API_1_2_0;
+typedef RENDERDOC_API_1_6_0 RENDERDOC_API_1_3_0;
+typedef RENDERDOC_API_1_6_0 RENDERDOC_API_1_4_0;
+typedef RENDERDOC_API_1_6_0 RENDERDOC_API_1_4_1;
+typedef RENDERDOC_API_1_6_0 RENDERDOC_API_1_4_2;
+typedef RENDERDOC_API_1_6_0 RENDERDOC_API_1_5_0;
 
 //////////////////////////////////////////////////////////////////////////////////////////////////
 // RenderDoc API entry point

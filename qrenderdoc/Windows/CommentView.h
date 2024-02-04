@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2017-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -44,6 +44,8 @@ public:
 
   // ICommentView
   QWidget *Widget() override { return this; }
+  void SetComments(const rdcstr &text) override;
+  rdcstr GetComments() override;
   // ICaptureViewer
   void OnCaptureLoaded() override;
   void OnCaptureClosed() override;
@@ -55,6 +57,8 @@ private slots:
 private:
   Ui::CommentView *ui;
   ICaptureContext &m_Ctx;
+
+  void Restyle(int start, int end);
 
   bool m_ignoreModifications;
 

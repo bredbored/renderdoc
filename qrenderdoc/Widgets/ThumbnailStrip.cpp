@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2016-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -77,6 +77,9 @@ void ThumbnailStrip::showEvent(QShowEvent *event)
 
 void ThumbnailStrip::refreshLayout()
 {
+  if(updatesEnabled())
+    setUpdatesEnabled(false);
+
   QRect avail = geometry();
   avail.adjust(6, 6, -6, -6);
 
@@ -97,9 +100,7 @@ void ThumbnailStrip::refreshLayout()
     ui->scrollArea->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
 
     delete layout;
-    layout = new QHBoxLayout(ui->scrollAreaWidgetContents);
-    for(ResourcePreview *w : m_Thumbnails)
-      layout->addWidget(w);
+    layout = new QHBoxLayout();
     layout->setSpacing(6);
     layout->setContentsMargins(6, 6, 6, 6);
     layout->setAlignment(Qt::AlignTop);
@@ -139,9 +140,7 @@ void ThumbnailStrip::refreshLayout()
     ui->scrollArea->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
 
     delete layout;
-    layout = new QVBoxLayout(ui->scrollAreaWidgetContents);
-    for(ResourcePreview *w : m_Thumbnails)
-      layout->addWidget(w);
+    layout = new QVBoxLayout();
     layout->setSpacing(6);
     layout->setContentsMargins(6, 6, 6, 6);
     layout->setAlignment(Qt::AlignTop);
@@ -172,4 +171,15 @@ void ThumbnailStrip::refreshLayout()
         c->setSize(QSize(avail.width(), aspectHeight));
     }
   }
+
+  for(ResourcePreview *w : m_Thumbnails)
+    layout->addWidget(w);
+
+  for(ResourcePreview *w : m_Thumbnails)
+    if(w->isActive())
+      w->show();
+
+  ui->scrollAreaWidgetContents->setLayout(layout);
+
+  setUpdatesEnabled(true);
 }

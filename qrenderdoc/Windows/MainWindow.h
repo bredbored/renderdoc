@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2016-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -28,9 +28,11 @@
 #include <QMainWindow>
 #include <QMutex>
 #include <QSemaphore>
+#include <QThread>
 #include <QTimer>
-#include "3rdparty/toolwindowmanager/ToolWindowManager.h"
+#include <QUrl>
 #include "Code/Interface/QRDInterface.h"
+#include "toolwindowmanager/ToolWindowManager.h"
 
 namespace Ui
 {
@@ -38,6 +40,7 @@ class MainWindow;
 }
 
 class RDLabel;
+class RDMenu;
 class LambdaThread;
 class QMimeData;
 class QProgressBar;
@@ -46,6 +49,25 @@ class QToolButton;
 class CaptureDialog;
 class LiveCapture;
 class QNetworkAccessManager;
+
+class NetworkWorker : public QObject
+{
+private:
+  Q_OBJECT
+public:
+  explicit NetworkWorker();
+  ~NetworkWorker();
+
+signals:
+  void requestFailed(QUrl url, QString error);
+  void requestCompleted(QUrl url, QByteArray replyData);
+
+public slots:
+  void get(QUrl url);
+
+private:
+  QNetworkAccessManager *manager = NULL;
+};
 
 class MainWindow : public QMainWindow, public IMainWindow, public ICaptureViewer
 {
@@ -60,6 +82,8 @@ public:
   QWidget *Widget() override { return this; }
   void RegisterShortcut(const rdcstr &shortcut, QWidget *widget, ShortcutCallback callback) override;
   void UnregisterShortcut(const rdcstr &shortcut, QWidget *widget) override;
+  void BringToFront() override;
+
   // ICaptureViewer
   void OnCaptureLoaded() override;
   void OnCaptureClosed() override;
@@ -70,14 +94,16 @@ public:
   ToolWindowManager::AreaReference mainToolArea();
   ToolWindowManager::AreaReference leftToolArea();
 
-  void show();
+  void LoadInitialLayout();
+
+  void sendErrorReport(bool forceCaptureInclusion);
 
   void setProgress(float val);
   void setRemoteHost(int hostIdx);
   void takeCaptureOwnership() { m_OwnTempCapture = true; }
   void captureModified();
   void LoadFromFilename(const QString &filename, bool temporary);
-  void LoadCapture(const QString &filename, bool temporary, bool local);
+  void LoadCapture(const QString &filename, const ReplayOptions &opts, bool temporary, bool local);
   void CloseCapture();
   QString GetSavePath(QString title = QString(), QString filter = QString());
 
@@ -91,6 +117,12 @@ public:
   void ShowLiveCapture(LiveCapture *live);
   void LiveCaptureClosed(LiveCapture *live);
 
+  bool PromptCloseCapture();
+  bool PromptSaveCaptureAs();
+  bool SaveCurrentCapture(QString saveFilename);
+
+  void RemoveRecentCapture(const QString &filename);
+
   QMenu *GetBaseMenu(WindowMenu base, rdcstr name);
   QList<QAction *> GetMenuActions();
 
@@ -101,7 +133,7 @@ public:
   void showPipelineViewer() { on_action_Pipeline_State_triggered(); }
   void showCaptureDialog() { on_action_Launch_Application_triggered(); }
   void showDebugMessageView() { on_action_Errors_and_Warnings_triggered(); }
-  void showDiagnosticLogView() { on_action_View_Diagnostic_Log_File_triggered(); }
+  void showDiagnosticLogView();
   void showCommentView() { on_action_Comments_triggered(); }
   void showStatisticsViewer() { on_action_Statistics_Viewer_triggered(); }
   void showTimelineBar() { on_action_Timeline_triggered(); }
@@ -117,6 +149,7 @@ private slots:
   void on_action_Exit_triggered();
   void on_action_About_triggered();
   void on_action_Open_Capture_triggered();
+  void on_action_Open_Capture_with_Options_triggered();
   void on_action_Save_Capture_Inplace_triggered();
   void on_action_Save_Capture_As_triggered();
   void on_action_Close_Capture_triggered();
@@ -142,8 +175,6 @@ private slots:
   void on_action_Manage_Remote_Servers_triggered();
   void on_action_Settings_triggered();
   void on_action_View_Documentation_triggered();
-  void on_action_View_Diagnostic_Log_File_triggered();
-  void on_action_Diagnostic_Log_triggered() { on_action_View_Diagnostic_Log_File_triggered(); }
   void on_action_Source_on_GitHub_triggered();
   void on_action_Build_Release_Downloads_triggered();
   void on_action_Show_Tips_triggered();
@@ -166,6 +197,12 @@ private slots:
   void ClearRecentCaptureFiles();
   void ClearRecentCaptureSettings();
 
+  void networkRequestFailed(QUrl url, QString error);
+  void networkRequestCompleted(QUrl url, QByteArray data);
+
+signals:
+  void networkRequestGet(QUrl url);
+
 private:
   void closeEvent(QCloseEvent *event) override;
   void changeEvent(QEvent *event) override;
@@ -179,6 +216,9 @@ private:
   void exportCapture(const CaptureFileFormat &fmt);
 
   QString dragFilename(const QMimeData *mimeData);
+
+  void MakeNetworkRequest(QUrl url, std::function<void(QByteArray)> success,
+                          std::function<void(QString)> failure = {});
 
   enum class UpdateResult
   {
@@ -203,7 +243,7 @@ private:
   RDLabel *statusIcon;
   RDLabel *statusText;
   QProgressBar *statusProgress;
-  QMenu *contextChooserMenu;
+  RDMenu *contextChooserMenu;
   QToolButton *contextChooser;
 
   QAction *updateAction = NULL;
@@ -217,7 +257,10 @@ private:
   rdcarray<RemoteHost> m_ProbeRemoteHosts;
   QMutex m_ProbeRemoteHostsLock;
 
-  QNetworkAccessManager *m_NetManager;
+  NetworkWorker *m_NetWorker;
+  LambdaThread *m_NetManagerThread;
+  QMap<QUrl, std::function<void(QString)>> m_NetworkFailCallbacks;
+  QMap<QUrl, std::function<void(QByteArray)>> m_NetworkCompleteCallbacks;
 
   bool m_messageAlternate = false;
 
@@ -240,8 +283,6 @@ private:
   void recentCaptureFile(const QString &filename);
   void recentCaptureSetting(const QString &filename);
 
-  bool PromptCloseCapture();
-  bool PromptSaveCaptureAs();
   void OpenCaptureConfigFile(const QString &filename, bool exe);
 
   QVariantMap saveState();
@@ -254,7 +295,7 @@ private:
 
   void FillRemotesMenu(QMenu *menu, bool includeLocalhost);
 
-  void showLaunchError(ReplayStatus status);
+  void showLaunchError(ResultDetails result);
 
-  bool isCapturableAppRunningOnAndroid();
+  bool isUnshareableDeviceInUse();
 };

@@ -27,6 +27,7 @@
 
 #include <QHash>
 #include <QLabel>
+#include <QPointer>
 #include <QVariant>
 #include <QWidget>
 
@@ -249,6 +250,12 @@ public:
   static void raiseToolWindow(QWidget *toolWindow);
 
   /*!
+   * Force close a window, to be used when a toolWindow has become orphaned
+   * (no valid parent)
+   */
+  void forceCloseToolWindow(QWidget *toolWindow);
+
+  /*!
    * \brief saveState
    */
   QVariantMap saveState();
@@ -286,10 +293,10 @@ private:
   QList<ToolWindowManagerArea *> m_areas;                         // all areas for this manager
   QList<ToolWindowManagerWrapper *> m_wrappers;                   // all wrappers for this manager
   // list of tool windows that are currently dragged, or empty list if there is no current drag
-  QList<QWidget *> m_draggedToolWindows;
-  ToolWindowManagerWrapper
-      *m_draggedWrapper;                 // the wrapper if a whole float window is being dragged
-  ToolWindowManagerArea *m_hoverArea;    // the area currently being hovered over in a drag
+  QList<QPointer<QWidget>> m_draggedToolWindows;
+  // the wrapper if a whole float window is being dragged
+  QPointer<ToolWindowManagerWrapper> m_draggedWrapper;
+  QPointer<ToolWindowManagerArea> m_hoverArea;    // the area currently being hovered over in a drag
   // a semi-transparent preview of where the dragged toolwindow(s) will be docked
   QWidget *m_previewOverlay;
   QWidget *m_previewTabOverlay;

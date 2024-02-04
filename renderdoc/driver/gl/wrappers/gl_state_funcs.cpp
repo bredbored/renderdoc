@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  * Copyright (c) 2014 Crytek
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -923,7 +923,7 @@ bool WrappedOpenGL::Serialise_glDepthBoundsEXT(SerialiserType &ser, GLclampd nea
 
   if(IsReplayingAndReading())
   {
-    CheckReplayFunctionPresent(GL.glDepthBoundsEXT);
+    CheckReplayFunctionPresent(glDepthBoundsEXT);
 
     GL.glDepthBoundsEXT(nearVal, farVal);
   }
@@ -1428,7 +1428,7 @@ bool WrappedOpenGL::Serialise_glRasterSamplesEXT(SerialiserType &ser, GLuint sam
 
   if(IsReplayingAndReading())
   {
-    CheckReplayFunctionPresent(GL.glRasterSamplesEXT);
+    CheckReplayFunctionPresent(glRasterSamplesEXT);
 
     GL.glRasterSamplesEXT(samples, fixedsamplelocations ? GL_TRUE : GL_FALSE);
   }
@@ -1927,7 +1927,7 @@ bool WrappedOpenGL::Serialise_glPolygonOffsetClamp(SerialiserType &ser, GLfloat 
 
   if(IsReplayingAndReading())
   {
-    CheckReplayFunctionPresent(GL.glPolygonOffsetClamp);
+    CheckReplayFunctionPresent(glPolygonOffsetClamp);
 
     GL.glPolygonOffsetClamp(factor, units, clamp);
   }
@@ -1967,7 +1967,7 @@ bool WrappedOpenGL::Serialise_glPrimitiveBoundingBox(SerialiserType &ser, GLfloa
 
   if(IsReplayingAndReading())
   {
-    CheckReplayFunctionPresent(GL.glPrimitiveBoundingBox);
+    CheckReplayFunctionPresent(glPrimitiveBoundingBox);
 
     GL.glPrimitiveBoundingBox(minX, minY, minZ, minW, maxX, maxY, maxZ, maxW);
   }

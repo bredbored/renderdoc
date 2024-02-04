@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  * Copyright (c) 2014 Crytek
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -25,41 +25,60 @@
 
 #pragma once
 
-#include "api/replay/renderdoc_replay.h"
 #include "common/common.h"
-#include "dxbc_disassemble.h"
+#include "dxbc_bytecode.h"
 
 namespace DXBC
 {
-class DXBCFile;
+struct Reflection;
+class DXBCContainer;
 struct CBufferVariable;
 }
 
-class WrappedID3D11Device;
-
-namespace ShaderDebug
+namespace DXBCBytecode
 {
+struct Declaration;
+class Program;
+enum OperandType : uint8_t;
+}
+
+class WrappedID3D11Device;
+enum DXGI_FORMAT;
+
+namespace DXBCDebug
+{
+struct BindingSlot
+{
+  BindingSlot() : shaderRegister(UINT32_MAX), registerSpace(UINT32_MAX) {}
+  BindingSlot(uint32_t shaderReg, uint32_t regSpace)
+      : shaderRegister(shaderReg), registerSpace(regSpace)
+  {
+  }
+  bool operator<(const BindingSlot &o) const
+  {
+    if(registerSpace != o.registerSpace)
+      return registerSpace < o.registerSpace;
+    return shaderRegister < o.shaderRegister;
+  }
+  uint32_t shaderRegister;
+  uint32_t registerSpace;
+};
+
+BindingSlot GetBindingSlotForDeclaration(const DXBCBytecode::Program &program,
+                                         const DXBCBytecode::Declaration &decl);
+BindingSlot GetBindingSlotForIdentifier(const DXBCBytecode::Program &program,
+                                        DXBCBytecode::OperandType declType, uint32_t identifier);
+
 struct GlobalState
 {
 public:
-  GlobalState()
-  {
-    for(int i = 0; i < 8; i++)
-    {
-      uavs[i].firstElement = uavs[i].numElements = uavs[i].hiddenCounter = 0;
-      uavs[i].rowPitch = uavs[i].depthPitch = 0;
-      uavs[i].tex = false;
-    }
-
-    for(int i = 0; i < 128; i++)
-      srvs[i].firstElement = srvs[i].numElements = 0;
-  }
+  GlobalState() {}
+  void PopulateGroupshared(const DXBCBytecode::Program *pBytecode);
 
   struct ViewFmt
   {
     int byteWidth = 0;
     int numComps = 0;
-    bool reversed = false;
     CompType fmt = CompType::Typeless;
     int stride = 0;
 
@@ -69,14 +88,19 @@ public:
         return stride;
 
       if(byteWidth == 10 || byteWidth == 11)
-        return 32;    // 10 10 10 2 or 11 11 10
+        return 4;    // 10 10 10 2 or 11 11 10
 
       return byteWidth * numComps;
     }
   };
 
-  struct
+  struct UAVData
   {
+    UAVData()
+        : firstElement(0), numElements(0), tex(false), rowPitch(0), depthPitch(0), hiddenCounter(0)
+    {
+    }
+
     bytebuf data;
     uint32_t firstElement;
     uint32_t numElements;
@@ -87,16 +111,21 @@ public:
     ViewFmt format;
 
     uint32_t hiddenCounter;
-  } uavs[64];
+  };
+  std::map<BindingSlot, UAVData> uavs;
+  typedef std::map<BindingSlot, UAVData>::iterator UAVIterator;
 
-  struct
+  struct SRVData
   {
+    SRVData() : firstElement(0), numElements(0) {}
     bytebuf data;
     uint32_t firstElement;
     uint32_t numElements;
 
     ViewFmt format;
-  } srvs[128];
+  };
+  std::map<BindingSlot, SRVData> srvs;
+  typedef std::map<BindingSlot, SRVData>::iterator SRVIterator;
 
   struct groupsharedMem
   {
@@ -107,7 +136,7 @@ public:
     bytebuf data;
   };
 
-  std::vector<groupsharedMem> groupshared;
+  rdcarray<groupsharedMem> groupshared;
 
   struct SampleEvalCacheKey
   {
@@ -145,39 +174,105 @@ public:
   // a bitmask of which registers were fetched into the cache, for quick checking
   uint64_t sampleEvalRegisterMask = 0;
   std::map<SampleEvalCacheKey, ShaderVariable> sampleEvalCache;
+
+  // copied from the parent trace
+  rdcarray<ShaderVariable> constantBlocks;
 };
 
-class State : public ShaderDebugState
+struct PSInputElement
 {
-public:
-  State()
+  PSInputElement(int regster, int element, int numWords, ShaderBuiltin attr, bool inc)
   {
-    quadIndex = 0;
-    nextInstruction = 0;
-    flags = ShaderEvents::NoEvent;
-    done = false;
-    trace = NULL;
-    dxbc = NULL;
-    device = NULL;
-    RDCEraseEl(semantics);
-  }
-  State(int quadIdx, const ShaderDebugTrace *t, DXBC::DXBCFile *f, WrappedID3D11Device *d)
-  {
-    quadIndex = quadIdx;
-    nextInstruction = 0;
-    flags = ShaderEvents::NoEvent;
-    done = false;
-    trace = t;
-    dxbc = f;
-    device = d;
-    RDCEraseEl(semantics);
+    reg = regster;
+    elem = element;
+    numwords = numWords;
+    sysattribute = attr;
+    included = inc;
   }
 
-  void SetTrace(int quadIdx, const ShaderDebugTrace *t)
-  {
-    quadIndex = quadIdx;
-    trace = t;
-  }
+  int reg;
+  int elem;
+  ShaderBuiltin sysattribute;
+
+  int numwords;
+
+  bool included;
+};
+
+void FlattenSingleVariable(uint32_t byteOffset, const rdcstr &basename, const ShaderVariable &v,
+                           rdcarray<ShaderVariable> &outvars);
+
+void FillViewFmt(DXGI_FORMAT format, GlobalState::ViewFmt &viewFmt);
+
+void LookupSRVFormatFromShaderReflection(const DXBC::Reflection &reflection,
+                                         const BindingSlot &slot, GlobalState::ViewFmt &viewFmt);
+
+void GatherPSInputDataForInitialValues(const DXBC::DXBCContainer *dxbc,
+                                       const DXBC::Reflection &prevStageDxbc,
+                                       rdcarray<PSInputElement> &initialValues,
+                                       rdcarray<rdcstr> &floatInputs, rdcarray<rdcstr> &inputVarNames,
+                                       rdcstr &psInputDefinition, int &structureStride);
+
+struct SampleGatherResourceData
+{
+  DXBCBytecode::ResourceDimension dim;
+  DXBC::ResourceRetType retType;
+  int sampleCount;
+  BindingSlot binding;
+};
+
+struct SampleGatherSamplerData
+{
+  DXBCBytecode::SamplerMode mode;
+  float bias;
+  BindingSlot binding;
+};
+
+enum class GatherChannel : uint8_t
+{
+  Red = 0,
+  Green = 1,
+  Blue = 2,
+  Alpha = 3,
+};
+
+class DebugAPIWrapper
+{
+public:
+  virtual void SetCurrentInstruction(uint32_t instruction) = 0;
+  virtual void AddDebugMessage(MessageCategory c, MessageSeverity sv, MessageSource src, rdcstr d) = 0;
+
+  // During shader debugging, when a new resource is encountered, this will be called to fetch the
+  // data on demand. Return true if the ShaderDebug::GlobalState data for the slot is populated,
+  // return false if the resource cannot be found.
+  virtual void FetchSRV(const BindingSlot &slot) = 0;
+  virtual void FetchUAV(const BindingSlot &slot) = 0;
+
+  virtual bool CalculateMathIntrinsic(DXBCBytecode::OpcodeType opcode, const ShaderVariable &input,
+                                      ShaderVariable &output1, ShaderVariable &output2) = 0;
+
+  virtual ShaderVariable GetSampleInfo(DXBCBytecode::OperandType type, bool isAbsoluteResource,
+                                       const BindingSlot &slot, const char *opString) = 0;
+
+  virtual ShaderVariable GetBufferInfo(DXBCBytecode::OperandType type, const BindingSlot &slot,
+                                       const char *opString) = 0;
+  virtual ShaderVariable GetResourceInfo(DXBCBytecode::OperandType type, const BindingSlot &slot,
+                                         uint32_t mipLevel, int &dim) = 0;
+
+  virtual bool CalculateSampleGather(DXBCBytecode::OpcodeType opcode,
+                                     SampleGatherResourceData resourceData,
+                                     SampleGatherSamplerData samplerData, ShaderVariable uv,
+                                     ShaderVariable ddxCalc, ShaderVariable ddyCalc,
+                                     const int8_t texelOffsets[3], int multisampleIndex,
+                                     float lodOrCompareValue, const uint8_t swizzle[4],
+                                     GatherChannel gatherChannel, const char *opString,
+                                     ShaderVariable &output) = 0;
+};
+
+class ThreadState
+{
+public:
+  ThreadState(int workgroupIdx, GlobalState &globalState, const DXBC::DXBCContainer *dxbc);
 
   void SetHelper() { done = true; }
   struct
@@ -189,41 +284,84 @@ public:
     uint32_t isFrontFace;
   } semantics;
 
-  void Init();
+  uint32_t nextInstruction;
+  GlobalState &global;
+  rdcarray<ShaderVariable> inputs;
+  rdcarray<ShaderVariable> variables;
+
   bool Finished() const;
 
-  State GetNext(GlobalState &global, State quad[4]) const;
+  void PrepareInitial(ShaderDebugState &initial);
+  void StepNext(ShaderDebugState *state, DebugAPIWrapper *apiWrapper,
+                const rdcarray<ThreadState> &prevWorkgroup);
 
 private:
   // index in the pixel quad
-  int quadIndex;
-
+  int workgroupIndex;
   bool done;
 
   // validates assignment for generation of non-normal values
-  bool AssignValue(ShaderVariable &dst, uint32_t dstIndex, const ShaderVariable &src,
-                   uint32_t srcIndex, bool flushDenorm);
+  ShaderEvents AssignValue(ShaderVariable &dst, uint32_t dstIndex, const ShaderVariable &src,
+                           uint32_t srcIndex, bool flushDenorm);
   // sets the destination operand by looking up in the register
   // file and applying any masking or swizzling
-  void SetDst(const DXBC::ASMOperand &dstoper, const DXBC::ASMOperation &op,
-              const ShaderVariable &val);
+  void SetDst(ShaderDebugState *state, const DXBCBytecode::Operand &dstoper,
+              const DXBCBytecode::Operation &op, const ShaderVariable &val);
+
+  void MarkResourceAccess(ShaderDebugState *state, DXBCBytecode::OperandType type,
+                          const BindingSlot &slot);
 
   // retrieves the value of the operand, by looking up
   // in the register file and performing any swizzling and
   // negation/abs functions
-  ShaderVariable GetSrc(const DXBC::ASMOperand &oper, const DXBC::ASMOperation &op) const;
+  ShaderVariable GetSrc(const DXBCBytecode::Operand &oper, const DXBCBytecode::Operation &op,
+                        bool allowFlushing = true) const;
 
-  ShaderVariable DDX(bool fine, State quad[4], const DXBC::ASMOperand &oper,
-                     const DXBC::ASMOperation &op) const;
-  ShaderVariable DDY(bool fine, State quad[4], const DXBC::ASMOperand &oper,
-                     const DXBC::ASMOperation &op) const;
+  ShaderVariable DDX(bool fine, const rdcarray<ThreadState> &quad,
+                     const DXBCBytecode::Operand &oper, const DXBCBytecode::Operation &op) const;
+  ShaderVariable DDY(bool fine, const rdcarray<ThreadState> &quad,
+                     const DXBCBytecode::Operand &oper, const DXBCBytecode::Operation &op) const;
 
-  VarType OperationType(const DXBC::OpcodeType &op) const;
-  bool OperationFlushing(const DXBC::OpcodeType &op) const;
+  const DXBC::Reflection *reflection;
+  const DXBCBytecode::Program *program;
+  const DXBC::IDebugInfo *debug;
 
-  DXBC::DXBCFile *dxbc;
-  const ShaderDebugTrace *trace;
-  WrappedID3D11Device *device;
+  rdcarray<BindpointIndex> m_accessedSRVs;
+  rdcarray<BindpointIndex> m_accessedUAVs;
 };
+
+struct InterpretDebugger : public ShaderDebugger
+{
+  ShaderDebugTrace *BeginDebug(const DXBC::DXBCContainer *dxbcContainer, const ShaderReflection &refl,
+                               const ShaderBindpointMapping &mapping, int activeIndex);
+
+  GlobalState global;
+  uint32_t eventId;
+
+  rdcarray<ThreadState> workgroup;
+
+  // convenience for access to active lane
+  ThreadState &activeLane() { return workgroup[activeLaneIndex]; }
+  int activeLaneIndex = 0;
+
+  int steps = 0;
+
+  const DXBC::DXBCContainer *dxbc;
+
+  void CalcActiveMask(rdcarray<bool> &activeMask);
+  rdcarray<ShaderDebugState> ContinueDebug(DebugAPIWrapper *apiWrapper);
+};
+
+uint32_t GetLogicalIdentifierForBindingSlot(const DXBCBytecode::Program &program,
+                                            DXBCBytecode::OperandType declType,
+                                            const DXBCDebug::BindingSlot &slot);
+
+void ApplyAllDerivatives(GlobalState &global, rdcarray<ThreadState> &quad, int destIdx,
+                         const rdcarray<PSInputElement> &initialValues, float *data);
+
+void AddCBufferToGlobalState(const DXBCBytecode::Program &program, GlobalState &global,
+                             rdcarray<SourceVariableMapping> &sourceVars,
+                             const ShaderReflection &refl, const ShaderBindpointMapping &mapping,
+                             const BindingSlot &slot, bytebuf &cbufData);
 
 };    // namespace ShaderDebug

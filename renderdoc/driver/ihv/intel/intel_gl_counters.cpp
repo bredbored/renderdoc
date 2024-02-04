@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2018-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -22,16 +22,13 @@
  * THE SOFTWARE.
  ******************************************************************************/
 
-#include <algorithm>
-#include <fstream>
-
 #include "common/common.h"
 #include "driver/gl/gl_dispatch_table.h"
 #include "strings/string_utils.h"
 
 #include "intel_gl_counters.h"
 
-const static std::vector<std::string> metricSetBlacklist = {
+const static rdcarray<rdcstr> metricSetBlacklist = {
     // Used for testing HW is programmed correctly.
     "TestOa",
     // Used to plumb raw data from the GL driver to metrics-discovery.
@@ -45,18 +42,41 @@ IntelGlCounters::~IntelGlCounters()
 {
 }
 
-std::vector<GPUCounter> IntelGlCounters::GetPublicCounterIds() const
+rdcarray<GPUCounter> IntelGlCounters::GetPublicCounterIds() const
 {
-  std::vector<GPUCounter> counters;
+  rdcarray<GPUCounter> counters;
 
   for(const IntelGlCounter &c : m_Counters)
     counters.push_back(c.desc.counter);
+
+  if(m_Paranoid)
+    counters.push_back(GPUCounter((int)GPUCounter::FirstIntel + m_Counters.size()));
 
   return counters;
 }
 
 CounterDescription IntelGlCounters::GetCounterDescription(GPUCounter index) const
 {
+  uint32_t idx = GPUCounterToCounterIndex(index);
+  if(idx >= m_Counters.size())
+  {
+    CounterDescription desc;
+
+    desc.counter = index;
+    desc.name = "Counters limited, see description";
+    desc.category = "More counters are available";
+    desc.description =
+        "Not all counters available, run 'sudo sysctl dev.i915.perf_stream_paranoid=0' to enable "
+        "more counters!";
+
+    desc.resultType = CompType::UInt;
+    desc.resultByteWidth = 8;
+    desc.unit = CounterUnit::Absolute;
+    desc.uuid = Uuid(0x8086, 0x1234, 0x5678, 0xABCD);
+
+    return desc;
+  }
+
   return m_Counters[GPUCounterToCounterIndex(index)].desc;
 }
 
@@ -67,7 +87,7 @@ static CompType glToRdcCounterType(GLuint glDataType)
     case GL_PERFQUERY_COUNTER_DATA_UINT32_INTEL: return CompType::UInt;
     case GL_PERFQUERY_COUNTER_DATA_UINT64_INTEL: return CompType::UInt;
     case GL_PERFQUERY_COUNTER_DATA_FLOAT_INTEL: return CompType::Float;
-    case GL_PERFQUERY_COUNTER_DATA_DOUBLE_INTEL: return CompType::Double;
+    case GL_PERFQUERY_COUNTER_DATA_DOUBLE_INTEL: return CompType::Float;
     case GL_PERFQUERY_COUNTER_DATA_BOOL32_INTEL: return CompType::UInt;
     default: RDCERR("Wrong counter data type: %u", glDataType);
   }
@@ -88,13 +108,14 @@ void IntelGlCounters::addCounter(const IntelGlQuery &query, GLuint counterId)
   GL.glGetIntegerv(eGL_PERFQUERY_COUNTER_DESC_LENGTH_MAX_INTEL, &len);
   counter.desc.description.resize(len);
 
+  GLuint64 rawCounterMaxValue = 0;
   GL.glGetPerfCounterInfoINTEL(
       query.queryId, counterId, (GLuint)counter.desc.name.size(), &counter.desc.name[0],
       (GLuint)counter.desc.description.size(), &counter.desc.description[0], &counter.offset,
-      &counter.desc.resultByteWidth, &counter.type, &counter.dataType, NULL);
+      &counter.desc.resultByteWidth, &counter.type, &counter.dataType, &rawCounterMaxValue);
 
-  if(m_CounterNames.find(counter.desc.name) != m_CounterNames.end())
-    return;
+  counter.desc.name.resize(strlen(&counter.desc.name[0]));
+  counter.desc.description.resize(strlen(&counter.desc.description[0]));
 
   uint32_t query_hash = strhash(query.name.c_str());
   uint32_t name_hash = strhash(counter.desc.name.c_str());
@@ -103,8 +124,34 @@ void IntelGlCounters::addCounter(const IntelGlQuery &query, GLuint counterId)
   counter.desc.resultType = glToRdcCounterType(counter.dataType);
   counter.desc.unit = CounterUnit::Absolute;
 
+  if(counter.desc.description.contains("Unit: cycles."))
+  {
+    counter.desc.unit = CounterUnit::Cycles;
+  }
+  else if(counter.desc.description.contains("Unit: bytes."))
+  {
+    counter.desc.unit = CounterUnit::Bytes;
+  }
+  else if(counter.desc.description.contains("Unit: percent."))
+  {
+    counter.desc.unit = CounterUnit::Percentage;
+  }
+  else if(counter.desc.description.contains("Unit: Hz."))
+  {
+    counter.desc.unit = CounterUnit::Hertz;
+  }
+  else if(counter.desc.description.contains("Unit: ns."))
+  {
+    counter.desc.unit = CounterUnit::Seconds;
+
+    counter.originalType = counter.desc.resultType;
+    counter.originalByteWidth = counter.desc.resultByteWidth;
+
+    counter.desc.resultType = CompType::Float;
+    counter.desc.resultByteWidth = sizeof(double);
+  }
+
   m_Counters.push_back(counter);
-  m_CounterNames[counter.desc.name] = counter;
 }
 
 void IntelGlCounters::addQuery(GLuint queryId)
@@ -117,15 +164,17 @@ void IntelGlCounters::addQuery(GLuint queryId)
   GL.glGetIntegerv(eGL_PERFQUERY_QUERY_NAME_LENGTH_MAX_INTEL, &len);
   query.name.resize(len);
   GLuint nCounters = 0;
+  GLuint nInstances = 0;
+  GLuint capsMask = 0;
   GL.glGetPerfQueryInfoINTEL(queryId, (GLuint)query.name.size(), &query.name[0], &query.size,
-                             &nCounters, NULL, NULL);
+                             &nCounters, &nInstances, &capsMask);
   // Some drivers raise an error when we query some of its IDs because those
   // are used to plumb external library with raw counter data.
   if(GL.glGetError() != eGL_NONE)
     return;
 
-  if(std::find(metricSetBlacklist.begin(), metricSetBlacklist.end(), query.name) !=
-     metricSetBlacklist.end())
+  query.name.resize(strlen(&query.name[0]));
+  if(metricSetBlacklist.contains(query.name))
     return;
 
   m_Queries[query.queryId] = query;
@@ -145,18 +194,21 @@ bool IntelGlCounters::Init()
   if(err != eGL_NONE)
     return false;
 
+  m_Paranoid = false;
+
 #if defined(RENDERDOC_PLATFORM_ANDROID) || defined(RENDERDOC_PLATFORM_LINUX)
-  std::ifstream f("/proc/sys/dev/i915/perf_stream_paranoid");
-  std::string contents;
-  std::getline(f, contents);
+  rdcstr contents;
+  FileIO::ReadAll("/proc/sys/dev/i915/perf_stream_paranoid", contents);
+  contents.trim();
   if(!contents.empty())
   {
-    int paranoid = std::stoi(contents);
+    int paranoid = atoi(contents.c_str());
     if(paranoid)
     {
       RDCWARN(
           "Not all counters available, run "
           "'sudo sysctl dev.i915.perf_stream_paranoid=0' to enable more counters!");
+      m_Paranoid = true;
     }
   }
 #endif
@@ -173,7 +225,10 @@ bool IntelGlCounters::Init()
 
 void IntelGlCounters::EnableCounter(GPUCounter index)
 {
-  const IntelGlCounter &counter = m_Counters[GPUCounterToCounterIndex(index)];
+  uint32_t idx = GPUCounterToCounterIndex(index);
+  if(idx >= m_Counters.size())
+    return;
+  const IntelGlCounter &counter = m_Counters[idx];
 
   for(uint32_t p = 0; p < m_EnabledQueries.size(); p++)
   {
@@ -214,7 +269,8 @@ void IntelGlCounters::EndPass()
 {
   // Flush all of the pass' queries to ensure we can begin further samples
   // with a different pass.
-  std::vector<uint8_t> data(m_Queries[m_EnabledQueries[m_passIndex]].size);
+  rdcarray<uint8_t> data;
+  data.resize(m_Queries[m_EnabledQueries[m_passIndex]].size);
   GLuint len;
   uint32_t nSamples = (uint32_t)m_glQueries.size() / (m_passIndex + 1);
 
@@ -266,18 +322,19 @@ void IntelGlCounters::CopyData(void *dest, const IntelGlCounter &counter, uint32
   uint32_t pass = CounterPass(counter);
   uint32_t queryHandle = m_glQueries[maxSampleIndex * pass + sample];
 
-  std::vector<uint8_t> data(m_Queries[m_EnabledQueries[pass]].size);
+  rdcarray<uint8_t> data;
+  data.resize(m_Queries[m_EnabledQueries[pass]].size);
   GLuint len;
   GL.glGetPerfQueryDataINTEL(queryHandle, 0, (GLsizei)data.size(), &data[0], &len);
 
   memcpy(dest, &data[counter.offset], counter.desc.resultByteWidth);
 }
 
-std::vector<CounterResult> IntelGlCounters::GetCounterData(uint32_t maxSampleIndex,
-                                                           const std::vector<uint32_t> &eventIDs,
-                                                           const std::vector<GPUCounter> &counters)
+rdcarray<CounterResult> IntelGlCounters::GetCounterData(uint32_t maxSampleIndex,
+                                                        const rdcarray<uint32_t> &eventIDs,
+                                                        const rdcarray<GPUCounter> &counters)
 {
-  std::vector<CounterResult> ret;
+  rdcarray<CounterResult> ret;
 
   RDCASSERT((maxSampleIndex * m_EnabledQueries.size()) == m_glQueries.size());
 
@@ -285,21 +342,76 @@ std::vector<CounterResult> IntelGlCounters::GetCounterData(uint32_t maxSampleInd
   {
     for(const GPUCounter &c : counters)
     {
-      const IntelGlCounter &counter = m_Counters[GPUCounterToCounterIndex(c)];
+      uint32_t idx = GPUCounterToCounterIndex(c);
+      if(idx >= m_Counters.size())
+      {
+        ret.push_back(CounterResult(eventIDs[s], c, uint64_t(0)));
+        continue;
+      }
+
+      const IntelGlCounter &counter = m_Counters[idx];
+
+      if(counter.desc.unit == CounterUnit::Seconds)
+      {
+        double nanoseconds = 0.0;
+        if(counter.originalType == CompType::UInt)
+        {
+          if(counter.desc.resultByteWidth == 8)
+          {
+            uint64_t r;
+            CopyData(&r, counter, s, maxSampleIndex);
+            nanoseconds = (double)r;
+          }
+          else
+          {
+            uint32_t r;
+            CopyData(&r, counter, s, maxSampleIndex);
+            nanoseconds = (double)r;
+          }
+        }
+        else if(counter.originalType == CompType::Float)
+        {
+          if(counter.desc.resultByteWidth == 8)
+          {
+            double r;
+            CopyData(&r, counter, s, maxSampleIndex);
+            nanoseconds = r;
+          }
+          else
+          {
+            float r;
+            CopyData(&r, counter, s, maxSampleIndex);
+            nanoseconds = r;
+          }
+        }
+        else
+        {
+          RDCERR("Wrong counter result type: %u", counter.originalType);
+        }
+
+        double seconds = nanoseconds / 1e9f;
+        ret.push_back(CounterResult(eventIDs[s], counter.desc.counter, seconds));
+
+        continue;
+      }
+
       switch(counter.desc.resultType)
       {
-        case CompType::Double:
-        {
-          double r;
-          CopyData(&r, counter, s, maxSampleIndex);
-          ret.push_back(CounterResult(eventIDs[s], counter.desc.counter, r));
-          break;
-        }
         case CompType::Float:
         {
-          float r;
-          CopyData(&r, counter, s, maxSampleIndex);
-          ret.push_back(CounterResult(eventIDs[s], counter.desc.counter, r));
+          if(counter.desc.resultByteWidth == 8)
+          {
+            double r;
+            CopyData(&r, counter, s, maxSampleIndex);
+            ret.push_back(CounterResult(eventIDs[s], counter.desc.counter, r));
+            break;
+          }
+          else
+          {
+            float r;
+            CopyData(&r, counter, s, maxSampleIndex);
+            ret.push_back(CounterResult(eventIDs[s], counter.desc.counter, r));
+          }
           break;
         }
         case CompType::UInt:

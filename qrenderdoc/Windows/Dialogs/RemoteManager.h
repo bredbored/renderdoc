@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2017-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -77,12 +77,12 @@ private:
 
   QList<RDTreeWidgetItem *> m_QueuedDeletes;
 
+  RemoteHost getRemoteHost(RDTreeWidgetItem *item);
   void queueDelete(RDTreeWidgetItem *item);
 
-  bool isRemoteServerLive(RDTreeWidgetItem *node);
   void setRemoteServerLive(RDTreeWidgetItem *node, bool live, bool busy);
 
-  void addHost(RemoteHost *host);
+  void addHost(RemoteHost host);
   void updateLookupsStatus();
   void runRemoteServer(RDTreeWidgetItem *node);
 

@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2017-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -28,7 +28,7 @@
 
 #if ENABLED(ENABLE_UNIT_TESTS)
 
-#include "3rdparty/catch/catch.hpp"
+#include "catch/catch.hpp"
 
 TEST_CASE("Test LZ4 compression/decompression", "[streamio][lz4]")
 {
@@ -58,7 +58,7 @@ TEST_CASE("Test LZ4 compression/decompression", "[streamio][lz4]")
 
     // check that the compression got good wins out of the above data. The random data will be
     // pretty much untouched but the rest should compress massively.
-    CHECK(buf.GetOffset() < 1024 * 1024 + 20 * 1024);
+    CHECK(buf.GetOffset() < 1024 * 1024 + 30 * 1024);
     CHECK(writer.GetOffset() == 4 * 1024 * 1024);
 
     CHECK_FALSE(writer.IsErrored());

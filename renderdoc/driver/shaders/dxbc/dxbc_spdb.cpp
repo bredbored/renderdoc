@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  * Copyright (c) 2014 Crytek
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -24,13 +24,15 @@
  ******************************************************************************/
 
 #include <algorithm>
-#include "dxbc_inspect.h"
+#include "common/formatting.h"
+#include "dxbc_container.h"
 
 #include "official/cvinfo.h"
+#include "os/os_specific.h"
 #include "dxbc_spdb.h"
 
 // uncomment the following to print (very verbose) debugging prints for SPDB processing
-//#define SPDBLOG(...) RDCDEBUG(__VA_ARGS__)
+// #define SPDBLOG(...) RDCDEBUG(__VA_ARGS__)
 
 #ifndef SPDBLOG
 #define SPDBLOG(...) (void)(__VA_ARGS__)
@@ -38,31 +40,29 @@
 
 namespace DXBC
 {
-static const uint32_t FOURCC_SPDB = MAKE_FOURCC('S', 'P', 'D', 'B');
+bool IsPDBFile(void *data, size_t length)
+{
+  FileHeaderPage *header = (FileHeaderPage *)data;
 
-SPDBChunk::SPDBChunk(DXBCFile *dxbc, void *chunk)
+  if(length < sizeof(FileHeaderPage))
+    return false;
+
+  if(memcmp(header->identifier, "Microsoft C/C++ MSF 7.00\r\n\032DS\0\0",
+            sizeof(header->identifier)) != 0)
+    return false;
+
+  return true;
+}
+
+SPDBChunk::SPDBChunk(byte *data, uint32_t spdblength)
 {
   m_HasDebugInfo = false;
 
-  byte *data = NULL;
-
   m_ShaderFlags = 0;
-
-  uint32_t spdblength;
-  {
-    uint32_t *raw = (uint32_t *)chunk;
-
-    if(raw[0] != FOURCC_SPDB)
-      return;
-
-    spdblength = raw[1];
-
-    data = (byte *)&raw[2];
-  }
 
   FileHeaderPage *header = (FileHeaderPage *)data;
 
-  if(memcmp(header->identifier, "Microsoft C/C++ MSF 7.00\r\n\032DS\0\0", sizeof(header->identifier)))
+  if(!IsPDBFile(data, spdblength))
   {
     RDCWARN("Unexpected SPDB type");
     return;
@@ -84,7 +84,7 @@ SPDBChunk::SPDBChunk(DXBCFile *dxbc, void *chunk)
   PageMapping directoryMapping(pages, header->PageSize, (uint32_t *)rootdirIndices, rootdirCount);
   const uint32_t *dirContents = (const uint32_t *)directoryMapping.Data();
 
-  std::vector<PDBStream> streams;
+  rdcarray<PDBStream> streams;
 
   streams.resize(*dirContents);
   dirContents++;
@@ -130,7 +130,7 @@ SPDBChunk::SPDBChunk(DXBCFile *dxbc, void *chunk)
   RDCASSERT(hashtable[0] == 0);
   hashtable++;
 
-  std::map<std::string, uint32_t> StreamNames;
+  std::map<rdcstr, uint32_t> StreamNames;
 
   uint32_t numset = 0;
   for(uint32_t i = 0; i < maxBit; i++)
@@ -167,28 +167,29 @@ SPDBChunk::SPDBChunk(DXBCFile *dxbc, void *chunk)
       SPDBLOG("Found file '%s' from stream %u", filename, it->second);
 
       if(filename[0] == 0)
-        filename = "shader";
+        filename = "unnamed_shader";
 
-      Files.push_back({filename, (char *)fileContents.Data()});
+      Files.push_back({filename, rdcstr((const char *)fileContents.Data(), s.byteLength)});
     }
   }
 
   struct TypeMember
   {
-    std::string name;
+    rdcstr name;
     uint16_t byteOffset;
     uint32_t typeIndex;
   };
 
   struct TypeDesc
   {
-    std::string name;
+    rdcstr name;
     VarType baseType;
     uint32_t byteSize;
     uint16_t vecSize;
-    uint16_t matArrayStride;
+    uint16_t matArrayStride : 15;
+    uint16_t colMajorMatrix : 1;
     LEAF_ENUM_e leafType;
-    std::vector<TypeMember> members;
+    rdcarray<TypeMember> members;
   };
 
   std::map<uint32_t, TypeDesc> typeInfo;
@@ -196,24 +197,24 @@ SPDBChunk::SPDBChunk(DXBCFile *dxbc, void *chunk)
   // prepopulate with basic types
   // for now we stick to full-precision 32-bit VarTypes. It's not clear if HLSL even emits the other
   // types
-  typeInfo[T_INT4] = {"int32_t", VarType::SInt, 4, 1, 0, LF_NUMERIC, {}};
-  typeInfo[T_INT2] = {"int16_t", VarType::SInt, 2, 1, 0, LF_NUMERIC, {}};
-  typeInfo[T_INT1] = {"int8_t", VarType::SInt, 1, 1, 0, LF_NUMERIC, {}};
-  typeInfo[T_LONG] = {"int32_t", VarType::SInt, 4, 1, 0, LF_NUMERIC, {}};
-  typeInfo[T_SHORT] = {"int16_t", VarType::SInt, 2, 1, 0, LF_NUMERIC, {}};
-  typeInfo[T_CHAR] = {"char", VarType::SInt, 1, 1, 0, LF_NUMERIC, {}};
-  typeInfo[T_BOOL32FF] = {"bool", VarType::UInt, 4, 1, 0, LF_NUMERIC, {}};
-  typeInfo[T_UINT4] = {"uint32_t", VarType::UInt, 4, 1, 0, LF_NUMERIC, {}};
-  typeInfo[T_UINT2] = {"uint16_t", VarType::UInt, 2, 1, 0, LF_NUMERIC, {}};
-  typeInfo[T_UINT1] = {"uint8_t", VarType::UInt, 1, 1, 0, LF_NUMERIC, {}};
-  typeInfo[T_ULONG] = {"uint32_t", VarType::UInt, 4, 1, 0, LF_NUMERIC, {}};
-  typeInfo[T_USHORT] = {"uint16_t", VarType::UInt, 2, 1, 0, LF_NUMERIC, {}};
-  typeInfo[T_UCHAR] = {"unsigned char", VarType::UInt, 1, 1, 0, LF_NUMERIC, {}};
-  typeInfo[T_REAL16] = {"half", VarType::Float, 2, 1, 0, LF_NUMERIC, {}};
-  typeInfo[T_REAL32] = {"float", VarType::Float, 4, 1, 0, LF_NUMERIC, {}};
+  typeInfo[T_INT4] = {"int32_t", VarType::SInt, 4, 1, 0, 0, LF_NUMERIC, {}};
+  typeInfo[T_INT2] = {"int16_t", VarType::SInt, 2, 1, 0, 0, LF_NUMERIC, {}};
+  typeInfo[T_INT1] = {"int8_t", VarType::SInt, 1, 1, 0, 0, LF_NUMERIC, {}};
+  typeInfo[T_LONG] = {"int32_t", VarType::SInt, 4, 1, 0, 0, LF_NUMERIC, {}};
+  typeInfo[T_SHORT] = {"int16_t", VarType::SInt, 2, 1, 0, 0, LF_NUMERIC, {}};
+  typeInfo[T_CHAR] = {"char", VarType::SInt, 1, 1, 0, 0, LF_NUMERIC, {}};
+  typeInfo[T_BOOL32FF] = {"bool", VarType::Bool, 4, 1, 0, 0, LF_NUMERIC, {}};
+  typeInfo[T_UINT4] = {"uint32_t", VarType::UInt, 4, 1, 0, 0, LF_NUMERIC, {}};
+  typeInfo[T_UINT2] = {"uint16_t", VarType::UInt, 2, 1, 0, 0, LF_NUMERIC, {}};
+  typeInfo[T_UINT1] = {"uint8_t", VarType::UInt, 1, 1, 0, 0, LF_NUMERIC, {}};
+  typeInfo[T_ULONG] = {"uint32_t", VarType::UInt, 4, 1, 0, 0, LF_NUMERIC, {}};
+  typeInfo[T_USHORT] = {"uint16_t", VarType::UInt, 2, 1, 0, 0, LF_NUMERIC, {}};
+  typeInfo[T_UCHAR] = {"unsigned char", VarType::UInt, 1, 1, 0, 0, LF_NUMERIC, {}};
+  typeInfo[T_REAL16] = {"half", VarType::Float, 2, 1, 0, 0, LF_NUMERIC, {}};
+  typeInfo[T_REAL32] = {"float", VarType::Float, 4, 1, 0, 0, LF_NUMERIC, {}};
   // modern HLSL fake half
-  typeInfo[T_REAL32PP] = {"half", VarType::Float, 4, 1, 0, LF_NUMERIC, {}};
-  typeInfo[T_REAL64] = {"double", VarType::Double, 8, 1, 0, LF_NUMERIC, {}};
+  typeInfo[T_REAL32PP] = {"half", VarType::Float, 4, 1, 0, 0, LF_NUMERIC, {}};
+  typeInfo[T_REAL64] = {"double", VarType::Double, 8, 1, 0, 0, LF_NUMERIC, {}};
 
   if(streams.size() >= 3)
   {
@@ -272,8 +273,8 @@ SPDBChunk::SPDBChunk(DXBCFile *dxbc, void *chunk)
           typeInfo[id] = {
               name,        typeInfo[vector->elemtype].baseType,
               *bytelength, (uint16_t)vector->count,
-              0,           type,
-              {},
+              0,           0,
+              type,        {},
           };
 
           break;
@@ -290,14 +291,22 @@ SPDBChunk::SPDBChunk(DXBCFile *dxbc, void *chunk)
               id, name, matrix->elemtype, matrix->rows, matrix->cols, *bytelength,
               matrix->majorStride, matrix->matattr.row_major ? "row" : "column");
 
+          uint16_t vecSize = 0, matStride = 0;
+
+          if(matrix->matattr.row_major)
+          {
+            vecSize = uint16_t(matrix->cols);
+            matStride = uint16_t(*bytelength / matrix->rows);
+          }
+          else
+          {
+            vecSize = uint16_t(matrix->rows);
+            matStride = uint16_t(*bytelength / matrix->cols);
+          }
+
           typeInfo[id] = {
-              name,
-              typeInfo[matrix->elemtype].baseType,
-              *bytelength,
-              uint16_t(matrix->rows),
-              uint16_t(*bytelength / matrix->cols),
-              type,
-              {},
+              name,      typeInfo[matrix->elemtype].baseType, *bytelength, vecSize,
+              matStride, matrix->matattr.row_major == 0,      type,        {},
           };
 
           break;
@@ -416,7 +425,7 @@ SPDBChunk::SPDBChunk(DXBCFile *dxbc, void *chunk)
 
           uint32_t idx = 0;
 
-          std::vector<TypeMember> &members = typeInfo[id].members;
+          rdcarray<TypeMember> &members = typeInfo[id].members;
 
           byte *iter = (byte *)fieldList->data;
           while(iter < bytes)
@@ -486,6 +495,17 @@ SPDBChunk::SPDBChunk(DXBCFile *dxbc, void *chunk)
                 idx++;
                 break;
               }
+              case LF_METHOD:
+              {
+                lfMethod *method = (lfMethod *)iter;
+
+                SPDBLOG("  [%u]: Method %s used %u times in method list %u", idx, method->Name,
+                        method->count, method->mList);
+
+                idx++;
+                iter = bytes;
+                break;
+              }
               case LF_BCLASS:
               case LF_BINTERFACE:
               {
@@ -544,7 +564,7 @@ SPDBChunk::SPDBChunk(DXBCFile *dxbc, void *chunk)
             structType = "class";
 
           typeInfo[id] = {
-              name, VarType::Float, *bytelength, 1, 0, type, typeInfo[structure->field].members,
+              name, VarType::Float, *bytelength, 1, 0, 0, type, typeInfo[structure->field].members,
           };
 
           SPDBLOG(
@@ -568,20 +588,29 @@ SPDBChunk::SPDBChunk(DXBCFile *dxbc, void *chunk)
                   mfunction->classtype, mfunction->rvtype, mfunction->parmcount, mfunction->arglist);
           break;
         }
+        case LF_METHODLIST:
+        {
+          lfMethodList *mlist = (lfMethodList *)leaf;
+          (void)mlist;
+          SPDBLOG("Type %x is a method list", id);
+          break;
+        }
         case LF_STRIDED_ARRAY:
         {
           lfStridedArray *stridedArray = (lfStridedArray *)leaf;
           // documentation isn't clear, but seems like byte size is always a uint16_t
-          uint16_t *bytelength = (uint16_t *)stridedArray->data;
+          uint16_t bytelength = *(uint16_t *)stridedArray->data;
+
+          uint16_t stride = uint16_t(stridedArray->stride);
+
+          if(bytelength == 0)
+          {
+            // busted debug info - don't trust the stride
+            stride = typeInfo[stridedArray->elemtype].byteSize & 0xffff;
+          }
 
           typeInfo[id] = {
-              "",
-              typeInfo[stridedArray->elemtype].baseType,
-              *bytelength,
-              1,
-              uint16_t(stridedArray->stride),
-              type,
-              {},
+              "", typeInfo[stridedArray->elemtype].baseType, bytelength, 1, stride, 0, type, {},
           };
 
           break;
@@ -673,7 +702,7 @@ SPDBChunk::SPDBChunk(DXBCFile *dxbc, void *chunk)
     m_Functions[0] = mainFunc;
   }
 
-  std::map<uint32_t, std::string> Names;
+  std::map<uint32_t, rdcstr> Names;
 
   if(StreamNames.find("/names") != StreamNames.end())
   {
@@ -711,7 +740,7 @@ SPDBChunk::SPDBChunk(DXBCFile *dxbc, void *chunk)
     }
   }
 
-  std::vector<DBIModule> modules;
+  rdcarray<DBIModule> modules;
 
   {
     PageMapping dbiMapping(pages, header->PageSize, &streams[3].pageIndices[0],
@@ -726,7 +755,7 @@ SPDBChunk::SPDBChunk(DXBCFile *dxbc, void *chunk)
     while(cur < end)
     {
       DBIModule *mod = (DBIModule *)cur;
-      cur += sizeof(DBIModule) - sizeof(std::string) * 2;
+      cur += sizeof(DBIModule) - sizeof(rdcstr) * 2;
 
       char *moduleName = (char *)cur;
       cur += strlen(moduleName) + 1;
@@ -739,7 +768,7 @@ SPDBChunk::SPDBChunk(DXBCFile *dxbc, void *chunk)
         cur++;
 
       DBIModule m;
-      memcpy(&m, mod, sizeof(DBIModule) - sizeof(std::string) * 2);
+      memcpy(&m, mod, sizeof(DBIModule) - sizeof(rdcstr) * 2);
       m.moduleName = moduleName;
       m.objectName = objectName;
 
@@ -750,7 +779,7 @@ SPDBChunk::SPDBChunk(DXBCFile *dxbc, void *chunk)
     RDCASSERT(cur == end);
   }
 
-  std::vector<Inlinee> inlines;
+  rdcarray<Inlinee> inlines;
 
   PROCSYM32 main = {};
 
@@ -770,7 +799,7 @@ SPDBChunk::SPDBChunk(DXBCFile *dxbc, void *chunk)
 
     RDCASSERT(moduledata[0] == CV_SIGNATURE_C13);
 
-    std::string localName;
+    rdcstr localName;
     CV_typ_t localType = 0;
 
     byte *basePtr = (byte *)&moduledata[1];
@@ -863,7 +892,7 @@ SPDBChunk::SPDBChunk(DXBCFile *dxbc, void *chunk)
           }
           else if(!strcmp(key, "hlslDefines"))
           {
-            std::string cmdlineDefines = "// Command line defines:\n\n";
+            rdcstr cmdlineDefines = "// Command line defines:\n\n";
 
             char *c = value;
 
@@ -910,14 +939,14 @@ SPDBChunk::SPDBChunk(DXBCFile *dxbc, void *chunk)
                   char *valend = c;
 
                   cmdlineDefines += "#define ";
-                  cmdlineDefines +=
-                      std::string(defstart, defend) + " " + std::string(valstart, valend);
+                  cmdlineDefines += rdcstr(defstart, defend - defstart) + " " +
+                                    rdcstr(valstart, valend - valstart);
                   cmdlineDefines += "\n";
                 }
                 else
                 {
                   cmdlineDefines += "#define ";
-                  cmdlineDefines += std::string(defstart, defend);
+                  cmdlineDefines += rdcstr(defstart, defend - defstart);
                   cmdlineDefines += "\n";
                 }
               }
@@ -1113,74 +1142,21 @@ SPDBChunk::SPDBChunk(DXBCFile *dxbc, void *chunk)
         DEFRANGESYMHLSL *defrange = (DEFRANGESYMHLSL *)sym;
 
         LocalMapping mapping;
-        RegisterRange &range = mapping.var.registers[0];
-
-        bool indexable = false;
-        const char *regtype = "";
-        const char *regprefix = "?";
 
         // CV_HLSLREG_e == OperandType
 
-        switch((OperandType)defrange->regType)
-        {
-          case TYPE_TEMP:
-            range.type = RegisterType::Temporary;
-            regtype = "temp";
-            regprefix = "r";
-            break;
-          case TYPE_INPUT:
-          case TYPE_INPUT_PRIMITIVEID:
-          case TYPE_INPUT_FORK_INSTANCE_ID:
-          case TYPE_INPUT_JOIN_INSTANCE_ID:
-          case TYPE_INPUT_CONTROL_POINT:
-          case TYPE_INPUT_PATCH_CONSTANT:
-          case TYPE_INPUT_DOMAIN_POINT:
-          case TYPE_INPUT_THREAD_ID:
-          case TYPE_INPUT_THREAD_GROUP_ID:
-          case TYPE_INPUT_THREAD_ID_IN_GROUP:
-          case TYPE_INPUT_COVERAGE_MASK:
-          case TYPE_INPUT_THREAD_ID_IN_GROUP_FLATTENED:
-          case TYPE_INPUT_GS_INSTANCE_ID:
-            range.type = RegisterType::Input;
-            regtype = "input";
-            regprefix = "v";
-            break;
-          case TYPE_OUTPUT:
-          case TYPE_OUTPUT_DEPTH:
-          case TYPE_OUTPUT_DEPTH_LESS_EQUAL:
-          case TYPE_OUTPUT_DEPTH_GREATER_EQUAL:
-          case TYPE_OUTPUT_STENCIL_REF:
-          case TYPE_OUTPUT_COVERAGE_MASK:
-            range.type = RegisterType::Output;
-            regtype = "output";
-            regprefix = "o";
-            break;
-          case TYPE_INDEXABLE_TEMP:
-            range.type = RegisterType::IndexedTemporary;
-            regtype = "indexable";
-            regprefix = "x";
-            indexable = true;
-            break;
-          default: break;
-        }
+        mapping.regType = (DXBCBytecode::OperandType)defrange->regType;
 
         // this is a virtual register, not stored
-        if((OperandType)defrange->regType == TYPE_STREAM)
+        if((DXBCBytecode::OperandType)defrange->regType == DXBCBytecode::TYPE_STREAM)
           continue;
 
-        const char *space = "";
-        switch((CV_HLSLMemorySpace_e)defrange->memorySpace)
-        {
-          case CV_HLSL_MEMSPACE_DATA: space = "data"; break;
-          case CV_HLSL_MEMSPACE_SAMPLER: space = "sampler"; break;
-          case CV_HLSL_MEMSPACE_RESOURCE: space = "resource"; break;
-          case CV_HLSL_MEMSPACE_RWRESOURCE: space = "rwresource"; break;
-          default: break;
-        }
+        const char *spaces[16] = {"data", "sampler", "resource", "rwresource"};
 
         SPDBLOG("S_DEFRANGE_HLSL: %u->%u bytes in parent: %s %s (dim %d) %s",
-                defrange->offsetParent, defrange->offsetParent + defrange->sizeInParent, regtype,
-                space, defrange->regIndices, defrange->spilledUdtMember ? "spilled" : "");
+                defrange->offsetParent, defrange->offsetParent + defrange->sizeInParent,
+                ToStr(mapping.regType).c_str(), spaces[defrange->memorySpace], defrange->regIndices,
+                defrange->spilledUdtMember ? "spilled" : "");
 
         if(defrange->regIndices > 1)
         {
@@ -1192,103 +1168,32 @@ SPDBChunk::SPDBChunk(DXBCFile *dxbc, void *chunk)
 
         char regcomps[] = "xyzw";
 
-        uint32_t regindex = indexable ? regoffset : regoffset / 16;
-        uint32_t regfirstcomp = indexable ? 0 : (regoffset % 16) / 4;
-        uint32_t regnumcomps = indexable ? 4 : defrange->sizeInParent / 4;
+        const bool indexable = (mapping.regType == DXBCBytecode::TYPE_INDEXABLE_TEMP);
 
-        bool builtinoutput = false;
-        mapping.var.builtin = ShaderBuiltin::Undefined;
-        switch((OperandType)defrange->regType)
-        {
-          case TYPE_OUTPUT_DEPTH:
-            builtinoutput = true;
-            mapping.var.builtin = ShaderBuiltin::DepthOutput;
-            break;
-          case TYPE_OUTPUT_DEPTH_LESS_EQUAL:
-            builtinoutput = true;
-            mapping.var.builtin = ShaderBuiltin::DepthOutputLessEqual;
-            break;
-          case TYPE_OUTPUT_DEPTH_GREATER_EQUAL:
-            builtinoutput = true;
-            mapping.var.builtin = ShaderBuiltin::DepthOutputGreaterEqual;
-            break;
-          case TYPE_OUTPUT_STENCIL_REF:
-            builtinoutput = true;
-            mapping.var.builtin = ShaderBuiltin::StencilReference;
-            break;
-          case TYPE_OUTPUT_COVERAGE_MASK:
-            builtinoutput = true;
-            mapping.var.builtin = ShaderBuiltin::MSAACoverage;
-            break;
-          case TYPE_INPUT_PRIMITIVEID: mapping.var.builtin = ShaderBuiltin::PrimitiveIndex; break;
-          case TYPE_INPUT_COVERAGE_MASK: mapping.var.builtin = ShaderBuiltin::MSAACoverage; break;
-          case TYPE_INPUT_THREAD_ID:
-            mapping.var.builtin = ShaderBuiltin::DispatchThreadIndex;
-            break;
-          case TYPE_INPUT_THREAD_GROUP_ID: mapping.var.builtin = ShaderBuiltin::GroupIndex; break;
-          case TYPE_INPUT_THREAD_ID_IN_GROUP:
-            mapping.var.builtin = ShaderBuiltin::GroupThreadIndex;
-            break;
-          case TYPE_INPUT_THREAD_ID_IN_GROUP_FLATTENED:
-            mapping.var.builtin = ShaderBuiltin::GroupFlatIndex;
-            break;
-          case TYPE_INPUT_GS_INSTANCE_ID:
-            mapping.var.builtin = ShaderBuiltin::GSInstanceIndex;
-            break;
-          default: break;
-        }
-
-        if(mapping.var.builtin != ShaderBuiltin::Undefined)
-        {
-          bool found = false;
-
-          if(builtinoutput)
-          {
-            for(size_t i = 0; i < dxbc->m_OutputSig.size(); i++)
-            {
-              if(dxbc->m_OutputSig[i].systemValue == mapping.var.builtin)
-              {
-                regindex = (uint32_t)i;
-                regfirstcomp = 0;
-                found = true;
-                break;
-              }
-            }
-          }
-          else
-          {
-            for(size_t i = 0; i < dxbc->m_InputSig.size(); i++)
-            {
-              if(dxbc->m_InputSig[i].systemValue == mapping.var.builtin)
-              {
-                regindex = (uint32_t)i;
-                regfirstcomp = 0;
-                found = true;
-                break;
-              }
-            }
-          }
-
-          // if not found in the signatures, then it's a fixed-function input like threadid - it
-          // will be matched by builtin
-          if(!found)
-            regindex = ~0U;
-        }
+        mapping.regIndex = indexable ? regoffset : regoffset / 16;
+        mapping.regFirstComp = indexable ? 0 : (regoffset % 16) / 4;
+        mapping.numComps = indexable ? 4 : defrange->sizeInParent / 4;
 
         char *regswizzle = regcomps;
-        regswizzle += regfirstcomp;
-        regswizzle[regnumcomps] = 0;
+        regswizzle += mapping.regFirstComp;
+        regswizzle[mapping.numComps] = 0;
 
-        SPDBLOG("Stored in %s%u.%s", regprefix, regindex, regswizzle);
+        SPDBLOG("Stored in %s %u.%s", ToStr(mapping.regType).c_str(), mapping.regIndex, regswizzle);
 
-        mapping.var.localName = localName;
+        mapping.var.name = localName;
 
         uint32_t varOffset = defrange->offsetParent;
         uint32_t varLen = defrange->sizeInParent;
 
+        mapping.varOffset = varOffset;
+
         const TypeDesc *vartype = &typeInfo[localType];
 
-        RDCASSERT(varOffset + varLen <= vartype->byteSize);
+        RDCASSERT((varOffset + varLen <= vartype->byteSize) ||
+                      (vartype->byteSize == 0 && vartype->leafType == LF_STRIDED_ARRAY),
+                  varOffset, varLen, vartype->byteSize, (uint32_t)vartype->leafType);
+
+        uint32_t varTypeByteSize = vartype->byteSize;
 
         // step through struct members
         while(!vartype->members.empty())
@@ -1297,12 +1202,24 @@ SPDBChunk::SPDBChunk(DXBCFile *dxbc, void *chunk)
 
           // find the child member this register corresponds to. We don't handle overlaps between
           // members
-          for(const TypeMember &mem : vartype->members)
+          for(size_t memIndex = 0; memIndex < vartype->members.size(); memIndex++)
           {
+            const TypeMember &mem = vartype->members[memIndex];
+
             TypeDesc &childType = typeInfo[mem.typeIndex];
 
             uint32_t memberOffset = mem.byteOffset;
             uint32_t memberLen = childType.byteSize;
+
+            if(memberLen == 0)
+            {
+              // if the member length is 0 this is busted debug info from fxc, so assume the member
+              // runs up to the end of the struct or the next member
+              if(memIndex == vartype->members.size() - 1)
+                memberLen = vartype->byteSize - memberOffset;
+              else
+                memberLen = vartype->members[memIndex + 1].byteOffset - memberOffset;
+            }
 
             // if this member is before our variable, continue
             if(memberOffset + memberLen <= varOffset)
@@ -1320,13 +1237,14 @@ SPDBChunk::SPDBChunk(DXBCFile *dxbc, void *chunk)
                      memberOffset + memberLen, varOffset, varOffset + varLen);
             }
 
-            mapping.var.localName = std::string(mapping.var.localName) + "." + mem.name;
+            mapping.var.name += "." + mem.name;
 
             // subtract off the offset of this member so we're now relative to it - since it might
             // be a struct itself and we need to recurse.
             varOffset -= memberOffset;
 
             vartype = &childType;
+            varTypeByteSize = memberLen;
 
             found = true;
 
@@ -1337,39 +1255,80 @@ SPDBChunk::SPDBChunk(DXBCFile *dxbc, void *chunk)
           {
             RDCERR("No member of %s corresponds to variable range [%u,%u]", vartype->name.c_str(),
                    varOffset, varOffset + varLen);
-            mapping.var.localName = std::string(mapping.var.localName) + ".__unknown__";
+            mapping.var.name += ".__unknown__";
             break;
           }
         }
 
-        mapping.var.type = vartype->baseType;
+        mapping.var.baseType = vartype->baseType;
         mapping.var.rows = 1;
-        mapping.var.columns = vartype->vecSize;
+        mapping.var.columns = uint8_t(vartype->vecSize);
+        mapping.var.elements = 1;
 
         // if it's an array or matrix, figure out the index
         if(vartype->matArrayStride)
         {
+          // number of rows is the number of vectors in the matrix's total byte size (each vector is
+          // a row)
+          mapping.var.rows =
+              uint8_t((varTypeByteSize + vartype->matArrayStride - 1) / vartype->matArrayStride);
+
+          // unless this is a column major matrix, in which case each vector is a column so swap the
+          // rows/columns (the number of ROWS is the vector size, when each vector is a column)
+          if(vartype->colMajorMatrix)
+            std::swap(mapping.var.rows, mapping.var.columns);
+
+          // calculate which vector we're on, and which component
           uint32_t idx = varOffset / vartype->matArrayStride;
-
-          mapping.var.localName = StringFormat::Fmt("%s[%u]", mapping.var.localName.c_str(), idx);
-          mapping.var.rows = RDCMAX(
-              1U, (vartype->byteSize + (vartype->matArrayStride - 1)) / vartype->matArrayStride);
-
           varOffset -= vartype->matArrayStride * idx;
-        }
+          uint32_t comp = (varOffset % 16) / 4;
 
-        if(vartype->leafType != LF_MATRIX)
-        {
-          mapping.var.elements = mapping.var.rows;
-          mapping.var.rows = 1;
+          // should now be down to a vector, so the remaining offset is the component. Unless we had
+          // multiple indices in which case it's a multi-dimensional array, or this is a subrange of
+          // an array mapped to a single register.
+          RDCASSERT(varOffset < 16 || defrange->regIndices > 1 || varLen < varTypeByteSize);
+
+          if(vartype->leafType == LF_MATRIX)
+          {
+            // if this is a matrix, start with the index as row, and component as column
+            uint32_t row = idx;
+            uint32_t col = comp;
+
+            // flip them if this is column major
+            if(vartype->colMajorMatrix)
+              std::swap(row, col);
+
+            // add the row to the name since we want our mapping row-major for better display
+            mapping.var.name += StringFormat::Fmt(".row%u", row);
+
+            // and set the component after flipping
+            comp = col;
+          }
+          else
+          {
+            // the number of rows is actually the number of elements (and number of rows is 1)
+            mapping.var.elements = mapping.var.rows;
+            mapping.var.rows = 1;
+
+            // if this is an array, the index is just the array index. However if we're mapping the
+            // whole array, don't add the index as the mapping will do that for us
+            if(varLen < varTypeByteSize)
+            {
+              mapping.var.name += StringFormat::Fmt("[%u]", idx);
+
+              // we've selected one element in the array, so it's not longer an array
+              mapping.var.elements = 1;
+            }
+          }
+
+          // set the offset explicitly to the component within the final vector we chose (whatever
+          // it is)
+          varOffset = comp * 4;
         }
 
         RDCASSERT(mapping.var.rows <= 4 && mapping.var.columns <= 4);
 
-        range.index = uint16_t(regindex & 0xffff);
-        mapping.regFirstComp = regfirstcomp;
         mapping.varFirstComp = (varOffset % 16) / 4;
-        mapping.numComps = regnumcomps;
 
         SPDBLOG("Valid from %x to %x", defrange->range.offStart,
                 defrange->range.offStart + defrange->range.cbRange);
@@ -1432,13 +1391,13 @@ SPDBChunk::SPDBChunk(DXBCFile *dxbc, void *chunk)
 
           iter += offsetof(FileChecksum, hashData);
 
-          std::string name;
+          rdcstr name;
 
           if(Names.find(checksum->nameIndex) != Names.end())
           {
             name = Names[checksum->nameIndex];
             if(name.empty())
-              name = Names[checksum->nameIndex] = "shader";
+              name = Names[checksum->nameIndex] = "unnamed_shader";
           }
           else
           {
@@ -1468,10 +1427,32 @@ SPDBChunk::SPDBChunk(DXBCFile *dxbc, void *chunk)
 
             for(size_t i = 0; i < Files.size(); i++)
             {
-              if(!_stricmp(Files[i].first.c_str(), name.c_str()))
+              if(!_stricmp(Files[i].filename.c_str(), name.c_str()))
               {
                 fileIdx = (int32_t)i;
                 break;
+              }
+            }
+
+            if(fileIdx == -1)
+            {
+              // if file index is still -1, try again but with normalised names
+              for(char &c : name)
+                if(c == '\\')
+                  c = '/';
+
+              for(size_t i = 0; i < Files.size(); i++)
+              {
+                rdcstr normalised = Files[i].filename;
+                for(char &c : normalised)
+                  if(c == '\\')
+                    c = '/';
+
+                if(!_stricmp(normalised.c_str(), name.c_str()))
+                {
+                  fileIdx = (int32_t)i;
+                  break;
+                }
               }
             }
 
@@ -1486,9 +1467,25 @@ SPDBChunk::SPDBChunk(DXBCFile *dxbc, void *chunk)
             // source according to #line
             if(!name.empty())
             {
-              Files.push_back({name, ""});
+              int32_t fileIdx = -1;
+              if(name == "unnamed_shader")
+              {
+                for(int32_t i = 0; i < Files.count(); i++)
+                {
+                  if(!_stricmp(Files[i].filename.c_str(), name.c_str()))
+                  {
+                    fileIdx = i;
+                    break;
+                  }
+                }
+              }
+              if(fileIdx == -1)
+              {
+                Files.push_back({name, ""});
+                fileIdx = (int32_t)Files.size() - 1;
+              }
 
-              FileMapping[chunkOffs] = (int32_t)Files.size() - 1;
+              FileMapping[chunkOffs] = fileIdx;
             }
             else
             {
@@ -1533,19 +1530,17 @@ SPDBChunk::SPDBChunk(DXBCFile *dxbc, void *chunk)
           {
             CV_Line_t &line = lines[l];
 
-            LineColumnInfo lineCol;
-            lineCol.fileIndex = fileIdx;
-            lineCol.lineStart = line.linenumStart;
-            lineCol.lineEnd = line.linenumStart + line.deltaLineEnd;
+            LineColumnInfo &lineInfo = m_InstructionInfo[line.offset].lineInfo;
+            lineInfo.fileIndex = fileIdx;
+            lineInfo.lineStart = line.linenumStart;
+            lineInfo.lineEnd = line.linenumStart + line.deltaLineEnd;
 
             if(hasColumns)
             {
               CV_Column_t &col = columns[l];
-              lineCol.colStart = col.offColumnStart;
-              lineCol.colEnd = col.offColumnEnd;
+              lineInfo.colStart = col.offColumnStart;
+              lineInfo.colEnd = col.offColumnEnd;
             }
-
-            m_Lines[line.offset] = lineCol;
           }
         }
         RDCASSERT(iter == subend);
@@ -1562,14 +1557,18 @@ SPDBChunk::SPDBChunk(DXBCFile *dxbc, void *chunk)
           size_t count = (subend - iter) / sizeof(CodeViewInfo::InlineeSourceLine);
           for(size_t i = 0; i < count; i++, inlinee++)
           {
-            inlines[i].id = inlinee->inlinee;
-            inlines[i].fileOffs = inlinee->fileId;
-            inlines[i].baseLineNum = inlinee->sourceLineNum;
+            for(size_t in = 0; in < inlines.size(); in++)
+            {
+              if(inlinee->inlinee == inlines[in].id)
+              {
+                inlines[in].fileOffs = inlinee->fileId;
+                inlines[in].baseLineNum = inlinee->sourceLineNum;
+              }
+            }
           }
         }
         else if(sourceLineType == CV_INLINEE_SOURCE_LINE_SIGNATURE_EX)
         {
-          size_t idx = 0;
           while(iter < subend)
           {
             CodeViewInfo::InlineeSourceLineEx *inlinee = (CodeViewInfo::InlineeSourceLineEx *)iter;
@@ -1577,10 +1576,14 @@ SPDBChunk::SPDBChunk(DXBCFile *dxbc, void *chunk)
             iter += sizeof(CodeViewInfo::InlineeSourceLineEx) +
                     sizeof(CV_off32_t) * inlinee->countOfExtraFiles;
 
-            inlines[idx].id = inlinee->inlinee;
-            inlines[idx].fileOffs = inlinee->fileId;
-            inlines[idx].baseLineNum = inlinee->sourceLineNum;
-            idx++;
+            for(size_t in = 0; in < inlines.size(); in++)
+            {
+              if(inlinee->inlinee == inlines[in].id)
+              {
+                inlines[in].fileOffs = inlinee->fileId;
+                inlines[in].baseLineNum = inlinee->sourceLineNum;
+              }
+            }
           }
         }
       }
@@ -1591,7 +1594,7 @@ SPDBChunk::SPDBChunk(DXBCFile *dxbc, void *chunk)
     }
   }
 
-  for(auto it = m_Lines.begin(); it != m_Lines.end(); ++it)
+  for(auto it = m_InstructionInfo.begin(); it != m_InstructionInfo.end(); ++it)
     it->second.callstack.push_back(m_Functions[0].name);
 
   SPDBLOG("Applying %zu inline sites", inlines.size());
@@ -1624,24 +1627,26 @@ SPDBChunk::SPDBChunk(DXBCFile *dxbc, void *chunk)
 
       int nPatched = 0;
 
-      auto it = m_Lines.lower_bound(loc.offsetStart);
+      auto it = m_InstructionInfo.lower_bound(loc.offsetStart);
 
-      for(; it != m_Lines.end() && it->first <= loc.offsetEnd; ++it)
+      for(; it != m_InstructionInfo.end() && it->first <= loc.offsetEnd; ++it)
       {
         if((it->first >= loc.offsetStart && it->first < loc.offsetEnd) ||
            (it->first == loc.offsetStart && it->first == loc.offsetEnd))
         {
+          LineColumnInfo &lineInfo = it->second.lineInfo;
+
           SPDBLOG("Patching %x between [%x,%x] from (%d %u:%u -> %u:%u) into (%d %u:%u -> %u:%u)",
-                  it->first, loc.offsetStart, loc.offsetEnd, it->second.fileIndex,
-                  it->second.lineStart, it->second.colStart, it->second.lineEnd, it->second.colEnd,
-                  fileIdx, loc.lineStart + inlines[i].baseLineNum, loc.colStart,
+                  it->first, loc.offsetStart, loc.offsetEnd, lineInfo.fileIndex, lineInfo.lineStart,
+                  lineInfo.colStart, lineInfo.lineEnd, lineInfo.colEnd, fileIdx,
+                  loc.lineStart + inlines[i].baseLineNum, loc.colStart,
                   loc.lineEnd + inlines[i].baseLineNum, loc.colEnd);
 
-          it->second.fileIndex = fileIdx;
-          it->second.lineStart = loc.lineStart + inlines[i].baseLineNum;
-          it->second.lineEnd = loc.lineEnd + inlines[i].baseLineNum;
-          it->second.colStart = loc.colStart;
-          it->second.colEnd = loc.colEnd;
+          lineInfo.fileIndex = fileIdx;
+          lineInfo.lineStart = loc.lineStart + inlines[i].baseLineNum;
+          lineInfo.lineEnd = loc.lineEnd + inlines[i].baseLineNum;
+          lineInfo.colStart = loc.colStart;
+          lineInfo.colEnd = loc.colEnd;
           if(loc.statement)
             it->second.callstack.push_back(m_Functions[inlines[i].id].name);
           nPatched++;
@@ -1657,48 +1662,49 @@ SPDBChunk::SPDBChunk(DXBCFile *dxbc, void *chunk)
   delete[] pages;
 
   // save the filenames in their original order
-  std::vector<std::string> filenames;
+  rdcarray<rdcstr> filenames;
   filenames.reserve(Files.size());
   for(size_t i = 0; i < Files.size(); i++)
-    filenames.push_back(Files[i].first);
+    filenames.push_back(Files[i].filename);
 
   // Sort files according to the order they come in the Names array, this seems to be more reliable
   // about placing the main file first.
-  std::sort(Files.begin(), Files.end(), [&Names](const rdcpair<std::string, std::string> &a,
-                                                 const rdcpair<std::string, std::string> &b) {
-    // any entries that aren't found in Names at all (like @cmdline that we add) will be sorted to
-    // the end.
-    size_t aIdx = ~0U, bIdx = ~0U;
+  std::sort(Files.begin(), Files.end(),
+            [&Names](const ShaderSourceFile &a, const ShaderSourceFile &b) {
+              // any entries that aren't found in Names at all (like @cmdline that we add) will be
+              // sorted to
+              // the end.
+              size_t aIdx = ~0U, bIdx = ~0U;
 
-    size_t i = 0;
-    for(auto it = Names.begin(); it != Names.end(); ++it)
-    {
-      if(it->second == a.first)
-        aIdx = i;
-      if(it->second == b.first)
-        bIdx = i;
+              size_t i = 0;
+              for(auto it = Names.begin(); it != Names.end(); ++it)
+              {
+                if(it->second == a.filename)
+                  aIdx = i;
+                if(it->second == b.filename)
+                  bIdx = i;
 
-      i++;
-    }
+                i++;
+              }
 
-    // if neither were found, sort by filename
-    if(aIdx == bIdx)
-      return a.first < b.first;
+              // if neither were found, sort by filename
+              if(aIdx == bIdx)
+                return a.filename < b.filename;
 
-    return aIdx < bIdx;
-  });
+              return aIdx < bIdx;
+            });
 
   // create a map from filename -> index
-  std::map<std::string, int32_t> remapping;
+  std::map<rdcstr, int32_t> remapping;
   for(size_t i = 0; i < Files.size(); i++)
-    remapping[Files[i].first] = (int32_t)i;
+    remapping[Files[i].filename] = (int32_t)i;
 
   // remap the line info by looking up the original intended filename, then looking up the new index
-  for(auto it = m_Lines.begin(); it != m_Lines.end(); ++it)
+  for(auto it = m_InstructionInfo.begin(); it != m_InstructionInfo.end(); ++it)
   {
-    if(it->second.fileIndex == -1)
+    if(it->second.lineInfo.fileIndex == -1)
       continue;
-    it->second.fileIndex = remapping[filenames[it->second.fileIndex]];
+    it->second.lineInfo.fileIndex = remapping[filenames[it->second.lineInfo.fileIndex]];
   }
 
   std::sort(m_Locals.begin(), m_Locals.end());
@@ -1706,21 +1712,35 @@ SPDBChunk::SPDBChunk(DXBCFile *dxbc, void *chunk)
   m_HasDebugInfo = true;
 }
 
-void SPDBChunk::GetLineInfo(size_t instruction, uintptr_t offset, LineColumnInfo &lineInfo) const
+void SPDBChunk::GetLineInfo(size_t, uintptr_t offset, LineColumnInfo &lineInfo) const
 {
-  auto it = m_Lines.lower_bound((uint32_t)offset);
+  if(offset == ~0U && !m_InstructionInfo.empty())
+  {
+    lineInfo = m_InstructionInfo.begin()->second.lineInfo;
+    return;
+  }
 
-  if(it != m_Lines.end() && (uintptr_t)it->first <= offset)
-    lineInfo = it->second;
+  auto it = m_InstructionInfo.lower_bound((uint32_t)offset);
+
+  if(it != m_InstructionInfo.end() && (uintptr_t)it->first <= offset)
+    lineInfo = it->second.lineInfo;
 }
 
-bool SPDBChunk::HasLocals() const
+void SPDBChunk::GetCallstack(size_t, uintptr_t offset, rdcarray<rdcstr> &callstack) const
+{
+  auto it = m_InstructionInfo.lower_bound((uint32_t)offset);
+
+  if(it != m_InstructionInfo.end() && (uintptr_t)it->first <= offset)
+    callstack = it->second.callstack;
+}
+
+bool SPDBChunk::HasSourceMapping() const
 {
   return true;
 }
 
-void SPDBChunk::GetLocals(size_t instruction, uintptr_t offset,
-                          rdcarray<LocalVariableMapping> &locals) const
+void SPDBChunk::GetLocals(const DXBC::DXBCContainer *dxbc, size_t, uintptr_t offset,
+                          rdcarray<SourceVariableMapping> &locals) const
 {
   locals.clear();
 
@@ -1748,6 +1768,29 @@ void SPDBChunk::GetLocals(size_t instruction, uintptr_t offset,
 
     bool added = false;
 
+    // set up the register range for this mapping
+    DebugVariableReference range;
+
+    // it's possible to declare coverage input but then not use it. We then get a local that
+    // doesn't map to any register because the register declaration is stripped.
+    // this doesn't happen on output because outputs don't get stripped in the same way.
+    if(it->regType == DXBCBytecode::TYPE_INPUT_COVERAGE_MASK &&
+       !dxbc->GetDXBCByteCode()->HasCoverageInput())
+      continue;
+
+    range.name = dxbc->GetDXBCByteCode()->GetRegisterName(it->regType, it->regIndex);
+    range.component = it->regFirstComp;
+
+    if(IsInput(it->regType))
+      range.type = DebugVariableType::Input;
+    else if(it->regType == DXBCBytecode::TYPE_CONSTANT_BUFFER)
+      range.type = DebugVariableType::Constant;
+    else
+      range.type = DebugVariableType::Variable;
+
+    // we don't handle more than float4 at a time (unless in an array)
+    RDCASSERT(it->numComps <= 4);
+
     // we apply each matching local over the top. Where there is an overlap (e.g. two variables with
     // the same name) we take the last mapping as authoratitive. This is a good solution for the
     // case where one function with a parameter/variable name calls an inner function with the same
@@ -1755,22 +1798,20 @@ void SPDBChunk::GetLocals(size_t instruction, uintptr_t offset,
     // use it in preference.
 
     // check if we already have a mapping for this variable
-    for(LocalVariableMapping &a : locals)
+    for(SourceVariableMapping &a : locals)
     {
-      const LocalVariableMapping &b = it->var;
+      const ShaderConstantType &b = it->var;
 
-      if(a.localName == b.localName)
+      if(a.name == b.name)
       {
-        RegisterRange range = b.registers[0];
-
+        a.variables.resize(RDCMAX(a.variables.size(), (size_t)it->varFirstComp + it->numComps));
         for(uint32_t i = 0; i < it->numComps; i++)
         {
-          a.registers[it->varFirstComp + i].type = b.registers[0].type;
-          a.registers[it->varFirstComp + i].index = b.registers[0].index;
-          a.registers[it->varFirstComp + i].component = uint16_t(it->regFirstComp + i);
+          a.variables[it->varFirstComp + i] = range;
+          a.variables[it->varFirstComp + i].component += (uint8_t)i;
         }
 
-        a.regCount = RDCMAX(a.regCount, it->varFirstComp + it->numComps);
+        RDCASSERT(it->var.elements == 1);
 
         // we've processed this, no need to add a new entry
         added = true;
@@ -1780,24 +1821,137 @@ void SPDBChunk::GetLocals(size_t instruction, uintptr_t offset,
 
     if(!added)
     {
-      locals.push_back(it->var);
-      LocalVariableMapping &a = locals.back();
+      SourceVariableMapping a;
 
-      // the register range is stored in [0] but we don't want to actually push that, so make it
-      // undefined and grab it locally
-      RegisterRange range;
-      std::swap(a.registers[0], range);
+      a.name = it->var.name;
+      a.type = it->var.baseType;
+      a.rows = it->var.rows;
+      a.columns = it->var.columns;
+      a.offset = it->varOffset;
+
+      a.variables.resize(it->varFirstComp + it->numComps);
 
       for(uint32_t i = 0; i < it->numComps; i++)
       {
-        a.registers[it->varFirstComp + i].type = range.type;
-        a.registers[it->varFirstComp + i].index = range.index;
-        a.registers[it->varFirstComp + i].component = uint16_t(it->regFirstComp + i);
+        a.variables[it->varFirstComp + i] = range;
+        a.variables[it->varFirstComp + i].component += (uint8_t)i;
       }
 
-      a.regCount = RDCMAX(it->var.columns, it->varFirstComp + it->numComps);
+      for(uint32_t e = 0; e < it->var.elements; e++)
+      {
+        if(it->var.elements > 1)
+        {
+          a.name = StringFormat::Fmt("%s[%u]", it->var.name.c_str(), e);
+          for(uint32_t i = 0; i < it->numComps; i++)
+          {
+            a.variables[it->varFirstComp + i].name =
+                StringFormat::Fmt("%s[%u]", range.name.c_str(), e);
+          }
+        }
+
+        locals.push_back(a);
+      }
     }
   }
+}
+
+IDebugInfo *ProcessSPDBChunk(void *chunk)
+{
+  uint32_t *raw = (uint32_t *)chunk;
+
+  if(raw[0] != FOURCC_SPDB)
+    return NULL;
+
+  uint32_t spdblength = raw[1];
+
+  return new SPDBChunk((byte *)&raw[2], spdblength);
+}
+
+IDebugInfo *ProcessPDB(byte *data, uint32_t length)
+{
+  return new SPDBChunk(data, length);
+}
+
+void UnwrapEmbeddedPDBData(bytebuf &bytes)
+{
+  if(!IsPDBFile(bytes.data(), bytes.size()))
+    return;
+
+  FileHeaderPage *header = (FileHeaderPage *)bytes.data();
+
+  uint32_t pageCount = header->PageCount;
+
+  if(pageCount * header->PageSize != bytes.size())
+  {
+    RDCWARN("Corrupt header/pdb. %u pages of %u size doesn't match %zu file size", pageCount,
+            header->PageSize, bytes.size());
+
+    // some DXC versions write the wrong page count, just count ourselves from the file size.
+    if((bytes.size() % header->PageSize) == 0)
+    {
+      header->PageCount = (uint32_t)bytes.size() / header->PageSize;
+      RDCWARN("Correcting page count to %u by dividing file size %zu by page size %u.",
+              header->PageCount, bytes.size(), header->PageSize);
+    }
+  }
+
+  const byte **pages = new const byte *[header->PageCount];
+  for(uint32_t i = 0; i < header->PageCount; i++)
+    pages[i] = &bytes[i * header->PageSize];
+
+  uint32_t rootdirCount = header->PagesForByteSize(header->RootDirSize);
+  uint32_t rootDirIndicesCount = header->PagesForByteSize(rootdirCount * sizeof(uint32_t));
+
+  PageMapping rootdirIndicesMapping(pages, header->PageSize, header->RootDirectory,
+                                    rootDirIndicesCount);
+  const byte *rootdirIndices = rootdirIndicesMapping.Data();
+
+  PageMapping directoryMapping(pages, header->PageSize, (uint32_t *)rootdirIndices, rootdirCount);
+  const uint32_t *dirContents = (const uint32_t *)directoryMapping.Data();
+
+  rdcarray<PDBStream> streams;
+
+  streams.resize(*dirContents);
+  dirContents++;
+
+  SPDBLOG("SPDB contains %zu streams", streams.size());
+
+  for(size_t i = 0; i < streams.size(); i++)
+  {
+    streams[i].byteLength = *dirContents;
+    SPDBLOG("Stream[%zu] is %u bytes", i, streams[i].byteLength);
+    dirContents++;
+  }
+
+  for(size_t i = 0; i < streams.size(); i++)
+  {
+    if(streams[i].byteLength == 0)
+      continue;
+
+    for(uint32_t p = 0; p < header->PagesForByteSize(streams[i].byteLength); p++)
+    {
+      streams[i].pageIndices.push_back(*dirContents);
+      dirContents++;
+    }
+  }
+
+  if(streams.size() > 5)
+  {
+    // stream 5 is expected to contain the embedded data if this is a turducken PDB
+    PageMapping embeddedData(pages, header->PageSize, &streams[5].pageIndices[0],
+                             (uint32_t)streams[5].pageIndices.size());
+
+    if(streams[5].pageIndices.size() > 0)
+    {
+      const byte *data = embeddedData.Data();
+
+      // if we have a DXBC file in this stream, then it's what we want
+      if(!memcmp(data, &FOURCC_DXBC, 4))
+        bytes.assign(data, streams[5].byteLength);
+    }
+  }
+
+  delete[] pages;
 }
 
 };    // namespace DXBC

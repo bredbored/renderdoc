@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  * Copyright (c) 2014 Crytek
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -25,13 +25,10 @@
 
 #pragma once
 
-#include <list>
 #include <map>
-#include <utility>
-#include "api/replay/renderdoc_replay.h"
 #include "driver/dx/official/d3d11_4.h"
-#include "driver/shaders/dxbc/dxbc_debug.h"
 #include "replay/replay_driver.h"
+#include "d3d11_common.h"
 
 class Camera;
 class Vec3f;
@@ -41,18 +38,18 @@ class WrappedID3D11DeviceContext;
 
 class D3D11ResourceManager;
 
-struct CopyPixelParams;
+struct D3D11CopyPixelParams;
 
-namespace ShaderDebug
+namespace DXBC
 {
-struct GlobalState;
-}
+class DXBCContainer;
+};
 
 struct TextureShaderDetails
 {
   TextureShaderDetails()
   {
-    texFmt = DXGI_FORMAT_UNKNOWN;
+    texFmt = srvFormat = DXGI_FORMAT_UNKNOWN;
     texWidth = 0;
     texHeight = 0;
     texDepth = 0;
@@ -70,7 +67,7 @@ struct TextureShaderDetails
     RDCEraseEl(srv);
   }
 
-  DXGI_FORMAT texFmt;
+  DXGI_FORMAT texFmt, srvFormat;
   UINT texWidth;
   UINT texHeight;
   UINT texDepth;
@@ -91,13 +88,51 @@ struct TextureShaderDetails
   ID3D11ShaderResourceView *srv[eTexType_Max];
 };
 
-struct D3D11DebugManager
+class D3D11DebugManager
 {
 public:
   D3D11DebugManager(WrappedID3D11Device *wrapper);
   ~D3D11DebugManager();
 
   void RenderForPredicate();
+
+  ResourceId AddCounterUAVBuffer(ID3D11UnorderedAccessView *uav);
+  ResourceId GetCounterBufferID(ID3D11UnorderedAccessView *uav)
+  {
+    auto it = m_UAVToCounterBuffer.find(uav);
+    if(it != m_UAVToCounterBuffer.end())
+      return it->second;
+    return ResourceId();
+  }
+  ID3D11UnorderedAccessView *GetCounterBufferUAV(ResourceId id)
+  {
+    auto it = m_CounterBufferToUAV.find(id);
+    if(it != m_CounterBufferToUAV.end())
+      return it->second;
+    return NULL;
+  }
+  void GetCounterBuffers(rdcarray<BufferDescription> &ret)
+  {
+    for(auto pair : m_CounterBufferToUAV)
+    {
+      BufferDescription buf;
+
+      // no original ID for this one
+      buf.resourceId = pair.first;
+      buf.length = 4;
+      buf.gpuAddress = 0;
+      buf.creationFlags = BufferCategory::ReadWrite;
+
+      ret.push_back(buf);
+    }
+  }
+
+  void FillWithDiscardPattern(DiscardType type, ID3D11Resource *res, UINT slice, UINT mip,
+                              const D3D11_RECT *pRect, UINT NumRects);
+  void FillWithDiscardPattern(DiscardType type, ID3D11Resource *res, UINT subresource,
+                              const D3D11_RECT *pRect, UINT NumRects);
+  void FillWithDiscardPattern(DiscardType type, ID3D11View *view, const D3D11_RECT *pRect,
+                              UINT NumRects);
 
   uint32_t GetStructCount(ID3D11UnorderedAccessView *uav);
   void GetBufferData(ID3D11Buffer *buff, uint64_t offset, uint64_t length, bytebuf &retData);
@@ -110,21 +145,14 @@ public:
 
   void FillCBuffer(ID3D11Buffer *buf, const void *data, size_t size);
 
-  TextureShaderDetails GetShaderDetails(ResourceId id, CompType typeHint, bool rawOutput);
+  TextureShaderDetails GetShaderDetails(ResourceId id, CompType typeCast, bool rawOutput);
 
-  void PixelHistoryCopyPixel(CopyPixelParams &params, uint32_t x, uint32_t y);
-
-  ShaderDebug::State CreateShaderDebugState(ShaderDebugTrace &trace, int quadIdx,
-                                            DXBC::DXBCFile *dxbc, const ShaderReflection &refl,
-                                            bytebuf *cbufData);
-  void CreateShaderGlobalState(ShaderDebug::GlobalState &global, DXBC::DXBCFile *dxbc,
-                               uint32_t UAVStartSlot, ID3D11UnorderedAccessView **UAVs,
-                               ID3D11ShaderResourceView **SRVs);
+  void PixelHistoryCopyPixel(D3D11CopyPixelParams &params, size_t eventSlot, uint32_t storeSlot);
 
   struct CacheElem
   {
     CacheElem(ResourceId id_, CompType typeHint_, bool raw_)
-        : created(false), id(id_), typeHint(typeHint_), raw(raw_), srvResource(NULL)
+        : created(false), id(id_), typeCast(typeHint_), raw(raw_), srvResource(NULL)
     {
       srv[0] = srv[1] = NULL;
     }
@@ -138,13 +166,13 @@ public:
 
     bool created;
     ResourceId id;
-    CompType typeHint;
+    CompType typeCast;
     bool raw;
     ID3D11Resource *srvResource;
     ID3D11ShaderResourceView *srv[2];
   };
 
-  CacheElem &GetCachedElem(ResourceId id, CompType typeHint, bool raw);
+  CacheElem &GetCachedElem(ResourceId id, CompType typeCast, bool raw);
 
 private:
   void InitCommonResources();
@@ -154,7 +182,10 @@ private:
   static const int NUM_CACHED_SRVS = 64;
   static const uint32_t STAGE_BUFFER_BYTE_SIZE = 4 * 1024 * 1024;
 
-  std::list<CacheElem> m_ShaderItemCache;
+  rdcarray<CacheElem> m_ShaderItemCache;
+
+  std::map<ResourceId, ID3D11UnorderedAccessView *> m_CounterBufferToUAV;
+  std::map<ID3D11UnorderedAccessView *, ResourceId> m_UAVToCounterBuffer;
 
   WrappedID3D11Device *m_pDevice = NULL;
   WrappedID3D11DeviceContext *m_pImmediateContext = NULL;
@@ -182,4 +213,27 @@ private:
 
   // RenderForPredicate
   ID3D11DepthStencilView *PredicateDSV = NULL;
+
+  struct DiscardPatternKey
+  {
+    uint32_t dim;
+    DXGI_FORMAT fmt;
+    DXGI_SAMPLE_DESC samp;
+
+    bool operator<(const DiscardPatternKey &o) const
+    {
+      if(dim != o.dim)
+        return dim < o.dim;
+      if(fmt != o.fmt)
+        return fmt < o.fmt;
+      return samp.Count < o.samp.Count;
+    }
+  };
+  std::map<DiscardPatternKey, ID3D11Resource *> m_DiscardPatterns;
+  bytebuf m_DiscardBytes;
+  ID3D11VertexShader *m_DiscardVS = NULL;
+  ID3D11PixelShader *m_DiscardFloatPS = NULL;
+  ID3D11PixelShader *m_DiscardIntPS = NULL;
+  ID3D11DepthStencilState *m_DiscardDepthState = NULL;
+  ID3D11RasterizerState *m_DiscardRasterState = NULL;
 };

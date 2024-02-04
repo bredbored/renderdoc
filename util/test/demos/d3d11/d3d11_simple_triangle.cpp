@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -24,7 +24,7 @@
 
 #include "d3d11_test.h"
 
-TEST(D3D11_Simple_Triangle, D3D11GraphicsTest)
+RD_TEST(D3D11_Simple_Triangle, D3D11GraphicsTest)
 {
   static constexpr const char *Description =
       "Just draws a simple triangle, using normal pipeline. Basic test that can be used "
@@ -44,11 +44,27 @@ TEST(D3D11_Simple_Triangle, D3D11GraphicsTest)
     ID3D11VertexShaderPtr vs = CreateVS(vsblob);
     ID3D11PixelShaderPtr ps = CreatePS(psblob);
 
-    ID3D11BufferPtr vb = MakeBuffer().Vertex().Data(DefaultTri);
+    ID3D11BufferPtr vb = MakeBuffer().Vertex().Mappable().Size(sizeof(DefaultTri));
+
+    D3D11_MAPPED_SUBRESOURCE mapped = Map(vb, 0, D3D11_MAP_WRITE_DISCARD);
+
+    memcpy(mapped.pData, DefaultTri, sizeof(DefaultTri));
+
+    ctx->Unmap(vb, 0);
+
+    // make a simple texture so that the structured data includes texture initial states
+    ID3D11Texture2DPtr fltTex = MakeTexture(DXGI_FORMAT_R32G32B32A32_FLOAT, 4, 4).RTV();
+    ID3D11RenderTargetViewPtr fltRT = MakeRTV(fltTex);
+
+    ID3D11Texture2DPtr fltMSTex =
+        MakeTexture(DXGI_FORMAT_R16G16B16A16_FLOAT, 4, 4).RTV().Multisampled(4);
+    ID3D11RenderTargetViewPtr fltMSRT = MakeRTV(fltMSTex);
 
     while(Running())
     {
-      ClearRenderTargetView(bbRTV, {0.4f, 0.5f, 0.6f, 1.0f});
+      ClearRenderTargetView(bbRTV, {0.2f, 0.2f, 0.2f, 1.0f});
+      ClearRenderTargetView(fltRT, {0.2f, 0.2f, 0.2f, 1.0f});
+      ClearRenderTargetView(fltMSRT, {0.2f, 0.2f, 0.2f, 1.0f});
 
       IASetVertexBuffer(vb, sizeof(DefaultA2V), 0);
       ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);

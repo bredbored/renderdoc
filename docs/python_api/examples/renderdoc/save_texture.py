@@ -24,7 +24,7 @@ def biggestDraw(prevBiggest, d):
 def sampleCode(controller):
 	# Find the biggest drawcall in the whole capture
 	draw = None
-	for d in controller.GetDrawcalls():
+	for d in controller.GetRootActions():
 		draw = biggestDraw(draw, d)
 
 	# Move to that draw
@@ -40,7 +40,7 @@ def sampleCode(controller):
 	
 	filename = str(int(texsave.resourceId))
 
-	print("Saving images of %s at %d: %s" % (filename, draw.eventId, draw.name))
+	print("Saving images of %s at %d: %s" % (filename, draw.eventId, draw.GetName(controller.GetStructuredFile())))
 
 	# Save different types of texture
 
@@ -78,31 +78,39 @@ def loadCapture(filename):
 	cap = rd.OpenCaptureFile()
 
 	# Open a particular file - see also OpenBuffer to load from memory
-	status = cap.OpenFile(filename, '', None)
+	result = cap.OpenFile(filename, '', None)
 
 	# Make sure the file opened successfully
-	if status != rd.ReplayStatus.Succeeded:
-		raise RuntimeError("Couldn't open file: " + str(status))
+	if result != rd.ResultCode.Succeeded:
+		raise RuntimeError("Couldn't open file: " + str(result))
 
 	# Make sure we can replay
 	if not cap.LocalReplaySupport():
 		raise RuntimeError("Capture cannot be replayed")
 
 	# Initialise the replay
-	status,controller = cap.OpenCapture(None)
+	result,controller = cap.OpenCapture(rd.ReplayOptions(), None)
 
-	if status != rd.ReplayStatus.Succeeded:
-		raise RuntimeError("Couldn't initialise replay: " + str(status))
+	if result != rd.ResultCode.Succeeded:
+		raise RuntimeError("Couldn't initialise replay: " + str(result))
 
 	return (cap, controller)
 
 if 'pyrenderdoc' in globals():
 	pyrenderdoc.Replay().BlockInvoke(sampleCode)
 else:
-	cap,controller = loadCapture('test.rdc')
+	rd.InitialiseReplay(rd.GlobalEnvironment(), [])
+
+	if len(sys.argv) <= 1:
+		print('Usage: python3 {} filename.rdc'.format(sys.argv[0]))
+		sys.exit(0)
+
+	cap,controller = loadCapture(sys.argv[1])
 
 	sampleCode(controller)
 
 	controller.Shutdown()
 	cap.Shutdown()
+
+	rd.ShutdownReplay()
 

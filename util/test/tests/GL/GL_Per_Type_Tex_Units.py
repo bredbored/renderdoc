@@ -8,14 +8,9 @@ class GL_Per_Type_Tex_Units(rdtest.TestCase):
     demos_test_name = 'GL_Per_Type_Tex_Units'
 
     def check_capture(self):
-        # Make an output so we can pick pixels
-        out: rd.ReplayOutput = self.controller.CreateOutput(rd.CreateHeadlessWindowingData(100, 100), rd.ReplayOutputType.Texture)
+        action = self.find_action("Draw")
 
-        self.check(out is not None)
-
-        draw = self.find_draw("Draw")
-
-        self.controller.SetFrameEvent(draw.eventId, False)
+        self.controller.SetFrameEvent(action.eventId, False)
 
         pipe: rd.PipeState = self.controller.GetPipelineState()
 
@@ -46,7 +41,7 @@ class GL_Per_Type_Tex_Units(rdtest.TestCase):
             raise rdtest.TestFailureException(
                 "First texture should be 8x8, not {}x{}".format(tex_details.width, tex_details.height))
 
-        data = self.controller.GetTextureData(id, 0, 0)
+        data = self.controller.GetTextureData(id, rd.Subresource(0, 0, 0))
         first_pixel = struct.unpack_from("BBBB", data, 0)
 
         if not rdtest.value_compare(first_pixel, (255, 0, 0, 255)):
@@ -76,7 +71,7 @@ class GL_Per_Type_Tex_Units(rdtest.TestCase):
                 "First texture should be 4x4x4, not {}x{}x{}".format(tex_details.width, tex_details.height,
                                                                      tex_details.depth))
 
-        data = self.controller.GetTextureData(id, 0, 0)
+        data = self.controller.GetTextureData(id, rd.Subresource(0, 0, 0))
         first_pixel = struct.unpack_from("BBBB", data, 0)
 
         if not rdtest.value_compare(first_pixel, (0, 255, 0, 255)):
@@ -84,19 +79,6 @@ class GL_Per_Type_Tex_Units(rdtest.TestCase):
 
         rdtest.log.success("Second texture is as expected")
 
-        tex = rd.TextureDisplay()
-        tex.resourceId = pipe.GetOutputTargets()[0].resourceId
-        out.SetTextureDisplay(tex)
-
-        tex_details = self.get_texture(tex.resourceId)
-
-        picked: rd.PixelValue = out.PickPixel(tex.resourceId, False,
-                                              int(tex_details.width / 2), int(tex_details.height / 2), 0, 0, 0)
-
-        if not rdtest.value_compare(picked.floatValue, [1.0, 1.0, 0.0, 0.2]):
-            raise rdtest.TestFailureException("Picked value {} doesn't match expectation".format(picked.floatValue))
+        self.check_pixel_value(pipe.GetOutputTargets()[0].resourceId, 0.5, 0.5, [1.0, 1.0, 0.0, 0.2])
 
         rdtest.log.success("Picked value is as expected")
-
-        out.Shutdown()
-

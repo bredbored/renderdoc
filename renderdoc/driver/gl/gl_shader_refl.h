@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2014-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -22,7 +22,6 @@
  * THE SOFTWARE.
  ******************************************************************************/
 
-#include "replay/replay_driver.h"
 #include "gl_dispatch_table.h"
 
 class WrappedOpenGL;
@@ -33,6 +32,7 @@ enum class FFVertexOutput : uint32_t
   PointSize,
   First = PointSize,
   ClipDistance,
+  CullDistance,
 
   // Compatibility implicit varyings, generally only comes back from glslang's reflection
   ClipVertex,
@@ -56,7 +56,6 @@ struct FixedFunctionVertexOutputs
 int ParseVersionStatement(const char *version);
 void MakeShaderReflection(GLenum shadType, GLuint sepProg, ShaderReflection &refl,
                           const FixedFunctionVertexOutputs &outputUsage);
-GLuint MakeSeparableShaderProgram(WrappedOpenGL &drv, GLenum type, std::vector<std::string> sources,
-                                  std::vector<std::string> *includepaths);
-void CheckVertexOutputUses(const std::vector<std::string> &sources,
-                           FixedFunctionVertexOutputs &outputUsage);
+GLuint MakeSeparableShaderProgram(WrappedOpenGL &drv, GLenum type, const rdcarray<rdcstr> &sources,
+                                  const rdcarray<rdcstr> &includepaths);
+void CheckVertexOutputUses(const rdcarray<rdcstr> &sources, FixedFunctionVertexOutputs &outputUsage);

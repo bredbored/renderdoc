@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  * Copyright (c) 2014 Crytek
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -26,21 +26,37 @@
 #include "d3d11_debug.h"
 #include "common/shader_cache.h"
 #include "data/resource.h"
-#include "driver/d3d11/d3d11_resources.h"
-#include "maths/camera.h"
 #include "maths/formatpacking.h"
 #include "maths/matrix.h"
 #include "d3d11_context.h"
 #include "d3d11_manager.h"
 #include "d3d11_renderstate.h"
+#include "d3d11_replay.h"
+#include "d3d11_resources.h"
 #include "d3d11_shader_cache.h"
 
 #include "data/hlsl/hlsl_cbuffers.h"
 
+static void InternalRef(ID3D11DeviceChild *child)
+{
+  if(child)
+  {
+    // we don't want any of our internal resources to show up as external references but we do
+    // certainly want to keep them alive.
+    // To solve this, we add an internal refcount and remove the implicit external refcount.
+    // Removing the external refcount means the device will also have no refcount so it will still
+    // be destroyed at the same time regardless of these objects. The internal ref will keep them
+    // alive even if the user doesn't have any pointers to them and they aren't bound anywhere.
+    // Effectively you can think of this as the same as if they were bound to some unknown undefined
+    // pipeline slot
+    IntAddRef(child);
+    child->Release();
+  }
+}
+
 D3D11DebugManager::D3D11DebugManager(WrappedID3D11Device *wrapper)
 {
-  if(RenderDoc::Inst().GetCrashHandler())
-    RenderDoc::Inst().GetCrashHandler()->RegisterMemoryRegion(this, sizeof(D3D11DebugManager));
+  RenderDoc::Inst().RegisterMemoryRegion(this, sizeof(D3D11DebugManager));
 
   m_pDevice = wrapper;
   m_pImmediateContext = wrapper->GetImmediateContext();
@@ -68,8 +84,7 @@ D3D11DebugManager::~D3D11DebugManager()
     m_ShaderItemCache.pop_back();
   }
 
-  if(RenderDoc::Inst().GetCrashHandler())
-    RenderDoc::Inst().GetCrashHandler()->UnregisterMemoryRegion(this);
+  RenderDoc::Inst().UnregisterMemoryRegion(this);
 }
 
 //////////////////////////////////////////////////////
@@ -105,6 +120,7 @@ void D3D11DebugManager::FillCBuffer(ID3D11Buffer *buf, const void *data, size_t 
 
   HRESULT hr = m_pImmediateContext->GetReal()->Map(UNWRAP(WrappedID3D11Buffer, buf), 0,
                                                    D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+  m_pDevice->CheckHRESULT(hr);
 
   if(FAILED(hr))
   {
@@ -135,38 +151,31 @@ void D3D11DebugManager::InitCommonResources()
   D3D11ShaderCache *shaderCache = m_pDevice->GetShaderCache();
   D3D11ResourceManager *rm = m_pDevice->GetResourceManager();
 
-  std::string multisamplehlsl = GetEmbeddedResource(multisample_hlsl);
-  std::string hlsl = GetEmbeddedResource(misc_hlsl);
+  rdcstr multisamplehlsl = GetEmbeddedResource(multisample_hlsl);
+  rdcstr hlsl = GetEmbeddedResource(misc_hlsl);
 
   if(m_pDevice->GetFeatureLevel() >= D3D_FEATURE_LEVEL_11_0)
   {
     CopyMSToArrayPS =
         shaderCache->MakePShader(multisamplehlsl.c_str(), "RENDERDOC_CopyMSToArray", "ps_5_0");
-    if(CopyMSToArrayPS)
-      m_pDevice->InternalRef();
+    InternalRef(CopyMSToArrayPS);
     CopyArrayToMSPS =
         shaderCache->MakePShader(multisamplehlsl.c_str(), "RENDERDOC_CopyArrayToMS", "ps_5_0");
-    if(CopyArrayToMSPS)
-      m_pDevice->InternalRef();
+    InternalRef(CopyArrayToMSPS);
     FloatCopyMSToArrayPS =
         shaderCache->MakePShader(multisamplehlsl.c_str(), "RENDERDOC_FloatCopyMSToArray", "ps_5_0");
-    if(FloatCopyMSToArrayPS)
-      m_pDevice->InternalRef();
+    InternalRef(FloatCopyMSToArrayPS);
     FloatCopyArrayToMSPS =
         shaderCache->MakePShader(multisamplehlsl.c_str(), "RENDERDOC_FloatCopyArrayToMS", "ps_5_0");
-    if(FloatCopyArrayToMSPS)
-      m_pDevice->InternalRef();
+    InternalRef(FloatCopyArrayToMSPS);
     DepthCopyMSToArrayPS =
         shaderCache->MakePShader(multisamplehlsl.c_str(), "RENDERDOC_DepthCopyMSToArray", "ps_5_0");
-    if(DepthCopyMSToArrayPS)
-      m_pDevice->InternalRef();
+    InternalRef(DepthCopyMSToArrayPS);
     DepthCopyArrayToMSPS =
         shaderCache->MakePShader(multisamplehlsl.c_str(), "RENDERDOC_DepthCopyArrayToMS", "ps_5_0");
-    if(DepthCopyArrayToMSPS)
-      m_pDevice->InternalRef();
+    InternalRef(DepthCopyArrayToMSPS);
     MSArrayCopyVS = shaderCache->MakeVShader(hlsl.c_str(), "RENDERDOC_FullscreenVS", "vs_4_0");
-    if(MSArrayCopyVS)
-      m_pDevice->InternalRef();
+    InternalRef(MSArrayCopyVS);
   }
   else
   {
@@ -191,7 +200,7 @@ void D3D11DebugManager::InitCommonResources()
   for(int i = 0; i < ARRAY_COUNT(PublicCBuffers); i++)
   {
     PublicCBuffers[i] = MakeCBuffer(PublicCBufferSize);
-    m_pDevice->InternalRef();
+    InternalRef(PublicCBuffers[i]);
     rm->SetInternalResource(PublicCBuffers[i]);
   }
 
@@ -205,7 +214,7 @@ void D3D11DebugManager::InitReplayResources()
   HRESULT hr = S_OK;
 
   {
-    std::string hlsl = GetEmbeddedResource(pixelhistory_hlsl);
+    rdcstr hlsl = GetEmbeddedResource(pixelhistory_hlsl);
 
     PixelHistoryUnusedCS =
         shaderCache->MakeCShader(hlsl.c_str(), "RENDERDOC_PixelHistoryUnused", "cs_5_0");
@@ -273,6 +282,55 @@ void D3D11DebugManager::InitReplayResources()
 
     SAFE_RELEASE(dummyTex);
   }
+
+  {
+    rdcstr hlsl = GetEmbeddedResource(misc_hlsl);
+
+    m_DiscardVS = shaderCache->MakeVShader(hlsl.c_str(), "RENDERDOC_FullscreenVS", "vs_4_0");
+    m_DiscardFloatPS = shaderCache->MakePShader(hlsl.c_str(), "RENDERDOC_DiscardFloatPS", "ps_4_0");
+    m_DiscardIntPS = shaderCache->MakePShader(hlsl.c_str(), "RENDERDOC_DiscardIntPS", "ps_4_0");
+
+    ResourceFormat fmt;
+    fmt.type = ResourceFormatType::Regular;
+    fmt.compType = CompType::Float;
+    fmt.compByteWidth = 4;
+    fmt.compCount = 1;
+    m_DiscardBytes = GetDiscardPattern(DiscardType::DiscardCall, fmt);
+    fmt.compType = CompType::SInt;
+    m_DiscardBytes.append(GetDiscardPattern(DiscardType::DiscardCall, fmt));
+
+    D3D11_DEPTH_STENCIL_DESC desc;
+
+    desc.BackFace.StencilFailOp = desc.BackFace.StencilPassOp = desc.BackFace.StencilDepthFailOp =
+        D3D11_STENCIL_OP_REPLACE;
+    desc.BackFace.StencilFunc = D3D11_COMPARISON_ALWAYS;
+    desc.FrontFace.StencilFailOp = desc.FrontFace.StencilPassOp =
+        desc.FrontFace.StencilDepthFailOp = D3D11_STENCIL_OP_REPLACE;
+    desc.FrontFace.StencilFunc = D3D11_COMPARISON_ALWAYS;
+    desc.DepthEnable = TRUE;
+    desc.DepthFunc = D3D11_COMPARISON_ALWAYS;
+    desc.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
+    desc.StencilReadMask = desc.StencilWriteMask = 0xff;
+    desc.StencilEnable = TRUE;
+
+    hr = m_pDevice->CreateDepthStencilState(&desc, &m_DiscardDepthState);
+
+    if(FAILED(hr))
+      RDCERR("Failed to create m_DiscardDepthState HRESULT: %s", ToStr(hr).c_str());
+
+    D3D11_RASTERIZER_DESC rastDesc;
+    RDCEraseEl(rastDesc);
+
+    rastDesc.CullMode = D3D11_CULL_NONE;
+    rastDesc.FillMode = D3D11_FILL_SOLID;
+    rastDesc.DepthClipEnable = FALSE;
+    rastDesc.ScissorEnable = TRUE;
+
+    hr = m_pDevice->CreateRasterizerState(&rastDesc, &m_DiscardRasterState);
+
+    if(FAILED(hr))
+      RDCERR("Failed to create m_DiscardRasterState HRESULT: %s", ToStr(hr).c_str());
+  }
 }
 
 void D3D11DebugManager::ShutdownResources()
@@ -281,31 +339,527 @@ void D3D11DebugManager::ShutdownResources()
 
   SAFE_RELEASE(PredicateDSV);
 
-  SAFE_RELEASE(CopyMSToArrayPS);
-  m_pDevice->InternalRelease();
-  SAFE_RELEASE(CopyArrayToMSPS);
-  m_pDevice->InternalRelease();
-  SAFE_RELEASE(FloatCopyMSToArrayPS);
-  m_pDevice->InternalRelease();
-  SAFE_RELEASE(FloatCopyArrayToMSPS);
-  m_pDevice->InternalRelease();
-  SAFE_RELEASE(DepthCopyMSToArrayPS);
-  m_pDevice->InternalRelease();
-  SAFE_RELEASE(DepthCopyArrayToMSPS);
-  m_pDevice->InternalRelease();
-  SAFE_RELEASE(PixelHistoryUnusedCS);
-  m_pDevice->InternalRelease();
-  SAFE_RELEASE(PixelHistoryCopyCS);
-  m_pDevice->InternalRelease();
+  // the objects we added with an internal ref, because they're used during capture, should also be
+  // released with an internal ref.
+  SAFE_INTRELEASE(CopyMSToArrayPS);
+  SAFE_INTRELEASE(CopyArrayToMSPS);
+  SAFE_INTRELEASE(FloatCopyMSToArrayPS);
+  SAFE_INTRELEASE(FloatCopyArrayToMSPS);
+  SAFE_INTRELEASE(DepthCopyMSToArrayPS);
+  SAFE_INTRELEASE(DepthCopyArrayToMSPS);
+  SAFE_INTRELEASE(MSArrayCopyVS);
 
-  SAFE_RELEASE(MSArrayCopyVS);
-  m_pDevice->InternalRelease();
+  SAFE_RELEASE(PixelHistoryUnusedCS);
+  SAFE_RELEASE(PixelHistoryCopyCS);
+
+  for(auto it = m_DiscardPatterns.begin(); it != m_DiscardPatterns.end(); it++)
+    if(it->second)
+      it->second->Release();
+
+  SAFE_RELEASE(m_DiscardVS);
+  SAFE_RELEASE(m_DiscardFloatPS);
+  SAFE_RELEASE(m_DiscardIntPS);
+  SAFE_RELEASE(m_DiscardDepthState);
+  SAFE_RELEASE(m_DiscardRasterState);
 
   for(int i = 0; i < ARRAY_COUNT(PublicCBuffers); i++)
   {
-    SAFE_RELEASE(PublicCBuffers[i]);
-    m_pDevice->InternalRelease();
+    SAFE_INTRELEASE(PublicCBuffers[i]);
   }
+}
+
+void D3D11DebugManager::FillWithDiscardPattern(DiscardType type, ID3D11Resource *res, UINT slice,
+                                               UINT mip, const D3D11_RECT *pRect, UINT NumRects)
+{
+  D3D11MarkerRegion region(StringFormat::Fmt("FillWithDiscardPattern %s slice %u mip %u",
+                                             ToStr(GetIDForDeviceChild(res)).c_str(), slice, mip));
+
+  D3D11_RECT all = {0, 0, 65536, 65536};
+  if(NumRects == 0)
+  {
+    NumRects = 1;
+    pRect = &all;
+  }
+
+  if(WrappedID3D11Buffer::IsAlloc(res))
+  {
+    D3D11MarkerRegion::Set("Buffer");
+
+    WrappedID3D11Buffer *buf = (WrappedID3D11Buffer *)res;
+
+    D3D11_BUFFER_DESC desc = {};
+    buf->GetDesc(&desc);
+
+    uint32_t value = 0xD15CAD3D;
+
+    for(UINT r = 0; r < NumRects; r++)
+    {
+      UINT size = RDCMIN(UINT(pRect[r].right - pRect[r].left), desc.ByteWidth);
+
+      if(desc.Usage == D3D11_USAGE_DYNAMIC || desc.Usage == D3D11_USAGE_STAGING)
+      {
+        // dynamic buffers can always be mapped
+        // staging buffers can be read-only, at which point we can't write to them
+        if(desc.CPUAccessFlags & D3D11_CPU_ACCESS_WRITE)
+        {
+          D3D11_MAPPED_SUBRESOURCE mapped = {};
+          D3D11_MAP mapping =
+              (desc.Usage == D3D11_USAGE_DYNAMIC) ? D3D11_MAP_WRITE_DISCARD : D3D11_MAP_WRITE;
+          HRESULT hr = m_pImmediateContext->Map(res, 0, mapping, 0, &mapped);
+          m_pDevice->CheckHRESULT(hr);
+
+          if(SUCCEEDED(hr))
+          {
+            byte *dst = (byte *)mapped.pData;
+            dst += pRect[r].left;
+            size_t copyStride = sizeof(uint32_t);
+            for(size_t i = 0; i < size; i += copyStride)
+            {
+              memcpy(dst, &value, RDCMIN(sizeof(uint32_t), size - i));
+              dst += copyStride;
+            }
+
+            m_pImmediateContext->Unmap(res, 0);
+          }
+          else
+          {
+            RDCERR("Couldn't fill discard pattern: %s", ToStr(hr).c_str());
+            return;
+          }
+        }
+      }
+      else if(desc.Usage == D3D11_USAGE_DEFAULT)
+      {
+        bytebuf pattern;
+        pattern.resize(AlignUp4(size));
+
+        for(size_t i = 0; i < pattern.size(); i += 4)
+          memcpy(&pattern[i], &value, sizeof(uint32_t));
+
+        // default buffers can be updated
+        D3D11_BOX box = {};
+        box.bottom = box.back = 1;
+        box.left = pRect[r].left;
+        box.right = box.left + size;
+        m_pImmediateContext->UpdateSubresource(res, 0, &box, pattern.data(), size, size);
+      }
+      // IMMUTABLE is the other option, which we can't do anything with
+    }
+  }
+  else
+  {
+    DiscardPatternKey key = {};
+    UINT numMips = 1;
+    UINT width = 1, height = 1, depth = 1;
+
+    // for textures we create a template texture with the same format and properties then do
+    // repeated copies
+    if(WrappedID3D11Texture1D::IsAlloc(res))
+    {
+      WrappedID3D11Texture1D *tex = (WrappedID3D11Texture1D *)res;
+
+      D3D11_TEXTURE1D_DESC desc = {};
+      tex->GetDesc(&desc);
+
+      key.dim = 1;
+      key.fmt = desc.Format;
+      numMips = desc.MipLevels;
+      width = desc.Width;
+    }
+    else if(WrappedID3D11Texture2D1::IsAlloc(res))
+    {
+      WrappedID3D11Texture2D1 *tex = (WrappedID3D11Texture2D1 *)res;
+
+      D3D11_TEXTURE2D_DESC desc = {};
+      tex->GetDesc(&desc);
+
+      key.dim = 2;
+      key.fmt = desc.Format;
+      key.samp = desc.SampleDesc;
+      numMips = desc.MipLevels;
+      width = desc.Width;
+      height = desc.Height;
+    }
+    else if(WrappedID3D11Texture3D1::IsAlloc(res))
+    {
+      WrappedID3D11Texture3D1 *tex = (WrappedID3D11Texture3D1 *)res;
+
+      D3D11_TEXTURE3D_DESC desc = {};
+      tex->GetDesc(&desc);
+
+      key.dim = 3;
+      key.fmt = desc.Format;
+      numMips = desc.MipLevels;
+      width = desc.Width;
+      height = desc.Height;
+      depth = desc.Depth;
+    }
+
+    UINT subresource = slice * numMips + mip;
+    if(key.dim == 3)
+      subresource = mip;
+
+    // depth-stencil resources can't be sub-copied, so we need to render to them
+    if(IsDepthFormat(key.fmt) || key.samp.Count > 1)
+    {
+      D3D11MarkerRegion::Set("Depth/MSAA texture");
+
+      D3D11_RENDER_TARGET_VIEW_DESC rtvDesc;
+      rtvDesc.Format = GetTypedFormat(key.fmt, CompType::Float);
+
+      D3D11_DEPTH_STENCIL_VIEW_DESC dsvDesc;
+      dsvDesc.Flags = 0;
+      dsvDesc.Format = GetDepthTypedFormat(key.fmt);
+
+      bool intFormat = !IsDepthFormat(key.fmt) && (IsIntFormat(key.fmt) || IsUIntFormat(key.fmt));
+
+      D3D11RenderStateTracker tracker(m_pImmediateContext);
+
+      m_pImmediateContext->ClearState();
+
+      m_pImmediateContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+      m_pImmediateContext->OMSetDepthStencilState(m_DiscardDepthState, 0);
+      m_pImmediateContext->VSSetShader(m_DiscardVS, NULL, 0);
+      m_pImmediateContext->PSSetShader(intFormat ? m_DiscardIntPS : m_DiscardFloatPS, NULL, 0);
+      m_pImmediateContext->RSSetState(m_DiscardRasterState);
+
+      if(key.samp.Count > 1)
+      {
+        dsvDesc.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2DMSARRAY;
+        dsvDesc.Texture2DMSArray.ArraySize = 1;
+        dsvDesc.Texture2DMSArray.FirstArraySlice = slice;
+
+        rtvDesc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2DMSARRAY;
+        rtvDesc.Texture2DMSArray.ArraySize = 1;
+        rtvDesc.Texture2DMSArray.FirstArraySlice = slice;
+      }
+      else if(key.dim == 1)
+      {
+        dsvDesc.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE1DARRAY;
+        dsvDesc.Texture1DArray.ArraySize = 1;
+        dsvDesc.Texture1DArray.FirstArraySlice = slice;
+        dsvDesc.Texture1DArray.MipSlice = mip;
+      }
+      else if(key.dim == 2)
+      {
+        dsvDesc.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2DARRAY;
+        dsvDesc.Texture2DArray.ArraySize = 1;
+        dsvDesc.Texture2DArray.FirstArraySlice = slice;
+        dsvDesc.Texture2DArray.MipSlice = mip;
+      }
+
+      ID3D11RenderTargetView *rtv = NULL;
+      ID3D11DepthStencilView *dsv = NULL;
+      if(IsDepthFormat(key.fmt))
+        m_pDevice->CreateDepthStencilView(res, &dsvDesc, &dsv);
+      else
+        m_pDevice->CreateRenderTargetView(res, &rtvDesc, &rtv);
+
+      m_pImmediateContext->OMSetRenderTargets(1, &rtv, dsv);
+
+      ID3D11Buffer *cbuf = MakeCBuffer(m_DiscardBytes.data(), m_DiscardBytes.size());
+      m_pImmediateContext->PSSetConstantBuffers(0, 1, &cbuf);
+
+      D3D11_VIEWPORT viewport = {0, 0, (float)width, (float)height, 0.0f, 1.0f};
+      m_pImmediateContext->RSSetViewports(1, &viewport);
+
+      for(UINT r = 0; r < NumRects; r++)
+      {
+        m_pImmediateContext->RSSetScissorRects(1, pRect + r);
+
+        if(dsv)
+        {
+          uint32_t pass = 1;
+          cbuf = MakeCBuffer(&pass, sizeof(pass));
+          m_pImmediateContext->PSSetConstantBuffers(1, 1, &cbuf);
+
+          m_pImmediateContext->Draw(3, 0);
+
+          m_pImmediateContext->OMSetDepthStencilState(m_DiscardDepthState, 0xff);
+          pass = 2;
+          cbuf = MakeCBuffer(&pass, sizeof(pass));
+          m_pImmediateContext->PSSetConstantBuffers(1, 1, &cbuf);
+
+          m_pImmediateContext->Draw(3, 0);
+        }
+        else
+        {
+          uint32_t pass = 0;
+          cbuf = MakeCBuffer(&pass, sizeof(pass));
+          m_pImmediateContext->PSSetConstantBuffers(1, 1, &cbuf);
+
+          m_pImmediateContext->Draw(3, 0);
+        }
+      }
+
+      SAFE_RELEASE(rtv);
+      SAFE_RELEASE(dsv);
+    }
+    else
+    {
+      ID3D11Resource *patternRes = m_DiscardPatterns[key];
+
+      if(patternRes == NULL)
+      {
+        bytebuf pattern = GetDiscardPattern(type, MakeResourceFormat(key.fmt));
+
+        if(key.dim == 1)
+        {
+          D3D11_TEXTURE1D_DESC desc;
+
+          desc.ArraySize = 1;
+          desc.Format = key.fmt;
+          desc.Width = DiscardPatternWidth;
+          desc.MipLevels = 1;
+          desc.Usage = D3D11_USAGE_IMMUTABLE;
+          desc.CPUAccessFlags = 0;
+          desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+          desc.MiscFlags = 0;
+
+          D3D11_SUBRESOURCE_DATA data = {};
+          data.pSysMem = pattern.data();
+          data.SysMemSlicePitch = data.SysMemPitch = GetRowPitch(desc.Width, desc.Format, 0);
+
+          ID3D11Texture1D *tex = NULL;
+
+          HRESULT hr = m_pDevice->CreateTexture1D(&desc, &data, &tex);
+          if(FAILED(hr))
+          {
+            RDCERR("Failed to create discard texture for %s HRESULT: %s", ToStr(key.fmt).c_str(),
+                   ToStr(hr).c_str());
+            return;
+          }
+
+          m_DiscardPatterns[key] = patternRes = tex;
+        }
+        else if(key.dim == 2)
+        {
+          D3D11_TEXTURE2D_DESC desc;
+
+          desc.ArraySize = 1;
+          desc.Format = key.fmt;
+          desc.Width = DiscardPatternWidth;
+          desc.Height = DiscardPatternHeight;
+          desc.MipLevels = 1;
+          desc.SampleDesc.Count = 1;
+          desc.SampleDesc.Quality = 0;
+          desc.Usage = D3D11_USAGE_IMMUTABLE;
+          desc.CPUAccessFlags = 0;
+          desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+          desc.MiscFlags = 0;
+
+          D3D11_SUBRESOURCE_DATA data = {};
+          data.pSysMem = pattern.data();
+          data.SysMemPitch = GetRowPitch(desc.Width, desc.Format, 0);
+          data.SysMemSlicePitch = data.SysMemPitch * desc.Height;
+
+          ID3D11Texture2D *tex = NULL;
+
+          HRESULT hr = m_pDevice->CreateTexture2D(&desc, &data, &tex);
+          if(FAILED(hr))
+          {
+            RDCERR("Failed to create discard texture for %s HRESULT: %s", ToStr(key.fmt).c_str(),
+                   ToStr(hr).c_str());
+            return;
+          }
+
+          m_DiscardPatterns[key] = patternRes = tex;
+        }
+        else
+        {
+          D3D11_TEXTURE3D_DESC desc;
+
+          desc.Format = key.fmt;
+          desc.Width = DiscardPatternWidth;
+          desc.Height = DiscardPatternHeight;
+          desc.Depth = 1;
+          desc.MipLevels = 1;
+          desc.Usage = D3D11_USAGE_IMMUTABLE;
+          desc.CPUAccessFlags = 0;
+          desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+          desc.MiscFlags = 0;
+
+          D3D11_SUBRESOURCE_DATA data = {};
+          data.pSysMem = pattern.data();
+          data.SysMemPitch = GetRowPitch(desc.Width, desc.Format, 0);
+          data.SysMemSlicePitch = data.SysMemPitch * desc.Height;
+
+          ID3D11Texture3D *tex = NULL;
+
+          HRESULT hr = m_pDevice->CreateTexture3D(&desc, &data, &tex);
+          if(FAILED(hr))
+          {
+            RDCERR("Failed to create discard texture for %s HRESULT: %s", ToStr(key.fmt).c_str(),
+                   ToStr(hr).c_str());
+            return;
+          }
+
+          m_DiscardPatterns[key] = patternRes = tex;
+        }
+      }
+
+      if(!patternRes)
+        return;
+
+      UINT z = 0;
+      if(key.dim == 3)
+        z = slice;
+
+      for(UINT r = 0; r < NumRects; r++)
+      {
+        D3D11_RECT rect = pRect[r];
+
+        UINT rectWidth = RDCMIN((UINT)rect.right, RDCMAX(1U, width >> mip));
+        UINT rectHeight = RDCMIN((UINT)rect.bottom, RDCMAX(1U, height >> mip));
+
+        for(UINT y = rect.top; y < rectHeight; y += DiscardPatternHeight)
+        {
+          for(UINT x = rect.left; x < rectWidth; x += DiscardPatternWidth)
+          {
+            D3D11_BOX box = {
+                0,
+                0,
+                0,
+                RDCMIN(DiscardPatternWidth, uint32_t(rectWidth - x)),
+                RDCMIN(DiscardPatternHeight, uint32_t(rectHeight - y)),
+                1,
+            };
+            m_pImmediateContext->CopySubresourceRegion(res, subresource, x, y, z, patternRes, 0,
+                                                       &box);
+          }
+        }
+      }
+    }
+  }
+}
+
+void D3D11DebugManager::FillWithDiscardPattern(DiscardType type, ID3D11Resource *res,
+                                               UINT subresource, const D3D11_RECT *pRect,
+                                               UINT NumRects)
+{
+  if(WrappedID3D11Texture1D::IsAlloc(res))
+  {
+    WrappedID3D11Texture1D *tex = (WrappedID3D11Texture1D *)res;
+
+    D3D11_TEXTURE1D_DESC desc = {};
+    tex->GetDesc(&desc);
+
+    // subresource uniquely identifies a slice and mip
+    FillWithDiscardPattern(type, res, subresource / desc.MipLevels, subresource % desc.MipLevels,
+                           pRect, NumRects);
+  }
+  else if(WrappedID3D11Texture2D1::IsAlloc(res))
+  {
+    WrappedID3D11Texture2D1 *tex = (WrappedID3D11Texture2D1 *)res;
+
+    D3D11_TEXTURE2D_DESC desc = {};
+    tex->GetDesc(&desc);
+
+    // subresource uniquely identifies a slice and mip
+    FillWithDiscardPattern(type, res, subresource / desc.MipLevels, subresource % desc.MipLevels,
+                           pRect, NumRects);
+  }
+  else if(WrappedID3D11Texture3D1::IsAlloc(res))
+  {
+    WrappedID3D11Texture3D1 *tex = (WrappedID3D11Texture3D1 *)res;
+
+    D3D11_TEXTURE3D_DESC desc = {};
+    tex->GetDesc(&desc);
+
+    // fill all slices in this mip
+    for(UINT z = 0; z < RDCMAX(1U, desc.Depth >> subresource); z++)
+      FillWithDiscardPattern(type, res, z, subresource, pRect, NumRects);
+  }
+  else if(WrappedID3D11Buffer::IsAlloc(res))
+  {
+    // buffer
+    FillWithDiscardPattern(type, res, 0, 0, pRect, NumRects);
+  }
+  else
+  {
+    RDCERR("Unknown resource type being discarded");
+    return;
+  }
+}
+
+void D3D11DebugManager::FillWithDiscardPattern(DiscardType type, ID3D11View *view,
+                                               const D3D11_RECT *pRect, UINT NumRects)
+{
+  D3D11MarkerRegion region(StringFormat::Fmt("FillWithDiscardPattern view %s",
+                                             ToStr(GetIDForDeviceChild(view)).c_str()));
+
+  ResourceRange range = ResourceRange::Null;
+
+  if(WrappedID3D11ShaderResourceView1::IsAlloc(view))
+  {
+    range = ResourceRange((WrappedID3D11ShaderResourceView1 *)view);
+  }
+  else if(WrappedID3D11UnorderedAccessView1::IsAlloc(view))
+  {
+    range = ResourceRange((WrappedID3D11UnorderedAccessView1 *)view);
+  }
+  else if(WrappedID3D11RenderTargetView1::IsAlloc(view))
+  {
+    range = ResourceRange((WrappedID3D11RenderTargetView1 *)view);
+  }
+  else if(WrappedID3D11DepthStencilView::IsAlloc(view))
+  {
+    range = ResourceRange((WrappedID3D11DepthStencilView *)view);
+  }
+  else
+  {
+    RDCERR("Unknown view type being discarded");
+    return;
+  }
+
+  ID3D11Resource *res = range.GetResource();
+  UINT numMips = 1;
+  bool tex3D = false;
+
+  // check for wrapped types first as they will be most common and don't
+  // require a virtual call
+  if(WrappedID3D11Texture1D::IsAlloc(res))
+  {
+    D3D11_TEXTURE1D_DESC desc = {};
+    ((WrappedID3D11Texture1D *)res)->GetDesc(&desc);
+    numMips = desc.MipLevels;
+  }
+  else if(WrappedID3D11Texture2D1::IsAlloc(res))
+  {
+    D3D11_TEXTURE2D_DESC desc = {};
+    ((WrappedID3D11Texture2D1 *)res)->GetDesc(&desc);
+    numMips = desc.MipLevels;
+  }
+  else if(WrappedID3D11Texture3D1::IsAlloc(res))
+  {
+    D3D11_TEXTURE3D_DESC desc = {};
+    ((WrappedID3D11Texture3D1 *)res)->GetDesc(&desc);
+    numMips = desc.MipLevels;
+    tex3D = true;
+  }
+  else if(WrappedID3D11Buffer::IsAlloc(res))
+  {
+    // nothing to do, just pass
+  }
+  else
+  {
+    RDCERR("View of unknown resource type being discarded");
+    return;
+  }
+
+  rdcarray<D3D11_RECT> rects;
+  rects.assign(pRect, NumRects);
+
+  // DiscardView1 on D3D11 only allows rects to be specified with DSVs and RTVs which should only
+  // target one mip.
+  if(NumRects > 0)
+    RDCASSERTMSG("Rects shouldn't be specified when we have multiple mips",
+                 range.GetMinMip() == range.GetMaxMip(), range.GetMinMip(), range.GetMaxMip(),
+                 NumRects);
+
+  for(UINT slice = range.GetMinSlice(); slice <= range.GetMaxSlice(); slice++)
+    for(UINT mip = range.GetMinMip(); mip <= range.GetMaxMip(); mip++)
+      FillWithDiscardPattern(type, res, slice, mip, pRect, NumRects);
 }
 
 uint32_t D3D11DebugManager::GetStructCount(ID3D11UnorderedAccessView *uav)
@@ -314,6 +868,7 @@ uint32_t D3D11DebugManager::GetStructCount(ID3D11UnorderedAccessView *uav)
 
   D3D11_MAPPED_SUBRESOURCE mapped;
   HRESULT hr = m_pImmediateContext->Map(StageBuffer, 0, D3D11_MAP_READ, 0, &mapped);
+  m_pDevice->CheckHRESULT(hr);
 
   if(FAILED(hr))
   {
@@ -337,7 +892,7 @@ void D3D11DebugManager::GetBufferData(ID3D11Buffer *buffer, uint64_t offset, uin
     return;
 
   RDCASSERT(offset < 0xffffffff);
-  RDCASSERT(length <= 0xffffffff);
+  RDCASSERT(length <= 0xffffffff || length == ~0ULL);
 
   uint32_t offs = (uint32_t)offset;
   uint32_t len = (uint32_t)length;
@@ -351,7 +906,7 @@ void D3D11DebugManager::GetBufferData(ID3D11Buffer *buffer, uint64_t offset, uin
     return;
   }
 
-  if(len == 0)
+  if(len == 0 || len > desc.ByteWidth)
   {
     len = desc.ByteWidth - offs;
   }
@@ -392,6 +947,7 @@ void D3D11DebugManager::GetBufferData(ID3D11Buffer *buffer, uint64_t offset, uin
 
     HRESULT hr = m_pImmediateContext->GetReal()->Map(UNWRAP(WrappedID3D11Buffer, StageBuffer), 0,
                                                      D3D11_MAP_READ, 0, &mapped);
+    m_pDevice->CheckHRESULT(hr);
 
     if(FAILED(hr))
     {
@@ -422,6 +978,14 @@ void D3D11DebugManager::RenderForPredicate()
   m_pImmediateContext->Draw(3, 0);
 }
 
+ResourceId D3D11DebugManager::AddCounterUAVBuffer(ID3D11UnorderedAccessView *uav)
+{
+  ResourceId ret = ResourceIDGen::GetNewUniqueID();
+  m_CounterBufferToUAV[ret] = uav;
+  m_UAVToCounterBuffer[uav] = ret;
+  return ret;
+}
+
 void D3D11Replay::GeneralMisc::Init(WrappedID3D11Device *device)
 {
   D3D11ShaderCache *shaderCache = device->GetShaderCache();
@@ -448,7 +1012,7 @@ void D3D11Replay::GeneralMisc::Init(WrappedID3D11Device *device)
     RDCERR("Failed to create scissoring rasterizer state HRESULT: %s", ToStr(hr).c_str());
 
   {
-    std::string hlsl = GetEmbeddedResource(misc_hlsl);
+    rdcstr hlsl = GetEmbeddedResource(misc_hlsl);
 
     FullscreenVS = shaderCache->MakeVShader(hlsl.c_str(), "RENDERDOC_FullscreenVS", "vs_4_0");
 
@@ -474,10 +1038,18 @@ void D3D11Replay::TextureRendering::Init(WrappedID3D11Device *device)
   HRESULT hr = S_OK;
 
   {
-    std::string hlsl = GetEmbeddedResource(texdisplay_hlsl);
+    rdcstr hlsl = GetEmbeddedResource(texdisplay_hlsl);
 
     TexDisplayVS = shaderCache->MakeVShader(hlsl.c_str(), "RENDERDOC_TexDisplayVS", "vs_4_0");
     TexDisplayPS = shaderCache->MakePShader(hlsl.c_str(), "RENDERDOC_TexDisplayPS", "ps_5_0");
+  }
+
+  {
+    rdcstr hlsl = GetEmbeddedResource(texremap_hlsl);
+
+    TexRemapPS[0] = shaderCache->MakePShader(hlsl.c_str(), "RENDERDOC_TexRemapFloat", "ps_5_0");
+    TexRemapPS[1] = shaderCache->MakePShader(hlsl.c_str(), "RENDERDOC_TexRemapUInt", "ps_5_0");
+    TexRemapPS[2] = shaderCache->MakePShader(hlsl.c_str(), "RENDERDOC_TexRemapSInt", "ps_5_0");
   }
 
   {
@@ -539,6 +1111,8 @@ void D3D11Replay::TextureRendering::Release()
   SAFE_RELEASE(BlendState);
   SAFE_RELEASE(TexDisplayVS);
   SAFE_RELEASE(TexDisplayPS);
+  for(int i = 0; i < 3; i++)
+    SAFE_RELEASE(TexRemapPS[i]);
 }
 
 void D3D11Replay::OverlayRendering::Init(WrappedID3D11Device *device)
@@ -546,7 +1120,7 @@ void D3D11Replay::OverlayRendering::Init(WrappedID3D11Device *device)
   D3D11ShaderCache *shaderCache = device->GetShaderCache();
 
   {
-    std::string hlsl = GetEmbeddedResource(misc_hlsl);
+    rdcstr hlsl = GetEmbeddedResource(misc_hlsl);
 
     FullscreenVS = shaderCache->MakeVShader(hlsl.c_str(), "RENDERDOC_FullscreenVS", "vs_4_0");
 
@@ -557,12 +1131,50 @@ void D3D11Replay::OverlayRendering::Init(WrappedID3D11Device *device)
   }
 
   {
-    std::string meshhlsl = GetEmbeddedResource(mesh_hlsl);
+    rdcstr meshhlsl = GetEmbeddedResource(mesh_hlsl);
 
     TriangleSizeGS =
         shaderCache->MakeGShader(meshhlsl.c_str(), "RENDERDOC_TriangleSizeGS", "gs_4_0");
     TriangleSizePS =
         shaderCache->MakePShader(meshhlsl.c_str(), "RENDERDOC_TriangleSizePS", "ps_4_0");
+  }
+  {
+    rdcstr hlsl = GetEmbeddedResource(depth_copy_hlsl);
+
+    DepthCopyPS = shaderCache->MakePShader(hlsl.c_str(), "RENDERDOC_DepthCopyPS", "ps_5_0");
+    DepthCopyArrayPS =
+        shaderCache->MakePShader(hlsl.c_str(), "RENDERDOC_DepthCopyArrayPS", "ps_5_0");
+    DepthCopyMSPS = shaderCache->MakePShader(hlsl.c_str(), "RENDERDOC_DepthCopyMSPS", "ps_5_0");
+    DepthCopyMSArrayPS =
+        shaderCache->MakePShader(hlsl.c_str(), "RENDERDOC_DepthCopyMSArrayPS", "ps_5_0");
+  }
+  {
+    D3D11_BLEND_DESC blendDesc = {};
+    blendDesc.RenderTarget[0].RenderTargetWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
+    HRESULT hr = device->CreateBlendState(&blendDesc, &DepthBlendRTMaskZero);
+    if(FAILED(hr))
+    {
+      RDCERR("Failed to create depth overlay blend state HRESULT: %s", ToStr(hr).c_str());
+    }
+  }
+  {
+    D3D11_DEPTH_STENCIL_DESC dsDesc = {};
+    dsDesc.DepthEnable = FALSE;
+    dsDesc.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
+    dsDesc.DepthFunc = D3D11_COMPARISON_ALWAYS;
+    dsDesc.StencilEnable = TRUE;
+    dsDesc.StencilReadMask = 0xff;
+    dsDesc.StencilWriteMask = 0x0;
+    dsDesc.FrontFace.StencilDepthFailOp = D3D11_STENCIL_OP_KEEP;
+    dsDesc.FrontFace.StencilFailOp = D3D11_STENCIL_OP_KEEP;
+    dsDesc.FrontFace.StencilPassOp = D3D11_STENCIL_OP_KEEP;
+    dsDesc.FrontFace.StencilFunc = D3D11_COMPARISON_EQUAL;
+    dsDesc.BackFace = dsDesc.FrontFace;
+    HRESULT hr = device->CreateDepthStencilState(&dsDesc, &DepthResolveDS);
+    if(FAILED(hr))
+    {
+      RDCERR("Failed to create depth resolve depth stencil state HRESULT: %s", ToStr(hr).c_str());
+    }
   }
 }
 
@@ -573,6 +1185,13 @@ void D3D11Replay::OverlayRendering::Release()
   SAFE_RELEASE(QOResolvePS);
   SAFE_RELEASE(TriangleSizeGS);
   SAFE_RELEASE(TriangleSizePS);
+  SAFE_RELEASE(DepthCopyPS);
+  SAFE_RELEASE(DepthCopyArrayPS);
+  SAFE_RELEASE(DepthCopyMSPS);
+  SAFE_RELEASE(DepthCopyMSArrayPS);
+
+  SAFE_RELEASE(DepthResolveDS);
+  SAFE_RELEASE(DepthBlendRTMaskZero);
 
   SAFE_RELEASE(Texture);
 }
@@ -661,12 +1280,13 @@ void D3D11Replay::MeshRendering::Init(WrappedID3D11Device *device)
   {
     // these elements are just for signature matching sake, so we don't need correct offsets/slots
     D3D11_INPUT_ELEMENT_DESC inputDescSecondary[2] = {
-        {"pos", 0, DXGI_FORMAT_R32G32B32A32_FLOAT}, {"sec", 0, DXGI_FORMAT_R8G8B8A8_UNORM},
+        {"pos", 0, DXGI_FORMAT_R32G32B32A32_FLOAT},
+        {"sec", 0, DXGI_FORMAT_R8G8B8A8_UNORM},
     };
 
-    std::string meshhlsl = GetEmbeddedResource(mesh_hlsl);
+    rdcstr meshhlsl = GetEmbeddedResource(mesh_hlsl);
 
-    std::vector<byte> bytecode;
+    rdcarray<byte> bytecode;
 
     MeshVS = shaderCache->MakeVShader(meshhlsl.c_str(), "RENDERDOC_MeshVS", "vs_4_0", 2,
                                       inputDescSecondary, &GenericLayout, &bytecode);
@@ -781,7 +1401,7 @@ void D3D11Replay::VertexPicking::Init(WrappedID3D11Device *device)
 
   HRESULT hr = S_OK;
 
-  std::string meshhlsl = GetEmbeddedResource(mesh_hlsl);
+  rdcstr meshhlsl = GetEmbeddedResource(mesh_hlsl);
 
   MeshPickCS = shaderCache->MakeCShader(meshhlsl.c_str(), "RENDERDOC_MeshPickCS", "cs_5_0");
 
@@ -893,6 +1513,139 @@ void D3D11Replay::PixelPicking::Release()
   SAFE_RELEASE(Texture);
   SAFE_RELEASE(RTV);
   SAFE_RELEASE(StageTexture);
+}
+
+void ShaderDebugging::Init(WrappedID3D11Device *device)
+{
+  D3D11ShaderCache *shaderCache = device->GetShaderCache();
+
+  HRESULT hr = S_OK;
+
+  rdcstr hlsl = GetEmbeddedResource(shaderdebug_hlsl);
+
+  MathCS = shaderCache->MakeCShader(hlsl.c_str(), "RENDERDOC_DebugMathOp", "cs_5_0");
+  SampleVS = shaderCache->MakeVShader(hlsl.c_str(), "RENDERDOC_DebugSampleVS", "vs_5_0");
+  SamplePS = shaderCache->MakePShader(hlsl.c_str(), "RENDERDOC_DebugSamplePS", "ps_5_0");
+
+  D3D11_BUFFER_DESC bDesc;
+
+  bDesc.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+  bDesc.ByteWidth = 6 * sizeof(Vec4f);
+  bDesc.CPUAccessFlags = 0;
+  bDesc.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+  bDesc.StructureByteStride = 6 * sizeof(Vec4f);
+  bDesc.Usage = D3D11_USAGE_DEFAULT;
+
+  hr = device->CreateBuffer(&bDesc, NULL, &OutBuf);
+
+  if(FAILED(hr))
+    RDCERR("Failed to create shader debugging output buffer HRESULT: %s", ToStr(hr).c_str());
+
+  bDesc.BindFlags = 0;
+  bDesc.MiscFlags = 0;
+  bDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+  bDesc.Usage = D3D11_USAGE_STAGING;
+
+  hr = device->CreateBuffer(&bDesc, NULL, &OutStageBuf);
+
+  if(FAILED(hr))
+    RDCERR("Failed to create shader debugging staging buffer HRESULT: %s", ToStr(hr).c_str());
+
+  bDesc.ByteWidth = 16 * sizeof(Vec4f);
+  bDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+  bDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+  bDesc.Usage = D3D11_USAGE_DYNAMIC;
+
+  hr = device->CreateBuffer(&bDesc, NULL, &ParamBuf);
+
+  if(FAILED(hr))
+    RDCERR("Failed to create shader debugging parameter buffer HRESULT: %s", ToStr(hr).c_str());
+
+  D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
+
+  uavDesc.Format = DXGI_FORMAT_UNKNOWN;
+  uavDesc.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+  uavDesc.Buffer.FirstElement = 0;
+  uavDesc.Buffer.NumElements = 1;
+  uavDesc.Buffer.Flags = 0;
+
+  if(OutBuf)
+    hr = device->CreateUnorderedAccessView(OutBuf, &uavDesc, &OutUAV);
+
+  if(FAILED(hr))
+    RDCERR("Failed to create shader debugging UAV HRESULT: %s", ToStr(hr).c_str());
+
+  D3D11_TEXTURE2D_DESC tdesc = {};
+
+  tdesc.ArraySize = 1;
+  tdesc.BindFlags = D3D11_BIND_RENDER_TARGET;
+  tdesc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+  tdesc.Width = 1;
+  tdesc.Height = 1;
+  tdesc.SampleDesc.Count = 1;
+
+  hr = device->CreateTexture2D(&tdesc, NULL, &DummyTex);
+
+  if(FAILED(hr))
+    RDCERR("Failed to create shader debugging dummy texture HRESULT: %s", ToStr(hr).c_str());
+
+  D3D11_RENDER_TARGET_VIEW_DESC rtDesc;
+
+  rtDesc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+  rtDesc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+  rtDesc.Texture2D.MipSlice = 0;
+
+  if(DummyTex)
+    hr = device->CreateRenderTargetView(DummyTex, &rtDesc, &DummyRTV);
+
+  if(FAILED(hr))
+    RDCERR("Failed to create shader debugging dummy RTV HRESULT: %s", ToStr(hr).c_str());
+
+  m_pDevice = device;
+}
+
+void ShaderDebugging::Release()
+{
+  SAFE_RELEASE(MathCS);
+  SAFE_RELEASE(SampleVS);
+  SAFE_RELEASE(SamplePS);
+  SAFE_RELEASE(ParamBuf);
+  SAFE_RELEASE(OutBuf);
+  SAFE_RELEASE(OutStageBuf);
+  SAFE_RELEASE(OutUAV);
+
+  SAFE_RELEASE(DummyTex);
+  SAFE_RELEASE(DummyRTV);
+
+  for(auto it = m_OffsetSamplePS.begin(); it != m_OffsetSamplePS.end(); ++it)
+    it->second->Release();
+}
+
+ID3D11PixelShader *ShaderDebugging::GetSamplePS(const int8_t offsets[3])
+{
+  uint32_t offsKey = offsets[0] | (offsets[1] << 8) | (offsets[2] << 16);
+  if(offsKey == 0)
+    return SamplePS;
+
+  ID3D11PixelShader *ps = m_OffsetSamplePS[offsKey];
+  if(ps)
+    return ps;
+
+  D3D11ShaderCache *shaderCache = m_pDevice->GetShaderCache();
+
+  shaderCache->SetCaching(true);
+
+  rdcstr hlsl = GetEmbeddedResource(shaderdebug_hlsl);
+
+  hlsl = StringFormat::Fmt("#define debugSampleOffsets int4(%d,%d,%d,0)\n\n%s", offsets[0],
+                           offsets[1], offsets[2], hlsl.c_str());
+
+  ps = m_OffsetSamplePS[offsKey] =
+      shaderCache->MakePShader(hlsl.c_str(), "RENDERDOC_DebugSamplePS", "ps_5_0");
+
+  shaderCache->SetCaching(false);
+
+  return ps;
 }
 
 void D3D11Replay::HistogramMinMax::Init(WrappedID3D11Device *device)
@@ -1013,7 +1766,7 @@ void D3D11Replay::HistogramMinMax::Init(WrappedID3D11Device *device)
   if(FAILED(hr))
     RDCERR("Failed to create result UAV 2 HRESULT: %s", ToStr(hr).c_str());
 
-  std::string histogramhlsl = GetEmbeddedResource(histogram_hlsl);
+  rdcstr histogramhlsl = GetEmbeddedResource(histogram_hlsl);
 
   for(int t = eTexType_1D; t < eTexType_Max; t++)
   {
@@ -1023,9 +1776,8 @@ void D3D11Replay::HistogramMinMax::Init(WrappedID3D11Device *device)
     // float, uint, sint
     for(int i = 0; i < 3; i++)
     {
-      std::string hlsl = std::string("#define SHADER_RESTYPE ") + ToStr(t) + "\n";
-      hlsl += std::string("#define UINT_TEX ") + (i == 1 ? "1" : "0") + "\n";
-      hlsl += std::string("#define SINT_TEX ") + (i == 2 ? "1" : "0") + "\n";
+      rdcstr hlsl = rdcstr("#define SHADER_RESTYPE ") + ToStr(t) + "\n";
+      hlsl += rdcstr("#define SHADER_BASETYPE ") + ToStr(i) + "\n";
       hlsl += histogramhlsl;
 
       TileMinMaxCS[t][i] =
@@ -1156,7 +1908,7 @@ void D3D11Replay::PixelHistory::Init(WrappedID3D11Device *device)
   }
 
   {
-    std::string hlsl = GetEmbeddedResource(pixelhistory_hlsl);
+    rdcstr hlsl = GetEmbeddedResource(pixelhistory_hlsl);
 
     PrimitiveIDPS = shaderCache->MakePShader(hlsl.c_str(), "RENDERDOC_PrimitiveIDPS", "ps_5_0");
   }

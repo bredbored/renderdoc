@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  * Copyright (c) 2014 Crytek
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -33,8 +33,7 @@
 #include <shlobj.h>
 #include <tchar.h>
 #include <algorithm>
-#include <string>
-#include <vector>
+#include "common/formatting.h"
 #include "core/core.h"
 #include "dbghelp/dbghelp.h"
 #include "os/os_specific.h"
@@ -42,10 +41,12 @@
 
 #include "dia2_stubs.h"
 
+#include <string>
+
 struct AddrInfo
 {
-  std::string funcName;
-  std::string fileName;
+  rdcstr funcName;
+  rdcstr fileName;
   unsigned long lineNum = 0;
 };
 
@@ -73,50 +74,58 @@ namespace DIA2
 {
 struct Module
 {
-  Module(IDiaDataSource *src, IDiaSession *sess) : pSource(src), pSession(sess) {}
+  Module(IDiaDataSource *src = NULL, IDiaSession *sess = NULL) : pSource(src), pSession(sess) {}
   IDiaDataSource *pSource;
   IDiaSession *pSession;
 };
 
-std::vector<Module> modules;
+rdcarray<Module> modules;
 
-std::wstring GetSymSearchPath()
+rdcwstr GetSymSearchPath()
 {
-  PWSTR appDataPath;
-  SHGetKnownFolderPath(FOLDERID_RoamingAppData, KF_FLAG_SIMPLE_IDLIST | KF_FLAG_DONT_UNEXPAND, NULL,
-                       &appDataPath);
-  std::wstring appdata = appDataPath;
-  CoTaskMemFree(appDataPath);
+  std::wstring sympath;
 
-  std::wstring sympath = L".;";
-  sympath += appdata;
-  sympath += L"\\renderdoc\\symbols;SRV*";
-  sympath += appdata;
-  sympath += L"\\renderdoc\\symbols\\symsrv*http://msdl.microsoft.com/download/symbols";
+  DWORD len = GetEnvironmentVariableW(L"_NT_SYMBOL_PATH", NULL, 0);
 
-  return sympath;
+  if(len == 0 && GetLastError() == ERROR_ENVVAR_NOT_FOUND)
+  {
+    // set up a default sympath to look up MS's symbol servers and cache them locally in RenderDoc's
+    // appdata folder.
+    PWSTR appDataPath;
+    SHGetKnownFolderPath(FOLDERID_RoamingAppData, KF_FLAG_SIMPLE_IDLIST | KF_FLAG_DONT_UNEXPAND,
+                         NULL, &appDataPath);
+    rdcwstr appdata = appDataPath;
+    CoTaskMemFree(appDataPath);
+
+    sympath = L".;";
+    sympath += appdata.c_str();
+    sympath += L"\\renderdoc\\symbols;SRV*";
+    sympath += appdata.c_str();
+    sympath += L"\\renderdoc\\symbols\\symsrv*http://msdl.microsoft.com/download/symbols";
+
+    return sympath.c_str();
+  }
+
+  sympath.resize(len + 1);
+  GetEnvironmentVariableW(L"_NT_SYMBOL_PATH", &sympath[0], len);
+  return sympath.c_str();
 }
 
-std::string LookupModule(const std::string &modName, GUID guid, DWORD age)
+rdcstr LookupModule(const rdcstr &modName, GUID guid, DWORD age)
 {
-  std::string ret = modName;
+  rdcstr ret = modName;
 
-  std::string pdbName = get_basename(ret);
+  rdcstr pdbName = get_basename(ret);
 
-  if(pdbName.find(".pdb") == std::string::npos && pdbName.find(".PDB") == std::string::npos)
+  if(pdbName.find(".pdb") == -1 && pdbName.find(".PDB") == -1)
   {
-    size_t offs = pdbName.find_last_of('.');
-
-    if(offs != std::string::npos)
-    {
-      pdbName.erase(offs + 1);
-      pdbName += "pdb";
-    }
+    if(pdbName.contains('.'))
+      pdbName = strip_extension(pdbName) + ".pdb";
   }
 
   if(dynSymFindFileInPathW != NULL)
   {
-    std::wstring sympath = GetSymSearchPath();
+    rdcwstr sympath = GetSymSearchPath();
 
     wchar_t path[MAX_PATH + 1] = {0};
     BOOL found = dynSymFindFileInPathW(GetCurrentProcess(), sympath.c_str(),
@@ -132,7 +141,7 @@ std::string LookupModule(const std::string &modName, GUID guid, DWORD age)
   return ret;
 }
 
-std::wstring msdiapath = L"msdia140.dll";
+rdcwstr msdiapath = L"msdia140.dll";
 
 HRESULT MakeDiaDataSource(IDiaDataSource **source)
 {
@@ -187,7 +196,7 @@ HRESULT MakeDiaDataSource(IDiaDataSource **source)
   return S_OK;
 }
 
-uint32_t GetModule(const std::wstring &pdbName, GUID guid, DWORD age)
+uint32_t GetModule(const rdcwstr &pdbName, GUID guid, DWORD age)
 {
   Module m(NULL, NULL);
 
@@ -307,12 +316,12 @@ AddrInfo GetAddr(uint32_t module, uint64_t addr)
     {
       ret.funcName = StringFormat::Wide2UTF8(file);
 
-      size_t voidoffs = ret.funcName.find("(void)");
+      int voidoffs = ret.funcName.find("(void)");
 
       // remove stupid (void) for empty parameters
-      if(voidoffs != std::string::npos)
+      if(voidoffs >= 0)
       {
-        ret.funcName.erase(voidoffs + 1);
+        ret.funcName.erase(voidoffs + 1, ~0U);
         ret.funcName.push_back(')');
       }
     }
@@ -411,32 +420,33 @@ private:
 
   void Collect();
 
-  std::vector<DWORD64> m_AddrStack;
+  rdcarray<DWORD64> m_AddrStack;
 };
 
 class Win32CallstackResolver : public Callstack::StackResolver
 {
 public:
-  Win32CallstackResolver(byte *moduleDB, size_t DBSize, RENDERDOC_ProgressCallback progress);
+  Win32CallstackResolver(bool interactive, byte *moduleDB, size_t DBSize,
+                         RENDERDOC_ProgressCallback progress);
   ~Win32CallstackResolver();
 
   Callstack::AddressDetails GetAddr(uint64_t addr);
 
 private:
-  std::string pdbBrowse(std::string startingPoint);
+  rdcstr pdbBrowse(rdcstr startingPoint);
 
   struct Module
   {
-    std::string name;
+    rdcstr name;
     DWORD64 base;
     DWORD size;
 
     uint32_t moduleId;
   };
 
-  std::vector<std::string> pdbRememberedPaths;
-  std::vector<std::string> pdbIgnores;
-  std::vector<Module> modules;
+  rdcarray<rdcstr> pdbRememberedPaths;
+  rdcarray<rdcstr> pdbIgnores;
+  rdcarray<Module> modules;
 
   char pipeMessageBuf[2048];
 };
@@ -473,7 +483,7 @@ static bool InitDbgHelp()
   else
   {
     wchar_t path[MAX_PATH] = {0};
-    GetModuleFileNameW(GetModuleHandleA(STRINGIZE(RDOC_DLL_FILE) ".dll"), path, MAX_PATH - 1);
+    GetModuleFileNameW(GetModuleHandleA(STRINGIZE(RDOC_BASE_NAME) ".dll"), path, MAX_PATH - 1);
 
     wchar_t *slash = wcsrchr(path, '\\');
 
@@ -636,7 +646,7 @@ BOOL CALLBACK EnumModule(PCWSTR ModuleName, DWORD64 BaseOfDll, PVOID UserContext
 
   WCHAR *pdb = ModInfo.CVData;
 
-  if(pdb == NULL || pdb[0] == 0)
+  if(pdb[0] == 0)
     pdb = ModInfo.ImageName;
 
   chunk.imageNameLen = wcslen(pdb) + 1;    // include null terminator
@@ -656,7 +666,7 @@ BOOL CALLBACK EnumModule(PCWSTR ModuleName, DWORD64 BaseOfDll, PVOID UserContext
 
 void Win32Callstack::Collect()
 {
-  std::vector<PVOID> stack32;
+  rdcarray<PVOID> stack32;
 
   stack32.resize(64);
 
@@ -667,7 +677,7 @@ void Win32Callstack::Collect()
   while(!stack32.empty() && (uint64_t)stack32[0] >= (uint64_t)renderdocBase &&
         (uint64_t)stack32[0] <= (uint64_t)renderdocBase + renderdocSize)
   {
-    stack32.erase(stack32.begin());
+    stack32.erase(0, 1);
   }
 
   m_AddrStack.resize(stack32.size());
@@ -699,7 +709,7 @@ Win32Callstack::~Win32Callstack()
 {
 }
 
-std::string Win32CallstackResolver::pdbBrowse(std::string startingPoint)
+rdcstr Win32CallstackResolver::pdbBrowse(rdcstr startingPoint)
 {
   OPENFILENAMEW ofn;
   RDCEraseMem(&ofn, sizeof(ofn));
@@ -712,8 +722,7 @@ std::string Win32CallstackResolver::pdbBrowse(std::string startingPoint)
   ofn.lpstrFilter = L"PDB File\0*.pdb\0";
   ofn.lpstrFile = outBuf;
   ofn.nMaxFile = MAX_PATH * 2 - 1;
-  ofn.Flags =
-      OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;    // | OFN_ENABLEINCLUDENOTIFY | OFN_ENABLEHOOK
+  ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;    // | OFN_ENABLEINCLUDENOTIFY | OFN_ENABLEHOOK
 
   BOOL ret = GetOpenFileNameW(&ofn);
 
@@ -723,10 +732,10 @@ std::string Win32CallstackResolver::pdbBrowse(std::string startingPoint)
   return StringFormat::Wide2UTF8(outBuf);
 }
 
-Win32CallstackResolver::Win32CallstackResolver(byte *moduleDB, size_t DBSize,
+Win32CallstackResolver::Win32CallstackResolver(bool interactive, byte *moduleDB, size_t DBSize,
                                                RENDERDOC_ProgressCallback progress)
 {
-  std::wstring configPath = StringFormat::UTF82Wide(FileIO::GetAppFolderFilename("config.ini"));
+  rdcwstr configPath = StringFormat::UTF82Wide(FileIO::GetAppFolderFilename("config.ini"));
   {
     FILE *f = NULL;
     _wfopen_s(&f, configPath.c_str(), L"a");
@@ -753,7 +762,7 @@ Win32CallstackResolver::Win32CallstackResolver(byte *moduleDB, size_t DBSize,
     break;
   }
 
-  std::string ignores = StringFormat::Wide2UTF8(inputBuf);
+  rdcstr ignores = StringFormat::Wide2UTF8(inputBuf);
 
   {
     DWORD read =
@@ -786,7 +795,13 @@ Win32CallstackResolver::Win32CallstackResolver(byte *moduleDB, size_t DBSize,
       const wchar_t *DIApaths[] = {
           // try to see if it's just in the PATH somewhere
           L"msdia140.dll",
-          // otherwise try each VS2017 SKU
+          // otherwise try each VS2017/2019/2022 SKU
+          L"C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\DIA SDK\\" DIA140,
+          L"C:\\Program Files\\Microsoft Visual Studio\\2022\\Enterprise\\DIA SDK\\" DIA140,
+          L"C:\\Program Files\\Microsoft Visual Studio\\2022\\Professional\\DIA SDK\\" DIA140,
+          L"C:\\Program Files (x86)\\Microsoft Visual Studio\\2019\\Community\\DIA SDK\\" DIA140,
+          L"C:\\Program Files (x86)\\Microsoft Visual Studio\\2019\\Enterprise\\DIA SDK\\" DIA140,
+          L"C:\\Program Files (x86)\\Microsoft Visual Studio\\2019\\Professional\\DIA SDK\\" DIA140,
           L"C:\\Program Files (x86)\\Microsoft Visual Studio\\2017\\Community\\DIA SDK\\" DIA140,
           L"C:\\Program Files (x86)\\Microsoft Visual Studio\\2017\\Enterprise\\DIA SDK\\" DIA140,
           L"C:\\Program Files (x86)\\Microsoft Visual Studio\\2017\\Professional\\DIA SDK\\" DIA140,
@@ -807,6 +822,10 @@ Win32CallstackResolver::Win32CallstackResolver(byte *moduleDB, size_t DBSize,
       while(FAILED(hr) || source == NULL)
       {
         SAFE_RELEASE(source);
+
+        // can't manually locate msdia if we're non-interactive
+        if(!interactive)
+          return;
 
         int ret = MessageBoxW(NULL,
                               L"Couldn't initialise DIA - it may not be registered. "
@@ -872,9 +891,9 @@ Win32CallstackResolver::Win32CallstackResolver(byte *moduleDB, size_t DBSize,
     m.size = chunk->size;
     m.moduleId = 0;
 
-    if(find(pdbIgnores.begin(), pdbIgnores.end(), m.name) != pdbIgnores.end())
+    if(pdbIgnores.contains(m.name))
     {
-      RDCWARN("Not attempting to get symbols for %ls", m.name.c_str());
+      RDCWARN("Not attempting to get symbols for %s", m.name.c_str());
 
       modules.push_back(m);
       continue;
@@ -882,7 +901,7 @@ Win32CallstackResolver::Win32CallstackResolver(byte *moduleDB, size_t DBSize,
 
     // get default pdb (this also looks up symbol server etc)
     // Always done in unicode
-    std::string defaultPdb = DIA2::LookupModule(m.name, chunk->guid, chunk->age);
+    rdcstr defaultPdb = DIA2::LookupModule(m.name, chunk->guid, chunk->age);
 
     // strip newline
     if(defaultPdb != "" && defaultPdb[defaultPdb.length() - 1] == '\n')
@@ -895,8 +914,8 @@ Win32CallstackResolver::Win32CallstackResolver(byte *moduleDB, size_t DBSize,
     {
       defaultPdb = strlower(get_basename(m.name));
 
-      size_t it = defaultPdb.find(".dll");
-      if(it != std::string::npos)
+      int it = defaultPdb.find(".dll");
+      if(it >= 0)
       {
         defaultPdb[it + 1] = 'p';
         defaultPdb[it + 2] = 'd';
@@ -904,7 +923,7 @@ Win32CallstackResolver::Win32CallstackResolver(byte *moduleDB, size_t DBSize,
       }
 
       it = defaultPdb.find(".exe");
-      if(it != std::string::npos)
+      if(it >= 0)
       {
         defaultPdb[it + 1] = 'p';
         defaultPdb[it + 2] = 'd';
@@ -913,7 +932,7 @@ Win32CallstackResolver::Win32CallstackResolver(byte *moduleDB, size_t DBSize,
       failed = true;
     }
 
-    std::string pdbName = defaultPdb;
+    rdcstr pdbName = defaultPdb;
 
     int fallbackIdx = -1;
 
@@ -932,10 +951,9 @@ Win32CallstackResolver::Win32CallstackResolver(byte *moduleDB, size_t DBSize,
         {
           pdbName = get_dirname(defaultPdb) + "\\" + get_basename(defaultPdb);
 
-          // prompt for new pdbName, unless it's renderdoc or dbghelp
-          if(pdbName.find("renderdoc.") != std::wstring::npos ||
-             pdbName.find("dbghelp.") != std::wstring::npos ||
-             pdbName.find("symsrv.") != std::wstring::npos)
+          // prompt for new pdbName, unless it's renderdoc or dbghelp, or we're non-interactive
+          if(pdbName.contains("renderdoc.") || pdbName.contains("dbghelp.") ||
+             pdbName.contains("symsrv.") || !interactive)
             pdbName = "";
           else
             pdbName = pdbBrowse(pdbName);
@@ -958,12 +976,9 @@ Win32CallstackResolver::Win32CallstackResolver(byte *moduleDB, size_t DBSize,
       {
         if(fallbackIdx >= (int)pdbRememberedPaths.size())
         {
-          std::string dir = get_dirname(pdbName);
-          if(find(pdbRememberedPaths.begin(), pdbRememberedPaths.end(), dir) ==
-             pdbRememberedPaths.end())
-          {
+          rdcstr dir = get_dirname(pdbName);
+          if(!pdbRememberedPaths.contains(dir))
             pdbRememberedPaths.push_back(dir);
-          }
         }
       }
     }
@@ -977,13 +992,15 @@ Win32CallstackResolver::Win32CallstackResolver(byte *moduleDB, size_t DBSize,
 
       // silently ignore renderdoc.dll, dbghelp.dll, and symsrv.dll without asking to permanently
       // ignore
-      if(m.name.find("renderdoc.") != std::wstring::npos ||
-         m.name.find("dbghelp.") != std::wstring::npos ||
-         m.name.find("symsrv.") != std::wstring::npos)
+      if(m.name.contains("renderdoc.") || m.name.contains("dbghelp.") || m.name.contains("symsrv."))
         continue;
 
-      std::string text = StringFormat::Fmt("Do you want to permanently ignore this file?\nPath: %s",
-                                           m.name.c_str());
+      // if we're not interactive, just continue
+      if(!interactive)
+        continue;
+
+      rdcstr text = StringFormat::Fmt("Do you want to permanently ignore this file?\nPath: %s",
+                                      m.name.c_str());
 
       int ret = MessageBoxA(NULL, text.c_str(), "Ignore this pdb?", MB_YESNO);
 
@@ -1004,7 +1021,7 @@ Win32CallstackResolver::Win32CallstackResolver(byte *moduleDB, size_t DBSize,
   }
 
   std::sort(pdbIgnores.begin(), pdbIgnores.end());
-  pdbIgnores.erase(std::unique(pdbIgnores.begin(), pdbIgnores.end()), pdbIgnores.end());
+  pdbIgnores.erase(std::unique(pdbIgnores.begin(), pdbIgnores.end()) - pdbIgnores.begin(), ~0U);
   merge(pdbIgnores, ignores, ';');
   WritePrivateProfileStringW(L"renderdoc", L"ignores", StringFormat::UTF82Wide(ignores).c_str(),
                              configPath.c_str());
@@ -1042,19 +1059,19 @@ Callstack::AddressDetails Win32CallstackResolver::GetAddr(DWORD64 addr)
         // the module it came from, and an offset
         info.funcName = get_basename(info.fileName);
 
-        info.funcName = StringFormat::Fmt("%s+0x%08llx", info.funcName.c_str(), addr - base);
+        int offs = info.funcName.find(".pdb");
 
-        size_t offs = info.funcName.find(".pdb");
-
-        if(offs != std::string::npos)
+        if(offs >= 0)
         {
-          info.funcName.erase(offs + 1);
+          info.funcName.erase(offs + 1, ~0U);
 
           if(i == 0)
             info.funcName += "exe";
           else
             info.funcName += "dll";
         }
+
+        info.funcName = StringFormat::Fmt("%s+0x%08llx", info.funcName.c_str(), addr - base);
       }
 
       break;
@@ -1092,9 +1109,10 @@ Stackwalk *Create()
   return new Win32Callstack(NULL, 0);
 }
 
-StackResolver *MakeResolver(byte *moduleDB, size_t DBSize, RENDERDOC_ProgressCallback progress)
+StackResolver *MakeResolver(bool interactive, byte *moduleDB, size_t DBSize,
+                            RENDERDOC_ProgressCallback progress)
 {
-  if(DBSize < 8 || memcmp(moduleDB, "WN32CALL", 8))
+  if(DBSize < 8 || memcmp(moduleDB, "WN32CALL", 8) != 0)
   {
     RDCWARN("Can't load callstack resolve for this log. Possibly from another platform?");
     return NULL;
@@ -1103,7 +1121,7 @@ StackResolver *MakeResolver(byte *moduleDB, size_t DBSize, RENDERDOC_ProgressCal
   // initialise dbghelp if we haven't already
   ::InitDbgHelp();
 
-  return new Win32CallstackResolver(moduleDB, DBSize, progress);
+  return new Win32CallstackResolver(interactive, moduleDB, DBSize, progress);
 }
 
 bool GetLoadedModules(byte *buf, size_t &size)

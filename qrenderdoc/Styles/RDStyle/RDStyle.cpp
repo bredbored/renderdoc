@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2016-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -24,6 +24,7 @@
 
 #include "RDStyle.h"
 #include <QAbstractItemView>
+#include <QApplication>
 #include <QComboBox>
 #include <QCommonStyle>
 #include <QDebug>
@@ -36,6 +37,10 @@
 
 namespace Constants
 {
+static const int SliderHandleHalfWidth = 5;
+static const int SliderGrooveHeight = 4;
+static const qreal SliderHandleCornerRadius = 4.0f;
+
 static const int ButtonMargin = 6;
 static const int ButtonBorder = 1;
 
@@ -43,6 +48,7 @@ static const int HighlightBorder = 2;
 
 static const int CheckWidth = 14;
 static const int CheckHeight = 14;
+static const float CheckCornerSize = 2.0f;
 static const int CheckMargin = 3;
 
 static const int GroupHMargin = 8;
@@ -133,6 +139,11 @@ void start(QAbstractAnimation *anim)
   anim->start();
 }
 };
+
+static QWindow *widgetWindow(const QWidget *widget)
+{
+  return widget ? widget->window()->windowHandle() : NULL;
+}
 
 RDStyle::RDStyle(ColorScheme scheme) : RDTweakedNativeStyle(new QCommonStyle())
 {
@@ -271,6 +282,11 @@ void RDStyle::polish(QWidget *widget)
   }
 }
 
+void RDStyle::polish(QApplication *app)
+{
+  app->setPalette(standardPalette());
+}
+
 void RDStyle::unpolish(QWidget *widget)
 {
   Animation::stop(widget);
@@ -306,33 +322,7 @@ bool RDStyle::eventFilter(QObject *watched, QEvent *event)
 QRect RDStyle::subControlRect(ComplexControl cc, const QStyleOptionComplex *opt, SubControl sc,
                               const QWidget *widget) const
 {
-  if(cc == QStyle::CC_ToolButton)
-  {
-    int indicatorWidth = proxy()->pixelMetric(PM_MenuButtonIndicator, opt, widget);
-
-    QRect ret = opt->rect;
-
-    const QStyleOptionToolButton *toolbutton = qstyleoption_cast<const QStyleOptionToolButton *>(opt);
-
-    // return the normal rect if there's no menu
-    if(!(toolbutton->subControls & SC_ToolButtonMenu) &&
-       !(toolbutton->features & QStyleOptionToolButton::MenuButtonPopup))
-    {
-      return ret;
-    }
-
-    if(sc == QStyle::SC_ToolButton)
-    {
-      ret.setRight(ret.right() - indicatorWidth);
-    }
-    else if(sc == QStyle::SC_ToolButtonMenu)
-    {
-      ret.setLeft(ret.right() - indicatorWidth);
-    }
-
-    return ret;
-  }
-  else if(cc == QStyle::CC_GroupBox)
+  if(cc == QStyle::CC_GroupBox)
   {
     QRect ret = opt->rect;
 
@@ -428,9 +418,8 @@ QRect RDStyle::subControlRect(ComplexControl cc, const QStyleOptionComplex *opt,
                               (scroll->pageStep * ret.width()) / (range + scroll->pageStep));
 
         slider.setWidth(qMin(slider.width(), sliderSize));
-        slider.moveLeft(ret.left() +
-                        (qreal(scroll->sliderPosition) / qreal(range)) *
-                            (ret.width() - slider.width()));
+        slider.moveLeft(ret.left() + (qreal(scroll->sliderPosition) / qreal(range)) *
+                                         (ret.width() - slider.width()));
       }
       else
       {
@@ -466,9 +455,8 @@ QRect RDStyle::subControlRect(ComplexControl cc, const QStyleOptionComplex *opt,
                               (scroll->pageStep * ret.height()) / (range + scroll->pageStep));
 
         slider.setHeight(qMin(slider.height(), sliderSize));
-        slider.moveTop(ret.top() +
-                       (qreal(scroll->sliderPosition) / qreal(range)) *
-                           (ret.height() - slider.height()));
+        slider.moveTop(ret.top() + (qreal(scroll->sliderPosition) / qreal(range)) *
+                                       (ret.height() - slider.height()));
       }
       else
       {
@@ -486,6 +474,37 @@ QRect RDStyle::subControlRect(ComplexControl cc, const QStyleOptionComplex *opt,
 
     return opt->rect;
   }
+  else if(cc == QStyle::CC_Slider)
+  {
+    QRect ret = opt->rect;
+    ret.adjust(1, 1, -1, -1);
+    if(sc == QStyle::SC_SliderGroove)
+    {
+      int toGrooveHeightHalfReduction = (ret.height() - Constants::SliderGrooveHeight) / 2;
+      // QSlider code handles only moving the handle up to where it abutts the groove in either
+      // direction, reducing it here breaks that calculation. We'll do it visually when actually
+      // painting
+      ret.adjust(0, toGrooveHeightHalfReduction, 0, -toGrooveHeightHalfReduction);
+    }
+    else if(sc == QStyle::SC_SliderHandle)
+    {
+      const QAbstractSlider *slider = qobject_cast<const QAbstractSlider *>(widget);
+      int sliderMin = slider->minimum();
+      int sliderMax = slider->maximum();
+      int sliderPos = slider->sliderPosition();
+      qreal posUNorm = (qreal)(sliderPos - sliderMin) / (qreal)(sliderMax - sliderMin);
+      int grooveLeft = ret.left() + Constants::SliderHandleHalfWidth;
+      int grooveRight = ret.right() - Constants::SliderHandleHalfWidth;
+      int grooveWidth = grooveRight - grooveLeft;
+      int sliderX = (int)(posUNorm * (qreal)grooveWidth) + grooveLeft;
+      // since sizes are inclusive, x-w to x+w results in 2w+1 width (w pixels either side + the x
+      // pixel itself), so we make this favour the right side so it's w-1 pixels to the left, the x
+      // pixel and then w pixels to the right, for a total of 2w
+      ret.setLeft(sliderX - Constants::SliderHandleHalfWidth + 1);
+      ret.setRight(sliderX + Constants::SliderHandleHalfWidth);
+    }
+    return ret;
+  }
   else if(cc == QStyle::CC_ComboBox)
   {
     QRect rect = opt->rect;
@@ -493,8 +512,13 @@ QRect RDStyle::subControlRect(ComplexControl cc, const QStyleOptionComplex *opt,
     if(sc == QStyle::SC_ComboBoxFrame || sc == QStyle::SC_ComboBoxListBoxPopup)
       return rect;
 
-    rect.adjust(Constants::ComboMargin, Constants::ComboMargin, -Constants::ComboMargin,
-                -Constants::ComboMargin);
+    const QStyleOptionComboBox *combo = qstyleoption_cast<const QStyleOptionComboBox *>(opt);
+
+    if(combo->subControls & QStyle::SC_ComboBoxFrame)
+    {
+      rect.adjust(Constants::ComboMargin, Constants::ComboMargin, -Constants::ComboMargin,
+                  -Constants::ComboMargin);
+    }
 
     if(sc == QStyle::SC_ComboBoxEditField)
       return rect.adjusted(0, 0, -Constants::ComboArrowDim, 0);
@@ -632,6 +656,7 @@ QSize RDStyle::sizeFromContents(ContentsType type, const QStyleOption *opt, cons
   if(type == CT_PushButton || type == CT_ToolButton)
   {
     const QStyleOptionButton *button = qstyleoption_cast<const QStyleOptionButton *>(opt);
+    const QStyleOptionToolButton *toolbutton = qstyleoption_cast<const QStyleOptionToolButton *>(opt);
 
     QSize ret = size;
 
@@ -640,6 +665,10 @@ QSize RDStyle::sizeFromContents(ContentsType type, const QStyleOption *opt, cons
     {
       ret.setWidth(qMax(50, ret.width()));
       ret.setHeight(qMax(15, ret.height()));
+    }
+    else if(type == CT_ToolButton && toolbutton)
+    {
+      ret = adjustToolButtonSize(toolbutton, size, widget);
     }
 
     // add margin and border
@@ -717,9 +746,14 @@ QSize RDStyle::sizeFromContents(ContentsType type, const QStyleOption *opt, cons
 
     const QStyleOptionMenuItem *menuitem = qstyleoption_cast<const QStyleOptionMenuItem *>(opt);
 
+    // add more room for items with shortcuts
+    if(menuitem->text.contains(QLatin1Char('\t')))
+      ret.setWidth(ret.width() + 4 * Constants::MenuBarMargin);
+
     // add room for an icon
-    if(menuitem->maxIconWidth)
-      ret.setWidth(ret.width() + Constants::MenuBarMargin + menuitem->maxIconWidth);
+    if(menuitem->maxIconWidth || menuitem->menuHasCheckableItems)
+      ret.setWidth(ret.width() + Constants::MenuBarMargin +
+                   std::max(menuitem->maxIconWidth, Constants::MenuBarIconSize));
 
     if(menuitem->menuItemType == QStyleOptionMenuItem::SubMenu)
       ret.setWidth(ret.width() + Constants::MenuSubmenuWidth);
@@ -734,7 +768,7 @@ QSize RDStyle::sizeFromContents(ContentsType type, const QStyleOption *opt, cons
     int iconSize = pixelMetric(QStyle::PM_SmallIconSize, opt, widget);
     QSize sz = menuitem->fontMetrics.size(Qt::TextShowMnemonic, menuitem->text);
 
-    if(!menuitem->icon.isNull())
+    if(!menuitem->icon.isNull() || menuitem->checkType != QStyleOptionMenuItem::NotCheckable)
     {
       sz.setWidth(sz.width() + Constants::MenuBarMargin + iconSize);
       sz = sz.expandedTo(QSize(1, iconSize));
@@ -836,7 +870,7 @@ int RDStyle::styleHint(StyleHint stylehint, const QStyleOption *opt, const QWidg
     return QFrame::StyledPanel | QFrame::Plain;
 
   if(stylehint == QStyle::SH_ComboBox_Popup)
-    return false;
+    return 0;
 
   if(stylehint == SH_ToolTipLabel_Opacity)
     return 255;
@@ -905,15 +939,14 @@ void RDStyle::drawComplexControl(ComplexControl control, const QStyleOptionCompl
     labelTextIcon.rect = subControlRect(control, opt, SC_ToolButton, widget);
 
     // draw the label text/icon
-    drawControl(CE_ToolButtonLabel, &labelTextIcon, p, widget);
+    proxy()->drawControl(CE_ToolButtonLabel, &labelTextIcon, p, widget);
 
     // draw the menu arrow, if there is one
-    if((toolbutton->subControls & SC_ToolButtonMenu) ||
-       (toolbutton->features & QStyleOptionToolButton::HasMenu))
+    if(shouldDrawToolButtonMenuArrow(toolbutton))
     {
       QStyleOptionToolButton menu = *toolbutton;
       menu.rect = subControlRect(control, opt, SC_ToolButtonMenu, widget);
-      drawPrimitive(PE_IndicatorArrowDown, &menu, p, widget);
+      proxy()->drawPrimitive(PE_IndicatorArrowDown, &menu, p, widget);
     }
 
     return;
@@ -928,7 +961,7 @@ void RDStyle::drawComplexControl(ComplexControl control, const QStyleOptionCompl
 
     const QStyleOptionGroupBox *group = qstyleoption_cast<const QStyleOptionGroupBox *>(opt);
 
-    QRect labelRect = subControlRect(CC_GroupBox, opt, QStyle::SC_GroupBoxLabel, widget);
+    QRect labelRect = proxy()->subControlRect(CC_GroupBox, opt, QStyle::SC_GroupBoxLabel, widget);
 
     labelRect.adjust(Constants::GroupHMargin, Constants::GroupVMargin, Constants::GroupHMargin,
                      Constants::GroupVMargin);
@@ -942,8 +975,8 @@ void RDStyle::drawComplexControl(ComplexControl control, const QStyleOptionCompl
       penRole = QPalette::NoRole;
     }
 
-    drawItemText(p, labelRect, Qt::AlignLeft | Qt::AlignTop | Qt::TextHideMnemonic, group->palette,
-                 group->state & State_Enabled, group->text, penRole);
+    proxy()->drawItemText(p, labelRect, Qt::AlignLeft | Qt::AlignTop | Qt::TextHideMnemonic,
+                          group->palette, group->state & State_Enabled, group->text, penRole);
 
     labelRect.setRight(subControlRect(CC_GroupBox, opt, QStyle::SC_GroupBoxFrame, widget).right());
     labelRect.adjust(-Constants::GroupHMargin / 2, 0, -Constants::GroupHMargin, 0);
@@ -953,12 +986,12 @@ void RDStyle::drawComplexControl(ComplexControl control, const QStyleOptionCompl
 
     if(opt->subControls & QStyle::SC_GroupBoxCheckBox)
     {
-      QRect checkBoxRect = subControlRect(CC_GroupBox, opt, SC_GroupBoxCheckBox, widget);
+      QRect checkBoxRect = proxy()->subControlRect(CC_GroupBox, opt, SC_GroupBoxCheckBox, widget);
 
       QStyleOptionButton box;
       (QStyleOption &)box = *(QStyleOption *)opt;
       box.rect = checkBoxRect;
-      drawPrimitive(PE_IndicatorCheckBox, &box, p, widget);
+      proxy()->drawPrimitive(PE_IndicatorCheckBox, &box, p, widget);
     }
 
     return;
@@ -993,7 +1026,7 @@ void RDStyle::drawComplexControl(ComplexControl control, const QStyleOptionCompl
       {
         p->setPen(QPen(sliderBrush, 2.5));
 
-        QRectF rect = subControlRect(CC_ScrollBar, opt, QStyle::SC_ScrollBarSubLine, widget);
+        QRectF rect = proxy()->subControlRect(CC_ScrollBar, opt, QStyle::SC_ScrollBarSubLine, widget);
 
         rect = rect.adjusted(margin, margin, -margin, -margin);
 
@@ -1042,7 +1075,7 @@ void RDStyle::drawComplexControl(ComplexControl control, const QStyleOptionCompl
       {
         p->setPen(QPen(sliderBrush, 2.5));
 
-        QRectF rect = subControlRect(CC_ScrollBar, opt, QStyle::SC_ScrollBarAddLine, widget);
+        QRectF rect = proxy()->subControlRect(CC_ScrollBar, opt, QStyle::SC_ScrollBarAddLine, widget);
 
         rect = rect.adjusted(margin, margin, -margin, -margin);
 
@@ -1093,7 +1126,8 @@ void RDStyle::drawComplexControl(ComplexControl control, const QStyleOptionCompl
     if((opt->state & activeHover) == activeHover)
     {
       QRect hoverRect =
-          subControlRect(CC_ScrollBar, opt, QStyle::SC_ScrollBarAddPage, widget)
+          proxy()
+              ->subControlRect(CC_ScrollBar, opt, QStyle::SC_ScrollBarAddPage, widget)
               .united(subControlRect(CC_ScrollBar, opt, QStyle::SC_ScrollBarSubPage, widget));
 
       QPainterPath path;
@@ -1102,7 +1136,7 @@ void RDStyle::drawComplexControl(ComplexControl control, const QStyleOptionCompl
       p->fillPath(path, hoverBrush);
     }
 
-    QRect slider = subControlRect(CC_ScrollBar, opt, QStyle::SC_ScrollBarSlider, widget);
+    QRect slider = proxy()->subControlRect(CC_ScrollBar, opt, QStyle::SC_ScrollBarSlider, widget);
 
     if(slider.isValid() && (opt->state & State_Enabled))
     {
@@ -1119,11 +1153,42 @@ void RDStyle::drawComplexControl(ComplexControl control, const QStyleOptionCompl
 
     return;
   }
+  else if(control == QStyle::CC_Slider)
+  {
+    QRect grooveRect = subControlRect(control, opt, QStyle::SC_SliderGroove, widget);
+    p->drawLine(QLine(grooveRect.x() + Constants::SliderHandleHalfWidth + 1,
+                      grooveRect.y() + grooveRect.height() / 2,
+                      grooveRect.right() - Constants::SliderHandleHalfWidth,
+                      grooveRect.y() + grooveRect.height() / 2));
+
+    p->save();
+    p->setRenderHint(QPainter::Antialiasing);
+
+    QRect handleRect = subControlRect(control, opt, QStyle::SC_SliderHandle, widget);
+    QBrush handleBrush = (m_Scheme == Light) ? opt->palette.brush(QPalette::Dark)
+                                             : opt->palette.brush(QPalette::Text);
+    QPainterPath path;
+    path.addRoundedRect(handleRect, Constants::SliderHandleCornerRadius,
+                        Constants::SliderHandleCornerRadius);
+    p->fillPath(path, handleBrush);
+
+    p->restore();
+
+    return;
+  }
   else if(control == QStyle::CC_ComboBox)
   {
-    drawRoundedRectBorder(opt, p, widget, QPalette::Base, false);
+    const QStyleOptionComboBox *combo = qstyleoption_cast<const QStyleOptionComboBox *>(opt);
 
-    QRectF rect = subControlRect(control, opt, QStyle::SC_ComboBoxArrow, widget);
+    if(combo->subControls & QStyle::SC_ComboBoxFrame)
+    {
+      drawRoundedRectBorder(opt, p, widget, QPalette::Base, false);
+    }
+
+    QRectF rect = proxy()->subControlRect(control, opt, QStyle::SC_ComboBoxArrow, widget);
+
+    if(!(combo->subControls & QStyle::SC_ComboBoxFrame))
+      p->fillRect(rect, opt->palette.brush(QPalette::Base));
 
     p->save();
     p->setRenderHint(QPainter::Antialiasing);
@@ -1179,7 +1244,7 @@ void RDStyle::drawComplexControl(ComplexControl control, const QStyleOptionCompl
 
     p->drawLine(rect.topRight(), rect.bottomRight());
 
-    rect = subControlRect(control, opt, QStyle::SC_SpinBoxUp, widget);
+    rect = proxy()->subControlRect(control, opt, QStyle::SC_SpinBoxUp, widget);
 
     p->setClipRect(rect);
 
@@ -1230,7 +1295,7 @@ void RDStyle::drawComplexControl(ComplexControl control, const QStyleOptionCompl
       p->drawPath(path);
     }
 
-    rect = subControlRect(control, opt, QStyle::SC_SpinBoxDown, widget);
+    rect = proxy()->subControlRect(control, opt, QStyle::SC_SpinBoxDown, widget);
 
     p->setClipRect(rect);
 
@@ -1282,6 +1347,93 @@ void RDStyle::drawComplexControl(ComplexControl control, const QStyleOptionCompl
   return RDTweakedNativeStyle::drawComplexControl(control, opt, p, widget);
 }
 
+static void drawX(const QStyleOption *opt, QPainter *p, const QRectF &rect)
+{
+  QPainterPath checkpath;
+  QPolygonF poly;
+
+  // Left side:
+  //
+  //             X
+  //             | CheckCornerSize
+  //             X
+  //              \\   innerSizeX, innerSizeY
+  //               \\  (width and height)
+  // CheckHeight    X
+  //               /
+  //              /
+  //             X
+  //             | CheckCornerSize
+  //             X
+
+  // Top side:
+  //
+  // X---X      X----X
+  //      \\   /
+  //       \\ /
+  //         X
+
+  Q_ASSERT(rect.height() == rect.width());
+
+  const float innerSize = float(rect.height() - Constants::CheckCornerSize * 2) / 2.0f;
+
+  const float totalSize = innerSize * 2 + Constants::CheckCornerSize * 2;
+  Q_ASSERT(totalSize == rect.height());
+
+  // left edge
+  QPointF pt = rect.topLeft();
+  poly << pt;
+  pt.setY(pt.y() + Constants::CheckCornerSize);
+  poly << pt;
+  pt.setY(pt.y() + innerSize);
+  pt.setX(pt.x() + innerSize);
+  poly << pt;
+  pt.setY(pt.y() + innerSize);
+  pt.setX(pt.x() - innerSize);
+  poly << pt;
+  pt.setY(pt.y() + Constants::CheckCornerSize);
+  poly << pt;
+
+  // bottom edge
+  pt.setX(pt.x() + Constants::CheckCornerSize);
+  poly << pt;
+  pt.setX(pt.x() + innerSize);
+  pt.setY(pt.y() - innerSize);
+  poly << pt;
+  pt.setX(pt.x() + innerSize);
+  pt.setY(pt.y() + innerSize);
+  poly << pt;
+  pt.setX(pt.x() + Constants::CheckCornerSize);
+  poly << pt;
+
+  // right edge
+  pt.setY(pt.y() - Constants::CheckCornerSize);
+  poly << pt;
+  pt.setX(pt.x() - innerSize);
+  pt.setY(pt.y() - innerSize);
+  poly << pt;
+  pt.setX(pt.x() + innerSize);
+  pt.setY(pt.y() - innerSize);
+  poly << pt;
+  pt.setY(pt.y() - Constants::CheckCornerSize);
+  poly << pt;
+
+  // top edge
+  pt.setX(pt.x() - Constants::CheckCornerSize);
+  poly << pt;
+  pt.setX(pt.x() - innerSize);
+  pt.setY(pt.y() + innerSize);
+  poly << pt;
+  pt.setX(pt.x() - innerSize);
+  pt.setY(pt.y() - innerSize);
+  poly << pt;
+  pt.setX(pt.x() - Constants::CheckCornerSize);
+  poly << pt;
+
+  checkpath.addPolygon(poly);
+  p->fillPath(checkpath, opt->palette.brush(QPalette::ButtonText));
+}
+
 void RDStyle::drawPrimitive(PrimitiveElement element, const QStyleOption *opt, QPainter *p,
                             const QWidget *widget) const
 {
@@ -1308,7 +1460,7 @@ void RDStyle::drawPrimitive(PrimitiveElement element, const QStyleOption *opt, Q
 
     QStyleOptionFrame frameOpt = *frame;
     frameOpt.frameShape = QFrame::Panel;
-    drawControl(CE_ShapedFrame, &frameOpt, p, widget);
+    proxy()->drawControl(CE_ShapedFrame, &frameOpt, p, widget);
     return;
   }
   else if(element == QStyle::PE_FrameFocusRect)
@@ -1397,6 +1549,20 @@ void RDStyle::drawPrimitive(PrimitiveElement element, const QStyleOption *opt, Q
   else if(element == QStyle::PE_IndicatorViewItemCheck || element == QStyle::PE_IndicatorCheckBox)
   {
     QRect rect = opt->rect;
+    int w = rect.width();
+    int h = rect.height();
+    if(w < h)
+    {
+      int padding = (h - w) / 2;
+      rect.setHeight(w);
+      rect.adjust(0, padding, 0, padding);
+    }
+    else if(h < w)
+    {
+      int padding = (w - h) / 2;
+      rect.setWidth(h);
+      rect.adjust(padding, 0, padding, 0);
+    }
 
     QPen outlinePen(outlineBrush(opt->palette), 1.0);
 
@@ -1416,7 +1582,7 @@ void RDStyle::drawPrimitive(PrimitiveElement element, const QStyleOption *opt, Q
 
     if(opt->state & State_On)
     {
-      p->fillRect(rect, opt->palette.brush(QPalette::ButtonText));
+      drawX(opt, p, rect);
     }
     else if(opt->state & State_NoChange)
     {
@@ -1441,9 +1607,25 @@ void RDStyle::drawPrimitive(PrimitiveElement element, const QStyleOption *opt, Q
       group = QPalette::Inactive;
 
     if(viewitem->state & QStyle::State_Selected)
-      p->fillRect(viewitem->rect, viewitem->palette.brush(group, QPalette::Highlight));
-    else if(viewitem->backgroundBrush.style() != Qt::NoBrush)
-      p->fillRect(viewitem->rect, viewitem->backgroundBrush);
+    {
+      if(viewitem->backgroundBrush.style() != Qt::NoBrush)
+      {
+        p->fillRect(viewitem->rect, viewitem->backgroundBrush);
+        // If we have a custom color, use the selection color at half opacity over the custom color
+        QColor col = viewitem->palette.color(group, QPalette::Highlight);
+        col.setAlphaF(0.5f);
+        p->fillRect(viewitem->rect, QBrush(col));
+      }
+      else
+      {
+        p->fillRect(viewitem->rect, viewitem->palette.brush(group, QPalette::Highlight));
+      }
+    }
+    else
+    {
+      if(viewitem->backgroundBrush.style() != Qt::NoBrush)
+        p->fillRect(viewitem->rect, viewitem->backgroundBrush);
+    }
 
     return;
   }
@@ -1451,9 +1633,12 @@ void RDStyle::drawPrimitive(PrimitiveElement element, const QStyleOption *opt, Q
   RDTweakedNativeStyle::drawPrimitive(element, opt, p, widget);
 }
 
-const QBrush &RDStyle::outlineBrush(const QPalette &pal) const
+const QBrush &RDStyle::outlineBrush(const QPalette &pal, QPalette::ColorRole role) const
 {
-  return m_Scheme == Light ? pal.brush(QPalette::WindowText) : pal.brush(QPalette::Light);
+  if(role == QPalette::Text || role == QPalette::WindowText)
+    return m_Scheme == Light ? pal.brush(QPalette::WindowText) : pal.brush(QPalette::Light);
+
+  return pal.brush(role);
 }
 
 void RDStyle::drawControl(ControlElement control, const QStyleOption *opt, QPainter *p,
@@ -1476,7 +1661,7 @@ void RDStyle::drawControl(ControlElement control, const QStyleOption *opt, QPain
     const QStyleOptionButton *radiobutton = qstyleoption_cast<const QStyleOptionButton *>(opt);
     if(radiobutton)
     {
-      QRectF rect = subElementRect(SE_CheckBoxIndicator, opt, widget);
+      QRectF rect = proxy()->subElementRect(SE_CheckBoxIndicator, opt, widget);
 
       rect = rect.adjusted(1.5, 1.5, -1, -1);
 
@@ -1519,7 +1704,7 @@ void RDStyle::drawControl(ControlElement control, const QStyleOption *opt, QPain
       p->restore();
 
       QStyleOptionButton labelText = *radiobutton;
-      labelText.rect = subElementRect(SE_RadioButtonContents, &labelText, widget);
+      labelText.rect = proxy()->subElementRect(SE_RadioButtonContents, &labelText, widget);
       drawControl(CE_RadioButtonLabel, &labelText, p, widget);
     }
 
@@ -1530,7 +1715,21 @@ void RDStyle::drawControl(ControlElement control, const QStyleOption *opt, QPain
     const QStyleOptionButton *checkbox = qstyleoption_cast<const QStyleOptionButton *>(opt);
     if(checkbox)
     {
-      QRectF rect = subElementRect(SE_CheckBoxIndicator, opt, widget).adjusted(1, 1, -1, -1);
+      QRectF rect = proxy()->subElementRect(SE_CheckBoxIndicator, opt, widget).adjusted(1, 1, -1, -1);
+      float w = rect.width();
+      float h = rect.height();
+      if(w < h)
+      {
+        int padding = (h - w) * 0.5;
+        rect.setHeight(w);
+        rect.adjust(0, padding, 0, padding);
+      }
+      else if(h < w)
+      {
+        int padding = (w - h) * 0.5;
+        rect.setWidth(h);
+        rect.adjust(padding, 0, padding, 0);
+      }
 
       QPen outlinePen(outlineBrush(opt->palette), 1.0);
 
@@ -1556,7 +1755,7 @@ void RDStyle::drawControl(ControlElement control, const QStyleOption *opt, QPain
 
       if(opt->state & State_On)
       {
-        p->fillRect(rect, opt->palette.brush(QPalette::ButtonText));
+        drawX(opt, p, rect);
       }
       else if(opt->state & State_NoChange)
       {
@@ -1568,8 +1767,8 @@ void RDStyle::drawControl(ControlElement control, const QStyleOption *opt, QPain
       p->restore();
 
       QStyleOptionButton labelText = *checkbox;
-      labelText.rect = subElementRect(SE_CheckBoxContents, &labelText, widget);
-      drawControl(CE_CheckBoxLabel, &labelText, p, widget);
+      labelText.rect = proxy()->subElementRect(SE_CheckBoxContents, &labelText, widget);
+      proxy()->drawControl(CE_CheckBoxLabel, &labelText, p, widget);
     }
 
     return;
@@ -1583,19 +1782,19 @@ void RDStyle::drawControl(ControlElement control, const QStyleOption *opt, QPain
 
       if(!checkbox->icon.isNull())
       {
-        drawItemPixmap(p, rect, Qt::AlignLeft | Qt::AlignVCenter,
-                       checkbox->icon.pixmap(
-                           checkbox->iconSize.width(), checkbox->iconSize.height(),
-                           checkbox->state & State_Enabled ? QIcon::Normal : QIcon::Disabled));
+        proxy()->drawItemPixmap(
+            p, rect, Qt::AlignLeft | Qt::AlignVCenter,
+            checkbox->icon.pixmap(widgetWindow(widget), checkbox->iconSize,
+                                  checkbox->state & State_Enabled ? QIcon::Normal : QIcon::Disabled));
 
         rect.setLeft(rect.left() + checkbox->iconSize.width() + Constants::CheckMargin);
       }
 
       if(!checkbox->text.isEmpty())
       {
-        drawItemText(p, rect, Qt::AlignLeft | Qt::AlignVCenter | Qt::TextHideMnemonic,
-                     checkbox->palette, checkbox->state & State_Enabled, checkbox->text,
-                     QPalette::WindowText);
+        proxy()->drawItemText(p, rect, Qt::AlignLeft | Qt::AlignVCenter | Qt::TextHideMnemonic,
+                              checkbox->palette, checkbox->state & State_Enabled, checkbox->text,
+                              QPalette::WindowText);
       }
     }
 
@@ -1613,7 +1812,8 @@ void RDStyle::drawControl(ControlElement control, const QStyleOption *opt, QPain
     qreal lineWidth = qMax(1, frame->lineWidth);
 
     p->save();
-    p->setPen(QPen(opt->palette.brush(widget->foregroundRole()), lineWidth));
+
+    p->setPen(QPen(outlineBrush(opt->palette, widget->foregroundRole()), lineWidth));
 
     qreal adjust = 0.5 * lineWidth;
 
@@ -1764,26 +1964,55 @@ void RDStyle::drawControl(ControlElement control, const QStyleOption *opt, QPain
 
     if(!menuitem->icon.isNull())
     {
-      int iconSize = pixelMetric(QStyle::PM_SmallIconSize, opt, widget);
+      int iconSize = proxy()->pixelMetric(QStyle::PM_SmallIconSize, opt, widget);
 
-      QPixmap pix = menuitem->icon.pixmap(
-          iconSize, iconSize, (menuitem->state & State_Enabled) ? QIcon::Normal : QIcon::Disabled);
+      QPixmap pix =
+          menuitem->icon.pixmap(widgetWindow(widget), QSize(iconSize, iconSize),
+                                (menuitem->state & State_Enabled) ? QIcon::Normal : QIcon::Disabled);
 
       if(!pix.isNull())
       {
         QRectF iconRect = rect;
         iconRect.setWidth(iconSize);
-        drawItemPixmap(p, iconRect.toRect(), Qt::AlignCenter | Qt::AlignTop | Qt::TextShowMnemonic,
-                       pix);
+        proxy()->drawItemPixmap(p, iconRect.toRect(),
+                                Qt::AlignCenter | Qt::AlignTop | Qt::TextShowMnemonic, pix);
         rect.adjust(iconSize + Constants::MenuBarMargin, 0, 0, 0);
       }
+    }
+    else if(menuitem->checkType != QStyleOptionMenuItem::NotCheckable)
+    {
+      int checkSize = proxy()->pixelMetric(QStyle::PM_SmallIconSize, opt, widget);
+
+      QRectF checkRect = rect.adjusted(1, 1, -1, -1);
+      checkRect.setWidth(checkSize);
+
+      // vertically align the check
+      int excess = checkRect.height() - checkRect.width();
+      if(excess > 0)
+      {
+        checkRect.setHeight(checkRect.height() - excess / 2);
+        excess -= excess / 2;
+        checkRect.setTop(checkRect.top() + excess);
+      }
+
+      QStyleOptionButton box;
+      (QStyleOption &)box = *(QStyleOption *)opt;
+      box.rect = checkRect.toRect().adjusted(1, 1, -1, -1);
+      if(menuitem->checked)
+        box.state |= State_On;
+      else
+        box.state &= ~State_On;
+      proxy()->drawPrimitive(PE_IndicatorCheckBox, &box, p, widget);
+
+      rect.adjust(checkSize + Constants::MenuBarMargin, 0, 0, 0);
     }
 
     if(menuitem->menuItemType == QStyleOptionMenuItem::Normal)
     {
       p->setFont(menuitem->font);
-      drawItemText(p, rect.toRect(), Qt::AlignCenter | Qt::AlignTop | Qt::TextShowMnemonic,
-                   menuitem->palette, menuitem->state & State_Enabled, menuitem->text, textrole);
+      proxy()->drawItemText(p, rect.toRect(), Qt::AlignCenter | Qt::AlignTop | Qt::TextShowMnemonic,
+                            menuitem->palette, menuitem->state & State_Enabled, menuitem->text,
+                            textrole);
     }
 
     p->restore();
@@ -1842,13 +2071,41 @@ void RDStyle::drawControl(ControlElement control, const QStyleOption *opt, QPain
     // draw the icon, if it exists
     if(!menuitem->icon.isNull())
     {
-      drawItemPixmap(
+      proxy()->drawItemPixmap(
           p, rect.toRect(), Qt::AlignLeft | Qt::AlignVCenter,
-          menuitem->icon.pixmap(Constants::MenuBarIconSize, Constants::MenuBarIconSize,
+          menuitem->icon.pixmap(widgetWindow(widget),
+                                QSize(Constants::MenuBarIconSize, Constants::MenuBarIconSize),
                                 menuitem->state & State_Enabled ? QIcon::Normal : QIcon::Disabled));
     }
+    else if(menuitem->checkType != QStyleOptionMenuItem::NotCheckable)
+    {
+      QRectF checkRect = rect.adjusted(1, 1, -1, -1);
+      checkRect.setWidth(Constants::MenuBarIconSize);
 
-    if(menuitem->maxIconWidth)
+      // vertically align the check
+      int excess = checkRect.height() - checkRect.width();
+      if(excess > 0)
+      {
+        checkRect.setHeight(checkRect.height() - excess / 2);
+        excess -= excess / 2;
+        checkRect.setTop(checkRect.top() + excess);
+      }
+
+      QStyleOptionButton box;
+      (QStyleOption &)box = *(QStyleOption *)opt;
+      box.rect = checkRect.toRect().adjusted(1, 1, -1, -1);
+      if(menuitem->checked)
+        box.state |= State_On;
+      else
+        box.state &= ~State_On;
+      proxy()->drawPrimitive(PE_IndicatorCheckBox, &box, p, widget);
+    }
+
+    if(menuitem->menuHasCheckableItems)
+      rect.adjust(
+          Constants::MenuBarMargin + std::max(Constants::MenuBarIconSize, menuitem->maxIconWidth),
+          0, 0, 0);
+    else if(menuitem->maxIconWidth)
       rect.adjust(Constants::MenuBarMargin + menuitem->maxIconWidth, 0, 0, 0);
 
     if(menuitem->menuItemType == QStyleOptionMenuItem::Normal ||
@@ -1862,25 +2119,28 @@ void RDStyle::drawControl(ControlElement control, const QStyleOption *opt, QPain
 
       if(tabIndex < 0)
       {
-        drawItemText(p, rect.toRect(), Qt::AlignLeft | Qt::AlignVCenter | Qt::TextShowMnemonic,
-                     menuitem->palette, menuitem->state & State_Enabled, menuitem->text, textrole);
+        proxy()->drawItemText(
+            p, rect.toRect(), Qt::AlignLeft | Qt::AlignVCenter | Qt::TextShowMnemonic,
+            menuitem->palette, menuitem->state & State_Enabled, menuitem->text, textrole);
       }
       else
       {
         QString title = text.left(tabIndex);
         QString shortcut = text.mid(tabIndex + 1, -1);
 
-        drawItemText(p, rect.toRect(), Qt::AlignLeft | Qt::AlignVCenter | Qt::TextShowMnemonic,
-                     menuitem->palette, menuitem->state & State_Enabled, title, textrole);
-        drawItemText(p, rect.toRect(), Qt::AlignRight | Qt::AlignVCenter | Qt::TextShowMnemonic,
-                     menuitem->palette, menuitem->state & State_Enabled, shortcut, textrole);
+        proxy()->drawItemText(p, rect.toRect(),
+                              Qt::AlignLeft | Qt::AlignVCenter | Qt::TextShowMnemonic,
+                              menuitem->palette, menuitem->state & State_Enabled, title, textrole);
+        proxy()->drawItemText(
+            p, rect.toRect(), Qt::AlignRight | Qt::AlignVCenter | Qt::TextShowMnemonic,
+            menuitem->palette, menuitem->state & State_Enabled, shortcut, textrole);
       }
 
       if(menuitem->menuItemType == QStyleOptionMenuItem::SubMenu)
       {
         QStyleOptionMenuItem submenu = *menuitem;
         submenu.rect.setLeft(submenu.rect.right() - Constants::MenuSubmenuWidth);
-        drawPrimitive(PE_IndicatorArrowRight, &submenu, p, widget);
+        proxy()->drawPrimitive(PE_IndicatorArrowRight, &submenu, p, widget);
       }
     }
 
@@ -1898,15 +2158,16 @@ void RDStyle::drawControl(ControlElement control, const QStyleOption *opt, QPain
 
     if(!tab->icon.isNull())
     {
-      drawItemPixmap(p, rect, Qt::AlignLeft | Qt::AlignVCenter,
-                     tab->icon.pixmap(tab->iconSize.width(), tab->iconSize.height(),
-                                      tab->state & State_Enabled ? QIcon::Normal : QIcon::Disabled));
+      proxy()->drawItemPixmap(
+          p, rect, Qt::AlignLeft | Qt::AlignVCenter,
+          tab->icon.pixmap(widgetWindow(widget), tab->iconSize,
+                           tab->state & State_Enabled ? QIcon::Normal : QIcon::Disabled));
 
       rect.setLeft(rect.left() + tab->iconSize.width() + Constants::TabMargin);
     }
 
-    drawItemText(p, rect, Qt::AlignLeft | Qt::AlignVCenter | Qt::TextHideMnemonic, tab->palette,
-                 tab->state & State_Enabled, tab->text, QPalette::WindowText);
+    proxy()->drawItemText(p, rect, Qt::AlignLeft | Qt::AlignVCenter | Qt::TextHideMnemonic,
+                          tab->palette, tab->state & State_Enabled, tab->text, QPalette::WindowText);
     return;
   }
   else if(control == QStyle::CE_TabBarTabShape)
@@ -1952,8 +2213,8 @@ void RDStyle::drawControl(ControlElement control, const QStyleOption *opt, QPain
   }
   else if(control == QStyle::CE_TabBarTab)
   {
-    drawControl(CE_TabBarTabShape, opt, p, widget);
-    drawControl(CE_TabBarTabLabel, opt, p, widget);
+    proxy()->drawControl(CE_TabBarTabShape, opt, p, widget);
+    proxy()->drawControl(CE_TabBarTabLabel, opt, p, widget);
     return;
   }
   else if(control == QStyle::CE_DockWidgetTitle)
@@ -1983,9 +2244,9 @@ void RDStyle::drawControl(ControlElement control, const QStyleOption *opt, QPain
 
     const QStyleOptionDockWidget *dockwidget = qstyleoption_cast<const QStyleOptionDockWidget *>(opt);
 
-    drawItemText(p, rect.toRect().adjusted(Constants::TabMargin, 0, 0, 0),
-                 Qt::AlignLeft | Qt::AlignTop | Qt::TextHideMnemonic, dockwidget->palette,
-                 dockwidget->state & State_Enabled, dockwidget->title, QPalette::WindowText);
+    proxy()->drawItemText(p, rect.toRect().adjusted(Constants::TabMargin, 0, 0, 0),
+                          Qt::AlignLeft | Qt::AlignTop | Qt::TextHideMnemonic, dockwidget->palette,
+                          dockwidget->state & State_Enabled, dockwidget->title, QPalette::WindowText);
 
     return;
   }
@@ -2008,14 +2269,16 @@ void RDStyle::drawControl(ControlElement control, const QStyleOption *opt, QPain
     // draw the icon, if it exists
     if(!header->icon.isNull())
     {
-      drawItemPixmap(
+      proxy()->drawItemPixmap(
           p, rect.toRect(), Qt::AlignLeft | Qt::AlignVCenter,
-          header->icon.pixmap(Constants::ItemHeaderIconSize, Constants::ItemHeaderIconSize,
+          header->icon.pixmap(widgetWindow(widget),
+                              QSize(Constants::ItemHeaderIconSize, Constants::ItemHeaderIconSize),
                               header->state & State_Enabled ? QIcon::Normal : QIcon::Disabled));
     }
 
-    drawItemText(p, rect.toRect(), Qt::AlignLeft | Qt::AlignVCenter | Qt::TextHideMnemonic,
-                 header->palette, header->state & State_Enabled, header->text, QPalette::WindowText);
+    proxy()->drawItemText(p, rect.toRect(), Qt::AlignLeft | Qt::AlignVCenter | Qt::TextHideMnemonic,
+                          header->palette, header->state & State_Enabled, header->text,
+                          QPalette::WindowText);
 
     if(header->sortIndicator != QStyleOptionHeader::None)
     {
@@ -2029,7 +2292,7 @@ void RDStyle::drawControl(ControlElement control, const QStyleOption *opt, QPain
         arrowRect.setLeft(arrowRect.right() - Constants::SpinButtonDim);
 
         qreal yoffset = 2.5f;
-        if(header->sortIndicator == QStyleOptionHeader::SortDown)
+        if(header->sortIndicator == QStyleOptionHeader::SortUp)
           yoffset = -yoffset;
 
         qreal ycentre = arrowRect.center().y();
@@ -2076,8 +2339,8 @@ void RDStyle::drawRoundedRectBorder(const QStyleOption *opt, QPainter *p, const 
 
   p->setRenderHint(QPainter::Antialiasing);
 
-  int xshift = pixelMetric(PM_ButtonShiftHorizontal, opt, widget);
-  int yshift = pixelMetric(PM_ButtonShiftVertical, opt, widget);
+  int xshift = proxy()->pixelMetric(PM_ButtonShiftHorizontal, opt, widget);
+  int yshift = proxy()->pixelMetric(PM_ButtonShiftVertical, opt, widget);
 
   QRect rect = opt->rect.adjusted(0, 0, -1, -1);
 

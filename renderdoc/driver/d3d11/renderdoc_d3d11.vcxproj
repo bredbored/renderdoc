@@ -24,6 +24,7 @@
     <RootNamespace>renderdoc_d3d11</RootNamespace>
     <ProjectName>d3d11</ProjectName>
   </PropertyGroup>
+  <Import Project="$(SolutionDir)\util\WindowsSDKTarget.props" />
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Label="Configuration">
     <ConfigurationType>StaticLibrary</ConfigurationType>
@@ -65,6 +66,8 @@
       <PreprocessorDefinitions>RENDERDOC_EXPORTS;RENDERDOC_PLATFORM_WIN32;WIN32;NDEBUG;_WINDOWS;_USRDLL;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <PrecompiledHeader>Use</PrecompiledHeader>
       <WarningLevel>Level4</WarningLevel>
+      <BasicRuntimeChecks>Default</BasicRuntimeChecks>
+      <BufferSecurityCheck>false</BufferSecurityCheck>
       <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
       <RuntimeTypeInfo>false</RuntimeTypeInfo>
       <TreatWarningAsError>true</TreatWarningAsError>
@@ -73,6 +76,7 @@
       <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
       <PrecompiledHeaderFile>precompiled.h</PrecompiledHeaderFile>
       <ForcedIncludeFiles>precompiled.h</ForcedIncludeFiles>
+      <AdditionalOptions>/w44062 /w44840 %(AdditionalOptions)</AdditionalOptions>
       <DisableSpecificWarnings>4100</DisableSpecificWarnings>
     </ClCompile>
     <Link>
@@ -88,10 +92,8 @@
   <ItemDefinitionGroup Condition="'$(Configuration)'=='Release'">
     <ClCompile>
       <Optimization>MaxSpeed</Optimization>
-      <BasicRuntimeChecks>Default</BasicRuntimeChecks>
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
-      <BufferSecurityCheck>false</BufferSecurityCheck>
     </ClCompile>
     <Link>
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
@@ -131,6 +133,7 @@
     <ClCompile Include="d3d11_shaderdebug.cpp" />
     <ClCompile Include="d3d11_stringise.cpp" />
     <ClCompile Include="d3d11_video.cpp" />
+    <ClCompile Include="d3d9_hooks.cpp" />
     <ClCompile Include="precompiled.cpp">
       <PrecompiledHeader>Create</PrecompiledHeader>
     </ClCompile>
@@ -140,6 +143,7 @@
     <ClInclude Include="d3d11_context.h" />
     <ClInclude Include="d3d11_debug.h" />
     <ClInclude Include="d3d11_device.h" />
+    <ClInclude Include="d3d11_hooks.h" />
     <ClInclude Include="d3d11_manager.h" />
     <ClInclude Include="d3d11_renderstate.h" />
     <ClInclude Include="d3d11_rendertext.h" />
@@ -163,6 +167,9 @@
     </ProjectReference>
     <ProjectReference Include="..\ihv\intel\Intel.vcxproj">
       <Project>{7fcb5fc5-1dbd-4da6-83a0-6ba4e945bda5}</Project>
+    </ProjectReference>
+    <ProjectReference Include="..\ihv\nv\NV.vcxproj">
+      <Project>{40349ad9-5558-4df4-84e2-11934de90a11}</Project>
     </ProjectReference>
     <ProjectReference Include="..\shaders\dxbc\renderdoc_dxbc.vcxproj">
       <Project>{c43ff27e-a155-4852-88ec-5ce9334c07a8}</Project>

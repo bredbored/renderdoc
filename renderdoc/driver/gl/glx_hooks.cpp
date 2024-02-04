@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2018-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -23,13 +23,13 @@
  ******************************************************************************/
 
 #include <dlfcn.h>
-#include "driver/gl/gl_driver.h"
-#include "driver/gl/glx_dispatch_table.h"
 #include "hooks/hooks.h"
+#include "gl_driver.h"
+#include "glx_dispatch_table.h"
 
 namespace Keyboard
 {
-void CloneDisplay(Display *dpy);
+void UseXlibDisplay(Display *dpy);
 }
 
 class GLXHook : LibraryHook
@@ -67,13 +67,17 @@ static void EnsureRealLibraryLoaded()
 {
   if(glxhook.handle == RTLD_NEXT)
   {
-    RDCLOG("Loading libGL at the last second");
+    if(!RenderDoc::Inst().IsReplayApp())
+      RDCLOG("Loading libGL at the last second");
 
     void *handle = Process::LoadModule("libGL.so.1");
     if(!handle)
       handle = Process::LoadModule("libGL.so");
     if(!handle)
       handle = Process::LoadModule("libGLX.so.0");
+
+    if(RenderDoc::Inst().IsReplayApp())
+      glxhook.handle = handle;
   }
 }
 
@@ -103,7 +107,7 @@ HOOK_EXPORT GLXContext glXCreateContext_renderdoc_hooked(Display *dpy, XVisualIn
 
   int value = 0;
 
-  Keyboard::CloneDisplay(dpy);
+  Keyboard::UseXlibDisplay(dpy);
 
   GLX.glXGetConfig(dpy, vis, GLX_BUFFER_SIZE, &value);
   init.colorBits = value;
@@ -124,10 +128,74 @@ HOOK_EXPORT GLXContext glXCreateContext_renderdoc_hooked(Display *dpy, XVisualIn
   data.ctx = ret;
   data.cfg = vis;
 
+  EnableGLHooks();
+
   {
     SCOPED_LOCK(glLock);
     glxhook.driver.CreateContext(data, shareList, init, false, false);
   }
+
+  return ret;
+}
+
+HOOK_EXPORT GLXContext glXCreateNewContext_renderdoc_hooked(Display *dpy, GLXFBConfig config,
+                                                            int renderType, GLXContext shareList,
+                                                            Bool direct)
+{
+  if(RenderDoc::Inst().IsReplayApp())
+  {
+    if(!GLX.glXCreateNewContext)
+      GLX.PopulateForReplay();
+
+    return GLX.glXCreateNewContext(dpy, config, renderType, shareList, direct);
+  }
+
+  EnsureRealLibraryLoaded();
+
+  GLXContext ret = GLX.glXCreateNewContext(dpy, config, renderType, shareList, direct);
+
+  // don't continue if context creation failed
+  if(!ret)
+    return ret;
+
+  GLInitParams init;
+
+  init.width = 0;
+  init.height = 0;
+
+  int value = 0;
+
+  XVisualInfo *vis = GLX.glXGetVisualFromFBConfig(dpy, config);
+
+  Keyboard::UseXlibDisplay(dpy);
+
+  GLX.glXGetConfig(dpy, vis, GLX_BUFFER_SIZE, &value);
+  init.colorBits = value;
+  GLX.glXGetConfig(dpy, vis, GLX_DEPTH_SIZE, &value);
+  init.depthBits = value;
+  GLX.glXGetConfig(dpy, vis, GLX_STENCIL_SIZE, &value);
+  init.stencilBits = value;
+  value = 1;    // default to srgb
+  GLX.glXGetConfig(dpy, vis, GLX_FRAMEBUFFER_SRGB_CAPABLE_ARB, &value);
+  init.isSRGB = value;
+  value = 1;
+  GLX.glXGetConfig(dpy, vis, GLX_SAMPLES_ARB, &value);
+  init.multiSamples = RDCMAX(1, value);
+
+  GLWindowingData data;
+  data.dpy = dpy;
+  data.wnd = (GLXDrawable)NULL;
+  data.ctx = ret;
+  data.cfg = vis;
+
+  EnableGLHooks();
+
+  {
+    SCOPED_LOCK(glLock);
+    glxhook.driver.CreateContext(data, shareList, init, false, false);
+  }
+
+  XFree(vis);
 
   return ret;
 }
@@ -170,7 +238,7 @@ HOOK_EXPORT GLXContext glXCreateContextAttribsARB_renderdoc_hooked(Display *dpy,
   int defaultAttribList[] = {0};
 
   const int *attribs = attribList ? attribList : defaultAttribList;
-  std::vector<int> attribVec;
+  rdcarray<int> attribVec;
 
   // modify attribs to our liking
   {
@@ -248,7 +316,7 @@ HOOK_EXPORT GLXContext glXCreateContextAttribsARB_renderdoc_hooked(Display *dpy,
 
   int value = 0;
 
-  Keyboard::CloneDisplay(dpy);
+  Keyboard::UseXlibDisplay(dpy);
 
   GLX.glXGetConfig(dpy, vis, GLX_BUFFER_SIZE, &value);
   init.colorBits = value;
@@ -269,6 +337,8 @@ HOOK_EXPORT GLXContext glXCreateContextAttribsARB_renderdoc_hooked(Display *dpy,
   data.ctx = ret;
   data.cfg = vis;
 
+  EnableGLHooks();
+
   {
     SCOPED_LOCK(glLock);
     glxhook.driver.CreateContext(data, shareList, init, core, true);
@@ -283,8 +353,16 @@ HOOK_EXPORT Bool glXMakeCurrent_renderdoc_hooked(Display *dpy, GLXDrawable drawa
 {
   if(RenderDoc::Inst().IsReplayApp())
   {
-    if(!GLX.glXMakeCurrent)
+    if(!GLX.glXMakeCurrent || !GLX.glXGetProcAddress)
       GLX.PopulateForReplay();
+
+    // populate GL function pointers now in case linked functions are called
+    if(GLX.glXGetProcAddress)
+    {
+      GL.PopulateWithCallback([](const char *funcName) -> void * {
+        return (void *)GLX.glXGetProcAddress((const GLubyte *)funcName);
+      });
+    }
 
     return GLX.glXMakeCurrent(dpy, drawable, ctx);
   }
@@ -298,17 +376,19 @@ HOOK_EXPORT Bool glXMakeCurrent_renderdoc_hooked(Display *dpy, GLXDrawable drawa
     SCOPED_LOCK(glLock);
 
     SetDriverForHooks(&glxhook.driver);
+    EnableGLHooks();
 
     if(ctx && glxhook.contexts.find(ctx) == glxhook.contexts.end())
     {
       glxhook.contexts.insert(ctx);
 
-      FetchEnabledExtensions();
-
-      // see gl_emulated.cpp
-      GL.EmulateUnsupportedFunctions();
-      GL.EmulateRequiredExtensions();
-      GL.DriverForEmulation(&glxhook.driver);
+      if(FetchEnabledExtensions())
+      {
+        // see gl_emulated.cpp
+        GL.EmulateUnsupportedFunctions();
+        GL.EmulateRequiredExtensions();
+        GL.DriverForEmulation(&glxhook.driver);
+      }
     }
 
     GLWindowingData data;
@@ -335,9 +415,9 @@ HOOK_EXPORT Bool glXMakeCurrent_renderdoc_hooked(Display *dpy, GLXDrawable drawa
         data.cfg = NULL;
     }
 
-    glxhook.driver.ActivateContext(data);
-
     glxhook.UpdateWindowSize(data, dpy, drawable);
+
+    glxhook.driver.ActivateContext(data);
 
     if(config)
       XFree(config);
@@ -353,8 +433,16 @@ HOOK_EXPORT Bool glXMakeContextCurrent_renderdoc_hooked(Display *dpy, GLXDrawabl
 {
   if(RenderDoc::Inst().IsReplayApp())
   {
-    if(!GLX.glXMakeContextCurrent)
+    if(!GLX.glXMakeContextCurrent || !GLX.glXGetProcAddress)
       GLX.PopulateForReplay();
+
+    // populate GL function pointers now in case linked functions are called
+    if(GLX.glXGetProcAddress)
+    {
+      GL.PopulateWithCallback([](const char *funcName) -> void * {
+        return (void *)GLX.glXGetProcAddress((const GLubyte *)funcName);
+      });
+    }
 
     return GLX.glXMakeContextCurrent(dpy, draw, read, ctx);
   }
@@ -368,17 +456,19 @@ HOOK_EXPORT Bool glXMakeContextCurrent_renderdoc_hooked(Display *dpy, GLXDrawabl
     SCOPED_LOCK(glLock);
 
     SetDriverForHooks(&glxhook.driver);
+    EnableGLHooks();
 
     if(ctx && glxhook.contexts.find(ctx) == glxhook.contexts.end())
     {
       glxhook.contexts.insert(ctx);
 
-      FetchEnabledExtensions();
-
-      // see gl_emulated.cpp
-      GL.EmulateUnsupportedFunctions();
-      GL.EmulateRequiredExtensions();
-      GL.DriverForEmulation(&glxhook.driver);
+      if(FetchEnabledExtensions())
+      {
+        // see gl_emulated.cpp
+        GL.EmulateUnsupportedFunctions();
+        GL.EmulateRequiredExtensions();
+        GL.DriverForEmulation(&glxhook.driver);
+      }
     }
 
     GLWindowingData data;
@@ -404,9 +494,9 @@ HOOK_EXPORT Bool glXMakeContextCurrent_renderdoc_hooked(Display *dpy, GLXDrawabl
         data.cfg = NULL;
     }
 
-    glxhook.driver.ActivateContext(data);
-
     glxhook.UpdateWindowSize(data, dpy, draw);
+
+    glxhook.driver.ActivateContext(data);
 
     if(config)
       XFree(config);
@@ -441,7 +531,9 @@ HOOK_EXPORT void glXSwapBuffers_renderdoc_hooked(Display *dpy, GLXDrawable drawa
     glxhook.UpdateWindowSize(data, dpy, drawable);
   }
 
-  glxhook.driver.SwapBuffers((void *)drawable);
+  gl_CurChunk = GLChunk::glXSwapBuffers;
+
+  glxhook.driver.SwapBuffers(WindowingSystem::Xlib, (void *)drawable);
 
   GLX.glXSwapBuffers(dpy, drawable);
 }
@@ -474,6 +566,8 @@ HOOK_EXPORT __GLXextFuncPtr glXGetProcAddress_renderdoc_hooked(const GLubyte *f)
   // return our glX hooks
   if(!strcmp(func, "glXCreateContext"))
     return (__GLXextFuncPtr)&glXCreateContext_renderdoc_hooked;
+  if(!strcmp(func, "glXCreateNewContext"))
+    return (__GLXextFuncPtr)&glXCreateNewContext_renderdoc_hooked;
   if(!strcmp(func, "glXDestroyContext"))
     return (__GLXextFuncPtr)&glXDestroyContext_renderdoc_hooked;
   if(!strcmp(func, "glXCreateContextAttribsARB"))
@@ -512,6 +606,12 @@ HOOK_EXPORT GLXContext glXCreateContext(Display *dpy, XVisualInfo *vis, GLXConte
                                         Bool direct)
 {
   return glXCreateContext_renderdoc_hooked(dpy, vis, shareList, direct);
+}
+
+HOOK_EXPORT GLXContext glXCreateNewContext(Display *dpy, GLXFBConfig config, int renderType,
+                                           GLXContext shareList, Bool direct)
+{
+  return glXCreateNewContext_renderdoc_hooked(dpy, config, renderType, shareList, direct);
 }
 
 HOOK_EXPORT void glXDestroyContext(Display *dpy, GLXContext ctx)
@@ -625,8 +725,6 @@ GLX_PASSTHRU_4(GLXFBConfig *, glXChooseFBConfig, Display *, dpy, int, screen, co
 GLX_PASSTHRU_3(XVisualInfo *, glXChooseVisual, Display *, dpy, int, screen, int *, attrib_list);
 GLX_PASSTHRU_4(int, glXGetConfig, Display *, dpy, XVisualInfo *, visual, int, attribute, int *,
                value);
-GLX_PASSTHRU_5(GLXContext, glXCreateNewContext, Display *, dpy, GLXFBConfig, config, int,
-               renderType, GLXContext, shareList, Bool, direct);
 GLX_PASSTHRU_4(void, glXCopyContext, Display *, dpy, GLXContext, source, GLXContext, dest,
                unsigned long, mask);
 GLX_PASSTHRU_4(int, glXQueryContext, Display *, dpy, GLXContext, ctx, int, attribute, int *, value);

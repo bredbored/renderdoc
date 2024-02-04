@@ -124,8 +124,8 @@
             <File Id='Qt5Network' Name='Qt5Network.dll' DiskId='1' Source='dist/Release32/Qt5Network.dll' />
             <File Id='Qt5Svg' Name='Qt5Svg.dll' DiskId='1' Source='dist/Release32/Qt5Svg.dll' />
             <File Id='Qt5Widgets' Name='Qt5Widgets.dll' DiskId='1' Source='dist/Release32/Qt5Widgets.dll' />
-            <File Id='libeay32' Name='libeay32.dll' DiskId='1' Source='dist/Release32/libeay32.dll' />
-            <File Id='ssleay32' Name='ssleay32.dll' DiskId='1' Source='dist/Release32/ssleay32.dll' />
+            <File Id='libcrypto' Name='libcrypto-1_1.dll' DiskId='1' Source='dist/Release32/libcrypto-1_1.dll' />
+            <File Id='libssl' Name='libssl-1_1.dll' DiskId='1' Source='dist/Release32/libssl-1_1.dll' />
           </Component>
 
           <Component Id='Python' Guid='63C5667D-38DA-464B-8E2F-B2857B8EAEC8'>
@@ -168,17 +168,15 @@
 
           <Directory Id='plugins' Name='plugins'>
             <Directory Id='plugins_amd' Name='amd'>
-              <Directory Id='plugins_amd_isa' Name='isa'>
-                <Component Id='gcn_plugin' Guid='B7DBB513-E971-43F9-A0D5-B3AF279DA07B'>
-                  <File Id='amdspvEXE' Name='amdspv.exe' DiskId='1' Source='dist/Release32/plugins/amd/isa/amdspv.exe' KeyPath='yes' />
-                  <File Id='spvgenDLL' Name='spvgen.dll' DiskId='1' Source='dist/Release32/plugins/amd/isa/spvgen.dll' />
-                  <File Id='virtualcontextEXE' Name='VirtualContext.exe' DiskId='1' Source='dist/Release32/plugins/amd/isa/VirtualContext.exe' />
-                </Component>
-              </Directory>
-              
               <Directory Id='plugins_amd_rgp' Name='rgp'>
                 <Component Id='rgp_plugin' Guid='A5766AE0-EF2E-4584-B529-3760F476B613'>
                   <File Id='amdrgpDLL' Name='DevDriverAPI.dll' DiskId='1' Source='dist/Release32/plugins/amd/rgp/DevDriverAPI.dll' KeyPath='yes' />
+                </Component>
+              </Directory>
+
+              <Directory Id='plugins_amd_ags' Name='ags'>
+                <Component Id='ags_plugin' Guid='1F42FA40-EC82-4E9C-9A6F-67CCF0251DB0'>
+                  <File Id='amdagsDLL' Name='amd_ags_x86.dll' DiskId='1' Source='dist/Release32/plugins/amd/ags/amd_ags_x86.dll' KeyPath='yes' />
                 </Component>
               </Directory>
 
@@ -198,13 +196,9 @@
               <Component Id='android_plugin' Guid='D469744A-7915-46B8-88B4-4B76223EE8CB'>
                 <File Id='APKarm32' Name='org.renderdoc.renderdoccmd.arm32.apk' DiskId='1' Source='dist/Release32/plugins/android/org.renderdoc.renderdoccmd.arm32.apk' KeyPath='yes' />
                 <File Id='APKarm64' Name='org.renderdoc.renderdoccmd.arm64.apk' DiskId='1' Source='dist/Release32/plugins/android/org.renderdoc.renderdoccmd.arm64.apk' />
-                <File Id='aapt' Name='aapt.exe' DiskId='1' Source='dist/Release32/plugins/android/aapt.exe' />
                 <File Id='adb' Name='adb.exe' DiskId='1' Source='dist/Release32/plugins/android/adb.exe' />
                 <File Id='AdbWinApi' Name='AdbWinApi.dll' DiskId='1' Source='dist/Release32/plugins/android/AdbWinApi.dll' />
                 <File Id='AdbWinUsbApi' Name='AdbWinUsbApi.dll' DiskId='1' Source='dist/Release32/plugins/android/AdbWinUsbApi.dll' />
-                <File Id='apksigner' Name='apksigner.jar' DiskId='1' Source='dist/Release32/plugins/android/apksigner.jar' />
-                <File Id='keystore' Name='renderdoc.keystore' DiskId='1' Source='dist/Release32/plugins/android/renderdoc.keystore' />
-                <File Id='zipalign' Name='zipalign.exe' DiskId='1' Source='dist/Release32/plugins/android/zipalign.exe' />
               </Component>
             </Directory>
 
@@ -311,9 +305,10 @@
     </Directory>
 
     <DirectoryRef Id="TARGETDIR">
-      <Merge Id="VCRedist32" DiskId="1" Language="0" SourceFile="C:\Program Files (x86)\Common Files\Merge Modules\Microsoft_VC140_CRT_x86.msm"/>
+      <Merge Id="VCRedist32" DiskId="1" Language="0" SourceFile="C:\Program Files (x86)\Microsoft Visual Studio\2019\Community\VC\Redist\MSVC\v142\MergeModules\Microsoft_VC142_CRT_x86.msm"/>
     </DirectoryRef>
 
+    <!-- check if the runtime is installed -->
     <Property Id="VCRT32INSTALLED" Value="0">
       <RegistrySearch Id="VCRT32Key"
         Root="HKLM"
@@ -321,6 +316,38 @@
         Name="Installed"
         Type="raw" />
     </Property>
+
+    <!-- grab the major/minor version numbers, as we need to check if 2019 is installed or only an older version -->
+    <Property Id="VCRT32MAJOR" Value="0">
+      <RegistrySearch Id="VCRT32MajorKey"
+        Root="HKLM"
+        Key="Software\Microsoft\VisualStudio\14.0\VC\Runtimes\x86"
+        Name="Major"
+        Type="raw" />
+    </Property>
+
+    <Property Id="VCRT32MINOR" Value="0">
+      <RegistrySearch Id="VCRT32MinorKey"
+        Root="HKLM"
+        Key="Software\Microsoft\VisualStudio\14.0\VC\Runtimes\x86"
+        Name="Minor"
+        Type="raw" />
+    </Property>
+
+    <!-- the versions are stored in DWORDs which windows installer returns as #14 etc. We need to strip the # to actually compare :( -->
+    <CustomAction Id="RemoveHash" Script="vbscript">
+      <![CDATA[
+        Session.Property("VCRT32MAJOR") = Replace(Session.Property("VCRT32MAJOR"),"#","")
+        Session.Property("VCRT32MINOR") = Replace(Session.Property("VCRT32MINOR"),"#","")
+        ]]>
+    </CustomAction>
+
+    <InstallExecuteSequence>
+      <Custom Action="RemoveHash" Before="LaunchConditions"/>
+    </InstallExecuteSequence>
+    <InstallUISequence>
+      <Custom Action="RemoveHash" Before="LaunchConditions"/>
+    </InstallUISequence>
 
     <Feature Id='Complete' Title='RenderDoc' Description='Everything included.' AllowAdvertise='no' Absent='disallow' Display='expand' Level='1' ConfigurableDirectory='INSTALLDIR'>
       <Feature Id='MainProgram' Title='Program' Description='The main executable with everything needed to capture and replay.' AllowAdvertise='no' Absent='disallow' Level='1'>
@@ -337,8 +364,8 @@
 
         <ComponentRef Id='LICENSE' />
 
-        <ComponentRef Id='gcn_plugin' />
         <ComponentRef Id='rgp_plugin' />
+        <ComponentRef Id='ags_plugin' />
         <ComponentRef Id='gpa_plugin' />
         <ComponentRef Id='android_plugin' />
         <ComponentRef Id='spirv_plugin' />
@@ -348,9 +375,10 @@
         <ComponentRef Id='ImageOpenWith' />
       </Feature>
 
-      <Feature Id="VCRedist32" Title="Visual C++ 2015 Runtime Update 3" AllowAdvertise="no" Display="hidden" Level="1">
+      <Feature Id="VCRedist32" Title="Visual C++ 2019 Runtime" AllowAdvertise="no" Display="hidden" Level="1">
+        <!-- install the redist either if it's not installed at all, or if it's too old (14.20 is the first VS2019 redist) -->
         <Condition Level='0'>
-          <![CDATA[Installed OR (VCRT32INSTALLED <> "0")]]>
+          <![CDATA[Installed OR (VCRT32INSTALLED <> "0" AND VCRT32MAJOR >= "14" AND VCRT32MINOR >= "20")]]>
         </Condition>
 
         <MergeRef Id="VCRedist32"/>

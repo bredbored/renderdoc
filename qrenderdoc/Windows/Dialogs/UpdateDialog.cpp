@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2017-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -116,11 +116,12 @@ void UpdateDialog::on_close_clicked()
 
 void UpdateDialog::on_update_clicked()
 {
-  QMessageBox::StandardButton res = RDDialog::question(
-      this, tr("RenderDoc Update"), tr("This will close RenderDoc immediately - if you have any "
-                                       "unsaved work, save it first!\n"
-                                       "Continue?"),
-      QMessageBox::Yes | QMessageBox::No | QMessageBox::Cancel);
+  QMessageBox::StandardButton res =
+      RDDialog::question(this, tr("RenderDoc Update"),
+                         tr("This will close RenderDoc immediately - if you have any "
+                            "unsaved work, save it first!\n"
+                            "Continue?"),
+                         QMessageBox::Yes | QMessageBox::No | QMessageBox::Cancel);
 
   if(res == QMessageBox::Yes)
   {
@@ -150,12 +151,7 @@ void UpdateDialog::on_update_clicked()
         if(!runningPrograms.isEmpty())
           runningPrograms += lit("\n");
 
-        QString target =
-            conn->GetTarget() ? QString::fromUtf8(conn->GetTarget()) : lit("<unknown>");
-        if(conn->GetAPI())
-          runningPrograms += tr("%1 running %2").arg(target).arg(QString::fromUtf8(conn->GetAPI()));
-        else
-          runningPrograms += target;
+        runningPrograms += tr("%1 running %2").arg(conn->GetTarget()).arg(conn->GetAPI());
 
         conn->Shutdown();
       }
@@ -204,7 +200,6 @@ void UpdateDialog::on_update_clicked()
                      });
 
     QObject::connect(req, &QNetworkReply::finished, [this, req]() {
-
       // don't do anything if we're finished after an error
       if(ui->update->isEnabled())
         return;
@@ -257,7 +252,6 @@ void UpdateDialog::on_update_clicked()
           QStringList() << lit("upgrade") << lit("--path") << appDir.absolutePath(), NULL, true);
 
       exit(0);
-
     });
   }
 }

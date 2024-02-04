@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  * Copyright (c) 2014 Crytek
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -34,7 +34,10 @@ class Matrix4f;
 class Camera : public ICamera
 {
 public:
-  Camera(CameraType t) : type(t), dirty(true), pos(), dist(0.0f), angles() { ResetArcball(); }
+  Camera(CameraType t) : type(t), dirty(true), pos(), dist(0.0f), angles()
+  {
+    Camera::ResetArcball();
+  }
   virtual ~Camera() {}
   void Shutdown() { delete this; }
   void SetPosition(float x, float y, float z)

@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  * Copyright (c) 2014 Crytek
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -25,9 +25,7 @@
 
 #pragma once
 
-#include <list>
 #include <map>
-#include "api/replay/renderdoc_replay.h"
 #include "core/core.h"
 #include "d3d11_common.h"
 #include "d3d11_manager.h"
@@ -71,14 +69,13 @@ struct MapIntercept
 class WrappedID3D11DeviceContext;
 
 // ID3DUserDefinedAnnotation
-class WrappedID3DUserDefinedAnnotation : public RefCounter, public ID3DUserDefinedAnnotation
+class WrappedID3DUserDefinedAnnotation : public ID3DUserDefinedAnnotation
 {
 public:
-  WrappedID3DUserDefinedAnnotation() : RefCounter(NULL), m_Context(NULL) {}
+  WrappedID3DUserDefinedAnnotation() : m_Context(NULL) {}
   void SetContext(WrappedID3D11DeviceContext *ctx) { m_Context = ctx; }
-  // doesn't need to soft-ref the device, for once!
-  IMPLEMENT_IUNKNOWN_WITH_REFCOUNTER_CUSTOMQUERY;
-
+  ULONG STDMETHODCALLTYPE AddRef();
+  ULONG STDMETHODCALLTYPE Release();
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppvObject);
 
   virtual INT STDMETHODCALLTYPE BeginEvent(LPCWSTR Name);
@@ -96,7 +93,7 @@ enum CaptureFailReason
   CaptureFailed_UncappedCmdlist,
 };
 
-class WrappedID3D11DeviceContext : public RefCounter, public ID3D11DeviceContext4
+class WrappedID3D11DeviceContext : public ID3D11DeviceContext4
 {
 private:
   friend class WrappedID3D11DeviceContext;
@@ -118,23 +115,17 @@ private:
     }
   };
 
+  // we manually implement ID3D11DeviceChild instead of using WrappedID3D11DeviceChild because the
+  // device contexts can be special
+  int32_t m_ExtRef;
+  int32_t m_IntRef;
   std::set<ResourceId> m_DeferredDirty;
   std::set<ResourceId> m_DeferredReferences;
 
   std::set<ResourceId> m_HighTrafficResources;
   std::map<MappedResource, MapIntercept> m_OpenMaps;
 
-  struct StreamOutData
-  {
-    StreamOutData() : query(NULL), running(false), numPrims(0) {}
-    ID3D11Query *query;
-    bool running;
-    uint64_t numPrims;
-  };
-
-  std::map<ResourceId, StreamOutData> m_StreamOutCounters;
-
-  std::map<ResourceId, std::vector<EventUsage> > m_ResourceUses;
+  std::map<ResourceId, rdcarray<EventUsage>> m_ResourceUses;
 
   WrappedID3D11Device *m_pDevice;
   ID3D11DeviceContext *m_pRealContext;
@@ -145,12 +136,13 @@ private:
   ID3D11DeviceContext3 *m_pRealContext3;
   ID3D11DeviceContext4 *m_pRealContext4;
 
-  WrappedID3D11VideoContext2 m_WrappedVideo;
+  WrappedID3D11VideoContext m_WrappedVideo;
 
+  D3D11_DEVICE_CONTEXT_TYPE m_Type;
   bool m_NeedUpdateSubWorkaround;
 
   WriteSerialiser m_ScratchSerialiser;
-  std::set<std::string> m_StringDB;
+  std::set<rdcstr> m_StringDB;
 
   ResourceId m_CurContextId;
 
@@ -176,8 +168,6 @@ private:
     RenderDoc::Inst().AddActiveDriver(RDCDriver::D3D11, false);
   }
 
-  bool m_PresentChunk;
-
   ResourceId m_FakeContext;
 
   bool m_DoStateVerify;
@@ -185,10 +175,8 @@ private:
 
   D3D11RenderState *m_DeferredSavedState;
 
-  std::vector<APIEvent> m_CurEvents, m_Events;
-  bool m_AddedDrawcall;
-
-  bool HasNonMarkerEvents();
+  rdcarray<APIEvent> m_CurEvents, m_Events;
+  bool m_AddedAction;
 
   WrappedID3DUserDefinedAnnotation m_UserAnnotation;
   int32_t m_MarkerIndentLevel;
@@ -202,36 +190,40 @@ private:
       ANNOT_ENDEVENT
     } m_Type;
     uint32_t m_Col;
-    std::wstring m_Name;
+    rdcstr m_Name;
   };
-  std::vector<Annotation> m_AnnotationQueue;
+  rdcarray<Annotation> m_AnnotationQueue;
   Threading::CriticalSection m_AnnotLock;
 
+  uint64_t m_TimeBase = 0;
+  double m_TimeFrequency = 1.0f;
   SDFile *m_StructuredFile = NULL;
 
   uint64_t m_CurChunkOffset;
   SDChunkMetaData m_ChunkMetadata;
-  uint32_t m_CurEventID, m_CurDrawcallID;
+  uint32_t m_CurEventID, m_CurActionID;
+  D3D11Chunk m_LastChunk;
 
-  ReplayStatus m_FailedReplayStatus = ReplayStatus::APIReplayFailed;
+  RDResult m_FailedReplayResult = ResultCode::APIReplayFailed;
 
-  DrawcallDescription m_ParentDrawcall;
-  std::map<ResourceId, DrawcallDescription> m_CmdLists;
+  ActionDescription m_ParentAction;
+  std::map<ResourceId, ActionDescription> m_CmdLists;
 
-  std::list<DrawcallDescription *> m_DrawcallStack;
+  rdcarray<ActionDescription *> m_ActionStack;
 
   D3D11ResourceManager *GetResourceManager();
-  static std::string GetChunkName(uint32_t idx);
+  static rdcstr GetChunkName(uint32_t idx);
 
   template <typename SerialiserType>
   void Serialise_DebugMessages(SerialiserType &ser);
 
   void DrainAnnotationQueue();
+  void LatchSOProperties();
 
-  void AddUsage(const DrawcallDescription &d);
+  void AddUsage(const ActionDescription &a);
 
   void AddEvent();
-  void AddDrawcall(const DrawcallDescription &d, bool hasEvents);
+  void AddAction(const ActionDescription &a);
 
   void RecordIndexBindStats(ID3D11Buffer *Buffer);
   void RecordVertexBindStats(UINT NumBuffers, ID3D11Buffer *const Buffers[]);
@@ -267,9 +259,7 @@ private:
   SERIALISED_ID3D11CONTEXT_MARKER_FUNCTIONS();
 
 public:
-  static const int AllocPoolCount = 1024;
-  static const int AllocPoolMaxByteSize = 3 * 1024 * 1024;
-  ALLOCATE_WITH_WRAPPED_POOL(WrappedID3D11DeviceContext, AllocPoolCount, AllocPoolMaxByteSize);
+  ALLOCATE_WITH_WRAPPED_POOL(WrappedID3D11DeviceContext);
 
   WrappedID3D11DeviceContext(WrappedID3D11Device *realDevice, ID3D11DeviceContext *context);
   virtual ~WrappedID3D11DeviceContext();
@@ -287,7 +277,7 @@ public:
   void MarkDirtyResource(ResourceId id);
 
   // insert a fake chunk just to store these parameters
-  void Present(UINT SyncInterval, UINT Flags);
+  IMPLEMENT_FUNCTION_SERIALISED(void, Present, UINT SyncInterval, UINT Flags);
 
   void CleanupCapture();
   bool ShadowStorageInUse(D3D11ResourceRecord *record);
@@ -311,30 +301,33 @@ public:
 
   bool ProcessChunk(ReadSerialiser &ser, D3D11Chunk chunk);
   void ReplayFakeContext(ResourceId id);
-  ReplayStatus ReplayLog(CaptureState readType, uint32_t startEventID, uint32_t endEventID,
-                         bool partial);
+  RDResult ReplayLog(CaptureState readType, uint32_t startEventID, uint32_t endEventID, bool partial);
   void SetFrameReader(StreamReader *reader) { m_FrameReader = reader; }
   void MarkResourceReferenced(ResourceId id, FrameRefType refType);
 
-  std::vector<EventUsage> GetUsage(ResourceId id) { return m_ResourceUses[id]; }
+  rdcarray<EventUsage> GetUsage(ResourceId id) { return m_ResourceUses[id]; }
   void ClearMaps();
 
   uint32_t GetEventID() { return m_CurEventID; }
   const APIEvent &GetEvent(uint32_t eventId) const;
 
-  const DrawcallDescription &GetRootDraw() { return m_ParentDrawcall; }
+  const ActionDescription &GetRootDraw() { return m_ParentAction; }
   void ThreadSafe_SetMarker(uint32_t col, const wchar_t *name);
   int ThreadSafe_BeginEvent(uint32_t col, const wchar_t *name);
   int ThreadSafe_EndEvent();
 
+  // internal addref/release
+  void IntAddRef();
+  void IntRelease();
+
   //////////////////////////////
   // implement IUnknown
-  ULONG STDMETHODCALLTYPE AddRef() { return RefCounter::SoftRef(m_pDevice); }
-  ULONG STDMETHODCALLTYPE Release() { return RefCounter::SoftRelease(m_pDevice); }
+  ULONG STDMETHODCALLTYPE AddRef();
+  ULONG STDMETHODCALLTYPE Release();
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppvObject);
 
   //////////////////////////////
-  // implement IDXGIDeviceChild
+  // implement ID3D11DeviceChild
 
   virtual HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID Name, UINT DataSize, const void *pData)
   {

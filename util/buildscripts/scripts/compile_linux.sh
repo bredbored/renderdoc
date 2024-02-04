@@ -4,7 +4,7 @@ echo "Building renderdoc-build docker image"
 
 # Ensure the docker image is prepared
 pushd "${BUILD_ROOT}"/scripts/docker
-docker build -t renderdoc-build .
+docker build -t renderdoc-build . || exit 1
 popd
 
 echo "Docker image built. Running build"
@@ -77,6 +77,7 @@ if [ "$VERSION32" == "$GITTAG" ]; then
 else
 
 	# Build the arm32 variant
+	rm -rf build-android-arm32
 	mkdir build-android-arm32
 	pushd build-android-arm32
 
@@ -98,6 +99,7 @@ if [ "$VERSION64" == "$GITTAG" ]; then
 
 else
 
+	rm -rf build-android-arm64
 	mkdir build-android-arm64
 	pushd build-android-arm64
 

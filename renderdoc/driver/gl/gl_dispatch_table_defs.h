@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2018-2019 Baldur Karlsson
+ * Copyright (c) 2018-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -138,8 +138,8 @@
   FUNC(glTexBufferRange, glTexBufferRangeEXT); \
   FUNC(glTexBufferRange, glTexBufferRangeOES); \
   FUNC(glTextureView, glTextureView); \
-  FUNC(glTextureView, glTextureViewEXT); \
   FUNC(glTextureView, glTextureViewOES); \
+  FUNC(glTextureView, glTextureViewEXT); \
   FUNC(glTexParameterIiv, glTexParameterIiv); \
   FUNC(glTexParameterIiv, glTexParameterIivEXT); \
   FUNC(glTexParameterIiv, glTexParameterIivOES); \
@@ -506,7 +506,9 @@
   FUNC(glMapBuffer, glMapBufferARB); \
   FUNC(glMapBuffer, glMapBufferOES); \
   FUNC(glMapBufferRange, glMapBufferRange); \
+  FUNC(glMapBufferRange, glMapBufferRangeEXT); \
   FUNC(glFlushMappedBufferRange, glFlushMappedBufferRange); \
+  FUNC(glFlushMappedBufferRange, glFlushMappedBufferRangeEXT); \
   FUNC(glUnmapBuffer, glUnmapBuffer); \
   FUNC(glUnmapBuffer, glUnmapBufferARB); \
   FUNC(glUnmapBuffer, glUnmapBufferOES); \
@@ -1399,8 +1401,8 @@
   AliasWrapper5(void, glTexBufferRangeEXT, glTexBufferRange, GLenum, target, GLenum, internalformat, GLuint, buffer, GLintptr, offset, GLsizeiptr, size); \
   AliasWrapper5(void, glTexBufferRangeOES, glTexBufferRange, GLenum, target, GLenum, internalformat, GLuint, buffer, GLintptr, offset, GLsizeiptr, size); \
   FuncWrapper8(void, glTextureView, GLuint, texture, GLenum, target, GLuint, origtexture, GLenum, internalformat, GLuint, minlevel, GLuint, numlevels, GLuint, minlayer, GLuint, numlayers); \
-  AliasWrapper8(void, glTextureViewEXT, glTextureView, GLuint, texture, GLenum, target, GLuint, origtexture, GLenum, internalformat, GLuint, minlevel, GLuint, numlevels, GLuint, minlayer, GLuint, numlayers); \
   AliasWrapper8(void, glTextureViewOES, glTextureView, GLuint, texture, GLenum, target, GLuint, origtexture, GLenum, internalformat, GLuint, minlevel, GLuint, numlevels, GLuint, minlayer, GLuint, numlayers); \
+  AliasWrapper8(void, glTextureViewEXT, glTextureView, GLuint, texture, GLenum, target, GLuint, origtexture, GLenum, internalformat, GLuint, minlevel, GLuint, numlevels, GLuint, minlayer, GLuint, numlayers); \
   FuncWrapper3(void, glTexParameterIiv, GLenum, target, GLenum, pname, const GLint *, params); \
   AliasWrapper3(void, glTexParameterIivEXT, glTexParameterIiv, GLenum, target, GLenum, pname, const GLint *, params); \
   AliasWrapper3(void, glTexParameterIivOES, glTexParameterIiv, GLenum, target, GLenum, pname, const GLint *, params); \
@@ -1767,7 +1769,9 @@
   AliasWrapper2(void *, glMapBufferARB, glMapBuffer, GLenum, target, GLenum, access); \
   AliasWrapper2(void *, glMapBufferOES, glMapBuffer, GLenum, target, GLenum, access); \
   FuncWrapper4(void *, glMapBufferRange, GLenum, target, GLintptr, offset, GLsizeiptr, length, GLbitfield, access); \
+  AliasWrapper4(void *, glMapBufferRangeEXT, glMapBufferRange, GLenum, target, GLintptr, offset, GLsizeiptr, length, GLbitfield, access); \
   FuncWrapper3(void, glFlushMappedBufferRange, GLenum, target, GLintptr, offset, GLsizeiptr, length); \
+  AliasWrapper3(void, glFlushMappedBufferRangeEXT, glFlushMappedBufferRange, GLenum, target, GLintptr, offset, GLsizeiptr, length); \
   FuncWrapper1(GLboolean, glUnmapBuffer, GLenum, target); \
   AliasWrapper1(GLboolean, glUnmapBufferARB, glUnmapBuffer, GLenum, target); \
   AliasWrapper1(GLboolean, glUnmapBufferOES, glUnmapBuffer, GLenum, target); \
@@ -2925,7 +2929,6 @@
   FUNC(glFinishObjectAPPLE); \
   FUNC(glFinishTextureSUNX); \
   FUNC(glFlushMappedBufferRangeAPPLE); \
-  FUNC(glFlushMappedBufferRangeEXT); \
   FUNC(glFlushPixelDataRangeNV); \
   FUNC(glFlushRasterSGIX); \
   FUNC(glFlushStaticDataIBM); \
@@ -3387,7 +3390,6 @@
   FUNC(glMap2d); \
   FUNC(glMap2f); \
   FUNC(glMap2xOES); \
-  FUNC(glMapBufferRangeEXT); \
   FUNC(glMapControlPointsNV); \
   FUNC(glMapGrid1d); \
   FUNC(glMapGrid1f); \
@@ -4837,7 +4839,6 @@
   UnsupportedWrapper2(void, glFinishObjectAPPLE, GLenum, object, GLint, name); \
   UnsupportedWrapper0(void, glFinishTextureSUNX); \
   UnsupportedWrapper3(void, glFlushMappedBufferRangeAPPLE, GLenum, target, GLintptr, offset, GLsizeiptr, size); \
-  UnsupportedWrapper3(void, glFlushMappedBufferRangeEXT, GLenum, target, GLintptr, offset, GLsizeiptr, length); \
   UnsupportedWrapper1(void, glFlushPixelDataRangeNV, GLenum, target); \
   UnsupportedWrapper0(void, glFlushRasterSGIX); \
   UnsupportedWrapper1(void, glFlushStaticDataIBM, GLenum, target); \
@@ -5299,7 +5300,6 @@
   UnsupportedWrapper10(void, glMap2d, GLenum, target, GLdouble, u1, GLdouble, u2, GLint, ustride, GLint, uorder, GLdouble, v1, GLdouble, v2, GLint, vstride, GLint, vorder, const GLdouble *, points); \
   UnsupportedWrapper10(void, glMap2f, GLenum, target, GLfloat, u1, GLfloat, u2, GLint, ustride, GLint, uorder, GLfloat, v1, GLfloat, v2, GLint, vstride, GLint, vorder, const GLfloat *, points); \
   UnsupportedWrapper10(void, glMap2xOES, GLenum, target, GLfixed, u1, GLfixed, u2, GLint, ustride, GLint, uorder, GLfixed, v1, GLfixed, v2, GLint, vstride, GLint, vorder, GLfixed, points); \
-  UnsupportedWrapper4(void *, glMapBufferRangeEXT, GLenum, target, GLintptr, offset, GLsizeiptr, length, GLbitfield, access); \
   UnsupportedWrapper9(void, glMapControlPointsNV, GLenum, target, GLuint, index, GLenum, type, GLsizei, ustride, GLsizei, vstride, GLint, uorder, GLint, vorder, GLboolean, packed, const void *, points); \
   UnsupportedWrapper3(void, glMapGrid1d, GLint, un, GLdouble, u1, GLdouble, u2); \
   UnsupportedWrapper3(void, glMapGrid1f, GLint, un, GLfloat, u1, GLfloat, u2); \
@@ -6378,7 +6378,7 @@
   UnsupportedWrapper6(void, glWriteMaskEXT, GLuint, res, GLuint, in, GLenum, outX, GLenum, outY, GLenum, outZ, GLenum, outW); \
 
 
-		
+        
 // the _renderdoc_hooked variants are to make sure we always have a function symbol exported that we
 // can return from GetProcAddress. On posix systems if another library (or the application itself)
 // creates a symbol called 'glEnable' we'll return the address of that, and break badly. Instead we
@@ -6418,12 +6418,7 @@
   CONCAT(function, _hooktype) CONCAT(unsupported_real_, function) = NULL; \
   ret HOOK_CC CONCAT(function, _renderdoc_hooked)() \
   { \
-    static bool hit = false; \
-    if(hit == false) \
-    { \
-      RDCERR("Function " STRINGIZE(function) " not supported - capture may be broken"); \
-      hit = true; \
-    } \
+    glhook.UseUnusedSupportedFunction(STRINGIZE(function)); \
     if(!CONCAT(unsupported_real_, function)) \
       CONCAT(unsupported_real_, function) = \
           (CONCAT(function, _hooktype))glhook.GetUnsupportedFunction(STRINGIZE(function)); \
@@ -6467,12 +6462,7 @@
   CONCAT(function, _hooktype) CONCAT(unsupported_real_, function) = NULL; \
   ret HOOK_CC CONCAT(function, _renderdoc_hooked)(t1 p1) \
   { \
-    static bool hit = false; \
-    if(hit == false) \
-    { \
-      RDCERR("Function " STRINGIZE(function) " not supported - capture may be broken"); \
-      hit = true; \
-    } \
+    glhook.UseUnusedSupportedFunction(STRINGIZE(function)); \
     if(!CONCAT(unsupported_real_, function)) \
       CONCAT(unsupported_real_, function) = \
           (CONCAT(function, _hooktype))glhook.GetUnsupportedFunction(STRINGIZE(function)); \
@@ -6516,12 +6506,7 @@
   CONCAT(function, _hooktype) CONCAT(unsupported_real_, function) = NULL; \
   ret HOOK_CC CONCAT(function, _renderdoc_hooked)(t1 p1, t2 p2) \
   { \
-    static bool hit = false; \
-    if(hit == false) \
-    { \
-      RDCERR("Function " STRINGIZE(function) " not supported - capture may be broken"); \
-      hit = true; \
-    } \
+    glhook.UseUnusedSupportedFunction(STRINGIZE(function)); \
     if(!CONCAT(unsupported_real_, function)) \
       CONCAT(unsupported_real_, function) = \
           (CONCAT(function, _hooktype))glhook.GetUnsupportedFunction(STRINGIZE(function)); \
@@ -6565,12 +6550,7 @@
   CONCAT(function, _hooktype) CONCAT(unsupported_real_, function) = NULL; \
   ret HOOK_CC CONCAT(function, _renderdoc_hooked)(t1 p1, t2 p2, t3 p3) \
   { \
-    static bool hit = false; \
-    if(hit == false) \
-    { \
-      RDCERR("Function " STRINGIZE(function) " not supported - capture may be broken"); \
-      hit = true; \
-    } \
+    glhook.UseUnusedSupportedFunction(STRINGIZE(function)); \
     if(!CONCAT(unsupported_real_, function)) \
       CONCAT(unsupported_real_, function) = \
           (CONCAT(function, _hooktype))glhook.GetUnsupportedFunction(STRINGIZE(function)); \
@@ -6614,12 +6594,7 @@
   CONCAT(function, _hooktype) CONCAT(unsupported_real_, function) = NULL; \
   ret HOOK_CC CONCAT(function, _renderdoc_hooked)(t1 p1, t2 p2, t3 p3, t4 p4) \
   { \
-    static bool hit = false; \
-    if(hit == false) \
-    { \
-      RDCERR("Function " STRINGIZE(function) " not supported - capture may be broken"); \
-      hit = true; \
-    } \
+    glhook.UseUnusedSupportedFunction(STRINGIZE(function)); \
     if(!CONCAT(unsupported_real_, function)) \
       CONCAT(unsupported_real_, function) = \
           (CONCAT(function, _hooktype))glhook.GetUnsupportedFunction(STRINGIZE(function)); \
@@ -6663,12 +6638,7 @@
   CONCAT(function, _hooktype) CONCAT(unsupported_real_, function) = NULL; \
   ret HOOK_CC CONCAT(function, _renderdoc_hooked)(t1 p1, t2 p2, t3 p3, t4 p4, t5 p5) \
   { \
-    static bool hit = false; \
-    if(hit == false) \
-    { \
-      RDCERR("Function " STRINGIZE(function) " not supported - capture may be broken"); \
-      hit = true; \
-    } \
+    glhook.UseUnusedSupportedFunction(STRINGIZE(function)); \
     if(!CONCAT(unsupported_real_, function)) \
       CONCAT(unsupported_real_, function) = \
           (CONCAT(function, _hooktype))glhook.GetUnsupportedFunction(STRINGIZE(function)); \
@@ -6712,12 +6682,7 @@
   CONCAT(function, _hooktype) CONCAT(unsupported_real_, function) = NULL; \
   ret HOOK_CC CONCAT(function, _renderdoc_hooked)(t1 p1, t2 p2, t3 p3, t4 p4, t5 p5, t6 p6) \
   { \
-    static bool hit = false; \
-    if(hit == false) \
-    { \
-      RDCERR("Function " STRINGIZE(function) " not supported - capture may be broken"); \
-      hit = true; \
-    } \
+    glhook.UseUnusedSupportedFunction(STRINGIZE(function)); \
     if(!CONCAT(unsupported_real_, function)) \
       CONCAT(unsupported_real_, function) = \
           (CONCAT(function, _hooktype))glhook.GetUnsupportedFunction(STRINGIZE(function)); \
@@ -6761,12 +6726,7 @@
   CONCAT(function, _hooktype) CONCAT(unsupported_real_, function) = NULL; \
   ret HOOK_CC CONCAT(function, _renderdoc_hooked)(t1 p1, t2 p2, t3 p3, t4 p4, t5 p5, t6 p6, t7 p7) \
   { \
-    static bool hit = false; \
-    if(hit == false) \
-    { \
-      RDCERR("Function " STRINGIZE(function) " not supported - capture may be broken"); \
-      hit = true; \
-    } \
+    glhook.UseUnusedSupportedFunction(STRINGIZE(function)); \
     if(!CONCAT(unsupported_real_, function)) \
       CONCAT(unsupported_real_, function) = \
           (CONCAT(function, _hooktype))glhook.GetUnsupportedFunction(STRINGIZE(function)); \
@@ -6810,12 +6770,7 @@
   CONCAT(function, _hooktype) CONCAT(unsupported_real_, function) = NULL; \
   ret HOOK_CC CONCAT(function, _renderdoc_hooked)(t1 p1, t2 p2, t3 p3, t4 p4, t5 p5, t6 p6, t7 p7, t8 p8) \
   { \
-    static bool hit = false; \
-    if(hit == false) \
-    { \
-      RDCERR("Function " STRINGIZE(function) " not supported - capture may be broken"); \
-      hit = true; \
-    } \
+    glhook.UseUnusedSupportedFunction(STRINGIZE(function)); \
     if(!CONCAT(unsupported_real_, function)) \
       CONCAT(unsupported_real_, function) = \
           (CONCAT(function, _hooktype))glhook.GetUnsupportedFunction(STRINGIZE(function)); \
@@ -6859,12 +6814,7 @@
   CONCAT(function, _hooktype) CONCAT(unsupported_real_, function) = NULL; \
   ret HOOK_CC CONCAT(function, _renderdoc_hooked)(t1 p1, t2 p2, t3 p3, t4 p4, t5 p5, t6 p6, t7 p7, t8 p8, t9 p9) \
   { \
-    static bool hit = false; \
-    if(hit == false) \
-    { \
-      RDCERR("Function " STRINGIZE(function) " not supported - capture may be broken"); \
-      hit = true; \
-    } \
+    glhook.UseUnusedSupportedFunction(STRINGIZE(function)); \
     if(!CONCAT(unsupported_real_, function)) \
       CONCAT(unsupported_real_, function) = \
           (CONCAT(function, _hooktype))glhook.GetUnsupportedFunction(STRINGIZE(function)); \
@@ -6908,12 +6858,7 @@
   CONCAT(function, _hooktype) CONCAT(unsupported_real_, function) = NULL; \
   ret HOOK_CC CONCAT(function, _renderdoc_hooked)(t1 p1, t2 p2, t3 p3, t4 p4, t5 p5, t6 p6, t7 p7, t8 p8, t9 p9, t10 p10) \
   { \
-    static bool hit = false; \
-    if(hit == false) \
-    { \
-      RDCERR("Function " STRINGIZE(function) " not supported - capture may be broken"); \
-      hit = true; \
-    } \
+    glhook.UseUnusedSupportedFunction(STRINGIZE(function)); \
     if(!CONCAT(unsupported_real_, function)) \
       CONCAT(unsupported_real_, function) = \
           (CONCAT(function, _hooktype))glhook.GetUnsupportedFunction(STRINGIZE(function)); \
@@ -6957,12 +6902,7 @@
   CONCAT(function, _hooktype) CONCAT(unsupported_real_, function) = NULL; \
   ret HOOK_CC CONCAT(function, _renderdoc_hooked)(t1 p1, t2 p2, t3 p3, t4 p4, t5 p5, t6 p6, t7 p7, t8 p8, t9 p9, t10 p10, t11 p11) \
   { \
-    static bool hit = false; \
-    if(hit == false) \
-    { \
-      RDCERR("Function " STRINGIZE(function) " not supported - capture may be broken"); \
-      hit = true; \
-    } \
+    glhook.UseUnusedSupportedFunction(STRINGIZE(function)); \
     if(!CONCAT(unsupported_real_, function)) \
       CONCAT(unsupported_real_, function) = \
           (CONCAT(function, _hooktype))glhook.GetUnsupportedFunction(STRINGIZE(function)); \
@@ -7006,12 +6946,7 @@
   CONCAT(function, _hooktype) CONCAT(unsupported_real_, function) = NULL; \
   ret HOOK_CC CONCAT(function, _renderdoc_hooked)(t1 p1, t2 p2, t3 p3, t4 p4, t5 p5, t6 p6, t7 p7, t8 p8, t9 p9, t10 p10, t11 p11, t12 p12) \
   { \
-    static bool hit = false; \
-    if(hit == false) \
-    { \
-      RDCERR("Function " STRINGIZE(function) " not supported - capture may be broken"); \
-      hit = true; \
-    } \
+    glhook.UseUnusedSupportedFunction(STRINGIZE(function)); \
     if(!CONCAT(unsupported_real_, function)) \
       CONCAT(unsupported_real_, function) = \
           (CONCAT(function, _hooktype))glhook.GetUnsupportedFunction(STRINGIZE(function)); \
@@ -7055,12 +6990,7 @@
   CONCAT(function, _hooktype) CONCAT(unsupported_real_, function) = NULL; \
   ret HOOK_CC CONCAT(function, _renderdoc_hooked)(t1 p1, t2 p2, t3 p3, t4 p4, t5 p5, t6 p6, t7 p7, t8 p8, t9 p9, t10 p10, t11 p11, t12 p12, t13 p13) \
   { \
-    static bool hit = false; \
-    if(hit == false) \
-    { \
-      RDCERR("Function " STRINGIZE(function) " not supported - capture may be broken"); \
-      hit = true; \
-    } \
+    glhook.UseUnusedSupportedFunction(STRINGIZE(function)); \
     if(!CONCAT(unsupported_real_, function)) \
       CONCAT(unsupported_real_, function) = \
           (CONCAT(function, _hooktype))glhook.GetUnsupportedFunction(STRINGIZE(function)); \
@@ -7104,12 +7034,7 @@
   CONCAT(function, _hooktype) CONCAT(unsupported_real_, function) = NULL; \
   ret HOOK_CC CONCAT(function, _renderdoc_hooked)(t1 p1, t2 p2, t3 p3, t4 p4, t5 p5, t6 p6, t7 p7, t8 p8, t9 p9, t10 p10, t11 p11, t12 p12, t13 p13, t14 p14) \
   { \
-    static bool hit = false; \
-    if(hit == false) \
-    { \
-      RDCERR("Function " STRINGIZE(function) " not supported - capture may be broken"); \
-      hit = true; \
-    } \
+    glhook.UseUnusedSupportedFunction(STRINGIZE(function)); \
     if(!CONCAT(unsupported_real_, function)) \
       CONCAT(unsupported_real_, function) = \
           (CONCAT(function, _hooktype))glhook.GetUnsupportedFunction(STRINGIZE(function)); \
@@ -7153,12 +7078,7 @@
   CONCAT(function, _hooktype) CONCAT(unsupported_real_, function) = NULL; \
   ret HOOK_CC CONCAT(function, _renderdoc_hooked)(t1 p1, t2 p2, t3 p3, t4 p4, t5 p5, t6 p6, t7 p7, t8 p8, t9 p9, t10 p10, t11 p11, t12 p12, t13 p13, t14 p14, t15 p15) \
   { \
-    static bool hit = false; \
-    if(hit == false) \
-    { \
-      RDCERR("Function " STRINGIZE(function) " not supported - capture may be broken"); \
-      hit = true; \
-    } \
+    glhook.UseUnusedSupportedFunction(STRINGIZE(function)); \
     if(!CONCAT(unsupported_real_, function)) \
       CONCAT(unsupported_real_, function) = \
           (CONCAT(function, _hooktype))glhook.GetUnsupportedFunction(STRINGIZE(function)); \
@@ -7202,12 +7122,7 @@
   CONCAT(function, _hooktype) CONCAT(unsupported_real_, function) = NULL; \
   ret HOOK_CC CONCAT(function, _renderdoc_hooked)(t1 p1, t2 p2, t3 p3, t4 p4, t5 p5, t6 p6, t7 p7, t8 p8, t9 p9, t10 p10, t11 p11, t12 p12, t13 p13, t14 p14, t15 p15, t16 p16) \
   { \
-    static bool hit = false; \
-    if(hit == false) \
-    { \
-      RDCERR("Function " STRINGIZE(function) " not supported - capture may be broken"); \
-      hit = true; \
-    } \
+    glhook.UseUnusedSupportedFunction(STRINGIZE(function)); \
     if(!CONCAT(unsupported_real_, function)) \
       CONCAT(unsupported_real_, function) = \
           (CONCAT(function, _hooktype))glhook.GetUnsupportedFunction(STRINGIZE(function)); \
@@ -7251,12 +7166,7 @@
   CONCAT(function, _hooktype) CONCAT(unsupported_real_, function) = NULL; \
   ret HOOK_CC CONCAT(function, _renderdoc_hooked)(t1 p1, t2 p2, t3 p3, t4 p4, t5 p5, t6 p6, t7 p7, t8 p8, t9 p9, t10 p10, t11 p11, t12 p12, t13 p13, t14 p14, t15 p15, t16 p16, t17 p17) \
   { \
-    static bool hit = false; \
-    if(hit == false) \
-    { \
-      RDCERR("Function " STRINGIZE(function) " not supported - capture may be broken"); \
-      hit = true; \
-    } \
+    glhook.UseUnusedSupportedFunction(STRINGIZE(function)); \
     if(!CONCAT(unsupported_real_, function)) \
       CONCAT(unsupported_real_, function) = \
           (CONCAT(function, _hooktype))glhook.GetUnsupportedFunction(STRINGIZE(function)); \

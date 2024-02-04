@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -24,6 +24,9 @@
 
 #include <unistd.h>
 #include <algorithm>
+#include "api/replay/data_types.h"
+#include "common/common.h"
+#include "common/formatting.h"
 #include "os/os_specific.h"
 
 extern char **environ;
@@ -38,17 +41,18 @@ char **GetCurrentEnvironment()
   return environ;
 }
 
-std::vector<int> getSockets(pid_t childPid)
+rdcarray<int> getSockets(pid_t childPid)
 {
-  std::vector<int> sockets;
-  std::string dirPath = StringFormat::Fmt("/proc/%d/fd", (int)childPid);
-  std::vector<PathEntry> files = FileIO::GetFilesInDirectory(dirPath.c_str());
+  rdcarray<int> sockets;
+  rdcstr dirPath = StringFormat::Fmt("/proc/%d/fd", (int)childPid);
+  rdcarray<PathEntry> files;
+  FileIO::GetFilesInDirectory(dirPath, files);
   if(files.empty())
     return sockets;
 
   for(const PathEntry &file : files)
   {
-    std::string target = StringFormat::Fmt("%s/%s", dirPath.c_str(), file.filename.c_str());
+    rdcstr target = StringFormat::Fmt("%s/%s", dirPath.c_str(), file.filename.c_str());
     char linkname[1024];
     ssize_t length = readlink(target.c_str(), linkname, 1023);
     if(length == -1)
@@ -67,7 +71,7 @@ int GetIdentPort(pid_t childPid)
 {
   int ret = 0;
 
-  std::string procfile = StringFormat::Fmt("/proc/%d/net/tcp", (int)childPid);
+  rdcstr procfile = StringFormat::Fmt("/proc/%d/net/tcp", (int)childPid);
 
   int waitTime = INITIAL_WAIT_TIME;
 
@@ -79,7 +83,7 @@ int GetIdentPort(pid_t childPid)
 
     waitTime *= 2;
 
-    FILE *f = FileIO::fopen(procfile.c_str(), "r");
+    FILE *f = FileIO::fopen(procfile, FileIO::ReadText);
 
     if(f == NULL)
     {
@@ -87,7 +91,7 @@ int GetIdentPort(pid_t childPid)
       continue;
     }
 
-    std::vector<int> sockets = getSockets(childPid);
+    rdcarray<int> sockets = getSockets(childPid);
 
     // read through the proc file to check for an open listen socket
     while(ret == 0 && !feof(f))
@@ -107,8 +111,7 @@ int GetIdentPort(pid_t childPid)
 
       // find open listen socket on 0.0.0.0:port
       if(num == 4 && hexip == 0 && hexport >= RenderDoc_FirstTargetControlPort &&
-         hexport <= RenderDoc_LastTargetControlPort &&
-         std::find(sockets.begin(), sockets.end(), inode) != sockets.end())
+         hexport <= RenderDoc_LastTargetControlPort && sockets.contains(inode))
       {
         ret = hexport;
       }
@@ -122,9 +125,28 @@ int GetIdentPort(pid_t childPid)
     RDCWARN("Couldn't locate renderdoc target control listening port between %u and %u in %s",
             (uint32_t)RenderDoc_FirstTargetControlPort, (uint32_t)RenderDoc_LastTargetControlPort,
             procfile.c_str());
+
+    if(!FileIO::exists(procfile))
+    {
+      RDCWARN("Process %u is no longer running - did it exit during initialisation or fail to run?",
+              childPid);
+    }
   }
 
   return ret;
+}
+
+void StopAtMainInChild()
+{
+}
+
+bool StopChildAtMain(pid_t childPid, bool *exitWithNoExec)
+{
+  return false;
+}
+
+void ResumeProcess(pid_t childPid, uint32_t delay)
+{
 }
 
 // because OSUtility::DebuggerPresent is called often we want it to be
@@ -135,7 +157,7 @@ bool debuggerPresent = false;
 
 void CacheDebuggerPresent()
 {
-  FILE *f = FileIO::fopen("/proc/self/status", "r");
+  FILE *f = FileIO::fopen("/proc/self/status", FileIO::ReadText);
 
   if(f == NULL)
   {
@@ -170,14 +192,15 @@ bool OSUtility::DebuggerPresent()
   return debuggerPresent;
 }
 
-const char *Process::GetEnvVariable(const char *name)
+rdcstr Process::GetEnvVariable(const rdcstr &name)
 {
-  return getenv(name);
+  const char *val = getenv(name.c_str());
+  return val ? val : rdcstr();
 }
 
 uint64_t Process::GetMemoryUsage()
 {
-  FILE *f = FileIO::fopen("/proc/self/statm", "r");
+  FILE *f = FileIO::fopen("/proc/self/statm", FileIO::ReadText);
 
   if(f == NULL)
   {
@@ -187,6 +210,8 @@ uint64_t Process::GetMemoryUsage()
 
   char line[512] = {};
   fgets(line, 511, f);
+
+  FileIO::fclose(f);
 
   uint32_t vmPages = 0;
   int num = sscanf(line, "%u", &vmPages);

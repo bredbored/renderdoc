@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -40,7 +40,7 @@ HRESULT WrappedID3D12Device::OpenExistingHeapFromAddress(const void *pAddress, R
 
   if(SUCCEEDED(ret))
   {
-    WrappedID3D12Heap1 *wrapped = new WrappedID3D12Heap1(real, this);
+    WrappedID3D12Heap *wrapped = new WrappedID3D12Heap(real, this);
 
     if(IsCaptureMode(m_State))
     {
@@ -50,6 +50,26 @@ HRESULT WrappedID3D12Device::OpenExistingHeapFromAddress(const void *pAddress, R
 
       // remove SHARED flags that are not allowed on real heaps
       heapDesc.Flags &= ~(D3D12_HEAP_FLAG_SHARED | D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER);
+
+      D3D12_FEATURE_DATA_D3D12_OPTIONS opts = {};
+      if(SUCCEEDED(m_pDevice->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &opts, sizeof(opts))))
+      {
+        if(opts.ResourceHeapTier == D3D12_RESOURCE_HEAP_TIER_1)
+        {
+          // tier 1 devices don't support heaps with no DENY flags, but the heap we get from here
+          // will likely have no DENY flags set. Artifically add one that should be safe for this
+          // kind of heap.
+          if((heapDesc.Flags & (D3D12_HEAP_FLAG_DENY_BUFFERS | D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES |
+                                D3D12_HEAP_FLAG_DENY_NON_RT_DS_TEXTURES)) == 0)
+          {
+            RDCWARN(
+                "Adding DENY_RT_DS_TEXTURES|DENY_NON_RT_DS_TEXTURES to OpenExistingHeap heap for "
+                "tier 1 compatibility");
+            heapDesc.Flags |=
+                D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES | D3D12_HEAP_FLAG_DENY_NON_RT_DS_TEXTURES;
+          }
+        }
+      }
 
       SCOPED_SERIALISE_CHUNK(D3D12Chunk::Device_CreateHeapFromAddress);
       Serialise_CreateHeap(ser, &heapDesc, riid, (void **)&wrapped);
@@ -67,6 +87,10 @@ HRESULT WrappedID3D12Device::OpenExistingHeapFromAddress(const void *pAddress, R
     }
 
     *ppvHeap = (ID3D12Heap *)wrapped;
+  }
+  else
+  {
+    CheckHRESULT(ret);
   }
 
   return ret;
@@ -88,7 +112,7 @@ HRESULT WrappedID3D12Device::OpenExistingHeapFromFileMapping(HANDLE hFileMapping
 
   if(SUCCEEDED(ret))
   {
-    WrappedID3D12Heap1 *wrapped = new WrappedID3D12Heap1(real, this);
+    WrappedID3D12Heap *wrapped = new WrappedID3D12Heap(real, this);
 
     if(IsCaptureMode(m_State))
     {
@@ -98,6 +122,23 @@ HRESULT WrappedID3D12Device::OpenExistingHeapFromFileMapping(HANDLE hFileMapping
 
       // remove SHARED flags that are not allowed on real heaps
       heapDesc.Flags &= ~(D3D12_HEAP_FLAG_SHARED | D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER);
+
+      D3D12_FEATURE_DATA_D3D12_OPTIONS opts = {};
+      if(SUCCEEDED(m_pDevice->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &opts, sizeof(opts))))
+      {
+        if(opts.ResourceHeapTier == D3D12_RESOURCE_HEAP_TIER_1)
+        {
+          // tier 1 devices don't support heaps with no DENY flags, but the heap we get from here
+          // will likely have no DENY flags set. Artifically add one that should be safe for this
+          // kind of heap.
+          if((heapDesc.Flags & (D3D12_HEAP_FLAG_DENY_BUFFERS | D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES |
+                                D3D12_HEAP_FLAG_DENY_NON_RT_DS_TEXTURES)) == 0)
+          {
+            RDCWARN("Adding DENY_RT_DS_TEXTURES to OpenExistingHeap heap for tier 1 compatibility");
+            heapDesc.Flags |= D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES;
+          }
+        }
+      }
 
       SCOPED_SERIALISE_CHUNK(D3D12Chunk::Device_CreateHeapFromFileMapping);
       Serialise_CreateHeap(ser, &heapDesc, riid, (void **)&wrapped);
@@ -116,6 +157,10 @@ HRESULT WrappedID3D12Device::OpenExistingHeapFromFileMapping(HANDLE hFileMapping
 
     *ppvHeap = (ID3D12Heap *)wrapped;
   }
+  else
+  {
+    CheckHRESULT(ret);
+  }
 
   return ret;
 }
@@ -125,6 +170,8 @@ HRESULT WrappedID3D12Device::EnqueueMakeResident(D3D12_RESIDENCY_FLAGS Flags, UI
                                                  ID3D12Fence *pFenceToSignal,
                                                  UINT64 FenceValueToSignal)
 {
+  SCOPED_READLOCK(m_CapTransitionLock);
+
   ID3D12Pageable **unwrapped = GetTempArray<ID3D12Pageable *>(NumObjects);
 
   // assume objects are immediately resident for the purposes of our tracking
@@ -133,31 +180,25 @@ HRESULT WrappedID3D12Device::EnqueueMakeResident(D3D12_RESIDENCY_FLAGS Flags, UI
     if(WrappedID3D12DescriptorHeap::IsAlloc(ppObjects[i]))
     {
       WrappedID3D12DescriptorHeap *heap = (WrappedID3D12DescriptorHeap *)ppObjects[i];
-      heap->SetResident(true);
+      heap->MakeResident();
       unwrapped[i] = heap->GetReal();
     }
-    else if(WrappedID3D12Resource1::IsAlloc(ppObjects[i]))
+    else if(WrappedID3D12Resource::IsAlloc(ppObjects[i]))
     {
-      WrappedID3D12Resource1 *res = (WrappedID3D12Resource1 *)ppObjects[i];
-      res->SetResident(true);
+      WrappedID3D12Resource *res = (WrappedID3D12Resource *)ppObjects[i];
+      res->MakeResident();
       unwrapped[i] = res->GetReal();
+    }
+    else if(WrappedID3D12Heap::IsAlloc(ppObjects[i]))
+    {
+      WrappedID3D12Heap *heap = (WrappedID3D12Heap *)ppObjects[i];
+      heap->MakeResident();
+      unwrapped[i] = heap->GetReal();
     }
     else
     {
       unwrapped[i] = (ID3D12Pageable *)Unwrap((ID3D12DeviceChild *)ppObjects[i]);
     }
-  }
-
-  bool capframe = false;
-
-  {
-    SCOPED_READLOCK(m_CapTransitionLock);
-    capframe = IsActiveCapturing(m_State);
-  }
-
-  if(capframe)
-  {
-    // serialise
   }
 
   return m_pDevice3->EnqueueMakeResident(Flags, NumObjects, unwrapped, Unwrap(pFenceToSignal),

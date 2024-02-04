@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -24,7 +24,7 @@
 
 #include "d3d11_test.h"
 
-TEST(D3D11_Structured_Buffer_Read, D3D11GraphicsTest)
+RD_TEST(D3D11_Structured_Buffer_Read, D3D11GraphicsTest)
 {
   static constexpr const char *Description =
       "Test reading from structured buffers, with and without offsets";
@@ -74,12 +74,13 @@ float4 main() : SV_Target0
 
     ID3D11BufferPtr structbuf = MakeBuffer().Structured(5 * sizeof(uint32_t)).Data(data).SRV();
     ID3D11ShaderResourceViewPtr structbufSRV[2] = {
-        MakeSRV(structbuf), MakeSRV(structbuf).FirstElement(5).NumElements(1),
+        MakeSRV(structbuf),
+        MakeSRV(structbuf).FirstElement(5).NumElements(1),
     };
 
     while(Running())
     {
-      ClearRenderTargetView(bbRTV, {0.4f, 0.5f, 0.6f, 1.0f});
+      ClearRenderTargetView(bbRTV, {0.2f, 0.2f, 0.2f, 1.0f});
 
       IASetVertexBuffer(vb, sizeof(DefaultA2V), 0);
       ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);

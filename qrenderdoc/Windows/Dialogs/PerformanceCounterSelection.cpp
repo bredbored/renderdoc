@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2016-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -50,6 +50,8 @@ enum class CounterFamily
   AMD,
   Intel,
   NVIDIA,
+  VulkanExtended,
+  ARM,
 };
 
 CounterFamily GetCounterFamily(GPUCounter counter)
@@ -66,6 +68,14 @@ CounterFamily GetCounterFamily(GPUCounter counter)
   {
     return CounterFamily::NVIDIA;
   }
+  else if(IsVulkanExtendedCounter(counter))
+  {
+    return CounterFamily::VulkanExtended;
+  }
+  else if(IsARMCounter(counter))
+  {
+    return CounterFamily::ARM;
+  }
 
   return CounterFamily::Generic;
 }
@@ -78,12 +88,14 @@ QString ToString(CounterFamily family)
     case CounterFamily::Generic: return lit("Generic");
     case CounterFamily::Intel: return lit("Intel");
     case CounterFamily::NVIDIA: return lit("NVIDIA");
+    case CounterFamily::VulkanExtended: return lit("Vulkan Extended");
+    case CounterFamily::ARM: return lit("ARM");
     case CounterFamily::Unknown: return lit("Unknown");
   }
 
   return QString();
 }
-}
+}    // namespace
 
 const int PerformanceCounterSelection::CounterDescriptionRole = Qt::UserRole + 1;
 const int PerformanceCounterSelection::CounterIdRole = Qt::UserRole + 2;
@@ -176,10 +188,10 @@ PerformanceCounterSelection::PerformanceCounterSelection(ICaptureContext &ctx,
             }
           });
 
-  connect(ui->save, &QPushButton::pressed, this, &PerformanceCounterSelection::Save);
-  connect(ui->load, &QPushButton::pressed, this, &PerformanceCounterSelection::Load);
-  connect(ui->sampleCounters, &QPushButton::pressed, this, &PerformanceCounterSelection::accept);
-  connect(ui->cancel, &QPushButton::pressed, this, &PerformanceCounterSelection::reject);
+  connect(ui->save, &QPushButton::clicked, this, &PerformanceCounterSelection::Save);
+  connect(ui->load, &QPushButton::clicked, this, &PerformanceCounterSelection::Load);
+  connect(ui->sampleCounters, &QPushButton::clicked, this, &PerformanceCounterSelection::accept);
+  connect(ui->cancel, &QPushButton::clicked, this, &PerformanceCounterSelection::reject);
 
   connect(ui->counterTree, &RDTreeWidget::itemChanged, [this](RDTreeWidgetItem *item, int) -> void {
     const QVariant d = item->data(0, CounterIdRole);
@@ -241,22 +253,22 @@ PerformanceCounterSelection::PerformanceCounterSelection(ICaptureContext &ctx,
 
   ui->counterTree->setMouseTracking(true);
 
-  ctx.Replay().AsyncInvoke([this, selectedCounters](IReplayController *controller) {
+  QPointer<PerformanceCounterSelection> ptr(this);
+  ctx.Replay().AsyncInvoke([this, ptr, selectedCounters](IReplayController *controller) {
     QVector<CounterDescription> counterDescriptions;
     for(const GPUCounter counter : controller->EnumerateCounters())
     {
       counterDescriptions.append(controller->DescribeCounter(counter));
     }
 
-    GUIInvoke::call(this, [counterDescriptions, selectedCounters, this]() {
-      SetCounters(counterDescriptions);
-      SetSelectedCounters(selectedCounters);
-    });
+    if(ptr)
+    {
+      GUIInvoke::call(this, [counterDescriptions, selectedCounters, this]() {
+        SetCounters(counterDescriptions);
+        SetSelectedCounters(selectedCounters);
+      });
+    }
   });
-
-  ui->counterTree->setContextMenuPolicy(Qt::CustomContextMenu);
-  QObject::connect(ui->counterTree, &RDTreeWidget::customContextMenuRequested, this,
-                   &PerformanceCounterSelection::counterTree_contextMenu);
 }
 
 PerformanceCounterSelection::~PerformanceCounterSelection()
@@ -272,7 +284,7 @@ void PerformanceCounterSelection::SetCounters(const QVector<CounterDescription> 
   RDTreeWidgetItem *currentRoot = NULL;
   CounterFamily currentFamily = CounterFamily::Unknown;
 
-  std::unordered_map<std::string, RDTreeWidgetItem *> categories;
+  QMap<rdcstr, RDTreeWidgetItem *> categories;
 
   for(const CounterDescription &desc : descriptions)
   {
@@ -295,23 +307,31 @@ void PerformanceCounterSelection::SetCounters(const QVector<CounterDescription> 
 
     RDTreeWidgetItem *categoryItem = NULL;
 
-    const std::string category = desc.category;
-    auto categoryIterator = categories.find(category);
-
-    if(categoryIterator == categories.end())
+    if(desc.category.empty())
     {
-      RDTreeWidgetItem *item = new RDTreeWidgetItem();
-      item->setText(0, desc.category);
-      item->setCheckState(0, Qt::Unchecked);
-      item->setData(0, PreviousCheckStateRole, Qt::Unchecked);
-      currentRoot->addChild(item);
-
-      categories[category] = item;
-      categoryItem = item;
+      // Show uncategorized counters at the root level
+      categoryItem = currentRoot;
     }
     else
     {
-      categoryItem = categoryIterator->second;
+      const rdcstr category = desc.category;
+      auto categoryIterator = categories.find(category);
+
+      if(categoryIterator == categories.end())
+      {
+        RDTreeWidgetItem *item = new RDTreeWidgetItem();
+        item->setText(0, desc.category);
+        item->setCheckState(0, Qt::Unchecked);
+        item->setData(0, PreviousCheckStateRole, Qt::Unchecked);
+        currentRoot->addChild(item);
+
+        categories[category] = item;
+        categoryItem = item;
+      }
+      else
+      {
+        categoryItem = categoryIterator.value();
+      }
     }
 
     RDTreeWidgetItem *counterItem = new RDTreeWidgetItem();
@@ -445,32 +465,6 @@ void PerformanceCounterSelection::Load()
     RDDialog::critical(this, tr("Error loading config"),
                        tr("Couldn't open path %1 for reading.").arg(filename));
   }
-}
-void PerformanceCounterSelection::counterTree_contextMenu(const QPoint &pos)
-{
-  RDTreeWidgetItem *item = ui->counterTree->itemAt(pos);
-
-  QMenu contextMenu(this);
-
-  QAction expandAll(tr("&Expand All"), this);
-  QAction collapseAll(tr("&Collapse All"), this);
-
-  contextMenu.addAction(&expandAll);
-  contextMenu.addAction(&collapseAll);
-
-  expandAll.setIcon(Icons::arrow_out());
-  collapseAll.setIcon(Icons::arrow_in());
-
-  expandAll.setEnabled(item && item->childCount() > 0);
-  collapseAll.setEnabled(item && item->childCount() > 0);
-
-  QObject::connect(&expandAll, &QAction::triggered,
-                   [this, item]() { ui->counterTree->expandAllItems(item); });
-
-  QObject::connect(&collapseAll, &QAction::triggered,
-                   [this, item]() { ui->counterTree->collapseAllItems(item); });
-
-  RDDialog::show(&contextMenu, ui->counterTree->viewport()->mapToGlobal(pos));
 }
 
 void PerformanceCounterSelection::on_enabledCounters_activated(const QModelIndex &index)

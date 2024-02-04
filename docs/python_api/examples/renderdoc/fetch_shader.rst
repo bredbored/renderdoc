@@ -3,14 +3,14 @@ Fetch Shader details
 
 In this example we will fetch the disassembly for a shader and a set of constant values.
 
-When disassembling a shader there may be more than one possible representation available, so we first enumerate the formats that are available using :py:meth:`~renderdoc.ReplayController.GetDisassemblyTargets` before selecting a target to disassemble to. The first target is always a reasonable default, and there will be at least one:
+When disassembling a shader there may be more than one possible representation available, so we first enumerate the formats that are available using :py:meth:`~renderdoc.ReplayController.GetDisassemblyTargets` before selecting a target to disassemble to. The first target is always a reasonable default, and there will be at least one. :py:meth:`~renderdoc.ReplayController.GetDisassemblyTargets` takes a parameter indicating whether the pipeline state object will be available - some disassembly targets require the full pipeline and are not available when disassembling only a shader in isolation:
 
 .. highlight:: python
 .. code:: python
 
     print("Available disassembly formats:")
 
-    targets = controller.GetDisassemblyTargets()
+    targets = controller.GetDisassemblyTargets(True)
 
     for disasm in targets:
         print("  - " + disasm)
@@ -43,7 +43,7 @@ Now we want to display the constants bound to this shader. Shader bindings is an
 .. highlight:: python
 .. code:: python
 
-    cbufferVars = controller.GetCBufferVariableContents(ps.resourceId, entry, 0, cb.resourceId, 0)
+    cbufferVars = controller.GetCBufferVariableContents(pipe, ps.resourceId, rd.ShaderStage.Pixel, entry, 0, cb.resourceId, 0, 0)
 
 Since constants can contain structs of other constants, we want to define a recursive function that will iterate over a constant and print it along with its value. We want to handle both vectors and matrices so we need to iterate over both rows and columns for each variable.
 

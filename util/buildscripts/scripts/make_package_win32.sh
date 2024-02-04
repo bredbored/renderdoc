@@ -78,13 +78,6 @@ else
 	echo "         distributed android SDK due to licensing concerns.";
 fi
 
-# Generate a debug key for signing purposes
-if [ -f "$JAVA_HOME/bin/keytool.exe" ] && [ -d dist/Release64/plugins/android ]; then
-	"$JAVA_HOME/bin/keytool.exe" -genkey -keystore dist/Release64/plugins/android/renderdoc.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=, OU=, O=, L=,  S=, C="
-elif [ -f "$JAVA_HOME/bin/keytool" ] && [ -d dist/Release64/plugins/android ]; then
-	"$JAVA_HOME/bin/keytool" -genkey -keystore dist/Release64/plugins/android/renderdoc.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=, OU=, O=, L=,  S=, C="
-fi
-
 if [ -d dist/Release64/plugins/android ]; then
 	cp -R dist/Release64/plugins/android dist/Release32/plugins/
 fi
@@ -141,12 +134,12 @@ if [ -f "${REPO_ROOT}"/dist/Installer32.msi ]; then
 	cp "${REPO_ROOT}"/dist/Installer32.msi ${FILENAME}_32.msi
 	cp "${REPO_ROOT}"/dist/Installer64.msi ${FILENAME}_64.msi
 
-	gpg -o ${FILENAME}_32.msi.sig --detach-sign --armor ${FILENAME}_32.msi
-	gpg -o ${FILENAME}_64.msi.sig --detach-sign --armor ${FILENAME}_64.msi
-
 	# On windows, also sign the installers
 	"${BUILD_ROOT}"/scripts/sign.sh ${FILENAME}_32.msi
 	"${BUILD_ROOT}"/scripts/sign.sh ${FILENAME}_64.msi
+
+	gpg -o ${FILENAME}_32.msi.sig --detach-sign --armor ${FILENAME}_32.msi
+	gpg -o ${FILENAME}_64.msi.sig --detach-sign --armor ${FILENAME}_64.msi
 
 fi;
 

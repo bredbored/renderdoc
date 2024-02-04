@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2018-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -24,9 +24,7 @@
 
 #pragma once
 
-#include "api/replay/renderdoc_replay.h"
 #include "core/core.h"
-#include "replay/replay_driver.h"
 #include "vk_common.h"
 #include "vk_core.h"
 
@@ -46,11 +44,11 @@ public:
   ~VulkanTextRenderer();
 
   void BeginText(const TextPrintState &textstate);
-  void RenderText(const TextPrintState &textstate, float x, float y, const char *fmt, ...);
+  void RenderText(const TextPrintState &textstate, float x, float y, const rdcstr &text);
   void EndText(const TextPrintState &textstate);
 
 private:
-  void RenderTextInternal(const TextPrintState &textstate, float x, float y, const char *text);
+  void RenderTextInternal(const TextPrintState &textstate, float x, float y, const rdcstr &text);
 
   static const uint32_t FONT_TEX_WIDTH = 256;
   static const uint32_t FONT_TEX_HEIGHT = 128;

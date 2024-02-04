@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -26,11 +26,13 @@
 // emulated where possible, so we can simplify most codepaths by just assuming they're
 // present elsewhere and using them unconditionally.
 
-#include "driver/gl/gl_common.h"
-#include "driver/gl/gl_dispatch_table.h"
-#include "driver/gl/gl_driver.h"
-#include "driver/gl/gl_resources.h"
+#include "../gl_common.h"
+#include "../gl_dispatch_table.h"
+#include "../gl_driver.h"
+#include "../gl_resources.h"
 #include "driver/shaders/spirv/glslang_compile.h"
+#include "maths/formatpacking.h"
+#include "maths/half_convert.h"
 
 namespace glEmulate
 {
@@ -79,6 +81,30 @@ struct PushPop
     GL.glGetIntegerv(binding, (GLint *)&o);
   }
 
+  PushPop(GLenum target, PFNGLBINDTEXTUREPROC bindFunc, PFNGLACTIVETEXTUREPROC activeFunc,
+          BindingLookupFunc bindingLookup)
+  {
+    GL.glGetIntegerv(eGL_ACTIVE_TEXTURE, (GLint *)&activeTex);
+    activeFunc(eGL_TEXTURE0);
+
+    other = bindFunc;
+    active = activeFunc;
+    t = target;
+    GL.glGetIntegerv(bindingLookup(target), (GLint *)&o);
+  }
+
+  PushPop(GLenum target, PFNGLBINDTEXTUREPROC bindFunc, PFNGLACTIVETEXTUREPROC activeFunc,
+          GLenum binding)
+  {
+    GL.glGetIntegerv(eGL_ACTIVE_TEXTURE, (GLint *)&activeTex);
+    activeFunc(eGL_TEXTURE0);
+
+    other = bindFunc;
+    active = activeFunc;
+    t = target;
+    GL.glGetIntegerv(binding, (GLint *)&o);
+  }
+
   PushPop(VAOMode, PFNGLBINDVERTEXARRAYPROC bindFunc)
   {
     vao = bindFunc;
@@ -99,14 +125,20 @@ struct PushPop
       prog(o);
     else if(other)
       other(t, o);
+
+    if(active)
+      active(activeTex);
   }
 
   PFNGLUSEPROGRAMPROC prog = NULL;
   PFNGLBINDVERTEXARRAYPROC vao = NULL;
   PFNGLBINDTEXTUREPROC other = NULL;
+  PFNGLACTIVETEXTUREPROC active = NULL;
 
   GLenum t = eGL_NONE;
   GLuint o = 0;
+
+  GLenum activeTex = eGL_TEXTURE0;
 };
 
 // if specifying the image or etc for a cubemap face, we must bind the cubemap itself.
@@ -126,9 +158,9 @@ GLenum TexBindTarget(GLenum target)
   return target;
 }
 
-#define PushPopTexture(target, obj)                                              \
-  GLenum bindtarget = TexBindTarget(target);                                     \
-  PushPop CONCAT(prev, __LINE__)(bindtarget, GL.glBindTexture, &TextureBinding); \
+#define PushPopTexture(target, obj)                                                                  \
+  GLenum bindtarget = TexBindTarget(target);                                                         \
+  PushPop CONCAT(prev, __LINE__)(bindtarget, GL.glBindTexture, GL.glActiveTexture, &TextureBinding); \
   GL.glBindTexture(bindtarget, obj);
 
 #define PushPopBuffer(target, obj)                                         \
@@ -314,6 +346,41 @@ void APIENTRY _glNamedFramebufferRenderbufferEXT(GLuint framebuffer, GLenum atta
   GL.glFramebufferRenderbuffer(eGL_DRAW_FRAMEBUFFER, attachment, renderbuffertarget, renderbuffer);
 }
 
+void APIENTRY _glInvalidateNamedFramebufferData(GLuint framebuffer, GLsizei numAttachments,
+                                                const GLenum *attachments)
+{
+  if(HasExt[ARB_invalidate_subdata])
+  {
+    PushPopFramebuffer(eGL_DRAW_FRAMEBUFFER, framebuffer);
+    GL.glInvalidateFramebuffer(eGL_DRAW_FRAMEBUFFER, numAttachments, attachments);
+  }
+  else if(HasExt[EXT_discard_framebuffer])
+  {
+    PushPopFramebuffer(eGL_DRAW_FRAMEBUFFER, framebuffer);
+    GL.glDiscardFramebufferEXT(eGL_DRAW_FRAMEBUFFER, numAttachments, attachments);
+  }
+  else
+  {
+    RDCERR("No support for framebuffer invalidate on GL %d", GLCoreVersion);
+  }
+}
+
+void APIENTRY _glInvalidateNamedFramebufferSubData(GLuint framebuffer, GLsizei numAttachments,
+                                                   const GLenum *attachments, GLint x, GLint y,
+                                                   GLsizei width, GLsizei height)
+{
+  if(HasExt[ARB_invalidate_subdata])
+  {
+    PushPopFramebuffer(eGL_DRAW_FRAMEBUFFER, framebuffer);
+    GL.glInvalidateSubFramebuffer(eGL_DRAW_FRAMEBUFFER, numAttachments, attachments, x, y, width,
+                                  height);
+  }
+  else
+  {
+    RDCERR("No support for framebuffer invalidate on GL %d", GLCoreVersion);
+  }
+}
+
 #pragma endregion
 
 #pragma region Renderbuffers
@@ -370,8 +437,8 @@ void APIENTRY _glGetNamedBufferSubDataEXT(GLuint buffer, GLintptr offset, GLsize
 void *APIENTRY _glMapNamedBufferEXT(GLuint buffer, GLenum access)
 {
   PushPopBuffer(eGL_COPY_READ_BUFFER, buffer);
-  GLint size;
-  GL.glGetBufferParameteriv(eGL_COPY_READ_BUFFER, eGL_BUFFER_SIZE, &size);
+  GLuint size = 0;
+  GL.glGetBufferParameteriv(eGL_COPY_READ_BUFFER, eGL_BUFFER_SIZE, (GLint *)&size);
 
   GLbitfield accessBits = eGL_MAP_READ_BIT | eGL_MAP_WRITE_BIT;
 
@@ -890,10 +957,12 @@ static const format_data formats[] = {
     // colour formats
     {eGL_R8, eGL_UNSIGNED_NORMALIZED, 1, 8, 0, 0},
     {eGL_R8_SNORM, eGL_SIGNED_NORMALIZED, 1, 8, 0, 0},
+    {eGL_SR8_EXT, eGL_UNSIGNED_NORMALIZED, 1, 8, 0, 0},
     {eGL_R16, eGL_UNSIGNED_NORMALIZED, 1, 16, 0, 0},
     {eGL_R16_SNORM, eGL_SIGNED_NORMALIZED, 1, 16, 0, 0},
     {eGL_RG8, eGL_UNSIGNED_NORMALIZED, 2, 8, 0, 0},
     {eGL_RG8_SNORM, eGL_SIGNED_NORMALIZED, 2, 8, 0, 0},
+    {eGL_SRG8_EXT, eGL_UNSIGNED_NORMALIZED, 2, 8, 0, 0},
     {eGL_RG16, eGL_UNSIGNED_NORMALIZED, 2, 16, 0, 0},
     {eGL_RG16_SNORM, eGL_SIGNED_NORMALIZED, 2, 16, 0, 0},
     {eGL_RGB4, eGL_UNSIGNED_NORMALIZED, 3, 4, 0, 0},
@@ -957,6 +1026,7 @@ static const format_data formats[] = {
     {eGL_RGB, eGL_UNSIGNED_BYTE, 3, 8, 0, 0},
     {eGL_RGBA, eGL_UNSIGNED_BYTE, 4, 8, 0, 0},
     {eGL_BGRA_EXT, eGL_UNSIGNED_BYTE, 4, 8, 0, 0},
+    {eGL_SRGB_ALPHA, eGL_UNSIGNED_NORMALIZED, 4, 8, 0, 0},
     {eGL_DEPTH_COMPONENT, eGL_NONE, 0, 0, 24, 0},
     {eGL_STENCIL_INDEX, eGL_NONE, 0, 0, 0, 8},
     {eGL_DEPTH_STENCIL, eGL_NONE, 0, 0, 24, 8},
@@ -1021,7 +1091,9 @@ void APIENTRY _glGetInternalformativ(GLenum target, GLenum internalformat, GLenu
 
   if(pname == eGL_COLOR_ENCODING)
   {
-    if(internalformat == eGL_SRGB8 || internalformat == eGL_SRGB8_ALPHA8)
+    if(internalformat == eGL_SR8_EXT || internalformat == eGL_SRG8_EXT ||
+       internalformat == eGL_SRGB8 || internalformat == eGL_SRGB8_ALPHA8 ||
+       internalformat == eGL_SRGB_ALPHA)
       *params = eGL_SRGB;
     else
       *params = eGL_LINEAR;
@@ -1846,8 +1918,8 @@ void APIENTRY _glClearBufferSubData(GLenum target, GLenum internalformat, GLintp
 void APIENTRY _glClearBufferData(GLenum target, GLenum internalformat, GLenum format, GLenum type,
                                  const void *data)
 {
-  GLint size = 0;
-  GL.glGetBufferParameteriv(target, eGL_BUFFER_SIZE, &size);
+  GLuint size = 0;
+  GL.glGetBufferParameteriv(target, eGL_BUFFER_SIZE, (GLint *)&size);
 
   _glClearBufferSubData(target, internalformat, 0, (GLsizeiptr)size, format, type, data);
 }
@@ -2362,7 +2434,7 @@ static glslang::TProgram *GetGlslangProgram(GLuint program, bool *hasRealProgram
     return NULL;
   }
 
-  ResourceId id = driver->GetResourceManager()->GetID(ProgramRes(driver->GetCtx(), program));
+  ResourceId id = driver->GetResourceManager()->GetResID(ProgramRes(driver->GetCtx(), program));
 
   if(!driver->m_Programs[id].glslangProgram)
   {
@@ -2406,7 +2478,8 @@ void APIENTRY _glGetProgramResourceiv(GLuint program, GLenum programInterface, G
     return;
   }
 
-  std::vector<ReflectionProperty> properties(propCount);
+  rdcarray<ReflectionProperty> properties;
+  properties.resize(propCount);
 
   for(GLsizei i = 0; i < propCount; i++)
     properties[i] = ConvertProperty(props[i]);
@@ -2473,7 +2546,7 @@ GLuint APIENTRY _glGetProgramResourceIndex(GLuint program, GLenum programInterfa
     return 0;
   }
 
-  return glslangGetProgramResourceIndex(glslangProgram, name);
+  return glslangGetProgramResourceIndex(glslangProgram, ConvertInterface(programInterface), name);
 }
 
 void APIENTRY _glGetProgramResourceName(GLuint program, GLenum programInterface, GLuint index,
@@ -2528,7 +2601,7 @@ void APIENTRY _glGetTexLevelParameteriv(GLenum target, GLint level, GLenum pname
   GLint boundTexture = 0;
   GL.glGetIntegerv(TextureBinding(target), (GLint *)&boundTexture);
 
-  ResourceId id = driver->GetResourceManager()->GetID(TextureRes(driver->GetCtx(), boundTexture));
+  ResourceId id = driver->GetResourceManager()->GetResID(TextureRes(driver->GetCtx(), boundTexture));
 
   WrappedOpenGL::TextureData &details = driver->m_Textures[id];
 
@@ -2559,17 +2632,9 @@ void APIENTRY _glGetTexLevelParameterfv(GLenum target, GLint level, GLenum pname
   *params = (GLfloat)param;
 }
 
-void APIENTRY _glGetTexImage(GLenum target, GLint level, GLenum format, GLenum type, void *pixels)
+void APIENTRY _glGetTexImage(GLenum target, GLint level, const GLenum format, const GLenum type,
+                             void *pixels)
 {
-  if((format == eGL_DEPTH_COMPONENT && !HasExt[NV_read_depth]) ||
-     (format == eGL_STENCIL && !HasExt[NV_read_stencil]) ||
-     (format == eGL_DEPTH_STENCIL && !HasExt[NV_read_depth_stencil]))
-  {
-    // TODO create a workaround for this
-    // return silently, check was made during startup
-    return;
-  }
-
   switch(target)
   {
     case eGL_TEXTURE_1D:
@@ -2585,13 +2650,25 @@ void APIENTRY _glGetTexImage(GLenum target, GLint level, GLenum format, GLenum t
     default: break;
   }
 
+  GLuint fbo = 0;
+  GL.glGenFramebuffers(1, &fbo);
+
+  PushPopFramebuffer(eGL_FRAMEBUFFER, fbo);
+
   GLint width = 0, height = 0, depth = 0;
   GL.glGetTexLevelParameteriv(target, level, eGL_TEXTURE_WIDTH, &width);
   GL.glGetTexLevelParameteriv(target, level, eGL_TEXTURE_HEIGHT, &height);
   GL.glGetTexLevelParameteriv(target, level, eGL_TEXTURE_DEPTH, &depth);
 
+  GLenum origInternalFormat = eGL_NONE;
+  GL.glGetTexLevelParameteriv(target, level, eGL_TEXTURE_INTERNAL_FORMAT,
+                              (GLint *)&origInternalFormat);
+
   GLint boundTexture = 0;
   GL.glGetIntegerv(TextureBinding(target), (GLint *)&boundTexture);
+
+  GLuint readtex = boundTexture;
+  GLuint deltex = 0;
 
   GLenum attachment = eGL_COLOR_ATTACHMENT0;
   if(format == eGL_DEPTH_COMPONENT)
@@ -2601,55 +2678,265 @@ void APIENTRY _glGetTexImage(GLenum target, GLint level, GLenum format, GLenum t
   else if(format == eGL_DEPTH_STENCIL)
     attachment = eGL_DEPTH_STENCIL_ATTACHMENT;
 
-  size_t sliceSize = GetByteSize(width, height, 1, format, type);
+  bool readDirectly = true;
+  bool depthFormat = false;
 
-  bool fixBGRA = false;
-  if(!HasExt[EXT_read_format_bgra] && format == eGL_BGRA)
-  {
-    if(type == eGL_UNSIGNED_BYTE)
-      fixBGRA = true;
-    else
-      RDCERR("Can't read back texture without EXT_read_format_bgra extension (data type: %s)",
-             ToStr(type).c_str());
-  }
-
-  GLuint readtex = boundTexture;
-  GLuint deltex = 0;
-
-  GLuint fbo = 0;
-  GL.glGenFramebuffers(1, &fbo);
-
-  PushPopFramebuffer(eGL_FRAMEBUFFER, fbo);
-
-  // ALPHA can't be bound to an FBO, so we need to blit to R8 by hand.
+  // we know luminance/alpha formats can't be read directly, so assume failure for them
   if(format == eGL_LUMINANCE_ALPHA || format == eGL_LUMINANCE || format == eGL_ALPHA)
   {
-    RDCDEBUG("Doing manual blit from %s to allow readback", ToStr(format).c_str());
+    readDirectly = false;
+  }
 
-    GLenum remapformat = eGL_RED;
-    if(format == eGL_LUMINANCE_ALPHA)
-      remapformat = eGL_RG;
+  // similarly for RGB8, pessimistically assume it can't be read from a framebuffer as not all
+  // drivers support it.
+  if(format == eGL_RGB && type == eGL_UNSIGNED_BYTE)
+  {
+    readDirectly = false;
+  }
+
+  if((format == eGL_DEPTH_COMPONENT && !HasExt[NV_read_depth]) ||
+     (format == eGL_STENCIL && !HasExt[NV_read_stencil]) ||
+     (format == eGL_DEPTH_STENCIL && !HasExt[NV_read_depth_stencil]))
+  {
+    readDirectly = false;
+  }
+
+  if(format == eGL_DEPTH_COMPONENT || format == eGL_STENCIL || format == eGL_DEPTH_STENCIL)
+  {
+    depthFormat = true;
+  }
+
+  // Qualcomm drivers seem to barf if we try to read from cubemap faces above X+ for mips 64x64 or
+  // smaller. In testing X+ works on any mip, and all faces work on larger mips, but since the
+  // driver seems completely unreliable in this area we enable the workaround blanket for all
+  // cubemap reads as different formats may break in different ways.
+  if(VendorCheck[VendorCheck_Qualcomm_emulate_cube_reads])
+  {
+    switch(target)
+    {
+      case eGL_TEXTURE_CUBE_MAP:
+      case eGL_TEXTURE_CUBE_MAP_POSITIVE_X:
+      case eGL_TEXTURE_CUBE_MAP_NEGATIVE_X:
+      case eGL_TEXTURE_CUBE_MAP_POSITIVE_Y:
+      case eGL_TEXTURE_CUBE_MAP_NEGATIVE_Y:
+      case eGL_TEXTURE_CUBE_MAP_POSITIVE_Z:
+      case eGL_TEXTURE_CUBE_MAP_NEGATIVE_Z:
+        RDCLOG("Forcing indirect read for cubemap face %s on level %d", ToStr(target).c_str(), level);
+        readDirectly = false;
+        break;
+      default: break;
+    }
+  }
+
+  // if we can't attach the texture to a framebuffer, we can't readpixels it directly
+  if(readDirectly)
+  {
+    switch(target)
+    {
+      case eGL_TEXTURE_3D:
+      case eGL_TEXTURE_2D_ARRAY:
+      case eGL_TEXTURE_CUBE_MAP_ARRAY:
+      case eGL_TEXTURE_2D_MULTISAMPLE_ARRAY:
+        GL.glFramebufferTextureLayer(eGL_FRAMEBUFFER, attachment, readtex, level, 0);
+        break;
+
+      case eGL_TEXTURE_CUBE_MAP:
+      case eGL_TEXTURE_CUBE_MAP_POSITIVE_X:
+      case eGL_TEXTURE_CUBE_MAP_NEGATIVE_X:
+      case eGL_TEXTURE_CUBE_MAP_POSITIVE_Y:
+      case eGL_TEXTURE_CUBE_MAP_NEGATIVE_Y:
+      case eGL_TEXTURE_CUBE_MAP_POSITIVE_Z:
+      case eGL_TEXTURE_CUBE_MAP_NEGATIVE_Z:
+      case eGL_TEXTURE_2D:
+      case eGL_TEXTURE_2D_MULTISAMPLE:
+      default:
+        GL.glFramebufferTexture2D(eGL_FRAMEBUFFER, attachment, target, readtex, level);
+        break;
+    }
+
+    GLenum status = GL.glCheckFramebufferStatus(eGL_FRAMEBUFFER);
+
+    readDirectly = (status == eGL_FRAMEBUFFER_COMPLETE);
+  }
+
+  GLenum readFormat = format;
+  GLenum readType = type;
+
+  ResourceFormat origFmt = MakeResourceFormat(target, origInternalFormat);
+
+  bool disableSRGBCorrect = false;
+
+  // do a blit to the nearest compatible expanded format if we can't read directly
+  if(!readDirectly)
+  {
+    ResourceFormat remappedFmt = origFmt;
+
+    // special case luminance/alpha
+    if(readFormat == eGL_ALPHA || readFormat == eGL_LUMINANCE ||
+       origFmt.type == ResourceFormatType::A8)
+    {
+      RDCASSERTEQUAL(origFmt.compType, CompType::UNorm);
+      RDCASSERTEQUAL(origFmt.compCount, 1);
+      RDCASSERTEQUAL(origFmt.compByteWidth, 1);
+      remappedFmt.compType = CompType::UNorm;
+      remappedFmt.compCount = 1;
+      remappedFmt.type = ResourceFormatType::Regular;
+      remappedFmt.compByteWidth = 1;
+
+      // we can read directly after the remap, because it's still a 1 component unorm texture it's
+      // just now in the right format
+      readDirectly = true;
+    }
+    else if(readFormat == eGL_LUMINANCE_ALPHA)
+    {
+      RDCASSERTEQUAL(origFmt.compType, CompType::UNorm);
+      RDCASSERTEQUAL(origFmt.compCount, 2);
+      RDCASSERTEQUAL(origFmt.compByteWidth, 1);
+      remappedFmt.compType = CompType::UNorm;
+      remappedFmt.compCount = 2;
+      remappedFmt.type = ResourceFormatType::Regular;
+      remappedFmt.compByteWidth = 1;
+
+      readDirectly = true;
+    }
+    else
+    {
+      if(depthFormat)
+      {
+        // all depth formats we read back as RGBA float
+        remappedFmt.compType = CompType::Float;
+        remappedFmt.compCount = 4;
+        remappedFmt.type = ResourceFormatType::Regular;
+
+        // try full floats
+        remappedFmt.compByteWidth = 4;
+
+        // unless it's not supported
+        if(!HasExt[OES_texture_float] && GLCoreVersion < 30)
+        {
+          remappedFmt.compByteWidth = 2;
+          RDCDEBUG("Implementation doesn't support float color targets, reading as half-float");
+        }
+      }
+      // for most regular formats we just try to remap to the 4-component version assuming that if
+      // the smaller version is supported then the larger version is supported and FBO'able. This
+      // should hold for RGB formats at least.
+      else if(origFmt.type == ResourceFormatType::Regular &&
+              (origFmt.compType == CompType::Float || origFmt.compType == CompType::UNorm ||
+               origFmt.compType == CompType::UInt || origFmt.compType == CompType::SInt ||
+               origFmt.compType == CompType::UNormSRGB))
+      {
+        remappedFmt.compCount = 4;
+        remappedFmt.SetBGRAOrder(false);
+      }
+      // for SNorm formats remap to RGBA16F as well and hope it's supported. This loses precision on
+      // RGBA16_SNORM but we accept that.
+      else if(origFmt.compType == CompType::SNorm)
+      {
+        remappedFmt.compType = CompType::Float;
+        remappedFmt.compCount = 4;
+        remappedFmt.type = ResourceFormatType::Regular;
+        remappedFmt.compByteWidth = 2;
+      }
+      // if it's a sub-1-byte unorm format, remap to RGBA8
+      else if(origFmt.type == ResourceFormatType::R4G4 ||
+              origFmt.type == ResourceFormatType::R4G4B4A4 ||
+              origFmt.type == ResourceFormatType::R5G5B5A1 ||
+              origFmt.type == ResourceFormatType::R5G6B5)
+      {
+        remappedFmt.compType = CompType::UNorm;
+        remappedFmt.compCount = 4;
+        remappedFmt.type = ResourceFormatType::Regular;
+        remappedFmt.compByteWidth = 1;
+        remappedFmt.SetBGRAOrder(false);
+      }
+      // similar with sub-16F special formats
+      else if(origFmt.type == ResourceFormatType::R10G10B10A2 && origFmt.compType == CompType::UNorm)
+      {
+        remappedFmt.compType = CompType::UNorm;
+        remappedFmt.compCount = 4;
+        remappedFmt.type = ResourceFormatType::Regular;
+        remappedFmt.compByteWidth = 1;
+      }
+      else if(origFmt.type == ResourceFormatType::R10G10B10A2 && origFmt.compType == CompType::UInt)
+      {
+        remappedFmt.compType = CompType::UInt;
+        remappedFmt.compCount = 4;
+        remappedFmt.type = ResourceFormatType::Regular;
+        remappedFmt.compByteWidth = 1;
+      }
+      else if(origFmt.type == ResourceFormatType::R11G11B10 ||
+              origFmt.type == ResourceFormatType::R9G9B9E5)
+      {
+        remappedFmt.compType = CompType::Float;
+        remappedFmt.compCount = 4;
+        remappedFmt.type = ResourceFormatType::Regular;
+        remappedFmt.compByteWidth = 2;
+      }
+    }
+
+    GLenum internalformat = MakeGLFormat(remappedFmt);
+    GLenum remapformat = GetBaseFormat(internalformat);
+    GLenum remaptype = GetDataType(internalformat);
+
+    RDCDEBUG("Doing manual blit from %s to %s with format %s and type %s to allow readback",
+             ToStr(origInternalFormat).c_str(), ToStr(internalformat).c_str(),
+             ToStr(format).c_str(), ToStr(type).c_str());
 
     GLint baseLevel = 0;
     GLint maxLevel = 0;
 
-    // sample from only the right level of the source texture
-    GL.glGetTexParameteriv(target, eGL_TEXTURE_BASE_LEVEL, &baseLevel);
-    GL.glGetTexParameteriv(target, eGL_TEXTURE_MAX_LEVEL, &maxLevel);
-    GL.glTexParameteri(target, eGL_TEXTURE_BASE_LEVEL, level);
-    GL.glTexParameteri(target, eGL_TEXTURE_MAX_LEVEL, level);
+    // for cubemaps we read them back face by face so we blit to a 2D texture, but we still need to
+    // bind the source texture as a cubemap
+    GLenum origTarget = target;
+    GLenum bindTarget = target;
+    switch(target)
+    {
+      case eGL_TEXTURE_CUBE_MAP:
+      case eGL_TEXTURE_CUBE_MAP_POSITIVE_X:
+      case eGL_TEXTURE_CUBE_MAP_NEGATIVE_X:
+      case eGL_TEXTURE_CUBE_MAP_POSITIVE_Y:
+      case eGL_TEXTURE_CUBE_MAP_NEGATIVE_Y:
+      case eGL_TEXTURE_CUBE_MAP_POSITIVE_Z:
+      case eGL_TEXTURE_CUBE_MAP_NEGATIVE_Z:
+        target = eGL_TEXTURE_2D;
+        bindTarget = eGL_TEXTURE_CUBE_MAP;
+        break;
+      default: break;
+    }
 
-    // only support 2D textures for now
-    RDCASSERT(target == eGL_TEXTURE_2D, target);
+    // sample from only the right level of the source texture
+    GL.glGetTexParameteriv(bindTarget, eGL_TEXTURE_BASE_LEVEL, &baseLevel);
+    GL.glGetTexParameteriv(bindTarget, eGL_TEXTURE_MAX_LEVEL, &maxLevel);
+    GL.glTexParameteri(bindTarget, eGL_TEXTURE_BASE_LEVEL, level);
+    GL.glTexParameteri(bindTarget, eGL_TEXTURE_MAX_LEVEL, level);
+
+    // support 2D/Array/3D textures for now
+    RDCASSERT((target == eGL_TEXTURE_2D) || (target == eGL_TEXTURE_2D_ARRAY) ||
+                  (target == eGL_TEXTURE_3D),
+              target);
     GL.glGenTextures(1, &readtex);
     GL.glBindTexture(target, readtex);
 
-    // allocate the R8 texture
+    // allocate the texture
     GL.glTexParameteri(target, eGL_TEXTURE_MAX_LEVEL, 0);
-    GL.glTexImage2D(target, 0, eGL_R8, width, height, 0, remapformat, eGL_UNSIGNED_BYTE, NULL);
+    if(target == eGL_TEXTURE_2D)
+    {
+      GL.glTexImage2D(target, 0, internalformat, width, height, 0, remapformat, remaptype, NULL);
+      GL.glFramebufferTexture2D(eGL_FRAMEBUFFER, eGL_COLOR_ATTACHMENT0, target, readtex, 0);
+    }
+    else
+    {
+      GL.glTexImage3D(target, 0, internalformat, width, height, depth, 0, remapformat, remaptype,
+                      NULL);
+      GL.glFramebufferTextureLayer(eGL_FRAMEBUFFER, eGL_COLOR_ATTACHMENT0, readtex, 0, 0);
+    }
 
-    // render to it
-    GL.glFramebufferTexture2D(eGL_FRAMEBUFFER, eGL_COLOR_ATTACHMENT0, target, readtex, 0);
+    GLenum fbostatus = GL.glCheckFramebufferStatus(eGL_FRAMEBUFFER);
+
+    if(fbostatus != eGL_FRAMEBUFFER_COMPLETE)
+      RDCERR("glReadPixels emulation blit FBO is %s with format %s", ToStr(fbostatus).c_str(),
+             ToStr(internalformat).c_str());
 
     // push rendering state
     GLPushPopState textState;
@@ -2664,32 +2951,108 @@ void APIENTRY _glGetTexImage(GLenum target, GLint level, GLenum format, GLenum t
     GL.glDisable(eGL_SCISSOR_TEST);
     GL.glViewport(0, 0, width, height);
 
-    GL.glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    bool oldFBOsrgb = false;
+    if(HasExt[EXT_framebuffer_sRGB])
+    {
+      oldFBOsrgb = GL.glIsEnabled(eGL_FRAMEBUFFER_SRGB) == GL_TRUE;
+      GL.glEnable(eGL_FRAMEBUFFER_SRGB);
+    }
+    else if(origFmt.compType == CompType::UNormSRGB)
+    {
+      disableSRGBCorrect = true;
+    }
 
     GL.glActiveTexture(eGL_TEXTURE0);
-    GL.glBindTexture(eGL_TEXTURE_2D, boundTexture);
+    GL.glBindTexture(bindTarget, boundTexture);
 
     GLuint prog;
 
     {
-      const char *vs =
-          "attribute vec2 pos;\n"
-          "void main() { gl_Position = vec4(pos, 0.5, 0.5); }";
-
-      char fs_src[] =
-          "precision highp float;\n"
-          "uniform vec2 res;\n"
-          "uniform sampler2D srcTex;\n"
-          "void main() { gl_FragColor = texture2D(srcTex, vec2(gl_FragCoord.xy)/res).?aaa; }";
-
-      char *swizzle = strchr(fs_src, '?');
-
+      const char *swizzle = "rgba";
       if(format == eGL_ALPHA)
-        *swizzle = 'a';
-      else
-        *swizzle = 'r';
+      {
+        swizzle = "aaaa";
+      }
+      else if(format == eGL_LUMINANCE || depthFormat)
+      {
+        swizzle = "rrrr";
+      }
+      else if(format == eGL_LUMINANCE_ALPHA)
+      {
+        swizzle = "raaa";
+      }
 
-      const char *fs = fs_src;
+      rdcstr vssource;
+      rdcstr fssource;
+      if(bindTarget == eGL_TEXTURE_CUBE_MAP)
+      {
+        vssource =
+            "attribute vec2 pos;\n"
+            "void main() { gl_Position = vec4(pos, 0.5, 0.5); }";
+
+        rdcstr cubecoord = "\nvec3 CalcCubeCoord(vec2 uv) {\nuv -= vec2(0.5);\nvec3 coord;\n";
+
+        if(origTarget == eGL_TEXTURE_CUBE_MAP_POSITIVE_X)
+          cubecoord += "coord = vec3(0.5, -uv.y, -uv.x);\n";
+        else if(origTarget == eGL_TEXTURE_CUBE_MAP_NEGATIVE_X)
+          cubecoord += "coord = vec3(-0.5, -uv.y, uv.x);\n";
+        else if(origTarget == eGL_TEXTURE_CUBE_MAP_POSITIVE_Y)
+          cubecoord += "coord = vec3(uv.x, 0.5, uv.y);\n";
+        else if(origTarget == eGL_TEXTURE_CUBE_MAP_NEGATIVE_Y)
+          cubecoord += "coord = vec3(uv.x, -0.5, -uv.y);\n";
+        else if(origTarget == eGL_TEXTURE_CUBE_MAP_POSITIVE_Z)
+          cubecoord += "coord = vec3(uv.x, -uv.y, 0.5);\n";
+        else    // origTarget == eGL_TEXTURE_CUBE_MAP_NEGATIVE_Z
+          cubecoord += "coord = vec3(-uv.x, -uv.y, -0.5);\n";
+
+        cubecoord += "\nreturn coord;\n}\n";
+
+        fssource = rdcstr(
+                       "precision highp float;\n"
+                       "uniform vec3 res;\n"
+                       "uniform samplerCube srcTex;\n") +
+                   cubecoord +
+                   "void main() { gl_FragColor = textureCube(srcTex, "
+                   "CalcCubeCoord(vec2(gl_FragCoord.xy)/res.xy))." +
+                   swizzle + "; }";
+      }
+      else if(target == eGL_TEXTURE_2D)
+      {
+        vssource =
+            "attribute vec2 pos;\n"
+            "void main() { gl_Position = vec4(pos, 0.5, 0.5); }";
+
+        fssource =
+            rdcstr(
+                "precision highp float;\n"
+                "uniform vec3 res;\n"
+                "uniform sampler2D srcTex;\n"
+                "void main() { gl_FragColor = texture2D(srcTex, vec2(gl_FragCoord.xy)/res.xy).") +
+            swizzle + "; }";
+      }
+      else
+      {
+        vssource =
+            "#version 300 es\n"
+            "in vec2 pos;\n"
+            "void main() { gl_Position = vec4(pos, 0.5, 0.5); }";
+
+        const char *sampler = (target == eGL_TEXTURE_2D_ARRAY) ? "sampler2DArray" : "sampler3D";
+
+        fssource =
+            rdcstr(
+                "#version 300 es\n"
+                "uniform highp vec3 res;\n"
+                "uniform highp ") +
+            sampler +
+            " srcTex;\n"
+            "out highp vec4 color;\n"
+            "void main() { color = texture(srcTex, vec3(gl_FragCoord.xy/res.xy, res.z).xyz)." +
+            swizzle + "; }";
+      }
+
+      const char *vs = vssource.c_str();
+      const char *fs = fssource.c_str();
 
       GLuint vert = GL.glCreateShader(eGL_VERTEX_SHADER);
       GLuint frag = GL.glCreateShader(eGL_FRAGMENT_SHADER);
@@ -2758,16 +3121,47 @@ void APIENTRY _glGetTexImage(GLenum target, GLint level, GLenum format, GLenum t
 
     GL.glUseProgram(prog);
 
-    loc = GL.glGetUniformLocation(prog, "srcTex");
-    GL.glUniform1i(loc, 0);
-    loc = GL.glGetUniformLocation(prog, "res");
-    GL.glUniform2f(loc, float(width), float(height));
+    GLenum depthMode = eGL_DEPTH_COMPONENT;
+    if(depthFormat && HasExt[ARB_stencil_texturing])
+    {
+      GL.glGetTexParameteriv(bindTarget, eGL_DEPTH_STENCIL_TEXTURE_MODE, (GLint *)&depthMode);
+    }
 
-    GL.glDrawArrays(eGL_TRIANGLES, 0, 3);
+    for(int32_t d = 0; d < depth; ++d)
+    {
+      GL.glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+
+      if(depthFormat && HasExt[ARB_stencil_texturing])
+      {
+        GL.glTexParameteri(bindTarget, eGL_DEPTH_STENCIL_TEXTURE_MODE, eGL_DEPTH_COMPONENT);
+      }
+      if(target != eGL_TEXTURE_2D)
+      {
+        GL.glFramebufferTextureLayer(eGL_FRAMEBUFFER, eGL_COLOR_ATTACHMENT0, readtex, 0, d);
+      }
+
+      loc = GL.glGetUniformLocation(prog, "srcTex");
+      GL.glUniform1i(loc, 0);
+      loc = GL.glGetUniformLocation(prog, "res");
+      GL.glUniform3f(loc, float(width), float(height), float(d));
+
+      GL.glDrawArrays(eGL_TRIANGLES, 0, 3);
+
+      // if we support reading stencil, read the stencil into green
+      if(remapformat == eGL_DEPTH_STENCIL && HasExt[ARB_stencil_texturing])
+      {
+        GL.glTexParameteri(bindTarget, eGL_DEPTH_STENCIL_TEXTURE_MODE, eGL_STENCIL_INDEX);
+        GL.glColorMask(GL_FALSE, GL_TRUE, GL_FALSE, GL_FALSE);
+        GL.glDrawArrays(eGL_TRIANGLES, 0, 3);
+      }
+    }
 
     GL.glDeleteVertexArrays(1, &vao);
     GL.glDeleteBuffers(1, &vb);
     GL.glDeleteProgram(prog);
+
+    if(HasExt[EXT_framebuffer_sRGB] && !oldFBOsrgb)
+      GL.glDisable(eGL_FRAMEBUFFER_SRGB);
 
     // pop rendering state
     textState.Pop(true);
@@ -2776,16 +3170,41 @@ void APIENTRY _glGetTexImage(GLenum target, GLint level, GLenum format, GLenum t
     deltex = readtex;
 
     // restore base/max level as we changed them to sample from the right level above
-    GL.glBindTexture(target, boundTexture);
-    GL.glTexParameteri(target, eGL_TEXTURE_BASE_LEVEL, baseLevel);
-    GL.glTexParameteri(target, eGL_TEXTURE_MAX_LEVEL, maxLevel);
+    GL.glBindTexture(bindTarget, boundTexture);
+    GL.glTexParameteri(bindTarget, eGL_TEXTURE_BASE_LEVEL, baseLevel);
+    GL.glTexParameteri(bindTarget, eGL_TEXTURE_MAX_LEVEL, maxLevel);
+
+    if(depthFormat && HasExt[ARB_stencil_texturing])
+    {
+      GL.glTexParameteri(bindTarget, eGL_DEPTH_STENCIL_TEXTURE_MODE, depthMode);
+    }
 
     // read from the blitted texture from level 0, as red
     GL.glBindTexture(target, readtex);
     level = 0;
-    format = remapformat;
+    readFormat = remapformat;
+    readType = remaptype;
+
+    attachment = eGL_COLOR_ATTACHMENT0;
 
     RDCDEBUG("Done blit");
+  }
+
+  size_t dstSliceSize = GetByteSize(width, height, 1, format, type);
+
+  bool swizzleBGRA = false;
+
+  // if we can't read BGRA natively, read as RGBA and swizzle manually
+  if(!HasExt[EXT_read_format_bgra] && readFormat == eGL_BGRA)
+  {
+    readFormat = eGL_RGBA;
+    swizzleBGRA = true;
+  }
+
+  if(!readDirectly && readFormat == eGL_RGBA && readType == eGL_UNSIGNED_SHORT_4_4_4_4)
+  {
+    readType = eGL_UNSIGNED_BYTE;
+    swizzleBGRA = true;
   }
 
   for(GLint d = 0; d < depth; ++d)
@@ -2818,85 +3237,273 @@ void APIENTRY _glGetTexImage(GLenum target, GLint level, GLenum format, GLenum t
     if(status != eGL_FRAMEBUFFER_COMPLETE)
       RDCERR("glReadPixels emulation FBO is %s", ToStr(status).c_str());
 
-    byte *dst = (byte *)pixels + d * sliceSize;
-    GLenum readFormat = fixBGRA ? eGL_RGBA : format;
+    byte *dst = (byte *)pixels + d * dstSliceSize;
 
-    GLenum implFormat = eGL_NONE, implType = eGL_NONE;
+    // pick the read format/type
 
-    GL.glGetIntegerv(eGL_IMPLEMENTATION_COLOR_READ_FORMAT, (GLint *)&implFormat);
-    GL.glGetIntegerv(eGL_IMPLEMENTATION_COLOR_READ_TYPE, (GLint *)&implType);
-
-    // spec says this must be supported
-    bool validReadback = (readFormat == eGL_RGBA && type == eGL_UNSIGNED_BYTE);
-
-    // the implementation is allowed to support one other format/type pair, it can vary by texture.
-    // Normally this will be the 'natural' readback format/type pair that we are trying
-    validReadback |= (readFormat == implFormat && type == implType);
-
-    if(validReadback)
+    if((readFormat == eGL_RGBA && readType == eGL_UNSIGNED_BYTE) ||
+       (readFormat == eGL_RGBA_INTEGER && readType == eGL_UNSIGNED_INT) ||
+       (readFormat == eGL_RGBA_INTEGER && readType == eGL_INT) ||
+       (readFormat == eGL_RGBA && readType == eGL_UNSIGNED_INT_2_10_10_10_REV))
     {
-      GL.glReadPixels(0, 0, width, height, readFormat, type, (void *)dst);
+      // if we were already planning to use one of the spec-guaranteed supported combinations,
+      // great! use that
     }
     else
     {
-      // unfortunately the readback is not supported directly, we'll need to fudge it.
-      RDCDEBUG("Reading as %s/%s but impl supported pair is %s/%s", ToStr(readFormat).c_str(),
-               ToStr(type).c_str(), ToStr(implFormat).c_str(), ToStr(implType).c_str());
+      // see what format and type the implementation supports
+      GLenum implFormat = eGL_NONE, implType = eGL_NONE;
 
-      if(readFormat == implFormat && (type == eGL_HALF_FLOAT_OES || type == eGL_HALF_FLOAT) &&
-         (implType == eGL_HALF_FLOAT_OES || implType == eGL_HALF_FLOAT))
+      if(!depthFormat)
       {
-        // if the format itself is supported and we just have a mismatch between eGL_HALF_FLOAT_OES
-        // and eGL_HALF_FLOAT (different enum values), we can just use the implementation's pair
-        // as-is.
+        GL.glGetIntegerv(eGL_IMPLEMENTATION_COLOR_READ_FORMAT, (GLint *)&implFormat);
+        GL.glGetIntegerv(eGL_IMPLEMENTATION_COLOR_READ_TYPE, (GLint *)&implType);
 
-        GL.glReadPixels(0, 0, width, height, readFormat, implType, (void *)dst);
+        // GL_HALF_FLOAT and GL_HALF_FLOAT_OES have different enum values but are the same
+        // otherwise. we always use the normal enum ourselves, but if the driver wants the _OES
+        // version then just use that so we match and can do a direct readback.
+        if(implType == eGL_HALF_FLOAT_OES && readType == eGL_HALF_FLOAT)
+          readType = eGL_HALF_FLOAT_OES;
       }
-      else if(readFormat == eGL_RGB && implFormat == eGL_RGBA && type == implType)
+
+      if(!depthFormat && implFormat == readFormat && implType == readType)
       {
-        // if the only difference is that the implementation wants to read RGBA for an RGB format
-        // (could be understandable if the native storage is RGBA anyway for RGB textures) then we
-        // can readback into a temporary buffer and strip the alpha.
+        // great, the implementation supports the format and type we want
+      }
+      else
+      {
+        // need to remap now from what we read to what we need to write.
+        readDirectly = false;
 
-        size_t size = GetByteSize(width, height, 1, implFormat, type);
-        byte *readback = new byte[size];
-        GL.glReadPixels(0, 0, width, height, implFormat, implType, readback);
+        // if all that's different is the number of components, read as one of the
+        // guaranteed-supported format/type pairs
+        if((readFormat == eGL_RGBA || readFormat == eGL_RGB || readFormat == eGL_RG ||
+            readFormat == eGL_RED) &&
+           (readType == eGL_UNSIGNED_BYTE || readType == eGL_UNSIGNED_SHORT_4_4_4_4))
+        {
+          readFormat = eGL_RGBA;
+          readType = eGL_UNSIGNED_BYTE;
+        }
+        else if((readFormat == eGL_RGBA_INTEGER || readFormat == eGL_RGB_INTEGER ||
+                 readFormat == eGL_RG_INTEGER || readFormat == eGL_RED_INTEGER) &&
+                (readType == eGL_UNSIGNED_BYTE || readType == eGL_UNSIGNED_SHORT ||
+                 readType == eGL_UNSIGNED_INT))
+        {
+          readFormat = eGL_RGBA_INTEGER;
+          readType = eGL_UNSIGNED_INT;
+        }
+        else if((readFormat == eGL_RGBA_INTEGER || readFormat == eGL_RGB_INTEGER ||
+                 readFormat == eGL_RG_INTEGER || readFormat == eGL_RED_INTEGER) &&
+                (readType == eGL_BYTE || readType == eGL_SHORT || readType == eGL_INT))
+        {
+          readFormat = eGL_RGBA_INTEGER;
+          readType = eGL_INT;
+        }
+        else
+        {
+          // TODO maybe fallback to one of the guaranteed ones? or find a way to negotiate a better
+          // one?
+          RDCWARN(
+              "Implementation reported format %s / type %s readback format for %s. Trying with "
+              "desired format %s / type %s pair anyway.",
+              ToStr(implFormat).c_str(), ToStr(implType).c_str(), ToStr(origInternalFormat).c_str(),
+              ToStr(readFormat).c_str(), ToStr(readType).c_str());
+        }
+      }
+    }
 
-        // how big is a component (1/2/4 bytes)
-        size_t compSize = GetByteSize(1, 1, 1, eGL_RED, type);
+    PixelUnpackState unpack;
+    PixelPackState pack;
+    unpack.Fetch(false);
+    pack.Fetch(false);
 
-        byte *src = readback;
+    ResetPixelPackState(false, 1);
+    ResetPixelUnpackState(false, 1);
+
+    if(readDirectly)
+    {
+      // fast path, we're reading directly in the exact format
+      memset(dst, 0, dstSliceSize);
+      GL.glReadPixels(0, 0, width, height, readFormat, readType, (void *)dst);
+    }
+    else
+    {
+      RDCDEBUG("Readback with remapping for texture format %s", ToStr(origInternalFormat).c_str());
+
+      // unfortunately the readback is not in the right format directly, we'll need to read back
+      // whatever we got and then convert to the output format.
+
+      size_t sliceSize = GetByteSize(width, height, 1, readFormat, readType);
+      byte *readback = new byte[sliceSize];
+      GL.glReadPixels(0, 0, width, height, readFormat, readType, readback);
+
+      uint32_t readCompCount = 1;
+      if(readFormat == eGL_RGBA || readFormat == eGL_RGBA_INTEGER)
+        readCompCount = 4;
+      else if(readFormat == eGL_RGB || readFormat == eGL_RGB_INTEGER)
+        readCompCount = 3;
+      else if(readFormat == eGL_RG || readFormat == eGL_RG_INTEGER)
+        readCompCount = 2;
+      else if(readFormat == eGL_RED || readFormat == eGL_RED_INTEGER)
+        readCompCount = 1;
+      else if(readFormat == eGL_DEPTH_COMPONENT || readFormat == eGL_STENCIL_INDEX)
+        readCompCount = 1;
+      else if(readFormat == eGL_DEPTH_STENCIL)
+        readCompCount = 2;
+      else
+        RDCERR("Unexpected implementation format %s, assuming one component",
+               ToStr(readFormat).c_str());
+
+      // how big is a component (1/2/4 bytes)
+      size_t readCompSize = GetByteSize(1, 1, 1, eGL_RED, readType);
+
+      if(depthFormat)
+        readCompSize = 4;
+
+      // if the type didn't change from what the caller expects, we only changed the number of
+      // components. This is easy to remap
+      if(type == readType && !disableSRGBCorrect && !depthFormat &&
+         (origFmt.type == ResourceFormatType::Regular || origFmt.type == ResourceFormatType::A8))
+      {
+        RDCDEBUG("Component number changed only");
+
+        uint32_t dstCompCount = origFmt.compCount;
+
+        byte *srcPixel = readback;
+        byte *dstPixel = dst;
 
         // for each pixel
         for(GLint i = 0; i < width * height; i++)
         {
           // copy RGB
-          memcpy(dst, src, compSize * 3);
+          memcpy(dstPixel, srcPixel, readCompSize * dstCompCount);
 
           // advance dst by RGB
-          dst += compSize * 3;
+          dstPixel += readCompSize * dstCompCount;
 
           // advance src by RGBA
-          src += compSize * 4;
+          srcPixel += readCompSize * readCompCount;
         }
-
-        delete[] readback;
-
-        fixBGRA = false;
       }
       else
       {
-        RDCERR("Unhandled readback failure");
-        memset(dst, 0, sliceSize);
+        RDCDEBUG("Component format changed");
+
+        ResourceFormat readFmt;
+        readFmt.type = ResourceFormatType::Regular;
+        readFmt.compCount = readCompCount & 0xff;
+        readFmt.compByteWidth = readCompSize & 0xff;
+
+        if(IsSIntFormat(GetSizedFormat(readFormat)))
+        {
+          switch(readType)
+          {
+            case eGL_UNSIGNED_INT:
+            case eGL_UNSIGNED_SHORT:
+            case eGL_UNSIGNED_BYTE: readFmt.compType = CompType::UInt; break;
+            case eGL_INT:
+            case eGL_SHORT:
+            case eGL_BYTE: readFmt.compType = CompType::SInt; break;
+            default:
+              RDCERR("Unexpected readType %s", ToStr(readType).c_str());
+              readFmt.compType = CompType::UInt;
+              break;
+          }
+        }
+        else
+        {
+          switch(readType)
+          {
+            case eGL_UNSIGNED_INT:
+            case eGL_UNSIGNED_SHORT:
+            case eGL_UNSIGNED_BYTE: readFmt.compType = CompType::UNorm; break;
+            case eGL_INT:
+            case eGL_SHORT:
+            case eGL_BYTE: readFmt.compType = CompType::SNorm; break;
+            case eGL_HALF_FLOAT_OES:
+            case eGL_HALF_FLOAT:
+            case eGL_FLOAT:
+            case eGL_DOUBLE: readFmt.compType = CompType::Float; break;
+            default:
+              RDCERR("Unexpected readType %s", ToStr(readType).c_str());
+              readFmt.compType = CompType::UNorm;
+              break;
+          }
+
+          // if we couldn't enable FRAMEBUFFER_SRGB to ensure the blit is srgb-preserving, we wrote
+          // out linear data. So we need to under-correct to at least get values approximately right
+          // even if we lost some information by missing a correct. Since we can't control whether a
+          // sRGB texture is read as sRGB.
+          if(!disableSRGBCorrect && origFmt.compType == CompType::UNormSRGB)
+            readFmt.compType = CompType::UNormSRGB;
+        }
+
+        byte *srcPixel = readback;
+        byte *dstPixel = dst;
+
+        size_t dstStride = origFmt.ElementSize();
+
+        bool d24 = false;
+        // D24 is not written tightly packed, add extra byte for padding
+        if(origFmt.type == ResourceFormatType::Regular && origFmt.compCount == 1 &&
+           origFmt.compByteWidth == 3 && origFmt.compType == CompType::Depth)
+        {
+          d24 = true;
+          dstStride = 4;
+          RDCDEBUG("Handling D24 only");
+        }
+
+        // go pixel-by-pixel, reading in the readback format and writing in the dest format
+        for(GLint i = 0; i < width * height; i++)
+        {
+          FloatVector vec = DecodeFormattedComponents(readFmt, srcPixel);
+
+          EncodeFormattedComponents(origFmt, vec, dstPixel);
+
+          // GL expects ABGR order for these formats where our standard encoder writes BGRA, swizzle
+          // here
+          if(origFmt.type == ResourceFormatType::R4G4B4A4)
+          {
+            uint16_t val = 0;
+            memcpy(&val, dstPixel, sizeof(val));
+            val = ((val & 0x0fff) << 4) | ((val & 0xf000) >> 12);
+            memcpy(dstPixel, &val, sizeof(val));
+          }
+          else if(origFmt.type == ResourceFormatType::R5G5B5A1)
+          {
+            uint16_t val = 0;
+            memcpy(&val, dstPixel, sizeof(val));
+            val = ((val & 0x7fff) << 1) | ((val & 0x8000) >> 12);
+            memcpy(dstPixel, &val, sizeof(val));
+          }
+
+          if(d24)
+          {
+            // normally we'd expect D24 to be in the bottom 3 bytes, since D24S8 puts stencil in the
+            // top byte. However on upload GL doesn't really support a proper preserving upload (or
+            // not portably) so we specify UNSIGNED_INT. Shifting like this is what a proper GL
+            // implementation does on read and gives us the right results.
+            uint32_t *p = (uint32_t *)dstPixel;
+            *p = (*p << 8) | (*p >> 16);
+          }
+
+          dstPixel += dstStride;
+          srcPixel += readCompSize * readCompCount;
+        }
       }
+
+      delete[] readback;
     }
 
-    if(fixBGRA)
+    unpack.Apply(false);
+    pack.Apply(false);
+
+    if(swizzleBGRA)
     {
       // since we read back the texture with RGBA format, we have to flip the R and B components
       byte *b = dst;
       for(GLint i = 0, n = width * height; i < n; ++i, b += 4)
-        std::swap(*b, *(b + 2));
+        std::swap(b[0], b[2]);
     }
   }
 
@@ -3303,6 +3910,8 @@ void GLDispatchTable::EmulateRequiredExtensions()
     EMULATE_FUNC(glBlitNamedFramebuffer)
     EMULATE_FUNC(glVertexArrayElementBuffer);
     EMULATE_FUNC(glVertexArrayVertexBuffers)
+    EMULATE_FUNC(glInvalidateNamedFramebufferData);
+    EMULATE_FUNC(glInvalidateNamedFramebufferSubData);
   }
 }
 
@@ -3314,25 +3923,61 @@ void GLDispatchTable::DriverForEmulation(WrappedOpenGL *driver)
 #if ENABLED(ENABLE_UNIT_TESTS)
 
 #undef None
+#undef Always
 
 #include "../gl_shader_refl.h"
-#include "3rdparty/catch/catch.hpp"
+#include "catch/catch.hpp"
+#include "data/glsl_shaders.h"
+#include "replay/replay_driver.h"
 #include "strings/string_utils.h"
 
 GLint APIENTRY _testStub_GetUniformLocation(GLuint program, const GLchar *name)
 {
   // use existing ARB_program_interface_query to get value
   GLuint index = GL.glGetProgramResourceIndex(program, eGL_UNIFORM, name);
+
+  uint32_t arrayIdx = 0;
+
+  // if we're querying for an array index like tex2D[1] then query for the base and add 1000000 *
+  // arrayIdx.
+  // This should only then be used in GetUniformiv below where we 'decode' the arrayIdx from the
+  // location and then add it onto the returned value.
+  if(index == GL_INVALID_INDEX && strchr(name, '['))
+  {
+    rdcstr nm = name;
+    int offs = nm.indexOf('[');
+    offs++;
+
+    while(nm[offs] >= '0' && nm[offs] <= '9')
+    {
+      arrayIdx *= 10;
+      arrayIdx += int(nm[offs]) - int('0');
+      offs++;
+    }
+
+    nm.erase(nm.indexOf('['), nm.size());
+    nm += "[0]";
+    index = GL.glGetProgramResourceIndex(program, eGL_UNIFORM, nm.c_str());
+  }
+
   RDCASSERT(index != GL_INVALID_INDEX);
 
-  return index;
+  // safe to add this on in all other cases because arrayIdx is 0 by default
+  return index + 1000000 * arrayIdx;
 }
 
 void APIENTRY _testStub_GetUniformiv(GLuint program, GLint location, GLint *params)
 {
+  uint32_t arrayIdx = location / 1000000;
+
+  if(arrayIdx > 0)
+    location -= arrayIdx * 1000000;
+
   // abuse this query which returns the right value for uniform bindings also
   GLenum prop = eGL_UNIFORM;
   GL.glGetProgramResourceiv(program, eGL_UNIFORM, location, 1, &prop, 1, NULL, params);
+
+  *params += arrayIdx;
 }
 
 void APIENTRY _testStub_GetIntegerv(GLenum pname, GLint *params)
@@ -3418,7 +4063,8 @@ void APIENTRY _testStub_GetActiveUniformBlockiv(GLuint program, GLuint uniformBl
 
 GLint APIENTRY _testStub_AttribLocation(GLuint program, const GLchar *name)
 {
-  GLuint index = GL.glGetProgramResourceIndex(program, eGL_UNIFORM_BLOCK, name);
+  GLuint index = GL.glGetProgramResourceIndex(program, eGL_PROGRAM_INPUT, name);
+
   RDCASSERT(index != GL_INVALID_INDEX);
   GLenum prop = eGL_LOCATION;
   GLint value = -1;
@@ -3429,11 +4075,13 @@ GLint APIENTRY _testStub_AttribLocation(GLuint program, const GLchar *name)
   return value;
 }
 
-void MakeOfflineShaderReflection(ShaderStage stage, const std::string &source,
+void MakeOfflineShaderReflection(ShaderStage stage, const rdcstr &source, const rdcstr &entryPoint,
                                  ShaderReflection &refl, ShaderBindpointMapping &mapping)
 {
-  InitSPIRVCompiler();
-  RenderDoc::Inst().RegisterShutdownFunction(&ShutdownSPIRVCompiler);
+  rdcspv::Init();
+  RenderDoc::Inst().RegisterShutdownFunction(&rdcspv::Shutdown);
+
+  RDCASSERT(entryPoint == "main");
 
   // as a hack, create a local 'driver' and just populate m_Programs with what we want.
   GLDummyPlatform dummy;
@@ -3447,7 +4095,7 @@ void MakeOfflineShaderReflection(ShaderStage stage, const std::string &source,
   GL = GLDispatchTable();
   GL.EmulateRequiredExtensions();
 
-  glslang::TShader *sh = CompileShaderForReflection(SPIRVShaderStage(stage), {source});
+  glslang::TShader *sh = CompileShaderForReflection(rdcspv::ShaderStage(stage), {source});
 
   REQUIRE(sh);
 
@@ -3464,6 +4112,10 @@ void MakeOfflineShaderReflection(ShaderStage stage, const std::string &source,
   CheckVertexOutputUses({source}, outputUsage);
 
   MakeShaderReflection(ShaderEnum((size_t)stage), fakeProg, refl, outputUsage);
+
+  refl.debugInfo.files.resize(1);
+  refl.debugInfo.files[0].filename = "main.glsl";
+  refl.debugInfo.files[0].contents = source;
 
   // implement some stubs for testing
   GL.glGetUniformLocation = &_testStub_GetUniformLocation;
@@ -3484,32 +4136,32 @@ void MakeOfflineShaderReflection(ShaderStage stage, const std::string &source,
 // helper function that uses the replay proxy system to compile and reflect the shader using the
 // current driver. Unused by default but you can change the unit test below to call this function
 // instead of MakeOfflineShaderReflection.
-//
-// Note that we can't fill out ShaderBindpointMapping easily on the actual driver
-void MakeOnlineShaderReflection(ShaderStage stage, const std::string &source,
+void MakeOnlineShaderReflection(ShaderStage stage, const rdcstr &source, const rdcstr &entryPoint,
                                 ShaderReflection &refl, ShaderBindpointMapping &mapping)
 {
-  ReplayStatus status = ReplayStatus::UnknownError;
+  RDResult status = ResultCode::APIUnsupported;
   IReplayDriver *driver = NULL;
 
-  std::map<RDCDriver, std::string> replays = RenderDoc::Inst().GetReplayDrivers();
+  RDCASSERT(entryPoint == "main");
+
+  std::map<RDCDriver, rdcstr> replays = RenderDoc::Inst().GetReplayDrivers();
 
   if(replays.find(RDCDriver::OpenGL) != replays.end())
     status = RenderDoc::Inst().CreateProxyReplayDriver(RDCDriver::OpenGL, &driver);
 
-  if(status != ReplayStatus::Succeeded)
+  if(status != ResultCode::Succeeded)
   {
     RDCERR("No GL support locally, couldn't create proxy GL driver for reflection");
     return;
   }
 
   ResourceId id;
-  std::string errors;
+  rdcstr errors;
   bytebuf buf;
   buf.resize(source.size());
   memcpy(buf.data(), source.data(), source.size());
-  driver->BuildCustomShader(ShaderEncoding::GLSL, buf, "main", ShaderCompileFlags(), stage, &id,
-                            &errors);
+  driver->BuildTargetShader(ShaderEncoding::GLSL, buf, "main", ShaderCompileFlags(), stage, id,
+                            errors);
 
   if(id == ResourceId())
   {
@@ -3517,870 +4169,29 @@ void MakeOnlineShaderReflection(ShaderStage stage, const std::string &source,
     return;
   }
 
-  refl = *driver->GetShader(id, ShaderEntryPoint("main", ShaderStage::Fragment));
+  refl = *driver->GetShader(ResourceId(), id, ShaderEntryPoint("main", ShaderStage::Fragment));
+
+  // hack the mapping so that tests can skip checks of mapping when using online compilation (see
+  // MAPPING_VALID)
+  mapping.inputAttributes.resize(1);
+  mapping.inputAttributes[0] = 0x12345678;
+
+  // Note that we can't fill out ShaderBindpointMapping easily on the actual driver through the
+  // replay interface
+  WARN("Using online reflection - all checks with ShaderBindpointMapping will fail");
 
   driver->FreeCustomShader(id);
 
   driver->Shutdown();
 }
 
-TEST_CASE("Validate ARB_program_interface_query emulation", "[opengl][glslang]")
+TEST_CASE("Validate ARB_program_interface_query emulation", "[opengl][glslang][reflection]")
 {
-  SECTION("Single shader deep dive")
-  {
-    std::string source = R"(
-#version 450 core
-
-struct glstruct
-{
-  float a;
-  int b;
-  mat2x2 c;
-};
-
-layout(binding = 8, std140) uniform ubo_block {
-	float ubo_a;
-	layout(column_major) mat4x3 ubo_b;
-	layout(row_major) mat4x3 ubo_c;
-  ivec2 ubo_d;
-  vec2 ubo_e[3];
-  glstruct ubo_f;
-  layout(offset = 256) vec4 ubo_z;
-} ubo_root;
-
-layout(binding = 2, std430) buffer ssbo
-{
-  uint ssbo_a[10];
-  glstruct ssbo_b[3];
-  float ssbo_c;
-} ssbo_root;
-
-layout(binding = 0) uniform atomic_uint atom;
-
-layout(location = 3) in vec2 a_input;
-layout(location = 6) flat in uvec3 z_input;
-
-uniform vec3 global_var[5];
-uniform mat3x2 global_var2[3];
-
-layout(binding = 3) uniform sampler2D tex2D;
-layout(binding = 5) uniform isampler3D tex3D;
-
-layout(location = 0) out vec4 a_output;
-layout(location = 1) out vec3 z_output;
-layout(location = 2) out int b_output;
-
-void main() {
-  float a = ubo_root.ubo_a + global_var2[2][0][1];
-  a_output = vec4(sin(float(a) + gl_FragCoord.x), 0, 0, 1);
-  z_output = textureLod(tex2D, a_output.xy, a_output.z).xyz + a_input.xyx + global_var[4];
-  ssbo_root.ssbo_a[5] = 4 + atomicCounter(atom) + z_input.y;
-  b_output = ssbo_root.ssbo_b[2].b + texelFetch(tex3D, ivec3(z_input), 0).x;
-  gl_FragDepth = z_output.y; 
-}
-
-)";
-
-#define REQUIRE_ARRAY_SIZE(size, min) \
-  REQUIRE(size >= min);               \
-  CHECK(size == min);
-
-    ShaderReflection refl;
-    ShaderBindpointMapping mapping;
-    MakeOfflineShaderReflection(ShaderStage::Fragment, source, refl, mapping);
-
-    REQUIRE_ARRAY_SIZE(refl.inputSignature.size(), 3);
-    {
-      CHECK(refl.inputSignature[0].varName == "a_input");
-      {
-        const SigParameter &sig = refl.inputSignature[0];
-        INFO("signature element: " << sig.varName.c_str());
-
-        CHECK(sig.regIndex == 3);
-        CHECK(sig.systemValue == ShaderBuiltin::Undefined);
-        CHECK(sig.compType == CompType::Float);
-        CHECK(sig.compCount == 2);
-        CHECK(sig.regChannelMask == 0x3);
-        CHECK(sig.channelUsedMask == 0x3);
-      }
-
-      CHECK(refl.inputSignature[1].varName == "z_input");
-      {
-        const SigParameter &sig = refl.inputSignature[1];
-        INFO("signature element: " << sig.varName.c_str());
-
-        CHECK(sig.regIndex == 6);
-        CHECK(sig.systemValue == ShaderBuiltin::Undefined);
-        CHECK(sig.compType == CompType::UInt);
-        CHECK(sig.compCount == 3);
-        CHECK(sig.regChannelMask == 0x7);
-        CHECK(sig.channelUsedMask == 0x7);
-      }
-
-      CHECK(refl.inputSignature[2].varName == "gl_FragCoord");
-      {
-        const SigParameter &sig = refl.inputSignature[2];
-        INFO("signature element: " << sig.varName.c_str());
-
-        CHECK(sig.regIndex == 0);
-        CHECK(sig.systemValue == ShaderBuiltin::Position);
-        CHECK(sig.compType == CompType::Float);
-        CHECK(sig.compCount == 4);
-        CHECK(sig.regChannelMask == 0xf);
-        CHECK(sig.channelUsedMask == 0xf);
-      }
-    }
-
-    REQUIRE_ARRAY_SIZE(refl.outputSignature.size(), 4);
-    {
-      CHECK(refl.outputSignature[0].varName == "a_output");
-      {
-        const SigParameter &sig = refl.outputSignature[0];
-        INFO("signature element: " << sig.varName.c_str());
-
-        CHECK(sig.regIndex == 0);
-        CHECK(sig.systemValue == ShaderBuiltin::ColorOutput);
-        CHECK(sig.compType == CompType::Float);
-        CHECK(sig.compCount == 4);
-        CHECK(sig.regChannelMask == 0xf);
-        CHECK(sig.channelUsedMask == 0xf);
-      }
-
-      CHECK(refl.outputSignature[1].varName == "z_output");
-      {
-        const SigParameter &sig = refl.outputSignature[1];
-        INFO("signature element: " << sig.varName.c_str());
-
-        CHECK(sig.regIndex == 1);
-        CHECK(sig.systemValue == ShaderBuiltin::ColorOutput);
-        CHECK(sig.compType == CompType::Float);
-        CHECK(sig.compCount == 3);
-        CHECK(sig.regChannelMask == 0x7);
-        CHECK(sig.channelUsedMask == 0x7);
-      }
-
-      CHECK(refl.outputSignature[2].varName == "b_output");
-      {
-        const SigParameter &sig = refl.outputSignature[2];
-        INFO("signature element: " << sig.varName.c_str());
-
-        CHECK(sig.regIndex == 2);
-        CHECK(sig.systemValue == ShaderBuiltin::ColorOutput);
-        CHECK(sig.compType == CompType::SInt);
-        CHECK(sig.compCount == 1);
-        CHECK(sig.regChannelMask == 0x1);
-        CHECK(sig.channelUsedMask == 0x1);
-      }
-
-      CHECK(refl.outputSignature[3].varName == "gl_FragDepth");
-      {
-        const SigParameter &sig = refl.outputSignature[3];
-        INFO("signature element: " << sig.varName.c_str());
-
-        // when not running with a driver we default to just using the index instead of looking up
-        // the location of outputs, so this will be wrong
-        // CHECK(sig.regIndex == 0);
-        CHECK(sig.systemValue == ShaderBuiltin::DepthOutput);
-        CHECK(sig.compType == CompType::Float);
-        CHECK(sig.compCount == 1);
-        CHECK(sig.regChannelMask == 0x1);
-        CHECK(sig.channelUsedMask == 0x1);
-      }
-    }
-
-    REQUIRE_ARRAY_SIZE(refl.readOnlyResources.size(), 2);
-    {
-      CHECK(refl.readOnlyResources[0].name == "tex2D");
-      {
-        const ShaderResource &res = refl.readOnlyResources[0];
-        INFO("read-only resource: " << res.name.c_str());
-
-        CHECK(res.bindPoint == 0);
-        CHECK(res.resType == TextureType::Texture2D);
-        CHECK(res.variableType.members.empty());
-        CHECK(res.variableType.descriptor.type == VarType::Float);
-        CHECK(res.variableType.descriptor.rows == 1);
-        CHECK(res.variableType.descriptor.columns == 4);
-        CHECK(res.variableType.descriptor.name == "sampler2D");
-      }
-
-      CHECK(refl.readOnlyResources[1].name == "tex3D");
-      {
-        const ShaderResource &res = refl.readOnlyResources[1];
-        INFO("read-only resource: " << res.name.c_str());
-
-        CHECK(res.bindPoint == 1);
-        CHECK(res.resType == TextureType::Texture3D);
-        CHECK(res.variableType.members.empty());
-        CHECK(res.variableType.descriptor.type == VarType::SInt);
-        CHECK(res.variableType.descriptor.rows == 1);
-        CHECK(res.variableType.descriptor.columns == 4);
-        CHECK(res.variableType.descriptor.name == "isampler3D");
-      }
-    }
-
-    REQUIRE_ARRAY_SIZE(refl.readWriteResources.size(), 2);
-    {
-      CHECK(refl.readWriteResources[0].name == "atom");
-      {
-        const ShaderResource &res = refl.readWriteResources[0];
-        INFO("read-write resource: " << res.name.c_str());
-
-        CHECK(res.bindPoint == 0);
-        CHECK(res.resType == TextureType::Buffer);
-        CHECK(res.variableType.members.empty());
-        CHECK(res.variableType.descriptor.type == VarType::UInt);
-        CHECK(res.variableType.descriptor.rows == 1);
-        CHECK(res.variableType.descriptor.columns == 1);
-        CHECK(res.variableType.descriptor.name == "atomic_uint");
-      }
-
-      CHECK(refl.readWriteResources[1].name == "ssbo");
-      {
-        const ShaderResource &res = refl.readWriteResources[1];
-        INFO("read-write resource: " << res.name.c_str());
-
-        CHECK(res.bindPoint == 1);
-        CHECK(res.resType == TextureType::Buffer);
-        CHECK(res.variableType.descriptor.type == VarType::UInt);
-        CHECK(res.variableType.descriptor.rows == 0);
-        CHECK(res.variableType.descriptor.columns == 0);
-        CHECK(res.variableType.descriptor.name == "buffer");
-
-        REQUIRE_ARRAY_SIZE(res.variableType.members.size(), 3);
-        {
-          CHECK(res.variableType.members[0].name == "ssbo_a");
-          {
-            const ShaderConstant &member = res.variableType.members[0];
-            INFO("SSBO member: " << member.name.c_str());
-
-            CHECK(member.byteOffset == 0);
-            CHECK(member.type.members.empty());
-            CHECK(member.type.descriptor.type == VarType::UInt);
-            CHECK(member.type.descriptor.rows == 1);
-            CHECK(member.type.descriptor.columns == 1);
-            CHECK(member.type.descriptor.elements == 10);
-            CHECK(member.type.descriptor.arrayByteStride == 4);
-            CHECK(member.type.descriptor.name == "uint");
-          }
-
-          CHECK(res.variableType.members[1].name == "ssbo_b");
-          {
-            const ShaderConstant &member = res.variableType.members[1];
-            INFO("SSBO member: " << member.name.c_str());
-
-            CHECK(member.byteOffset == 40);
-            // this doesn't reflect in native introspection, so we skip it
-            // CHECK(member.type.descriptor.elements == 3);
-            CHECK(member.type.descriptor.name == "struct");
-            CHECK(member.type.descriptor.arrayByteStride == 24);
-
-            REQUIRE_ARRAY_SIZE(member.type.members.size(), 3);
-            {
-              CHECK(member.type.members[0].name == "a");
-              {
-                const ShaderConstant &submember = member.type.members[0];
-                INFO("SSBO submember: " << submember.name.c_str());
-
-                CHECK(submember.byteOffset == 40);
-                CHECK(submember.type.members.empty());
-                CHECK(submember.type.descriptor.type == VarType::Float);
-                CHECK(submember.type.descriptor.rows == 1);
-                CHECK(submember.type.descriptor.columns == 1);
-                CHECK(submember.type.descriptor.name == "float");
-              }
-
-              CHECK(member.type.members[1].name == "b");
-              {
-                const ShaderConstant &submember = member.type.members[1];
-                INFO("SSBO submember: " << submember.name.c_str());
-
-                CHECK(submember.byteOffset == 44);
-                CHECK(submember.type.members.empty());
-                CHECK(submember.type.descriptor.type == VarType::SInt);
-                CHECK(submember.type.descriptor.rows == 1);
-                CHECK(submember.type.descriptor.columns == 1);
-                CHECK(submember.type.descriptor.name == "int");
-              }
-
-              CHECK(member.type.members[2].name == "c");
-              {
-                const ShaderConstant &submember = member.type.members[2];
-                INFO("SSBO submember: " << submember.name.c_str());
-
-                CHECK(submember.byteOffset == 48);
-                CHECK(submember.type.members.empty());
-                CHECK(submember.type.descriptor.type == VarType::Float);
-                CHECK(submember.type.descriptor.rows == 2);
-                CHECK(submember.type.descriptor.columns == 2);
-                CHECK(submember.type.descriptor.rowMajorStorage == false);
-                CHECK(submember.type.descriptor.name == "mat2");
-              }
-            }
-          }
-
-          CHECK(res.variableType.members[2].name == "ssbo_c");
-          {
-            const ShaderConstant &member = res.variableType.members[2];
-            INFO("SSBO member: " << member.name.c_str());
-
-            CHECK(member.byteOffset == 112);
-            CHECK(member.type.members.empty());
-            CHECK(member.type.descriptor.type == VarType::Float);
-            CHECK(member.type.descriptor.rows == 1);
-            CHECK(member.type.descriptor.columns == 1);
-            CHECK(member.type.descriptor.name == "float");
-          }
-        }
-      }
-    }
-
-    REQUIRE_ARRAY_SIZE(refl.constantBlocks.size(), 2);
-    {
-      CHECK(refl.constantBlocks[0].name == "ubo_block");
-      {
-        const ConstantBlock &cblock = refl.constantBlocks[0];
-        INFO("UBO: " << cblock.name.c_str());
-
-        CHECK(cblock.bindPoint == 0);
-        CHECK(cblock.bufferBacked);
-        CHECK(cblock.byteSize == 272);
-
-        REQUIRE_ARRAY_SIZE(cblock.variables.size(), 1);
-
-        CHECK(cblock.variables[0].name == "ubo_block");
-        const ShaderConstant &ubo_root = cblock.variables[0];
-
-        CHECK(ubo_root.byteOffset == 0);
-        CHECK(ubo_root.type.descriptor.name == "struct");
-
-        REQUIRE_ARRAY_SIZE(ubo_root.type.members.size(), 7);
-        {
-          CHECK(ubo_root.type.members[0].name == "ubo_a");
-          {
-            const ShaderConstant &member = ubo_root.type.members[0];
-            INFO("UBO member: " << member.name.c_str());
-
-            CHECK(member.byteOffset == 0);
-            CHECK(member.type.members.empty());
-            CHECK(member.type.descriptor.type == VarType::Float);
-            CHECK(member.type.descriptor.rows == 1);
-            CHECK(member.type.descriptor.columns == 1);
-            CHECK(member.type.descriptor.name == "float");
-          }
-
-          CHECK(ubo_root.type.members[1].name == "ubo_b");
-          {
-            const ShaderConstant &member = ubo_root.type.members[1];
-            INFO("UBO member: " << member.name.c_str());
-
-            CHECK(member.byteOffset == 16);
-            CHECK(member.type.members.empty());
-            CHECK(member.type.descriptor.type == VarType::Float);
-            CHECK(member.type.descriptor.rows == 3);
-            CHECK(member.type.descriptor.columns == 4);
-            CHECK(member.type.descriptor.rowMajorStorage == false);
-            CHECK(member.type.descriptor.name == "mat4x3");
-          }
-
-          CHECK(ubo_root.type.members[2].name == "ubo_c");
-          {
-            const ShaderConstant &member = ubo_root.type.members[2];
-            INFO("UBO member: " << member.name.c_str());
-
-            CHECK(member.byteOffset == 80);
-            CHECK(member.type.members.empty());
-            CHECK(member.type.descriptor.type == VarType::Float);
-            CHECK(member.type.descriptor.rows == 3);
-            CHECK(member.type.descriptor.columns == 4);
-            CHECK(member.type.descriptor.rowMajorStorage == true);
-            CHECK(member.type.descriptor.name == "mat4x3");
-          }
-
-          CHECK(ubo_root.type.members[3].name == "ubo_d");
-          {
-            const ShaderConstant &member = ubo_root.type.members[3];
-            INFO("UBO member: " << member.name.c_str());
-
-            CHECK(member.byteOffset == 128);
-            CHECK(member.type.members.empty());
-            CHECK(member.type.descriptor.type == VarType::SInt);
-            CHECK(member.type.descriptor.rows == 1);
-            CHECK(member.type.descriptor.columns == 2);
-            CHECK(member.type.descriptor.name == "ivec2");
-          }
-
-          CHECK(ubo_root.type.members[4].name == "ubo_e");
-          {
-            const ShaderConstant &member = ubo_root.type.members[4];
-            INFO("UBO member: " << member.name.c_str());
-
-            CHECK(member.byteOffset == 144);
-            CHECK(member.type.members.empty());
-            CHECK(member.type.descriptor.type == VarType::Float);
-            CHECK(member.type.descriptor.rows == 1);
-            CHECK(member.type.descriptor.columns == 2);
-            CHECK(member.type.descriptor.elements == 3);
-            CHECK(member.type.descriptor.arrayByteStride == 16);
-            CHECK(member.type.descriptor.name == "vec2");
-          }
-
-          CHECK(ubo_root.type.members[5].name == "ubo_f");
-          {
-            const ShaderConstant &member = ubo_root.type.members[5];
-            INFO("UBO member: " << member.name.c_str());
-
-            CHECK(member.byteOffset == 192);
-            // this doesn't reflect in native introspection, so we skip it
-            // CHECK(member.type.descriptor.elements == 3);
-            CHECK(member.type.descriptor.name == "struct");
-
-            REQUIRE_ARRAY_SIZE(member.type.members.size(), 3);
-            {
-              CHECK(member.type.members[0].name == "a");
-              {
-                const ShaderConstant &submember = member.type.members[0];
-                INFO("UBO submember: " << submember.name.c_str());
-
-                CHECK(submember.byteOffset == 192);
-                CHECK(submember.type.members.empty());
-                CHECK(submember.type.descriptor.type == VarType::Float);
-                CHECK(submember.type.descriptor.rows == 1);
-                CHECK(submember.type.descriptor.columns == 1);
-                CHECK(submember.type.descriptor.name == "float");
-              }
-
-              CHECK(member.type.members[1].name == "b");
-              {
-                const ShaderConstant &submember = member.type.members[1];
-                INFO("UBO submember: " << submember.name.c_str());
-
-                CHECK(submember.byteOffset == 196);
-                CHECK(submember.type.members.empty());
-                CHECK(submember.type.descriptor.type == VarType::SInt);
-                CHECK(submember.type.descriptor.rows == 1);
-                CHECK(submember.type.descriptor.columns == 1);
-                CHECK(submember.type.descriptor.name == "int");
-              }
-
-              CHECK(member.type.members[2].name == "c");
-              {
-                const ShaderConstant &submember = member.type.members[2];
-                INFO("UBO submember: " << submember.name.c_str());
-
-                CHECK(submember.byteOffset == 208);
-                CHECK(submember.type.members.empty());
-                CHECK(submember.type.descriptor.type == VarType::Float);
-                CHECK(submember.type.descriptor.rows == 2);
-                CHECK(submember.type.descriptor.columns == 2);
-                CHECK(submember.type.descriptor.rowMajorStorage == false);
-                CHECK(submember.type.descriptor.name == "mat2");
-              }
-            }
-          }
-
-          CHECK(ubo_root.type.members[6].name == "ubo_z");
-          {
-            const ShaderConstant &member = ubo_root.type.members[6];
-            INFO("UBO member: " << member.name.c_str());
-
-            CHECK(member.byteOffset == 256);
-            CHECK(member.type.members.empty());
-            CHECK(member.type.descriptor.type == VarType::Float);
-            CHECK(member.type.descriptor.rows == 1);
-            CHECK(member.type.descriptor.columns == 4);
-            CHECK(member.type.descriptor.name == "vec4");
-          }
-        }
-      }
-
-      CHECK(refl.constantBlocks[1].name == "$Globals");
-      {
-        const ConstantBlock &cblock = refl.constantBlocks[1];
-        INFO("UBO: " << cblock.name.c_str());
-
-        CHECK(cblock.bindPoint == 1);
-        CHECK(!cblock.bufferBacked);
-
-        REQUIRE_ARRAY_SIZE(cblock.variables.size(), 2);
-        {
-          CHECK(cblock.variables[0].name == "global_var");
-          {
-            const ShaderConstant &member = cblock.variables[0];
-            INFO("UBO member: " << member.name.c_str());
-
-            CHECK(member.type.members.empty());
-            CHECK(member.type.descriptor.type == VarType::Float);
-            CHECK(member.type.descriptor.rows == 1);
-            CHECK(member.type.descriptor.columns == 3);
-            CHECK(member.type.descriptor.elements == 5);
-            CHECK(member.type.descriptor.name == "vec3");
-          }
-
-          CHECK(cblock.variables[1].name == "global_var2");
-          {
-            const ShaderConstant &member = cblock.variables[1];
-            INFO("UBO member: " << member.name.c_str());
-
-            CHECK(member.type.members.empty());
-            CHECK(member.type.descriptor.type == VarType::Float);
-            CHECK(member.type.descriptor.rows == 2);
-            CHECK(member.type.descriptor.columns == 3);
-            CHECK(member.type.descriptor.elements == 3);
-            CHECK(member.type.descriptor.rowMajorStorage == false);
-            CHECK(member.type.descriptor.name == "mat3x2");
-          }
-        }
-      }
-    }
-
-    REQUIRE(refl.samplers.empty());
-    REQUIRE(refl.interfaces.empty());
-
-    REQUIRE_ARRAY_SIZE(mapping.inputAttributes.size(), 16);
-    for(size_t i = 0; i < mapping.inputAttributes.size(); i++)
-    {
-      CHECK(mapping.inputAttributes[i] == -1);
-    }
-
-    REQUIRE_ARRAY_SIZE(mapping.readOnlyResources.size(), 2);
-    {
-      // tex2d
-      CHECK(mapping.readOnlyResources[0].bindset == 0);
-      CHECK(mapping.readOnlyResources[0].bind == 3);
-      CHECK(mapping.readOnlyResources[0].arraySize == 1);
-      CHECK(mapping.readOnlyResources[0].used);
-
-      // tex3d
-      CHECK(mapping.readOnlyResources[1].bindset == 0);
-      CHECK(mapping.readOnlyResources[1].bind == 5);
-      CHECK(mapping.readOnlyResources[1].arraySize == 1);
-      CHECK(mapping.readOnlyResources[1].used);
-    }
-
-    REQUIRE_ARRAY_SIZE(mapping.readWriteResources.size(), 2);
-    {
-      // atom
-      CHECK(mapping.readWriteResources[0].bindset == 0);
-      CHECK(mapping.readWriteResources[0].bind == 0);
-      CHECK(mapping.readWriteResources[0].arraySize == 1);
-      CHECK(mapping.readWriteResources[0].used);
-
-      // ssbo
-      CHECK(mapping.readWriteResources[1].bindset == 0);
-      CHECK(mapping.readWriteResources[1].bind == 2);
-      CHECK(mapping.readWriteResources[1].arraySize == 1);
-      CHECK(mapping.readWriteResources[1].used);
-    }
-
-    REQUIRE_ARRAY_SIZE(mapping.constantBlocks.size(), 2);
-    {
-      // ubo
-      CHECK(mapping.constantBlocks[0].bindset == 0);
-      CHECK(mapping.constantBlocks[0].bind == 8);
-      CHECK(mapping.constantBlocks[0].arraySize == 1);
-      CHECK(mapping.constantBlocks[0].used);
-
-      // $Globals
-      CHECK(mapping.constantBlocks[1].bindset == -1);
-      CHECK(mapping.constantBlocks[1].bind == -1);
-      CHECK(mapping.constantBlocks[1].arraySize == 1);
-      CHECK(mapping.constantBlocks[1].used);
-    }
-
-    REQUIRE(mapping.samplers.empty());
-  };
-
-  SECTION("vertex shader fixed function outputs")
-  {
-    std::string source = R"(
-#version 150 core
-
-void main() {
-  gl_Position = vec4(0, 1, 0, 1);
-}
-
-)";
-
-    ShaderReflection refl;
-    ShaderBindpointMapping mapping;
-    MakeOfflineShaderReflection(ShaderStage::Vertex, source, refl, mapping);
-
-    REQUIRE_ARRAY_SIZE(refl.outputSignature.size(), 1);
-    {
-      CHECK(refl.outputSignature[0].varName == "gl_Position");
-      {
-        const SigParameter &sig = refl.outputSignature[0];
-        INFO("signature element: " << sig.varName.c_str());
-
-        CHECK(sig.regIndex == 0);
-        CHECK(sig.systemValue == ShaderBuiltin::Position);
-        CHECK(sig.compType == CompType::Float);
-        CHECK(sig.compCount == 4);
-        CHECK(sig.regChannelMask == 0xf);
-        CHECK(sig.channelUsedMask == 0xf);
-      }
-    }
-
-    std::string source2 = R"(
-#version 150 core
-
-void main() {
-  gl_Position = vec4(0, 1, 0, 1);
-  gl_PointSize = 1.5f;
-}
-
-)";
-
-    refl = ShaderReflection();
-    mapping = ShaderBindpointMapping();
-    MakeOfflineShaderReflection(ShaderStage::Vertex, source2, refl, mapping);
-
-    REQUIRE_ARRAY_SIZE(refl.outputSignature.size(), 2);
-    {
-      CHECK(refl.outputSignature[0].varName == "gl_Position");
-      {
-        const SigParameter &sig = refl.outputSignature[0];
-        INFO("signature element: " << sig.varName.c_str());
-
-        CHECK(sig.regIndex == 0);
-        CHECK(sig.systemValue == ShaderBuiltin::Position);
-        CHECK(sig.compType == CompType::Float);
-        CHECK(sig.compCount == 4);
-        CHECK(sig.regChannelMask == 0xf);
-        CHECK(sig.channelUsedMask == 0xf);
-      }
-
-      CHECK(refl.outputSignature[1].varName == "gl_PointSize");
-      {
-        const SigParameter &sig = refl.outputSignature[1];
-        INFO("signature element: " << sig.varName.c_str());
-
-        CHECK(sig.regIndex == 0);
-        CHECK(sig.systemValue == ShaderBuiltin::PointSize);
-        CHECK(sig.compType == CompType::Float);
-        CHECK(sig.compCount == 1);
-        CHECK(sig.regChannelMask == 0x1);
-        CHECK(sig.channelUsedMask == 0x1);
-      }
-    }
-  };
-
-  SECTION("shader input/output blocks")
-  {
-    std::string source = R"(
-#version 420 core
-
-layout(triangles) in;
-layout(triangle_strip, max_vertices = 4) out;
-
-in gl_PerVertex
-{
-	vec4 gl_Position;
-} gl_in[];
-
-in block
-{
-	vec2 Texcoord;
-} In[];
-
-out gl_PerVertex
-{
-	vec4 gl_Position;
-};
-
-out block
-{
-	vec2 Texcoord;
-} Out;
-
-void main()
-{
-	for(int i = 0; i < gl_in.length(); ++i)
-	{
-		gl_Position = gl_in[i].gl_Position;
-		Out.Texcoord = In[i].Texcoord;
-		EmitVertex();
-	}
-	EndPrimitive();
-}
-
-)";
-
-    ShaderReflection refl;
-    ShaderBindpointMapping mapping;
-    MakeOfflineShaderReflection(ShaderStage::Geometry, source, refl, mapping);
-
-    REQUIRE_ARRAY_SIZE(refl.inputSignature.size(), 2);
-    {
-      CHECK(refl.inputSignature[0].varName == "block.Texcoord");
-      {
-        const SigParameter &sig = refl.inputSignature[0];
-        INFO("signature element: " << sig.varName.c_str());
-
-        CHECK(sig.regIndex == 0);
-        CHECK(sig.systemValue == ShaderBuiltin::Undefined);
-        CHECK(sig.compType == CompType::Float);
-        CHECK(sig.compCount == 2);
-        CHECK(sig.regChannelMask == 0x3);
-        CHECK(sig.channelUsedMask == 0x3);
-      }
-
-      CHECK(refl.inputSignature[1].varName == "gl_PerVertex.gl_Position");
-      {
-        const SigParameter &sig = refl.inputSignature[1];
-        INFO("signature element: " << sig.varName.c_str());
-
-        CHECK(sig.regIndex == 0);
-        CHECK(sig.systemValue == ShaderBuiltin::Position);
-        CHECK(sig.compType == CompType::Float);
-        CHECK(sig.compCount == 4);
-        CHECK(sig.regChannelMask == 0xf);
-        CHECK(sig.channelUsedMask == 0xf);
-      }
-    }
-
-    REQUIRE_ARRAY_SIZE(refl.outputSignature.size(), 2);
-    {
-      CHECK(refl.outputSignature[0].varName == "block.Texcoord");
-      {
-        const SigParameter &sig = refl.outputSignature[0];
-        INFO("signature element: " << sig.varName.c_str());
-
-        CHECK(sig.regIndex == 0);
-        CHECK(sig.systemValue == ShaderBuiltin::Undefined);
-        CHECK(sig.compType == CompType::Float);
-        CHECK(sig.compCount == 2);
-        CHECK(sig.regChannelMask == 0x3);
-        CHECK(sig.channelUsedMask == 0x3);
-      }
-
-      CHECK(refl.outputSignature[1].varName == "gl_Position");
-      {
-        const SigParameter &sig = refl.outputSignature[1];
-        INFO("signature element: " << sig.varName.c_str());
-
-        CHECK(sig.regIndex == 0);
-        CHECK(sig.systemValue == ShaderBuiltin::Position);
-        CHECK(sig.compType == CompType::Float);
-        CHECK(sig.compCount == 4);
-        CHECK(sig.regChannelMask == 0xf);
-        CHECK(sig.channelUsedMask == 0xf);
-      }
-    }
-  };
-
-  SECTION("matrix and array outputs")
-  {
-    std::string source = R"(
-#version 150 core
-
-out vec3 outarr[3];
-out mat2 outmat;
-
-void main()
-{
-  gl_Position = vec4(0, 0, 0, 1);
-  outarr[0] = gl_Position.xyz;
-  outarr[1] = gl_Position.xyz;
-  outarr[2] = gl_Position.xyz;
-  outmat = mat2(0, 0, 0, 0);
-}
-
-)";
-
-    ShaderReflection refl;
-    ShaderBindpointMapping mapping;
-    MakeOfflineShaderReflection(ShaderStage::Vertex, source, refl, mapping);
-
-    REQUIRE_ARRAY_SIZE(refl.outputSignature.size(), 6);
-    {
-      CHECK(refl.outputSignature[0].varName == "outarr[0]");
-      {
-        const SigParameter &sig = refl.outputSignature[0];
-        INFO("signature element: " << sig.varName.c_str());
-
-        CHECK(sig.regIndex == 0);
-        CHECK(sig.arrayIndex == 0);
-        CHECK(sig.systemValue == ShaderBuiltin::Undefined);
-        CHECK(sig.compType == CompType::Float);
-        CHECK(sig.compCount == 3);
-        CHECK(sig.regChannelMask == 0x7);
-        CHECK(sig.channelUsedMask == 0x7);
-      }
-
-      CHECK(refl.outputSignature[1].varName == "outarr[1]");
-      {
-        const SigParameter &sig = refl.outputSignature[1];
-        INFO("signature element: " << sig.varName.c_str());
-
-        CHECK(sig.regIndex == 1);
-        CHECK(sig.arrayIndex == 1);
-        CHECK(sig.systemValue == ShaderBuiltin::Undefined);
-        CHECK(sig.compType == CompType::Float);
-        CHECK(sig.compCount == 3);
-        CHECK(sig.regChannelMask == 0x7);
-        CHECK(sig.channelUsedMask == 0x7);
-      }
-
-      CHECK(refl.outputSignature[2].varName == "outarr[2]");
-      {
-        const SigParameter &sig = refl.outputSignature[2];
-        INFO("signature element: " << sig.varName.c_str());
-
-        CHECK(sig.regIndex == 2);
-        CHECK(sig.arrayIndex == 2);
-        CHECK(sig.systemValue == ShaderBuiltin::Undefined);
-        CHECK(sig.compType == CompType::Float);
-        CHECK(sig.compCount == 3);
-        CHECK(sig.regChannelMask == 0x7);
-        CHECK(sig.channelUsedMask == 0x7);
-      }
-
-      CHECK(refl.outputSignature[3].varName == "outmat:row0");
-      {
-        const SigParameter &sig = refl.outputSignature[3];
-        INFO("signature element: " << sig.varName.c_str());
-
-        CHECK(sig.regIndex == 3);
-        CHECK(sig.systemValue == ShaderBuiltin::Undefined);
-        CHECK(sig.compType == CompType::Float);
-        CHECK(sig.compCount == 2);
-        CHECK(sig.regChannelMask == 0x3);
-        CHECK(sig.channelUsedMask == 0x3);
-      }
-
-      CHECK(refl.outputSignature[4].varName == "outmat:row1");
-      {
-        const SigParameter &sig = refl.outputSignature[4];
-        INFO("signature element: " << sig.varName.c_str());
-
-        CHECK(sig.regIndex == 4);
-        CHECK(sig.systemValue == ShaderBuiltin::Undefined);
-        CHECK(sig.compType == CompType::Float);
-        CHECK(sig.compCount == 2);
-        CHECK(sig.regChannelMask == 0x3);
-        CHECK(sig.channelUsedMask == 0x3);
-      }
-
-      CHECK(refl.outputSignature[5].varName == "gl_Position");
-      {
-        const SigParameter &sig = refl.outputSignature[5];
-        INFO("signature element: " << sig.varName.c_str());
-
-        CHECK(sig.regIndex == 0);
-        CHECK(sig.systemValue == ShaderBuiltin::Position);
-        CHECK(sig.compType == CompType::Float);
-        CHECK(sig.compCount == 4);
-        CHECK(sig.regChannelMask == 0xf);
-        CHECK(sig.channelUsedMask == 0xf);
-      }
-    }
-  };
+  TestGLSLReflection(ShaderType::GLSL, MakeOfflineShaderReflection);
 
   SECTION("shader stage references")
   {
-    std::string vssource = R"(
+    rdcstr vssource = R"(
 #version 450 core
 
 uniform float unused_uniform; // declared in both, used in neither
@@ -4397,7 +4208,7 @@ void main() {
 
 )";
 
-    std::string fssource = R"(
+    rdcstr fssource = R"(
 #version 450 core
 
 uniform float unused_uniform; // declared in both, used in neither
@@ -4418,8 +4229,8 @@ void main() {
 
 )";
 
-    InitSPIRVCompiler();
-    RenderDoc::Inst().RegisterShutdownFunction(&ShutdownSPIRVCompiler);
+    rdcspv::Init();
+    RenderDoc::Inst().RegisterShutdownFunction(&rdcspv::Shutdown);
 
     // as a hack, create a local 'driver' and just populate m_Programs with what we want.
     GLDummyPlatform dummy;
@@ -4432,8 +4243,8 @@ void main() {
     GL.EmulateRequiredExtensions();
 
     glslang::TProgram *prog = LinkProgramForReflection(
-        {CompileShaderForReflection(SPIRVShaderStage::Vertex, {vssource}),
-         CompileShaderForReflection(SPIRVShaderStage::Fragment, {fssource})});
+        {CompileShaderForReflection(rdcspv::ShaderStage::Vertex, {vssource}),
+         CompileShaderForReflection(rdcspv::ShaderStage::Fragment, {fssource})});
 
     REQUIRE(prog);
 

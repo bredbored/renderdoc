@@ -7,6 +7,13 @@ set(RDOC_INCLUDES
     PRIVATE ${RDOC_SOURCE_DIR}/3rdparty)
 set(RDOC_LIBRARIES)
 
+option(ENABLE_DLSYM_HOOKING "Enable dlsym() hooking via glibc internals" OFF)
+
+if(ENABLE_DLSYM_HOOKING)
+    set(RDOC_DEFINITIONS ${RDOC_DEFINITIONS} PRIVATE -DRENDERDOC_HOOK_DLSYM)
+    message(WARNING "Enabling dlsym() hooking - may cause issues, segfaults, crashes, or bad behaviour. Only enable if absolutely required")
+endif()
+
 if(ANDROID)
     list(APPEND RDOC_LIBRARIES
         PRIVATE -lm
@@ -15,21 +22,25 @@ if(ANDROID)
         PRIVATE -landroid)
 elseif(APPLE)
     list(APPEND RDOC_LIBRARIES
+        PRIVATE -lstdc++
         PRIVATE -liconv
         PRIVATE -lm
         PRIVATE -ldl)
 
-    if(ENABLE_VULKAN)
-        find_library(COCOA_LIBRARY Cocoa)
-        list(APPEND RDOC_LIBRARIES PRIVATE ${COCOA_LIBRARY})
+    find_library(COCOA_LIBRARY Cocoa)
+    list(APPEND RDOC_LIBRARIES PRIVATE ${COCOA_LIBRARY})
 
-        find_library(QUARTZCORE_LIBRARY QuartzCore)
-        list(APPEND RDOC_LIBRARIES PRIVATE ${QUARTZCORE_LIBRARY})
-    endif()
+    find_library(QUARTZCORE_LIBRARY QuartzCore)
+    list(APPEND RDOC_LIBRARIES PRIVATE ${QUARTZCORE_LIBRARY})
 
     if(ENABLE_GL)
         find_library(OPENGL_LIBRARY OpenGL)
         list(APPEND RDOC_LIBRARIES PRIVATE ${OPENGL_LIBRARY})
+    endif()
+
+    if(ENABLE_METAL)
+        find_library(METAL_LIBRARY Metal)
+        list(APPEND RDOC_LIBRARIES PRIVATE ${METAL_LIBRARY})
     endif()
 elseif(ENABLE_GGP)
     find_package(PkgConfig REQUIRED)
@@ -47,6 +58,15 @@ elseif(UNIX)
         PRIVATE -lm
         PRIVATE -ldl
         PRIVATE -lrt)
+
+    if(FREEBSD)
+        list(APPEND RDOC_LIBRARIES
+            PRIVATE -L/usr/local/lib
+            PRIVATE -liconv
+            PRIVATE -lexecinfo
+            PRIVATE -lutil
+        )
+    endif()
 
     if(ENABLE_XLIB)
         find_package(X11 REQUIRED)
@@ -70,6 +90,16 @@ elseif(UNIX)
         list(APPEND RDOC_LIBRARIES
             PRIVATE -l${XCB_LIBRARIES})
     endif()
+
+    if(ENABLE_UNSUPPORTED_EXPERIMENTAL_POSSIBLY_BROKEN_WAYLAND)
+        pkg_check_modules(PKG_WAYLAND QUIET wayland-client)
+
+        list(APPEND RDOC_INCLUDES
+            PRIVATE ${PKG_WAYLAND_INCLUDE_DIRS})
+
+        list(APPEND RDOC_LIBRARIES
+            PRIVATE -l${PKG_WAYLAND_LIBRARIES})
+    endif()
 endif()
 
 if(NOT "x${CMAKE_THREAD_LIBS_INIT}" STREQUAL "x")
@@ -78,27 +108,36 @@ endif()
 
 set(sources
     api/app/renderdoc_app.h
-    api/replay/basic_types.h
+    api/replay/apidefs.h
+    api/replay/capture_options.h
+    api/replay/common_pipestate.h
+    api/replay/pipestate.h
+    api/replay/pipestate.inl
+    api/replay/control_types.h
+    api/replay/data_types.h
+    api/replay/rdcarray.h
+    api/replay/rdcdatetime.h
+    api/replay/rdcflatmap.h
+    api/replay/rdcpair.h
+    api/replay/rdcstr.h
+    api/replay/replay_enums.h
+    api/replay/resourceid.h
+    api/replay/shader_types.h
     api/replay/stringise.h
     api/replay/structured_data.h
-    api/replay/capture_options.h
-    api/replay/control_types.h
-    api/replay/common_pipestate.h
-    api/replay/d3d11_pipestate.h
-    api/replay/data_types.h
-    api/replay/gl_pipestate.h
-    api/replay/renderdoc_replay.h
-    api/replay/replay_enums.h
-    api/replay/shader_types.h
-    api/replay/vk_pipestate.h
     api/replay/version.h
+    api/replay/gl_pipestate.h
+    api/replay/vk_pipestate.h
+    api/replay/renderdoc_replay.h
     api/replay/renderdoc_tostr.inl
     common/common.cpp
     common/common.h
     common/custom_assert.h
     common/dds_readwrite.cpp
     common/dds_readwrite.h
+    common/formatting.h
     common/globalconfig.h
+    common/result.h
     common/shader_cache.h
     common/threading.h
     common/timing.h
@@ -110,6 +149,9 @@ set(sources
     core/crash_handler.h
     core/target_control.cpp
     core/remote_server.cpp
+    core/remote_server.h
+    core/settings.cpp
+    core/settings.h
     core/replay_proxy.cpp
     core/replay_proxy.h
     core/intervals.h
@@ -117,10 +159,8 @@ set(sources
     core/bit_flag_iterator.h
     core/bit_flag_iterator_tests.cpp
     android/android.cpp
-    android/android_patch.cpp
     android/android_tools.cpp
     android/android_utils.cpp
-    android/android_manifest.cpp
     android/android.h
     android/android_utils.h
     android/jdwp.h
@@ -131,6 +171,8 @@ set(sources
     core/plugins.h
     core/resource_manager.cpp
     core/resource_manager.h
+    core/sparse_page_table.cpp
+    core/sparse_page_table.h
     data/glsl/glsl_ubos.h
     data/glsl/glsl_ubos_cpp.h
     hooks/hooks.cpp
@@ -138,16 +180,20 @@ set(sources
     maths/camera.cpp
     maths/camera.h
     maths/formatpacking.h
+    maths/formatpacking.cpp
     maths/half_convert.h
     maths/matrix.cpp
     maths/matrix.h
     maths/quat.h
+    maths/vec.cpp
     maths/vec.h
     os/os_specific.cpp
     os/os_specific.h
     replay/app_api.cpp
     replay/basic_types_tests.cpp
     replay/capture_options.cpp
+    replay/dummy_driver.cpp
+    replay/dummy_driver.h
     replay/renderdoc_serialise.inl
     replay/capture_file.cpp
     replay/entry_points.cpp
@@ -179,7 +225,6 @@ set(sources
     3rdparty/jpeg-compressor/jpgd.h
     3rdparty/jpeg-compressor/jpge.cpp
     3rdparty/jpeg-compressor/jpge.h
-    3rdparty/android/android_manifest.h
     3rdparty/catch/catch.cpp
     3rdparty/catch/catch.hpp
     3rdparty/pugixml/pugixml.cpp
@@ -187,8 +232,12 @@ set(sources
     3rdparty/pugixml/pugiconfig.hpp
     3rdparty/lz4/lz4.c
     3rdparty/lz4/lz4.h
+    3rdparty/md5/md5.c
+    3rdparty/md5/md5.h
     3rdparty/miniz/miniz.c
     3rdparty/miniz/miniz.h
+    3rdparty/superluminal/superluminal.cpp
+    3rdparty/superluminal/superluminal.h
     3rdparty/zstd/bitstream.h
     3rdparty/zstd/compiler.h
     3rdparty/zstd/cpu.h
@@ -233,7 +282,7 @@ set(sources
     3rdparty/zstd/zstdmt_compress.h
     3rdparty/stb/stb_image.h
     3rdparty/stb/stb_image_write.h
-    3rdparty/stb/stb_image_resize.h
+    3rdparty/stb/stb_image_resize2.h
     3rdparty/stb/stb_impl.c
     3rdparty/stb/stb_truetype.h
     3rdparty/tinyexr/tinyexr.cpp
@@ -260,6 +309,7 @@ elseif(APPLE)
     list(APPEND sources
         data/embedded_files.h
         os/posix/apple/apple_stringio.cpp
+        os/posix/apple/apple_helpers.mm
         os/posix/apple/apple_callstack.cpp
         os/posix/apple/apple_process.cpp
         os/posix/apple/apple_threading.cpp
@@ -288,6 +338,23 @@ elseif(ENABLE_GGP)
         os/posix/posix_stringio.cpp
         os/posix/posix_threading.cpp
         os/posix/posix_specific.h)
+elseif(FREEBSD)
+    list(APPEND sources
+        data/embedded_files.h
+        os/posix/bsd/bsd_stringio.cpp
+        os/posix/bsd/bsd_callstack.cpp
+        os/posix/bsd/bsd_threading.cpp
+        os/posix/bsd/bsd_process.cpp
+        os/posix/bsd/bsd_hook.cpp
+        os/posix/bsd/bsd_network.cpp
+        3rdparty/plthook/plthook.h
+        3rdparty/plthook/plthook_elf.c
+        os/posix/posix_network.h
+        os/posix/posix_network.cpp
+        os/posix/posix_process.cpp
+        os/posix/posix_stringio.cpp
+        os/posix/posix_threading.cpp
+        os/posix/posix_specific.h)
 elseif(UNIX)
     list(APPEND sources
         data/embedded_files.h
@@ -305,6 +372,26 @@ elseif(UNIX)
         os/posix/posix_stringio.cpp
         os/posix/posix_threading.cpp
         os/posix/posix_specific.h)
+endif()
+
+if(NOT ANDROID)
+    list(APPEND sources
+        3rdparty/compressonator/BC1_Encode_kernel.cpp
+        3rdparty/compressonator/BC2_Encode_kernel.cpp
+        3rdparty/compressonator/BC3_Encode_kernel.cpp
+        3rdparty/compressonator/BC4_Encode_kernel.cpp
+        3rdparty/compressonator/BC5_Encode_kernel.cpp
+        3rdparty/compressonator/BC6_Encode_kernel.cpp
+        3rdparty/compressonator/BC7_Encode_Kernel.cpp)
+
+    set_source_files_properties(3rdparty/compressonator/BC1_Encode_kernel.cpp
+        3rdparty/compressonator/BC2_Encode_kernel.cpp
+        3rdparty/compressonator/BC3_Encode_kernel.cpp
+        3rdparty/compressonator/BC4_Encode_kernel.cpp
+        3rdparty/compressonator/BC5_Encode_kernel.cpp
+        3rdparty/compressonator/BC6_Encode_kernel.cpp
+        3rdparty/compressonator/BC7_Encode_Kernel.cpp
+        PROPERTIES COMPILE_FLAGS "-D_LINUX -Wno-newline-eof -Wno-missing-braces -Wno-char-subscripts -Wno-sign-compare -Wno-unused-value -Wno-strict-aliasing -Wno-shift-negative-value -Wno-implicit-fallthrough")
 endif()
 
 if(CMAKE_COMPILER_IS_GNUCXX)
@@ -330,20 +417,47 @@ if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang" OR APPLE)
 
         set_property(SOURCE strings/utf8printf.cpp
             APPEND_STRING PROPERTY COMPILE_FLAGS " -Wno-unknown-warning -Wno-format-truncation")
+
+    	# stb_image requires these flags to enable ARM SIMD (NEON) for arm32
+        if (CMAKE_SYSTEM_PROCESSOR MATCHES "arm" AND NOT CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")
+            set_source_files_properties(3rdparty/stb/stb_impl.c
+                PROPERTIES COMPILE_FLAGS "-mfpu=neon-vfpv4 -mfp16-format=ieee")
+        endif()
     endif()
 
     # Need to add -Wno-unknown-warning-option since only newer clang versions have
     # -Wno-unused-lambda-capture available
     if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-	       # Only clang has this warning. Fixing it in this file causes a compile error on windows
-	       set_source_files_properties(os/os_specific.cpp
-	           PROPERTIES COMPILE_FLAGS "-Wno-unknown-warning-option -Wno-unused-lambda-capture")
+        set_property(SOURCE 3rdparty/jpeg-compressor/jpgd.cpp
+            APPEND_STRING PROPERTY COMPILE_FLAGS " -Wno-unreachable-code-break -Wno-implicit-fallthrough -Wno-shadow -Wno-shorten-64-to-32")
+
+        set_property(SOURCE 3rdparty/jpeg-compressor/jpge.cpp
+            APPEND_STRING PROPERTY COMPILE_FLAGS " -Wno-shorten-64-to-32")
+
+        set_property(SOURCE 3rdparty/compressonator/BC6_Encode_kernel.cpp
+            APPEND_STRING PROPERTY COMPILE_FLAGS " -Wno-tautological-constant-out-of-range-compare")
+
+        # Only clang has this warning. Fixing it in this file causes a compile error on windows
+        set_source_files_properties(os/os_specific.cpp
+            PROPERTIES COMPILE_FLAGS "-Wno-unknown-warning-option -Wno-unused-lambda-capture")
+        
+        # We are deliberately testing self-assign here
+        set_source_files_properties(replay/basic_types_tests.cpp
+            PROPERTIES COMPILE_FLAGS "-Wno-unknown-warning-option -Wno-self-assign-overloaded")
+
+        # stb_image requires these flags to enable ARM SIMD (NEON) for arm32
+        if (CMAKE_SYSTEM_PROCESSOR MATCHES "arm" AND NOT CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")
+            set_source_files_properties(3rdparty/stb/stb_impl.c
+                        PROPERTIES COMPILE_FLAGS "-mfpu=neon-vfpv4")
+        endif()
     endif()
 endif()
 
 set(data
     data/glsl/blit.vert
     data/glsl/checkerboard.frag
+    data/glsl/depth_copy.frag
+    data/glsl/depth_copyms.frag
     data/glsl/glsl_ubos.h
     data/glsl/glsl_globals.h
     data/glsl/fixedcol.frag
@@ -356,7 +470,12 @@ set(data
     data/glsl/minmaxtile.comp
     data/glsl/quadresolve.frag
     data/glsl/quadwrite.frag
+    data/glsl/pixelhistory_mscopy.comp
+    data/glsl/pixelhistory_mscopy_depth.comp
+    data/glsl/pixelhistory_primid.frag
+    data/glsl/shaderdebug_sample.vert
     data/glsl/texdisplay.frag
+    data/glsl/texremap.frag
     data/glsl/gl_texsample.h
     data/glsl/gles_texsample.h
     data/glsl/vk_texsample.h
@@ -370,6 +489,11 @@ set(data
     data/glsl/trisize.geom
     data/glsl/deptharr2ms.frag
     data/glsl/depthms2arr.frag
+    data/glsl/discard.frag
+    data/glsl/vk_ms2buffer.comp
+    data/glsl/vk_depthms2buffer.comp
+    data/glsl/vk_buffer2ms.comp
+    data/glsl/vk_depthbuf2ms.frag
     data/sourcecodepro.ttf
     driver/vulkan/renderdoc.json)
 
@@ -414,6 +538,11 @@ if(UNIX)
 endif()
 
 set(renderdoc_objects)
+
+if(ENABLE_METAL)
+    add_subdirectory(driver/metal)
+    list(APPEND renderdoc_objects $<TARGET_OBJECTS:rdoc_metal>)
+endif()
 
 if(ENABLE_GL OR ENABLE_GLES)
     add_subdirectory(driver/gl)
@@ -469,6 +598,18 @@ if(ENABLE_GL OR ENABLE_GLES)
     list(APPEND renderdoc_objects $<TARGET_OBJECTS:rdoc_intel>)
 endif()
 
+# pull in the ARM folder for perf query
+if(ENABLE_GL OR ENABLE_GLES)
+    add_subdirectory(driver/ihv/arm)
+    list(APPEND renderdoc_objects $<TARGET_OBJECTS:rdoc_arm>)
+endif()
+
+# pull in the NVIDIA folder
+if(NOT ANDROID AND NOT APPLE AND (ENABLE_GL OR ENABLE_GLES OR ENABLE_VULKAN))
+    add_subdirectory(driver/ihv/nv)
+    list(APPEND renderdoc_objects $<TARGET_OBJECTS:rdoc_nv>)
+endif()
+
 add_library(rdoc OBJECT ${sources})
 target_compile_definitions(rdoc ${RDOC_DEFINITIONS})
 target_include_directories(rdoc ${RDOC_INCLUDES})
@@ -495,7 +636,7 @@ link_directories(${CMAKE_CURRENT_BINARY_DIR})
 # On apple we need to pass the force_load parameter here - if we set it with LINK_FLAGS below
 # it gets applied too early (even if the -lrenderdoc_libentry is later)
 if(APPLE)
-    list(APPEND RDOC_LIBRARIES PRIVATE "-Wl,-force_load,librenderdoc_libentry.a -lrenderdoc_libentry")
+    list(APPEND RDOC_LIBRARIES PRIVATE "-Wl,-force_load,$<TARGET_FILE:renderdoc_libentry>")
 else()
     list(APPEND RDOC_LIBRARIES PRIVATE -lrenderdoc_libentry)
 endif()
@@ -508,10 +649,18 @@ target_link_libraries(renderdoc ${RDOC_LIBRARIES})
 add_dependencies(renderdoc renderdoc_libentry)
 
 if(UNIX AND NOT ANDROID AND NOT APPLE)
-    set(RDOC_LINK_FLAGS "-Wl,--undefined,force_include_libentry -Wl,--version-script,${CMAKE_CURRENT_SOURCE_DIR}/renderdoc.version")
+    set(RDOC_LINK_FLAGS "-Wl,--undefined,force_include_libentry -Wl,--version-script,${CMAKE_CURRENT_SOURCE_DIR}/${RDOC_BASE_NAME}.version")
 
     if(NOT ENABLE_ASAN AND NOT ENABLE_TSAN)
         set(RDOC_LINK_FLAGS "${RDOC_LINK_FLAGS} -Wl,--no-undefined")
+    endif()
+
+    if(ENABLE_GGP)
+        set(RDOC_LINK_FLAGS "${RDOC_LINK_FLAGS} -Wl,--hash-style=gnu -Wl,--build-id=sha1")
+    endif()
+
+    if(NOT RELEASE_MODE)
+        configure_file(${CMAKE_CURRENT_SOURCE_DIR}/librenderdoc.so-gdb.py ${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/librenderdoc.so-gdb.py)
     endif()
 
     set_target_properties(renderdoc PROPERTIES LINK_FLAGS "${RDOC_LINK_FLAGS}")
@@ -520,26 +669,35 @@ endif()
 
 # On macOS set the rpath so that linked libraries are relative to the executable, not absolute
 if(APPLE)
-    set_target_properties(renderdoc PROPERTIES MACOSX_RPATH 1)
+    set_target_properties(renderdoc PROPERTIES MACOSX_RPATH TRUE)
+    set_target_properties(renderdoc PROPERTIES SKIP_BUILD_RPATH TRUE)
     set_target_properties(renderdoc PROPERTIES INSTALL_RPATH "@executable_path/../lib")
-    set_target_properties(renderdoc PROPERTIES INSTALL_NAME_DIR "@executable_path/../lib")
-    set_target_properties(renderdoc PROPERTIES BUILD_WITH_INSTALL_RPATH 1)
-    set_target_properties(renderdoc PROPERTIES BUILD_WITH_INSTALL_NAME_DIR 1)
+    set_target_properties(renderdoc PROPERTIES BUILD_WITH_INSTALL_RPATH TRUE)
+    set_target_properties(renderdoc PROPERTIES BUILD_WITH_INSTALL_NAME_DIR TRUE)
+endif()
+
+if(INTERNAL_SELF_CAPTURE)
+    set_target_properties(renderdoc PROPERTIES OUTPUT_NAME "rdocself")
 endif()
 
 if(ANDROID)
-    set_target_properties(renderdoc PROPERTIES LINK_FLAGS "-Wl,--undefined,force_include_libentry -Wl,--build-id")
+    set(RDOC_LINK_FLAGS "-Wl,--undefined,force_include_libentry -Wl,--build-id")
+    if(ENABLE_ASAN)
+        set(RDOC_LINK_FLAGS "${RDOC_LINK_FLAGS} -fsanitize=address")
+    endif()
+    set_target_properties(renderdoc PROPERTIES LINK_FLAGS "${RDOC_LINK_FLAGS}")
     # rename output library
     set_target_properties(renderdoc PROPERTIES OUTPUT_NAME "VkLayer_GLES_RenderDoc")
 
-    if(STRIP_ANDROID_LIBRARY AND CMAKE_STRIP AND CMAKE_BUILD_TYPE STREQUAL "Release")
+    if(STRIP_ANDROID_LIBRARY AND ANDROID_STRIP_TOOL AND RELEASE_MODE)
         add_custom_command(TARGET renderdoc POST_BUILD
             COMMAND echo Stripping $<TARGET_FILE:renderdoc>
-            COMMAND ${CMAKE_STRIP} --strip-unneeded $<TARGET_FILE:renderdoc>)
+            COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:renderdoc> $<TARGET_FILE:renderdoc>.dbg
+            COMMAND ${ANDROID_STRIP_TOOL} --strip-unneeded $<TARGET_FILE:renderdoc>)
     endif()
 endif()
 
 install (TARGETS renderdoc DESTINATION lib${LIB_SUFFIX}/${LIB_SUBFOLDER})
 
 # Copy in application API header to include
-install (FILES api/app/renderdoc_app.h DESTINATION include RENAME renderdoc.h)
+install (FILES api/app/renderdoc_app.h DESTINATION include RENAME renderdoc_app.h)

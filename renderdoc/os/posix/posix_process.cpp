@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2016-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -32,14 +32,27 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
-#include "api/app/renderdoc_app.h"
+#include <map>
+#include "api/replay/capture_options.h"
+#include "api/replay/control_types.h"
+#include "common/formatting.h"
 #include "common/threading.h"
+#include "core/core.h"
 #include "os/os_specific.h"
 #include "strings/string_utils.h"
+
+// defined in apple_helpers.mm
+extern rdcstr apple_GetExecutablePathFromAppBundle(const char *appBundlePath);
 
 // defined in foo/foo_process.cpp
 char **GetCurrentEnvironment();
 int GetIdentPort(pid_t childPid);
+
+// functions to try and let the child run just far enough to get to main() but no further. This lets
+// us check the ident port and resume.
+void StopAtMainInChild();
+bool StopChildAtMain(pid_t childPid, bool *exitWithNoExec);
+void ResumeProcess(pid_t childPid, uint32_t delay = 0);
 
 #if ENABLED(RDOC_APPLE)
 
@@ -224,19 +237,19 @@ static void SetupZombieCollectionHandler()
 namespace FileIO
 {
 void ReleaseFDAfterFork();
-std::string FindFileInPath(const std::string &fileName);
+rdcstr FindFileInPath(const rdcstr &fileName);
 };
 
-static const std::string GetAbsoluteAppPathFromName(const std::string &appName)
+static const rdcstr GetAbsoluteAppPathFromName(const rdcstr &appName)
 {
-  std::string appPath;
+  rdcstr appPath;
 
   // If the application name contains a slash character convert it to an absolute path and return it
-  if(appName.find("/") != std::string::npos)
+  if(appName.contains("/"))
   {
     char realpathBuffer[PATH_MAX];
-    std::string appDir = get_dirname(appName);
-    std::string appBasename = get_basename(appName);
+    rdcstr appDir = get_dirname(appName);
+    rdcstr appBasename = get_basename(appName);
     realpath(appDir.c_str(), realpathBuffer);
     appPath = realpathBuffer;
     appPath += "/" + appBasename;
@@ -247,17 +260,17 @@ static const std::string GetAbsoluteAppPathFromName(const std::string &appName)
   return FileIO::FindFileInPath(appName);
 }
 
-static std::vector<EnvironmentModification> &GetEnvModifications()
+static rdcarray<EnvironmentModification> &GetEnvModifications()
 {
-  static std::vector<EnvironmentModification> envCallbacks;
+  static rdcarray<EnvironmentModification> envCallbacks;
   return envCallbacks;
 }
 
-static std::map<std::string, std::string> EnvStringToEnvMap(const char **envstring)
+static std::map<rdcstr, rdcstr> EnvStringToEnvMap(char *const *envstring)
 {
-  std::map<std::string, std::string> ret;
+  std::map<rdcstr, rdcstr> ret;
 
-  const char **e = envstring;
+  char *const *e = envstring;
 
   while(*e)
   {
@@ -269,11 +282,8 @@ static std::map<std::string, std::string> EnvStringToEnvMap(const char **envstri
       continue;
     }
 
-    std::string name;
-    std::string value;
-
-    name.assign(*e, equals);
-    value = equals + 1;
+    rdcstr name = rdcstr(*e, equals - *e);
+    rdcstr value = equals + 1;
 
     ret[name] = value;
 
@@ -283,30 +293,30 @@ static std::map<std::string, std::string> EnvStringToEnvMap(const char **envstri
   return ret;
 }
 
-static std::string shellExpand(const std::string &in)
+static rdcstr shellExpand(const rdcstr &in)
 {
-  std::string path = trim(in);
+  rdcstr path = in.trimmed();
 
   // if it begins with ./ then replace with working directory
   if(path[0] == '.' && path[1] == '/')
   {
     char cwd[1024] = {};
     getcwd(cwd, 1023);
-    return std::string(cwd) + path.substr(1);
+    return rdcstr(cwd) + path.substr(1);
   }
 
   // if it's ~/... then replace with $HOME and return
   if(path[0] == '~' && path[1] == '/')
-    return std::string(getenv("HOME")) + path.substr(1);
+    return Process::GetEnvVariable("HOME") + path.substr(1);
 
   // if it's ~user/... then use getpwname
   if(path[0] == '~')
   {
-    size_t slash = path.find('/');
+    int slash = path.find('/');
 
-    std::string username;
+    rdcstr username;
 
-    if(slash != std::string::npos)
+    if(slash >= 0)
     {
       RDCASSERT(slash > 1);
       username = path.substr(1, slash - 1);
@@ -320,19 +330,97 @@ static std::string shellExpand(const std::string &in)
 
     if(pwdata)
     {
-      if(slash != std::string::npos)
-        return std::string(pwdata->pw_dir) + path.substr(slash);
+      if(slash >= 0)
+        return rdcstr(pwdata->pw_dir) + path.substr(slash);
 
-      return std::string(pwdata->pw_dir);
+      return rdcstr(pwdata->pw_dir);
     }
   }
 
   return path;
 }
 
-void Process::RegisterEnvironmentModification(EnvironmentModification modif)
+using PFN_setenv = decltype(&setenv);
+
+int direct_setenv(const char *name, const char *value, int overwrite)
+{
+// on linux try to bypass any hooks to ensure we don't break (looking at you bash)
+#if ENABLED(RDOC_LINUX)
+  static PFN_setenv dyn_setenv = NULL;
+  static bool checked = false;
+  if(!checked)
+  {
+    checked = true;
+    void *libc = dlopen("libc.so.6", RTLD_NOLOAD | RTLD_GLOBAL | RTLD_NOW);
+    if(libc)
+      dyn_setenv = (PFN_setenv)dlsym(libc, "setenv");
+  }
+
+  if(dyn_setenv)
+    return dyn_setenv(name, value, overwrite);
+#endif
+
+  return setenv(name, value, overwrite);
+}
+
+void Process::RegisterEnvironmentModification(const EnvironmentModification &modif)
 {
   GetEnvModifications().push_back(modif);
+}
+
+void ApplySingleEnvMod(EnvironmentModification &m, rdcstr &value)
+{
+  switch(m.mod)
+  {
+    case EnvMod::Set: value = m.value.c_str(); break;
+    case EnvMod::Append:
+    {
+      if(!value.empty())
+      {
+        if(m.sep == EnvSep::Platform || m.sep == EnvSep::Colon)
+          value += ":";
+        else if(m.sep == EnvSep::SemiColon)
+          value += ";";
+      }
+      value += m.value.c_str();
+      break;
+    }
+    case EnvMod::Prepend:
+    {
+      if(!value.empty())
+      {
+        rdcstr prep = m.value;
+        if(m.sep == EnvSep::Platform || m.sep == EnvSep::Colon)
+          prep += ":";
+        else if(m.sep == EnvSep::SemiColon)
+          prep += ";";
+        value = prep + value;
+      }
+      else
+      {
+        value = m.value.c_str();
+      }
+      break;
+    }
+  }
+}
+
+void ApplyEnvironmentModifications(rdcarray<EnvironmentModification> &modifications)
+{
+  // turn environment string to a UTF-8 map
+  char **currentEnvironment = GetCurrentEnvironment();
+  std::map<rdcstr, rdcstr> currentEnv = EnvStringToEnvMap(currentEnvironment);
+
+  for(size_t i = 0; i < modifications.size(); i++)
+  {
+    EnvironmentModification &m = modifications[i];
+
+    rdcstr value = currentEnv[m.name.c_str()];
+
+    ApplySingleEnvMod(m, value);
+
+    direct_setenv(m.name.c_str(), value.c_str(), true);
+  }
 }
 
 // on linux we apply environment changes before launching the program, as
@@ -344,162 +432,65 @@ void Process::RegisterEnvironmentModification(EnvironmentModification modif)
 // in process (e.g. if we notice a setting and want to enable an env var as a result)
 void Process::ApplyEnvironmentModification()
 {
-  // turn environment string to a UTF-8 map
-  char **currentEnvironment = GetCurrentEnvironment();
-  std::map<std::string, std::string> currentEnv =
-      EnvStringToEnvMap((const char **)currentEnvironment);
-  std::vector<EnvironmentModification> &modifications = GetEnvModifications();
-
-  for(size_t i = 0; i < modifications.size(); i++)
-  {
-    EnvironmentModification &m = modifications[i];
-
-    std::string value = currentEnv[m.name.c_str()];
-
-    switch(m.mod)
-    {
-      case EnvMod::Set: value = m.value.c_str(); break;
-      case EnvMod::Append:
-      {
-        if(!value.empty())
-        {
-          if(m.sep == EnvSep::Platform || m.sep == EnvSep::Colon)
-            value += ":";
-          else if(m.sep == EnvSep::SemiColon)
-            value += ";";
-        }
-        value += m.value.c_str();
-        break;
-      }
-      case EnvMod::Prepend:
-      {
-        if(!value.empty())
-        {
-          std::string prep = m.value;
-          if(m.sep == EnvSep::Platform || m.sep == EnvSep::Colon)
-            prep += ":";
-          else if(m.sep == EnvSep::SemiColon)
-            prep += ";";
-          value = prep + value;
-        }
-        else
-        {
-          value = m.value.c_str();
-        }
-        break;
-      }
-    }
-
-    setenv(m.name.c_str(), value.c_str(), true);
-  }
+  rdcarray<EnvironmentModification> &modifications = GetEnvModifications();
+  ApplyEnvironmentModifications(modifications);
 
   // these have been applied to the current process
   modifications.clear();
 }
 
-static void CleanupStringArray(char **arr, char **invalid)
+static void CleanupStringArray(char **arr)
 {
-  if(arr != invalid)
+  char **arr_delete = arr;
+
+  while(*arr)
   {
-    char **arr_delete = arr;
-
-    while(*arr)
-    {
-      delete[] * arr;
-      arr++;
-    }
-
-    delete[] arr_delete;
+    delete[] * arr;
+    arr++;
   }
+
+  delete[] arr_delete;
 }
 
-static pid_t RunProcess(const char *app, const char *workingDir, const char *cmdLine, char **envp,
-                        int stdoutPipe[2] = NULL, int stderrPipe[2] = NULL)
+static rdcarray<rdcstr> ParseCommandLine(const rdcstr &appName, const rdcstr &cmdLine)
 {
-  if(!app)
-    return (pid_t)0;
+  // argv[0] is the application name, by convention
+  rdcarray<rdcstr> argv = {appName};
 
-  std::string appName = app;
-  std::string workDir = (workingDir && workingDir[0]) ? workingDir : get_dirname(appName);
-
-// handle funky apple .app folders that aren't actually executables
-#if ENABLED(RDOC_APPLE)
-  if(appName.size() > 5 && appName.rfind(".app") == appName.size() - 4)
-  {
-    std::string realAppName = appName + "/Contents/MacOS/" + get_basename(appName);
-    realAppName.erase(realAppName.size() - 4);
-
-    if(FileIO::exists(realAppName.c_str()))
-    {
-      RDCLOG("Running '%s' the actual executable for '%s'", realAppName.c_str(), appName.c_str());
-      appName = realAppName;
-    }
-  }
-#endif
-
-  // do very limited expansion. wordexp(3) does too much for our needs, so we just expand ~
-  // since that could be quite a common case.
-  appName = shellExpand(appName);
-  workDir = shellExpand(workDir);
-
-  // it is safe to use app directly as execve never modifies argv
-  char *emptyargv[] = {(char *)appName.c_str(), NULL};
-  char **argv = emptyargv;
-
-  const char *c = cmdLine;
+  const char *c = cmdLine.c_str();
 
   // parse command line into argv[], similar to how bash would
-  if(cmdLine)
+  if(!cmdLine.empty())
   {
-    int argc = 1;
-
-    // get a rough upper bound on the number of arguments
-    while(*c)
-    {
-      if(*c == ' ' || *c == '\t')
-        argc++;
-      c++;
-    }
-
-    argv = new char *[argc + 2];
-    memset(argv, 0, (argc + 2) * sizeof(char *));
-
-    c = cmdLine;
-
-    std::string a;
-
-    argc = 0;    // current argument we're fetching
-
-    // argv[0] is the application name, by convention
-    size_t len = appName.length() + 1;
-    argv[argc] = new char[len];
-    strcpy(argv[argc], appName.c_str());
-
-    argc++;
+    rdcstr a;
+    bool haveArg = false;
 
     bool dquot = false, squot = false;    // are we inside ''s or ""s
     while(*c)
     {
       if(!dquot && !squot && (*c == ' ' || *c == '\t'))
       {
-        if(!a.empty())
+        if(!a.empty() || haveArg)
         {
           // if we've fetched some number of non-space characters
-          argv[argc] = new char[a.length() + 1];
-          memcpy(argv[argc], a.c_str(), a.length() + 1);
-          argc++;
+          argv.push_back(a);
         }
 
         a = "";
+        haveArg = false;
       }
-      else if(!dquot && *c == '"')
+      // if we're not quoting at all and see a quote, enter that quote mode
+      else if(!dquot && !squot && *c == '"')
       {
         dquot = true;
+        haveArg = true;
       }
-      else if(!squot && *c == '\'')
+      else if(!dquot && !squot && *c == '\'')
       {
         squot = true;
+        haveArg = true;
       }
+      // exit quoting if we see the matching quote (we skip over escapes separately)
       else if(dquot && *c == '"')
       {
         dquot = false;
@@ -525,9 +516,8 @@ static pid_t RunProcess(const char *app, const char *workingDir, const char *cmd
           }
           else
           {
-            CleanupStringArray(argv, emptyargv);
-            RDCERR("Malformed command line:\n%s", cmdLine);
-            return 0;
+            RDCERR("Malformed command line:\n%s", cmdLine.c_str());
+            return {};
           }
         }
         else
@@ -543,23 +533,66 @@ static pid_t RunProcess(const char *app, const char *workingDir, const char *cmd
       c++;
     }
 
-    if(!a.empty())
+    if(!a.empty() || haveArg)
     {
       // if we've fetched some number of non-space characters
-      argv[argc] = new char[a.length() + 1];
-      memcpy(argv[argc], a.c_str(), a.length() + 1);
-      argc++;
+      argv.push_back(a);
     }
 
     if(squot || dquot)
     {
-      CleanupStringArray(argv, emptyargv);
-      RDCERR("Malformed command line\n%s", cmdLine);
-      return 0;
+      RDCERR("Malformed command line\n%s", cmdLine.c_str());
+      return {};
     }
   }
 
-  const std::string appPath(GetAbsoluteAppPathFromName(appName));
+  return argv;
+}
+
+static pid_t RunProcess(rdcstr appName, rdcstr workDir, const rdcstr &cmdLine, char **envp,
+                        bool pauseAtMain, int stdoutPipe[2] = NULL, int stderrPipe[2] = NULL)
+{
+  if(appName.empty())
+    return (pid_t)0;
+
+  if(workDir.empty())
+    workDir = get_dirname(appName);
+
+// handle funky apple .app folders that aren't actually executables
+#if ENABLED(RDOC_APPLE)
+  if(appName.size() > 5 && appName.endsWith(".app"))
+  {
+    rdcstr realAppName = apple_GetExecutablePathFromAppBundle(appName.c_str());
+    if(realAppName.empty())
+    {
+      RDCERR("Invalid application path '%s'", appName.c_str());
+      return (pid_t)0;
+    }
+
+    if(FileIO::exists(realAppName))
+    {
+      RDCLOG("Running '%s' the actual executable for '%s'", realAppName.c_str(), appName.c_str());
+      appName = realAppName;
+    }
+  }
+#endif
+
+  // do very limited expansion. wordexp(3) does too much for our needs, so we just expand ~
+  // since that could be quite a common case.
+  appName = shellExpand(appName);
+  workDir = shellExpand(workDir);
+
+  rdcarray<rdcstr> argvList = ParseCommandLine(appName, cmdLine);
+
+  if(argvList.empty())
+    return 0;
+
+  char **argv = new char *[argvList.size() + 1];
+  for(size_t i = 0; i < argvList.size(); i++)
+    argv[i] = argvList[i].data();
+  argv[argvList.size()] = NULL;
+
+  const rdcstr appPath(GetAbsoluteAppPathFromName(appName));
 
   pid_t childPid = 0;
 
@@ -573,6 +606,9 @@ static pid_t RunProcess(const char *app, const char *workingDir, const char *cmd
     childPid = fork();
     if(childPid == 0)
     {
+      if(pauseAtMain)
+        StopAtMainInChild();
+
       FileIO::ReleaseFDAfterFork();
       if(stdoutPipe)
       {
@@ -596,20 +632,26 @@ static pid_t RunProcess(const char *app, const char *workingDir, const char *cmd
     }
     else
     {
-      // remember this PID so we can wait on it later
-      SCOPED_SPINLOCK(zombieLock);
+      if(pauseAtMain)
+        StopChildAtMain(childPid, NULL);
 
-      PIDNode *node = NULL;
+      if(!stdoutPipe)
+      {
+        // remember this PID so we can wait on it later
+        SCOPED_SPINLOCK(zombieLock);
 
-      // take a child from the free list if available, otherwise allocate a new one
-      if(freeChildren.head)
-        node = freeChildren.pop_front();
-      else
-        node = new PIDNode();
+        PIDNode *node = NULL;
 
-      node->pid = childPid;
+        // take a child from the free list if available, otherwise allocate a new one
+        if(freeChildren.head)
+          node = freeChildren.pop_front();
+        else
+          node = new PIDNode();
 
-      children.append(node);
+        node->pid = childPid;
+
+        children.append(node);
+      }
     }
   }
 
@@ -620,22 +662,26 @@ static pid_t RunProcess(const char *app, const char *workingDir, const char *cmd
     close(stderrPipe[1]);
   }
 
-  CleanupStringArray(argv, emptyargv);
+  delete[] argv;
   return childPid;
 }
 
-ExecuteResult Process::InjectIntoProcess(uint32_t pid, const rdcarray<EnvironmentModification> &env,
-                                         const char *logfile, const CaptureOptions &opts,
-                                         bool waitForExit)
+rdcpair<RDResult, uint32_t> Process::InjectIntoProcess(uint32_t pid,
+                                                       const rdcarray<EnvironmentModification> &env,
+                                                       const rdcstr &logfile,
+                                                       const CaptureOptions &opts, bool waitForExit)
 {
   RDCUNIMPLEMENTED("Injecting into already running processes on linux");
-  return {ReplayStatus::InjectionFailed, 0};
+  return {
+      RDResult(ResultCode::InjectionFailed,
+               "Injecting into already running processes is not supported on non-Windows systems"),
+      0};
 }
 
-uint32_t Process::LaunchProcess(const char *app, const char *workingDir, const char *cmdLine,
+uint32_t Process::LaunchProcess(const rdcstr &app, const rdcstr &workingDir, const rdcstr &cmdLine,
                                 bool internal, ProcessResult *result)
 {
-  if(app == NULL || app[0] == 0)
+  if(app.empty())
   {
     RDCERR("Invalid empty 'app'");
     return 0;
@@ -651,8 +697,8 @@ uint32_t Process::LaunchProcess(const char *app, const char *workingDir, const c
   }
 
   char **currentEnvironment = GetCurrentEnvironment();
-  uint32_t ret = (uint32_t)RunProcess(app, workingDir, cmdLine, currentEnvironment,
-                                      result ? stdoutPipe : NULL, result ? stderrPipe : NULL);
+  pid_t ret = RunProcess(app, workingDir, cmdLine, currentEnvironment, false,
+                         result ? stdoutPipe : NULL, result ? stderrPipe : NULL);
 
   if(result)
   {
@@ -667,16 +713,31 @@ uint32_t Process::LaunchProcess(const char *app, const char *workingDir, const c
       {
         stdoutRead = read(stdoutPipe[0], chBuf, sizeof(chBuf));
         if(stdoutRead > 0)
-          result->strStdout += std::string(chBuf, stdoutRead);
+          result->strStdout += rdcstr(chBuf, stdoutRead);
       } while(stdoutRead > 0);
 
       do
       {
         stderrRead = read(stderrPipe[0], chBuf, sizeof(chBuf));
         if(stderrRead > 0)
-          result->strStderror += std::string(chBuf, stderrRead);
+          result->strStderror += rdcstr(chBuf, stderrRead);
 
       } while(stderrRead > 0);
+
+      result->retCode = 1;
+      pid_t p;
+      int status;
+      while((p = waitpid(ret, &status, WUNTRACED | WCONTINUED)) < 0 && errno == EINTR)
+      {
+        RDCLOG("Waiting on pid %u to exit", ret);
+      }
+
+      if(p < 0)
+        RDCLOG("Failed to wait on pid %u, error: %d", ret, p, errno);
+      else if(WIFEXITED(status))
+        result->retCode = WEXITSTATUS(status);
+      else
+        RDCWARN("Process did not exit normally");
     }
 
     // Close read ends.
@@ -684,42 +745,22 @@ uint32_t Process::LaunchProcess(const char *app, const char *workingDir, const c
     close(stderrPipe[0]);
   }
 
-  return ret;
+  return (uint32_t)ret;
 }
 
-uint32_t Process::LaunchScript(const char *script, const char *workingDir, const char *argList,
-                               bool internal, ProcessResult *result)
+uint32_t Process::LaunchScript(const rdcstr &script, const rdcstr &workingDir,
+                               const rdcstr &argList, bool internal, ProcessResult *result)
 {
   // Change parameters to invoke command interpreter
-  std::string args = "-lc \"" + std::string(script) + " " + std::string(argList) + "\"";
+  rdcstr args = "-lc \"" + script + " " + argList + "\"";
 
-  return LaunchProcess("bash", workingDir, args.c_str(), internal, result);
+  return LaunchProcess("bash", workingDir, args, internal, result);
 }
 
-ExecuteResult Process::LaunchAndInjectIntoProcess(const char *app, const char *workingDir,
-                                                  const char *cmdLine,
-                                                  const rdcarray<EnvironmentModification> &envList,
-                                                  const char *capturefile,
-                                                  const CaptureOptions &opts, bool waitForExit)
+void GetHookingEnvMods(rdcarray<EnvironmentModification> &modifications, const CaptureOptions &opts,
+                       const rdcstr &capturefile)
 {
-  if(app == NULL || app[0] == 0)
-  {
-    RDCERR("Invalid empty 'app'");
-    return {ReplayStatus::InternalError, 0};
-  }
-
-  // turn environment string to a UTF-8 map
-  char **currentEnvironment = GetCurrentEnvironment();
-  std::map<std::string, std::string> env = EnvStringToEnvMap((const char **)currentEnvironment);
-  std::vector<EnvironmentModification> modifications = GetEnvModifications();
-
-  for(const EnvironmentModification &e : envList)
-    modifications.push_back(e);
-
-  if(capturefile == NULL)
-    capturefile = "";
-
-  std::string binpath, libpath, ownlibpath;
+  rdcstr binpath, libpath, ownlibpath;
   {
     FileIO::GetExecutableFilename(binpath);
     binpath = get_dirname(binpath);
@@ -738,35 +779,157 @@ ExecuteResult Process::LaunchAndInjectIntoProcess(const char *app, const char *w
   FileIO::GetLibraryFilename(ownlibpath);
   ownlibpath = get_dirname(ownlibpath);
 
-  std::string libfile = "librenderdoc" LIB_SUFFIX;
+  rdcstr libfile = "lib" STRINGIZE(RDOC_BASE_NAME) LIB_SUFFIX;
 
 // on macOS, the path must be absolute
 #if ENABLED(RDOC_APPLE)
-  libfile = libpath + "/" + libfile;
+  FileIO::GetLibraryFilename(libfile);
 #endif
 
-  std::string optstr = opts.EncodeAsString();
+  rdcstr optstr = opts.EncodeAsString();
 
-  modifications.push_back(
-      EnvironmentModification(EnvMod::Append, EnvSep::Platform, LIB_PATH_ENV_VAR, binpath.c_str()));
-  modifications.push_back(
-      EnvironmentModification(EnvMod::Append, EnvSep::Platform, LIB_PATH_ENV_VAR, libpath.c_str()));
   modifications.push_back(EnvironmentModification(EnvMod::Append, EnvSep::Platform,
-                                                  LIB_PATH_ENV_VAR, ownlibpath.c_str()));
+                                                  "RENDERDOC_ORIGLIBPATH",
+                                                  Process::GetEnvVariable(LIB_PATH_ENV_VAR)));
+  modifications.push_back(EnvironmentModification(EnvMod::Append, EnvSep::Platform,
+                                                  "RENDERDOC_ORIGPRELOAD",
+                                                  Process::GetEnvVariable(PRELOAD_ENV_VAR)));
   modifications.push_back(
-      EnvironmentModification(EnvMod::Append, EnvSep::Platform, PRELOAD_ENV_VAR, libfile.c_str()));
+      EnvironmentModification(EnvMod::Append, EnvSep::Platform, LIB_PATH_ENV_VAR, binpath));
+  modifications.push_back(
+      EnvironmentModification(EnvMod::Append, EnvSep::Platform, LIB_PATH_ENV_VAR, libpath));
+  modifications.push_back(
+      EnvironmentModification(EnvMod::Append, EnvSep::Platform, LIB_PATH_ENV_VAR, ownlibpath));
+  modifications.push_back(
+      EnvironmentModification(EnvMod::Append, EnvSep::Platform, PRELOAD_ENV_VAR, libfile));
   modifications.push_back(
       EnvironmentModification(EnvMod::Set, EnvSep::NoSep, "RENDERDOC_CAPFILE", capturefile));
   modifications.push_back(
-      EnvironmentModification(EnvMod::Set, EnvSep::NoSep, "RENDERDOC_CAPOPTS", optstr.c_str()));
+      EnvironmentModification(EnvMod::Set, EnvSep::NoSep, "RENDERDOC_CAPOPTS", optstr));
   modifications.push_back(EnvironmentModification(EnvMod::Set, EnvSep::NoSep,
                                                   "RENDERDOC_DEBUG_LOG_FILE", RDCGETLOGFILE()));
+}
+
+void PreForkConfigureHooks()
+{
+  rdcarray<EnvironmentModification> modifications;
+
+  GetHookingEnvMods(modifications, RenderDoc::Inst().GetCaptureOptions(),
+                    RenderDoc::Inst().GetCaptureFileTemplate());
+
+  ApplyEnvironmentModifications(modifications);
+}
+
+void GetUnhookedEnvp(char *const *envp, rdcstr &envpStr, rdcarray<char *> &modifiedEnv)
+{
+  std::map<rdcstr, rdcstr> envmap = EnvStringToEnvMap(envp);
+
+  // this is a nasty hack. We set this env var when we inject into a child, but because we don't
+  // know when vulkan may be initialised we need to leave it on indefinitely. If we're not
+  // injecting into children we need to unset this variable so it doesn't get inherited.
+  envmap.erase(RENDERDOC_VULKAN_LAYER_VAR);
+
+  envpStr.clear();
+
+  // flatten the map to a string
+  for(auto it = envmap.begin(); it != envmap.end(); it++)
+  {
+    envpStr += it->first;
+    envpStr += "=";
+    envpStr += it->second;
+    envpStr.push_back('\0');
+  }
+  envpStr.push_back('\0');
+
+  // create the array desired
+  char *c = envpStr.data();
+  while(*c)
+  {
+    modifiedEnv.push_back(c);
+    c += strlen(c) + 1;
+  }
+  modifiedEnv.push_back(NULL);
+}
+
+void GetHookedEnvp(char *const *envp, rdcstr &envpStr, rdcarray<char *> &modifiedEnv)
+{
+  rdcarray<EnvironmentModification> modifications;
+
+  GetHookingEnvMods(modifications, RenderDoc::Inst().GetCaptureOptions(),
+                    RenderDoc::Inst().GetCaptureFileTemplate());
+
+  std::map<rdcstr, rdcstr> envmap = EnvStringToEnvMap(envp);
+
+  for(EnvironmentModification &mod : modifications)
+  {
+    // update the values for original values we're storing, since they were gotten by querying the
+    // *current* environment not envp here.
+    if(mod.name == "RENDERDOC_ORIGLIBPATH")
+      mod.value = envmap[LIB_PATH_ENV_VAR];
+    else if(mod.name == "RENDERDOC_ORIGPRELOAD")
+      mod.value = envmap[PRELOAD_ENV_VAR];
+
+    // modify the map in-place
+    ApplySingleEnvMod(mod, envmap[mod.name.c_str()]);
+  }
+
+  envpStr.clear();
+
+  // flatten the map to a string
+  for(auto it = envmap.begin(); it != envmap.end(); it++)
+  {
+    envpStr += it->first;
+    envpStr += "=";
+    envpStr += it->second;
+    envpStr.push_back('\0');
+  }
+  envpStr.push_back('\0');
+
+  // create the array desired
+  char *c = envpStr.data();
+  while(*c)
+  {
+    modifiedEnv.push_back(c);
+    c += strlen(c) + 1;
+  }
+  modifiedEnv.push_back(NULL);
+}
+
+void ResetHookingEnvVars()
+{
+  direct_setenv(LIB_PATH_ENV_VAR, Process::GetEnvVariable("RENDERDOC_ORIGLIBPATH").c_str(), true);
+  direct_setenv(PRELOAD_ENV_VAR, Process::GetEnvVariable("RENDERDOC_ORIGPRELOAD").c_str(), true);
+  direct_setenv("RENDERDOC_ORIGLIBPATH", "", true);
+  direct_setenv("RENDERDOC_ORIGPRELOAD", "", true);
+}
+
+rdcpair<RDResult, uint32_t> Process::LaunchAndInjectIntoProcess(
+    const rdcstr &app, const rdcstr &workingDir, const rdcstr &cmdLine,
+    const rdcarray<EnvironmentModification> &envList, const rdcstr &capturefile,
+    const CaptureOptions &opts, bool waitForExit)
+{
+  if(app.empty())
+  {
+    RDResult result;
+    SET_ERROR_RESULT(result, ResultCode::InvalidParameter, "Invalid empty path to launch.");
+    return {result, 0};
+  }
+
+  // turn environment string to a UTF-8 map
+  char **currentEnvironment = GetCurrentEnvironment();
+  std::map<rdcstr, rdcstr> env = EnvStringToEnvMap(currentEnvironment);
+  rdcarray<EnvironmentModification> modifications = GetEnvModifications();
+
+  for(const EnvironmentModification &e : envList)
+    modifications.push_back(e);
+
+  GetHookingEnvMods(modifications, opts, capturefile);
 
   for(size_t i = 0; i < modifications.size(); i++)
   {
     EnvironmentModification &m = modifications[i];
 
-    std::string &value = env[m.name.c_str()];
+    rdcstr &value = env[m.name.c_str()];
 
     switch(m.mod)
     {
@@ -807,22 +970,25 @@ ExecuteResult Process::LaunchAndInjectIntoProcess(const char *app, const char *w
   int i = 0;
   for(auto it = env.begin(); it != env.end(); it++)
   {
-    std::string envline = it->first + "=" + it->second;
+    rdcstr envline = it->first + "=" + it->second;
     envp[i] = new char[envline.size() + 1];
     memcpy(envp[i], envline.c_str(), envline.size() + 1);
     i++;
   }
 
-  pid_t childPid = RunProcess(app, workingDir, cmdLine, envp);
+  RDCLOG("Running process %s for injection", app.c_str());
+
+  pid_t childPid = RunProcess(app, workingDir, cmdLine, envp, true);
 
   int ret = 0;
 
   if(childPid != (pid_t)0)
   {
-    // wait for child to have opened its socket
-    usleep(1000);
-
+    // ideally we stopped at main so we can check the port immediately. Otherwise this will do an
+    // exponential wait to get it as soon as possible
     ret = GetIdentPort(childPid);
+
+    ResumeProcess(childPid, opts.delayForDebugger);
 
     if(waitForExit)
     {
@@ -831,14 +997,24 @@ ExecuteResult Process::LaunchAndInjectIntoProcess(const char *app, const char *w
     }
   }
 
-  CleanupStringArray(envp, NULL);
-  return {ret == 0 ? ReplayStatus::InjectionFailed : ReplayStatus::Succeeded, (uint32_t)ret};
+  CleanupStringArray(envp);
+  RDResult result;
+  if(ret == 0)
+  {
+    SET_ERROR_RESULT(result, ResultCode::InjectionFailed,
+                     "Couldn't connect to target program. Check that it didn't crash or exit "
+                     "during early initialisation, e.g. due to an incorrectly configured working "
+                     "directory.");
+  }
+  return {result, (uint32_t)ret};
 }
 
-bool Process::StartGlobalHook(const char *pathmatch, const char *logfile, const CaptureOptions &opts)
+RDResult Process::StartGlobalHook(const rdcstr &pathmatch, const rdcstr &logfile,
+                                  const CaptureOptions &opts)
 {
   RDCUNIMPLEMENTED("Global hooking of all processes on linux");
-  return false;
+  return RDResult(ResultCode::InvalidParameter,
+                  "Global hooking is not supported on non-Windows systems");
 }
 
 bool Process::CanGlobalHook()
@@ -855,17 +1031,22 @@ void Process::StopGlobalHook()
 {
 }
 
-void *Process::LoadModule(const char *module)
+bool Process::IsModuleLoaded(const rdcstr &module)
 {
-  return dlopen(module, RTLD_NOW);
+  return dlopen(module.c_str(), RTLD_NOW | RTLD_NOLOAD) != NULL;
 }
 
-void *Process::GetFunctionAddress(void *module, const char *function)
+void *Process::LoadModule(const rdcstr &module)
+{
+  return dlopen(module.c_str(), RTLD_NOW);
+}
+
+void *Process::GetFunctionAddress(void *module, const rdcstr &function)
 {
   if(module == NULL)
     return NULL;
 
-  return dlsym(module, function);
+  return dlsym(module, function.c_str());
 }
 
 uint32_t Process::GetCurrentPID()
@@ -883,9 +1064,310 @@ void Process::Shutdown()
     delete del;
   }
 }
+
 #if ENABLED(ENABLE_UNIT_TESTS)
 
-#include "3rdparty/catch/catch.hpp"
+#include "catch/catch.hpp"
+
+TEST_CASE("Test command line parsing", "[osspecific]")
+{
+  rdcarray<rdcstr> args;
+
+  SECTION("empty command line")
+  {
+    args = ParseCommandLine("app", "");
+
+    REQUIRE(args.size() == 1);
+    CHECK(args[0] == "app");
+
+    args = ParseCommandLine("app", "   ");
+
+    REQUIRE(args.size() == 1);
+    CHECK(args[0] == "app");
+
+    args = ParseCommandLine("app", "  \t  \t ");
+
+    REQUIRE(args.size() == 1);
+    CHECK(args[0] == "app");
+  }
+
+  SECTION("whitespace command line")
+  {
+    args = ParseCommandLine("app", "'   '");
+
+    REQUIRE(args.size() == 2);
+    CHECK(args[0] == "app");
+    CHECK(args[1] == "   ");
+
+    args = ParseCommandLine("app", "   '   '");
+
+    REQUIRE(args.size() == 2);
+    CHECK(args[0] == "app");
+    CHECK(args[1] == "   ");
+
+    args = ParseCommandLine("app", "   '   '   ");
+
+    REQUIRE(args.size() == 2);
+    CHECK(args[0] == "app");
+    CHECK(args[1] == "   ");
+
+    args = ParseCommandLine("app", "   \"   \"   ");
+
+    REQUIRE(args.size() == 2);
+    CHECK(args[0] == "app");
+    CHECK(args[1] == "   ");
+  }
+
+  SECTION("a single parameter")
+  {
+    args = ParseCommandLine("app", "--foo");
+
+    REQUIRE(args.size() == 2);
+    CHECK(args[0] == "app");
+    CHECK(args[1] == "--foo");
+
+    args = ParseCommandLine("app", "--bar");
+
+    REQUIRE(args.size() == 2);
+    CHECK(args[0] == "app");
+    CHECK(args[1] == "--bar");
+
+    args = ParseCommandLine("app", "/a/path/to/somewhere");
+
+    REQUIRE(args.size() == 2);
+    CHECK(args[0] == "app");
+    CHECK(args[1] == "/a/path/to/somewhere");
+  }
+
+  SECTION("multiple parameters")
+  {
+    args = ParseCommandLine("app", "--foo --bar   ");
+
+    REQUIRE(args.size() == 3);
+    CHECK(args[0] == "app");
+    CHECK(args[1] == "--foo");
+    CHECK(args[2] == "--bar");
+
+    args = ParseCommandLine("app", "  --qux    \t   --asdf");
+
+    REQUIRE(args.size() == 3);
+    CHECK(args[0] == "app");
+    CHECK(args[1] == "--qux");
+    CHECK(args[2] == "--asdf");
+
+    args = ParseCommandLine("app", "--path /a/path/to/somewhere    --many --param a   b c     d ");
+
+    REQUIRE(args.size() == 9);
+    CHECK(args[0] == "app");
+    CHECK(args[1] == "--path");
+    CHECK(args[2] == "/a/path/to/somewhere");
+    CHECK(args[3] == "--many");
+    CHECK(args[4] == "--param");
+    CHECK(args[5] == "a");
+    CHECK(args[6] == "b");
+    CHECK(args[7] == "c");
+    CHECK(args[8] == "d");
+  }
+
+  SECTION("parameters with single quotes")
+  {
+    args = ParseCommandLine("app", "'single quoted single parameter'");
+
+    REQUIRE(args.size() == 2);
+    CHECK(args[0] == "app");
+    CHECK(args[1] == "single quoted single parameter");
+
+    args = ParseCommandLine("app", "      'single quoted single parameter'  ");
+
+    REQUIRE(args.size() == 2);
+    CHECK(args[0] == "app");
+    CHECK(args[1] == "single quoted single parameter");
+
+    args = ParseCommandLine("app", "      'single quoted \t\tsingle parameter'  ");
+
+    REQUIRE(args.size() == 2);
+    CHECK(args[0] == "app");
+    CHECK(args[1] == "single quoted \t\tsingle parameter");
+
+    args = ParseCommandLine("app", "   --thing='single quoted single parameter'  ");
+
+    REQUIRE(args.size() == 2);
+    CHECK(args[0] == "app");
+    CHECK(args[1] == "--thing=single quoted single parameter");
+
+    args = ParseCommandLine("app", " 'quoted string with \"double quotes inside\" it' ");
+
+    REQUIRE(args.size() == 2);
+    CHECK(args[0] == "app");
+    CHECK(args[1] == "quoted string with \"double quotes inside\" it");
+
+    args =
+        ParseCommandLine("app", " --multiple --params 'single quoted parameter'  --with --quotes ");
+
+    REQUIRE(args.size() == 6);
+    CHECK(args[0] == "app");
+    CHECK(args[1] == "--multiple");
+    CHECK(args[2] == "--params");
+    CHECK(args[3] == "single quoted parameter");
+    CHECK(args[4] == "--with");
+    CHECK(args[5] == "--quotes");
+
+    args = ParseCommandLine("app", "--explicit '' --empty");
+
+    REQUIRE(args.size() == 4);
+    CHECK(args[0] == "app");
+    CHECK(args[1] == "--explicit");
+    CHECK(args[2] == "");
+    CHECK(args[3] == "--empty");
+
+    args = ParseCommandLine("app", "--explicit '  ' --spaces");
+
+    REQUIRE(args.size() == 4);
+    CHECK(args[0] == "app");
+    CHECK(args[1] == "--explicit");
+    CHECK(args[2] == "  ");
+    CHECK(args[3] == "--spaces");
+
+    args = ParseCommandLine("app", "--explicit ''");
+
+    REQUIRE(args.size() == 3);
+    CHECK(args[0] == "app");
+    CHECK(args[1] == "--explicit");
+    CHECK(args[2] == "");
+
+    args = ParseCommandLine("app", "--explicit '  '");
+
+    REQUIRE(args.size() == 3);
+    CHECK(args[0] == "app");
+    CHECK(args[1] == "--explicit");
+    CHECK(args[2] == "  ");
+  }
+
+  SECTION("parameters with double quotes")
+  {
+    args = ParseCommandLine("app", "\"double quoted single parameter\"");
+
+    REQUIRE(args.size() == 2);
+    CHECK(args[0] == "app");
+    CHECK(args[1] == "double quoted single parameter");
+
+    args = ParseCommandLine("app", "      \"double quoted single parameter\"  ");
+
+    REQUIRE(args.size() == 2);
+    CHECK(args[0] == "app");
+    CHECK(args[1] == "double quoted single parameter");
+
+    args = ParseCommandLine("app", "      \"double quoted \t\tsingle parameter\"  ");
+
+    REQUIRE(args.size() == 2);
+    CHECK(args[0] == "app");
+    CHECK(args[1] == "double quoted \t\tsingle parameter");
+
+    args = ParseCommandLine("app", "   --thing=\"double quoted single parameter\"  ");
+
+    REQUIRE(args.size() == 2);
+    CHECK(args[0] == "app");
+    CHECK(args[1] == "--thing=double quoted single parameter");
+
+    args = ParseCommandLine("app", " \"quoted string with \\\"double quotes inside\\\" it\" ");
+
+    REQUIRE(args.size() == 2);
+    CHECK(args[0] == "app");
+    CHECK(args[1] == "quoted string with \"double quotes inside\" it");
+
+    args = ParseCommandLine("app", " \"string's contents has a quoted quote\" ");
+
+    REQUIRE(args.size() == 2);
+    CHECK(args[0] == "app");
+    CHECK(args[1] == "string's contents has a quoted quote");
+
+    args =
+        ParseCommandLine("app", " --multiple --params 'double quoted parameter'  --with --quotes ");
+
+    REQUIRE(args.size() == 6);
+    CHECK(args[0] == "app");
+    CHECK(args[1] == "--multiple");
+    CHECK(args[2] == "--params");
+    CHECK(args[3] == "double quoted parameter");
+    CHECK(args[4] == "--with");
+    CHECK(args[5] == "--quotes");
+
+    args = ParseCommandLine("app", "--explicit \"\" --empty");
+
+    REQUIRE(args.size() == 4);
+    CHECK(args[0] == "app");
+    CHECK(args[1] == "--explicit");
+    CHECK(args[2] == "");
+    CHECK(args[3] == "--empty");
+
+    args = ParseCommandLine("app", "--explicit \"  \" --spaces");
+
+    REQUIRE(args.size() == 4);
+    CHECK(args[0] == "app");
+    CHECK(args[1] == "--explicit");
+    CHECK(args[2] == "  ");
+    CHECK(args[3] == "--spaces");
+
+    args = ParseCommandLine("app", "--explicit \"\"");
+
+    REQUIRE(args.size() == 3);
+    CHECK(args[0] == "app");
+    CHECK(args[1] == "--explicit");
+    CHECK(args[2] == "");
+
+    args = ParseCommandLine("app", "--explicit \"  \"");
+
+    REQUIRE(args.size() == 3);
+    CHECK(args[0] == "app");
+    CHECK(args[1] == "--explicit");
+    CHECK(args[2] == "  ");
+  }
+
+  SECTION("concatenated quotes")
+  {
+    args = ParseCommandLine("app", "'foo''bar''blah'");
+
+    REQUIRE(args.size() == 2);
+    CHECK(args[0] == "app");
+    CHECK(args[1] == "foobarblah");
+
+    args = ParseCommandLine("app", "\"foo\"\"bar\"\"blah\"");
+
+    REQUIRE(args.size() == 2);
+    CHECK(args[0] == "app");
+    CHECK(args[1] == "foobarblah");
+
+    args = ParseCommandLine("app", "\"foo\"'bar'\"blah\"");
+
+    REQUIRE(args.size() == 2);
+    CHECK(args[0] == "app");
+    CHECK(args[1] == "foobarblah");
+
+    args = ParseCommandLine("app", "\"foo\"'bar'\"blah\"");
+
+    REQUIRE(args.size() == 2);
+    CHECK(args[0] == "app");
+    CHECK(args[1] == "foobarblah");
+
+    args = ParseCommandLine("app", "foo'bar'blah");
+
+    REQUIRE(args.size() == 2);
+    CHECK(args[0] == "app");
+    CHECK(args[1] == "foobarblah");
+
+    args = ParseCommandLine("app", "foo\"bar\"blah");
+
+    REQUIRE(args.size() == 2);
+    CHECK(args[0] == "app");
+    CHECK(args[1] == "foobarblah");
+
+    args = ParseCommandLine("app", "\"string with spaces\"' and other string'");
+
+    REQUIRE(args.size() == 2);
+    CHECK(args[0] == "app");
+    CHECK(args[1] == "string with spaces and other string");
+  }
+}
 
 TEST_CASE("Test PID Node list handling", "[osspecific]")
 {

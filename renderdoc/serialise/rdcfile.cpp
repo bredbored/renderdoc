@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2017-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -24,10 +24,11 @@
 
 #include "rdcfile.h"
 #include <errno.h>
-#include "3rdparty/jpeg-compressor/jpge.h"
-#include "3rdparty/stb/stb_image.h"
 #include "api/replay/version.h"
 #include "common/dds_readwrite.h"
+#include "common/formatting.h"
+#include "jpeg-compressor/jpge.h"
+#include "stb/stb_image.h"
 #include "lz4io.h"
 #include "zstdio.h"
 
@@ -49,9 +50,9 @@ bool is_exr_file(FILE *f)
 /*
 
  -----------------------------
- File format for version 0x100:
+ File format for version 0x100 and up:
 
- RDCHeader
+ FileHeader
  {
    uint64_t MAGIC_HEADER;
 
@@ -59,13 +60,19 @@ bool is_exr_file(FILE *f)
    uint32_t headerLength; // length of this header, from the start of the file. Allows adding new
                           // fields without breaking compatibilty
    char progVersion[16]; // string "v0.34" or similar with 0s after the string
+ }
 
+ BinaryThumbnail
+ {
    // thumbnail
    uint16_t thumbWidth;
    uint16_t thumbHeight; // thumbnail width and height. If 0x0, no thumbnail data
    uint32_t thumbLength; // number of bytes in thumbnail array below
    byte thumbData[ thumbLength ]; // JPG compressed thumbnail
+ }
 
+ CaptureMetaData
+ {
    // where was the capture created
    uint64_t machineIdent;
 
@@ -73,6 +80,13 @@ bool is_exr_file(FILE *f)
    uint8_t driverNameLength; // length in bytes of the driver name including null terminator
    char driverName[ driverNameLength ]; // the driver name in ASCII. Useful if the current
                                         // implementation doesn't recognise the driver ID above
+ }
+
+ if FileHeader.version >= 0x102 // new fields in 1.2
+ CaptureTimeBase
+ {
+   uint64_t timeBase; // base tick count for capture timers
+   double timeFreq;   // divisor for converting ticks to microseconds
  }
 
  1 or more sections:
@@ -182,6 +196,14 @@ struct CaptureMetaData
   char driverName[1] = {0};
 };
 
+struct CaptureTimeBase
+{
+  // the base tick count for all timers in the capture
+  uint64_t timeBase = 0;
+  // the frequency conversion such that microseconds = ticks / frequency
+  double timeFreq = 1.0;
+};
+
 struct BinarySectionHeader
 {
   // 0x0
@@ -209,50 +231,38 @@ struct BinarySectionHeader
 };
 };
 
-#define SETERROR(error, ...)                        \
-  {                                                 \
-    m_ErrorString = StringFormat::Fmt(__VA_ARGS__); \
-    RDCERR("%s", m_ErrorString.c_str());            \
-    m_Error = error;                                \
-  }
-
-#define RETURNERROR(error, ...)   \
-  {                               \
-    SETERROR(error, __VA_ARGS__); \
-    return;                       \
-  }
-
 RDCFile::~RDCFile()
 {
   if(m_File)
     FileIO::fclose(m_File);
-
-  if(m_Thumb.pixels)
-    delete[] m_Thumb.pixels;
 }
 
-void RDCFile::Open(const char *path)
+void RDCFile::Open(const rdcstr &path)
 {
   // silently fail when opening the empty string, to allow 'releasing' a capture file by opening an
   // empty path.
-  if(path == NULL || path[0] == 0)
+  if(path.empty())
   {
-    RETURNERROR(ContainerError::FileNotFound, "Invalid file path specified");
+    SET_ERROR_RESULT(m_Error, ResultCode::FileNotFound, "Invalid file path specified");
+    return;
   }
 
-  RDCLOG("Opening RDCFile %s", path);
+  RDCLOG("Opening RDCFile %s", path.c_str());
+
+  m_Untrusted = FileIO::IsUntrustedFile(path);
 
   // ensure section header is compiled correctly
   RDCCOMPILE_ASSERT(offsetof(BinarySectionHeader, name) == sizeof(uint32_t) * 10,
                     "BinarySectionHeader size has changed or contains padding");
 
-  m_File = FileIO::fopen(path, "rb");
+  m_File = FileIO::fopen(path, FileIO::ReadBinary);
   m_Filename = path;
 
   if(!m_File)
   {
-    RETURNERROR(ContainerError::FileNotFound, "Can't open capture file '%s' for read - errno %d",
-                path, errno);
+    SET_ERROR_RESULT(m_Error, ResultCode::FileNotFound,
+                     "Can't open capture file '%s' for read - errno %d", path.c_str(), errno);
+    return;
   }
 
   // try to identify if this is an image
@@ -262,7 +272,10 @@ void RDCFile::Open(const char *path)
 
     FileIO::fseek64(m_File, 0, SEEK_SET);
 
-    if(is_dds_file(m_File))
+    byte headerBuffer[4];
+    const size_t headerSize = FileIO::fread(headerBuffer, 1, 4, m_File);
+
+    if(is_dds_file(headerBuffer, headerSize))
       ret = x = y = comp = 1;
 
     if(is_exr_file(m_File))
@@ -275,6 +288,8 @@ void RDCFile::Open(const char *path)
       m_Driver = RDCDriver::Image;
       m_DriverName = "Image";
       m_MachineIdent = 0;
+      m_TimeBase = 0;
+      m_TimeFrequency = 1.0;
       return;
     }
   }
@@ -288,7 +303,7 @@ void RDCFile::Open(const char *path)
   Init(reader);
 }
 
-void RDCFile::Open(const std::vector<byte> &buffer)
+void RDCFile::Open(const bytebuf &buffer)
 {
   m_Buffer = buffer;
   m_File = NULL;
@@ -308,18 +323,22 @@ void RDCFile::Init(StreamReader &reader)
 
   if(reader.IsErrored())
   {
-    RETURNERROR(ContainerError::FileIO, "I/O error reading magic number");
+    SET_ERROR_RESULT(m_Error, ResultCode::FileIOFailed, "I/O error reading magic number");
+    return;
   }
 
   if(header.magic != MAGIC_HEADER)
   {
-    RETURNERROR(ContainerError::Corrupt, "Invalid capture file. Expected magic %08x, got %08x.",
-                MAGIC_HEADER, (uint32_t)header.magic);
+    SET_ERROR_RESULT(m_Error, ResultCode::FileUnrecognised,
+                     "Unrecognised file type. File magic number is %08x.", (uint32_t)header.magic);
+    return;
   }
 
   m_SerVer = header.version;
 
-  if(m_SerVer != SERIALISE_VERSION && m_SerVer != V1_0_VERSION)
+  // in v1.1 we changed chunk flags such that we could support 64-bit length. This is a backwards
+  // compatible change
+  if(m_SerVer != SERIALISE_VERSION && m_SerVer != V1_0_VERSION && m_SerVer != V1_1_VERSION)
   {
     if(header.version < V1_0_VERSION)
     {
@@ -327,11 +346,12 @@ void RDCFile::Init(StreamReader &reader)
       memcpy(header.progVersion, "v0.x", sizeof("v0.x"));
     }
 
-    RETURNERROR(
-        ContainerError::UnsupportedVersion,
+    SET_ERROR_RESULT(
+        m_Error, ResultCode::FileIncompatibleVersion,
         "Capture file from wrong version. This program (v%s) uses logfile version %u, this file is "
         "logfile version %u captured on %s.",
         MAJOR_MINOR_VERSION_STRING, SERIALISE_VERSION, header.version, header.progVersion);
+    return;
   }
 
   BinaryThumbnail thumb;
@@ -339,22 +359,26 @@ void RDCFile::Init(StreamReader &reader)
 
   if(reader.IsErrored())
   {
-    RETURNERROR(ContainerError::FileIO, "I/O error reading thumbnail header");
+    SET_ERROR_RESULT(m_Error, ResultCode::FileIOFailed, "I/O error reading thumbnail header");
+    return;
   }
 
   // check the thumbnail size is sensible
   if(thumb.length > 10 * 1024 * 1024)
   {
-    RETURNERROR(ContainerError::Corrupt, "Thumbnail byte length invalid: %u", thumb.length);
+    SET_ERROR_RESULT(m_Error, ResultCode::FileCorrupted, "Thumbnail byte length invalid: %u",
+                     thumb.length);
+    return;
   }
 
-  byte *thumbData = new byte[thumb.length];
-  reader.Read(thumbData, thumb.length);
+  bytebuf thumbData;
+  thumbData.resize(thumb.length);
+  reader.Read(thumbData.data(), thumb.length);
 
   if(reader.IsErrored())
   {
-    delete[] thumbData;
-    RETURNERROR(ContainerError::FileIO, "I/O error reading thumbnail data");
+    SET_ERROR_RESULT(m_Error, ResultCode::FileIOFailed, "I/O error reading thumbnail data");
+    return;
   }
 
   CaptureMetaData meta;
@@ -362,49 +386,61 @@ void RDCFile::Init(StreamReader &reader)
 
   if(reader.IsErrored())
   {
-    delete[] thumbData;
-    RETURNERROR(ContainerError::FileIO, "I/O error reading capture metadata");
+    SET_ERROR_RESULT(m_Error, ResultCode::FileIOFailed, "I/O error reading capture metadata");
+    return;
   }
 
   if(meta.driverNameLength == 0)
   {
-    delete[] thumbData;
-    RETURNERROR(ContainerError::Corrupt,
-                "Driver name length is invalid, must be at least 1 to contain NULL terminator");
+    SET_ERROR_RESULT(
+        m_Error, ResultCode::FileCorrupted,
+        "Driver name length is invalid, must be at least 1 to contain NULL terminator");
+    return;
   }
 
-  char *driverName = new char[meta.driverNameLength];
-  reader.Read(driverName, meta.driverNameLength);
+  rdcstr driverName;
+  driverName.resize(meta.driverNameLength);
+  reader.Read(driverName.data(), meta.driverNameLength);
+  driverName.trim();
 
   if(reader.IsErrored())
   {
-    delete[] thumbData;
-    delete[] driverName;
-    RETURNERROR(ContainerError::FileIO, "I/O error reading driver name");
+    SET_ERROR_RESULT(m_Error, ResultCode::FileIOFailed, "I/O error reading driver name");
+    return;
   }
 
-  driverName[meta.driverNameLength - 1] = '\0';
+  // this initialises to a default 'no conversion' timebase, with base of 0 and frequency of 1.0
+  // which means old captures without a timebase won't see anything change
+  CaptureTimeBase timeBase;
+
+  if(m_SerVer >= V1_2_VERSION)
+  {
+    reader.Read(&timeBase, sizeof(CaptureTimeBase));
+
+    if(reader.IsErrored())
+    {
+      SET_ERROR_RESULT(m_Error, ResultCode::FileIOFailed, "I/O error reading capture timebase");
+      return;
+    }
+  }
+
+  m_TimeBase = timeBase.timeBase;
+  m_TimeFrequency = timeBase.timeFreq;
 
   m_Driver = meta.driverID;
   m_DriverName = driverName;
   m_MachineIdent = meta.machineIdent;
   m_Thumb.width = thumb.width;
   m_Thumb.height = thumb.height;
-  m_Thumb.len = thumb.length;
   m_Thumb.format = FileType::JPG;
 
-  if(m_Thumb.len > 0 && m_Thumb.width > 0 && m_Thumb.height > 0)
-  {
-    m_Thumb.pixels = thumbData;
-    thumbData = NULL;
-  }
-
-  delete[] thumbData;
-  delete[] driverName;
+  if(m_Thumb.width > 0 && m_Thumb.height > 0)
+    m_Thumb.pixels.swap(thumbData);
 
   if(reader.GetOffset() > header.headerLength)
   {
-    RETURNERROR(ContainerError::FileIO, "I/O error seeking to end of header");
+    SET_ERROR_RESULT(m_Error, ResultCode::FileIOFailed, "I/O error seeking to end of header");
+    return;
   }
 
   reader.SkipBytes(header.headerLength - (uint32_t)reader.GetOffset());
@@ -428,10 +464,16 @@ void RDCFile::Init(StreamReader &reader)
       char c = 0;
       reader.Read(c);
       if(reader.IsErrored())
-        RETURNERROR(ContainerError::Corrupt, "Invalid ASCII data section '%hhx'", c);
+      {
+        SET_ERROR_RESULT(m_Error, ResultCode::FileCorrupted, "Invalid ASCII data section '%hhx'", c);
+        return;
+      }
 
       if(reader.AtEnd())
-        RETURNERROR(ContainerError::Corrupt, "Invalid truncated ASCII data section");
+      {
+        SET_ERROR_RESULT(m_Error, ResultCode::FileCorrupted, "Invalid truncated ASCII data section");
+        return;
+      }
 
       uint64_t length = 0;
 
@@ -449,7 +491,10 @@ void RDCFile::Init(StreamReader &reader)
       }
 
       if(reader.IsErrored() || reader.AtEnd())
-        RETURNERROR(ContainerError::Corrupt, "Invalid truncated ASCII data section");
+      {
+        SET_ERROR_RESULT(m_Error, ResultCode::FileCorrupted, "Invalid truncated ASCII data section");
+        return;
+      }
 
       uint32_t type = 0;
 
@@ -467,7 +512,10 @@ void RDCFile::Init(StreamReader &reader)
       }
 
       if(reader.IsErrored() || reader.AtEnd())
-        RETURNERROR(ContainerError::Corrupt, "Invalid truncated ASCII data section");
+      {
+        SET_ERROR_RESULT(m_Error, ResultCode::FileCorrupted, "Invalid truncated ASCII data section");
+        return;
+      }
 
       uint64_t version = 0;
 
@@ -485,9 +533,12 @@ void RDCFile::Init(StreamReader &reader)
       }
 
       if(reader.IsErrored() || reader.AtEnd())
-        RETURNERROR(ContainerError::Corrupt, "Invalid truncated ASCII data section");
+      {
+        SET_ERROR_RESULT(m_Error, ResultCode::FileCorrupted, "Invalid truncated ASCII data section");
+        return;
+      }
 
-      std::string name;
+      rdcstr name;
 
       c = 0;
 
@@ -502,7 +553,10 @@ void RDCFile::Init(StreamReader &reader)
       }
 
       if(reader.IsErrored() || reader.AtEnd())
-        RETURNERROR(ContainerError::Corrupt, "Invalid truncated ASCII data section");
+      {
+        SET_ERROR_RESULT(m_Error, ResultCode::FileCorrupted, "Invalid truncated ASCII data section");
+        return;
+      }
 
       SectionProperties props;
       props.flags = SectionFlags::ASCIIStored;
@@ -520,8 +574,11 @@ void RDCFile::Init(StreamReader &reader)
       reader.SkipBytes(loc.diskLength);
 
       if(reader.IsErrored())
-        RETURNERROR(ContainerError::Corrupt, "Error seeking past ASCII section '%s' data",
-                    name.c_str());
+      {
+        SET_ERROR_RESULT(m_Error, ResultCode::FileCorrupted,
+                         "Error seeking past ASCII section '%s' data", name.c_str());
+        return;
+      }
 
       m_Sections.push_back(props);
       m_SectionLocations.push_back(loc);
@@ -532,7 +589,10 @@ void RDCFile::Init(StreamReader &reader)
       reader.Read(reading, offsetof(BinarySectionHeader, name) - 1);
 
       if(reader.IsErrored())
-        RETURNERROR(ContainerError::Corrupt, "Error reading binary section header");
+      {
+        SET_ERROR_RESULT(m_Error, ResultCode::FileCorrupted, "Error reading binary section header");
+        return;
+      }
 
       SectionProperties props;
       props.flags = sectionHeader.sectionFlags;
@@ -543,8 +603,9 @@ void RDCFile::Init(StreamReader &reader)
 
       if(sectionHeader.sectionNameLength == 0 || sectionHeader.sectionNameLength > 2 * 1024)
       {
-        RETURNERROR(ContainerError::Corrupt, "Invalid section name length %u",
-                    sectionHeader.sectionNameLength);
+        SET_ERROR_RESULT(m_Error, ResultCode::FileCorrupted, "Invalid section name length %u",
+                         sectionHeader.sectionNameLength);
+        return;
       }
 
       props.name.resize(sectionHeader.sectionNameLength - 1);
@@ -552,12 +613,18 @@ void RDCFile::Init(StreamReader &reader)
       reader.Read(&props.name[0], sectionHeader.sectionNameLength - 1);
 
       if(reader.IsErrored())
-        RETURNERROR(ContainerError::Corrupt, "Error reading binary section header");
+      {
+        SET_ERROR_RESULT(m_Error, ResultCode::FileCorrupted, "Error reading binary section header");
+        return;
+      }
 
       reader.SkipBytes(1);
 
       if(reader.IsErrored())
-        RETURNERROR(ContainerError::Corrupt, "Error reading binary section header");
+      {
+        SET_ERROR_RESULT(m_Error, ResultCode::FileCorrupted, "Error reading binary section header");
+        return;
+      }
 
       SectionLocation loc;
       loc.headerOffset = headerOffset;
@@ -570,18 +637,25 @@ void RDCFile::Init(StreamReader &reader)
       reader.SkipBytes(loc.diskLength);
 
       if(reader.IsErrored())
-        RETURNERROR(ContainerError::Corrupt, "Error seeking past binary section '%s' data",
-                    props.name.c_str());
+      {
+        SET_ERROR_RESULT(m_Error, ResultCode::FileCorrupted,
+                         "Error seeking past binary section '%s' data", props.name.c_str());
+        return;
+      }
     }
     else
     {
-      RETURNERROR(ContainerError::Corrupt, "Unrecognised section type '%hhx'", sectionHeader.isASCII);
+      SET_ERROR_RESULT(m_Error, ResultCode::FileCorrupted, "Unrecognised section type '%hhx'",
+                       sectionHeader.isASCII);
+      return;
     }
   }
 
   if(SectionIndex(SectionType::FrameCapture) == -1)
   {
-    RETURNERROR(ContainerError::Corrupt, "Capture file doesn't have a frame capture");
+    SET_ERROR_RESULT(m_Error, ResultCode::FileCorrupted,
+                     "Capture file doesn't have a frame capture");
+    return;
   }
 
   int index = SectionIndex(SectionType::ExtendedThumbnail);
@@ -593,53 +667,54 @@ void RDCFile::Init(StreamReader &reader)
       ExtThumbnailHeader thumbHeader;
       if(thumbReader->Read(thumbHeader))
       {
-        thumbData = new byte[thumbHeader.len];
-        bool succeeded = thumbReader->Read(thumbData, thumbHeader.len) && !thumbReader->IsErrored();
+        thumbData.resize(thumbHeader.len);
+        bool succeeded =
+            thumbReader->Read(thumbData.data(), thumbHeader.len) && !thumbReader->IsErrored();
         if(succeeded && (uint32_t)thumbHeader.format < (uint32_t)FileType::Count)
         {
           m_Thumb.width = thumbHeader.width;
           m_Thumb.height = thumbHeader.height;
-          m_Thumb.len = thumbHeader.len;
           m_Thumb.format = thumbHeader.format;
-          delete[] m_Thumb.pixels;
-          m_Thumb.pixels = thumbData;
+          m_Thumb.pixels.swap(thumbData);
         }
-        else
-        {
-          delete[] thumbData;
-        }
-        thumbData = NULL;
       }
       delete thumbReader;
     }
   }
 }
 
-bool RDCFile::CopyFileTo(const char *filename)
+RDResult RDCFile::CopyFileTo(const rdcstr &filename)
 {
   if(!m_File)
-    return false;
+    RETURN_ERROR_RESULT(ResultCode::FileIOFailed, "Capture file '%s' is not currently open",
+                        m_Filename.c_str(), errno);
 
   // remember our position and close the file
   uint64_t prevPos = FileIO::ftell64(m_File);
   FileIO::fclose(m_File);
 
-  // try to move to the new location
-  bool success = FileIO::Copy(m_Filename.c_str(), filename, true);
+  RDResult ret;
 
   // if it succeeded, update our filename
-  if(success)
+  if(FileIO::Copy(m_Filename, filename, true))
+  {
     m_Filename = filename;
+  }
+  else
+  {
+    SET_ERROR_RESULT(ret, ResultCode::FileIOFailed, "Couldn't copy to file '%s': %s",
+                     filename.c_str(), FileIO::ErrorString().c_str());
+  }
 
   // re-open the file (either the new one, or the old one if it failed) and re-seek
-  m_File = FileIO::fopen(m_Filename.c_str(), "rb");
+  m_File = FileIO::fopen(m_Filename, FileIO::ReadBinary);
   FileIO::fseek64(m_File, prevPos, SEEK_SET);
 
-  return success;
+  return ret;
 }
 
-void RDCFile::SetData(RDCDriver driver, const char *driverName, uint64_t machineIdent,
-                      const RDCThumb *thumb)
+void RDCFile::SetData(RDCDriver driver, const rdcstr &driverName, uint64_t machineIdent,
+                      const RDCThumb *thumb, uint64_t timeBase, double timeFreq)
 {
   m_Driver = driver;
   m_DriverName = driverName;
@@ -647,25 +722,23 @@ void RDCFile::SetData(RDCDriver driver, const char *driverName, uint64_t machine
   if(thumb)
   {
     m_Thumb = *thumb;
-
-    byte *pixels = new byte[m_Thumb.len];
-    memcpy(pixels, thumb->pixels, m_Thumb.len);
-
-    m_Thumb.pixels = pixels;
   }
+  m_TimeBase = timeBase;
+  m_TimeFrequency = timeFreq;
 }
 
-void RDCFile::Create(const char *filename)
+void RDCFile::Create(const rdcstr &filename)
 {
-  m_File = FileIO::fopen(filename, "wb");
+  m_File = FileIO::fopen(filename, FileIO::WriteBinary);
   m_Filename = filename;
 
   RDCDEBUG("creating RDC file.");
 
   if(!m_File)
   {
-    RETURNERROR(ContainerError::FileIO, "Can't open capture file '%s' for write, errno %d",
-                filename, errno);
+    SET_ERROR_RESULT(m_Error, ResultCode::FileIOFailed,
+                     "Can't open capture file '%s' for write, errno %d", filename.c_str(), errno);
+    return;
   }
 
   RDCDEBUG("Opened capture file for write");
@@ -676,10 +749,10 @@ void RDCFile::Create(const char *filename)
 
   thumbHeader.width = m_Thumb.width;
   thumbHeader.height = m_Thumb.height;
-  const byte *jpgPixels = m_Thumb.pixels;
-  thumbHeader.length = m_Thumb.len;
+  const byte *jpgPixels = m_Thumb.pixels.data();
+  thumbHeader.length = (uint32_t)m_Thumb.pixels.size();
 
-  byte *jpgBuffer = NULL;
+  bytebuf jpgBuffer;
   if(m_Thumb.format != FileType::JPG && m_Thumb.width > 0 && m_Thumb.height > 0)
   {
     // the primary thumbnail must be in JPG format, must perform conversion
@@ -691,23 +764,24 @@ void RDCFile::Create(const char *filename)
 
     if(m_Thumb.format == FileType::Raw)
     {
-      rawPixels = m_Thumb.pixels;
+      rawPixels = m_Thumb.pixels.data();
     }
     else
     {
-      rawBuffer = stbi_load_from_memory(m_Thumb.pixels, (int)m_Thumb.len, &w, &h, &comp, 3);
+      rawBuffer =
+          stbi_load_from_memory(m_Thumb.pixels.data(), (int)m_Thumb.pixels.size(), &w, &h, &comp, 3);
       rawPixels = rawBuffer;
     }
 
     if(rawPixels)
     {
       int len = w * h * comp;
-      jpgBuffer = new byte[len];
+      jpgBuffer.resize(len);
       jpge::params p;
       p.m_quality = 90;
-      jpge::compress_image_to_jpeg_file_in_memory(jpgBuffer, len, w, h, comp, rawPixels, p);
+      jpge::compress_image_to_jpeg_file_in_memory(jpgBuffer.data(), len, w, h, comp, rawPixels, p);
       thumbHeader.length = (uint32_t)len;
-      jpgPixels = jpgBuffer;
+      jpgPixels = jpgBuffer.data();
     }
     else
     {
@@ -726,7 +800,12 @@ void RDCFile::Create(const char *filename)
   meta.driverNameLength = uint8_t(m_DriverName.size() + 1);
 
   header.headerLength = sizeof(FileHeader) + offsetof(BinaryThumbnail, data) + thumbHeader.length +
-                        offsetof(CaptureMetaData, driverName) + meta.driverNameLength;
+                        offsetof(CaptureMetaData, driverName) + meta.driverNameLength +
+                        sizeof(CaptureTimeBase);
+
+  CaptureTimeBase timeBase;
+  timeBase.timeBase = m_TimeBase;
+  timeBase.timeFreq = m_TimeFrequency;
 
   {
     StreamWriter writer(m_File, Ownership::Nothing);
@@ -741,16 +820,26 @@ void RDCFile::Create(const char *filename)
 
     writer.Write(m_DriverName.c_str(), meta.driverNameLength);
 
-    delete[] jpgBuffer;
+    writer.Write(timeBase);
+
     if(writer.IsErrored())
     {
-      RETURNERROR(ContainerError::FileIO, "Error writing file header");
+      SET_ERROR_RESULT(m_Error, ResultCode::FileIOFailed, "Error writing file header");
+      return;
     }
   }
 
   // re-open as read-only now.
   FileIO::fclose(m_File);
-  m_File = FileIO::fopen(filename, "rb");
+  m_File = FileIO::fopen(filename, FileIO::ReadBinary);
+
+  if(!m_File)
+  {
+    SET_ERROR_RESULT(m_Error, ResultCode::FileIOFailed,
+                     "Can't open capture file '%s' as read-only, errno %d", filename.c_str(), errno);
+    return;
+  }
+
   FileIO::fseek64(m_File, 0, SEEK_END);
 }
 
@@ -768,7 +857,7 @@ int RDCFile::SectionIndex(SectionType type) const
   return -1;
 }
 
-int RDCFile::SectionIndex(const char *name) const
+int RDCFile::SectionIndex(const rdcstr &name) const
 {
   for(size_t i = 0; i < m_Sections.size(); i++)
     if(m_Sections[i].name == name)
@@ -785,16 +874,18 @@ int RDCFile::SectionIndex(const char *name) const
 
 StreamReader *RDCFile::ReadSection(int index) const
 {
-  if(m_Error != ContainerError::NoError)
-    return new StreamReader(StreamReader::InvalidStream);
+  if(m_Error != ResultCode::Succeeded)
+    return new StreamReader(StreamReader::InvalidStream, m_Error);
 
   if(m_File == NULL)
   {
     if(index < (int)m_MemorySections.size())
       return new StreamReader(m_MemorySections[index]);
 
-    RDCERR("Section %d is not available in memory.", index);
-    return new StreamReader(StreamReader::InvalidStream);
+    RDResult res;
+    SET_ERROR_RESULT(res, ResultCode::InvalidParameter,
+                     "Section %d is not available in this capture file.", index);
+    return new StreamReader(StreamReader::InvalidStream, res);
   }
 
   const SectionProperties &props = m_Sections[index];
@@ -824,7 +915,7 @@ StreamReader *RDCFile::ReadSection(int index) const
 
 StreamWriter *RDCFile::WriteSection(const SectionProperties &props)
 {
-  if(m_Error != ContainerError::NoError)
+  if(m_Error != ResultCode::Succeeded)
     return new StreamWriter(StreamWriter::InvalidStream);
 
   RDCASSERT((size_t)props.type < (size_t)SectionType::Count);
@@ -836,7 +927,7 @@ StreamWriter *RDCFile::WriteSection(const SectionProperties &props)
     StreamWriter *w = new StreamWriter(64 * 1024);
 
     w->AddCloseCallback([this, props, w]() {
-      m_MemorySections.push_back(std::vector<byte>(w->GetData(), w->GetData() + w->GetOffset()));
+      m_MemorySections.push_back(bytebuf(w->GetData(), (size_t)w->GetOffset()));
 
       m_Sections.push_back(props);
       m_Sections.back().compressedSize = m_Sections.back().uncompressedSize =
@@ -850,12 +941,12 @@ StreamWriter *RDCFile::WriteSection(const SectionProperties &props)
   {
     uint64_t offs = FileIO::ftell64(m_File);
     FileIO::fclose(m_File);
-    m_File = FileIO::fopen(m_Filename.c_str(), "r+b");
+    m_File = FileIO::fopen(m_Filename, FileIO::UpdateBinary);
 
     if(m_File == NULL)
     {
       RDCERR("Couldn't re-open file as read/write to write section.");
-      m_File = FileIO::fopen(m_Filename.c_str(), "rb");
+      m_File = FileIO::fopen(m_Filename, FileIO::ReadBinary);
       if(m_File)
         FileIO::fseek64(m_File, offs, SEEK_SET);
       return new StreamWriter(StreamWriter::InvalidStream);
@@ -876,7 +967,7 @@ StreamWriter *RDCFile::WriteSection(const SectionProperties &props)
     return new StreamWriter(StreamWriter::InvalidStream);
   }
 
-  std::string name = props.name;
+  rdcstr name = props.name;
   SectionType type = props.type;
 
   // normalise names for known sections
@@ -900,7 +991,7 @@ StreamWriter *RDCFile::WriteSection(const SectionProperties &props)
   // fixups. We need to be able to fixup any pre-existing sections that got shifted around.
   StreamCloseCallback modifySectionCallback;
 
-  if(SectionIndex(type) >= 0 || SectionIndex(name.c_str()) >= 0)
+  if(SectionIndex(type) >= 0 || SectionIndex(name) >= 0)
   {
     if(type == SectionType::FrameCapture || name == ToStr(SectionType::FrameCapture))
     {
@@ -927,20 +1018,20 @@ StreamWriter *RDCFile::WriteSection(const SectionProperties &props)
         FILE *origFile = m_File;
 
         // save the sections
-        std::vector<SectionProperties> origSections = m_Sections;
-        std::vector<SectionLocation> origSectionLocations = m_SectionLocations;
+        rdcarray<SectionProperties> origSections = m_Sections;
+        rdcarray<SectionLocation> origSectionLocations = m_SectionLocations;
 
         SectionLocation oldCaptureLocation = m_SectionLocations[0];
 
         // remove section 0, the frame capture, since it will be fixed up separately
-        origSections.erase(origSections.begin());
-        origSectionLocations.erase(origSectionLocations.begin());
+        origSections.erase(0);
+        origSectionLocations.erase(0);
 
-        std::string tempFilename = FileIO::GetTempFolderFilename() + "capture_rewrite.rdc";
+        rdcstr tempFilename = FileIO::GetTempFolderFilename() + "capture_rewrite.rdc";
 
         // create the file, this will overwrite m_File with the new file and file header using the
         // existing loaded metadata
-        Create(tempFilename.c_str());
+        Create(tempFilename);
 
         // after we've written the frame capture, we need to copy over the other sections into the
         // temporary file and finally move the temporary file over the top of the existing file.
@@ -990,10 +1081,10 @@ StreamWriter *RDCFile::WriteSection(const SectionProperties &props)
           FileIO::fclose(m_File);
 
           // move the temp file over the original
-          FileIO::Move(tempFilename.c_str(), m_Filename.c_str(), true);
+          FileIO::Move(tempFilename, m_Filename, true);
 
           // re-open the file after it's been overwritten.
-          m_File = FileIO::fopen(m_Filename.c_str(), "r+b");
+          m_File = FileIO::fopen(m_Filename, FileIO::UpdateBinary);
         };
 
         // fall through - we'll write to m_File immediately after the file header
@@ -1013,19 +1104,19 @@ StreamWriter *RDCFile::WriteSection(const SectionProperties &props)
       int index = SectionIndex(type);
 
       if(index < 0)
-        index = SectionIndex(name.c_str());
+        index = SectionIndex(name);
 
       RDCASSERT(index >= 0);
 
-      std::vector<bytebuf> origSectionData;
-      std::vector<uint64_t> origHeaderSizes;
+      rdcarray<bytebuf> origSectionData;
+      rdcarray<uint64_t> origHeaderSizes;
 
       uint64_t overwriteLocation = m_SectionLocations[index].headerOffset;
       uint64_t oldLength = m_SectionLocations[index].diskLength;
 
       // erase the target section. The others will be moved up to match
-      m_Sections.erase(m_Sections.begin() + index);
-      m_SectionLocations.erase(m_SectionLocations.begin() + index);
+      m_Sections.erase(index);
+      m_SectionLocations.erase(index);
 
       origSectionData.reserve(NumSections() - index);
       origHeaderSizes.reserve(NumSections() - index);
@@ -1119,12 +1210,14 @@ StreamWriter *RDCFile::WriteSection(const SectionProperties &props)
 
   if(numWritten != offsetof(BinarySectionHeader, name) + name.size() + 1)
   {
-    SETERROR(ContainerError::FileIO, "Error seeking to end of file, errno %d", errno);
+    SET_ERROR_RESULT(m_Error, ResultCode::FileIOFailed, "Error seeking to end of file, errno %d",
+                     errno);
     return new StreamWriter(StreamWriter::InvalidStream);
   }
 
   // create a writer for writing to disk. It shouldn't close the file
-  StreamWriter *fileWriter = new StreamWriter(m_File, Ownership::Nothing);
+  StreamWriter *fileWriter =
+      new StreamWriter(FileWriter::MakeThreaded(m_File, Ownership::Nothing), Ownership::Stream);
 
   StreamWriter *compWriter = NULL;
 
@@ -1148,8 +1241,6 @@ StreamWriter *RDCFile::WriteSection(const SectionProperties &props)
 
   // register a destroy callback to tidy up the section at the end
   fileWriter->AddCloseCallback([this, type, name, headerOffset, dataOffset, fileWriter, compWriter]() {
-    FileIO::fflush(m_File);
-
     // the offset of the file writer is how many bytes were written to disk - the compressed length.
     uint64_t compressedLength = fileWriter->GetOffset();
 
@@ -1158,8 +1249,9 @@ StreamWriter *RDCFile::WriteSection(const SectionProperties &props)
     if(compWriter)
       uncompressedLength = compWriter->GetOffset();
 
-    RDCLOG("Finishing write to section %u (%s). Compressed from %llu bytes to %llu", type,
-           name.c_str(), uncompressedLength, compressedLength);
+    RDCLOG("Finishing write to section %u (%s). Compressed from %llu bytes to %llu (%.2f %%)", type,
+           name.c_str(), uncompressedLength, compressedLength,
+           100.0 * (double(compressedLength) / double(uncompressedLength)));
 
     // finish up the properties and add to list of sections
     m_CurrentWritingProps.compressedSize = compressedLength;
@@ -1182,7 +1274,9 @@ StreamWriter *RDCFile::WriteSection(const SectionProperties &props)
 
     if(bytesWritten != 2 * sizeof(uint64_t))
     {
-      RETURNERROR(ContainerError::FileIO, "Error applying fixup to section header, errno %d", errno);
+      SET_ERROR_RESULT(m_Error, ResultCode::FileIOFailed,
+                       "Error applying fixup to section header: %s", FileIO::ErrorString().c_str());
+      return;
     }
 
     FileIO::fflush(m_File);
@@ -1198,7 +1292,7 @@ StreamWriter *RDCFile::WriteSection(const SectionProperties &props)
     FileIO::fclose(m_File);
 
     // re-open the file and re-seek
-    m_File = FileIO::fopen(m_Filename.c_str(), "rb");
+    m_File = FileIO::fopen(m_Filename, FileIO::ReadBinary);
     FileIO::fseek64(m_File, prevPos, SEEK_SET);
   });
 
@@ -1206,7 +1300,7 @@ StreamWriter *RDCFile::WriteSection(const SectionProperties &props)
   return compWriter ? compWriter : fileWriter;
 }
 
-FILE *RDCFile::StealImageFileHandle(std::string &filename)
+FILE *RDCFile::StealImageFileHandle(rdcstr &filename)
 {
   if(m_Driver != RDCDriver::Image)
   {

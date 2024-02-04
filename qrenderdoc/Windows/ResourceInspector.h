@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2017-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -26,6 +26,7 @@
 
 #include <QFrame>
 #include "Code/Interface/QRDInterface.h"
+#include "Code/QRDUtils.h"
 
 namespace Ui
 {
@@ -36,6 +37,41 @@ class QCollatorSortFilterProxyModel;
 
 class RDTreeWidgetItem;
 class ResourceListItemModel;
+class StructuredDataItemModel;
+class RichTextViewDelegate;
+
+class ResourceSorterModel : public QCollatorSortFilterProxyModel
+{
+  Q_OBJECT
+
+public:
+  enum SortType
+  {
+    Alphabetical = 0,
+    Creation,
+    LastAccess,
+  };
+  explicit ResourceSorterModel(QObject *parent = Q_NULLPTR) : QCollatorSortFilterProxyModel(parent)
+  {
+  }
+  virtual ~ResourceSorterModel() {}
+  void setSortType(SortType type)
+  {
+    if(m_Sort != type)
+    {
+      m_Sort = type;
+      invalidate();
+      sort(0);
+    }
+  }
+
+protected:
+  virtual bool lessThan(const QModelIndex &source_left,
+                        const QModelIndex &source_right) const override;
+
+private:
+  SortType m_Sort = SortType::Alphabetical;
+};
 
 class ResourceInspector : public QFrame, public IResourceInspector, public ICaptureViewer
 {
@@ -49,6 +85,7 @@ public:
   QWidget *Widget() override { return this; }
   void Inspect(ResourceId id) override;
   ResourceId CurrentResource() override { return m_Resource; }
+  void RevealParameter(SDObject *param) override;
   // ICaptureViewer
   void OnCaptureLoaded() override;
   void OnCaptureClosed() override;
@@ -59,6 +96,7 @@ public slots:
   void on_renameResource_clicked();
   void on_resourceNameEdit_keyPress(QKeyEvent *event);
   void on_resetName_clicked();
+  void on_sortType_currentIndexChanged(int index);
 
   void on_cancelResourceListFilter_clicked();
   void on_resourceListFilter_textChanged(const QString &text);
@@ -76,6 +114,7 @@ protected:
 
 private:
   void HighlightUsage();
+  void SetResourceNameDisplay(const QString &name);
 
   Ui::ResourceInspector *ui;
   ICaptureContext &m_Ctx;
@@ -85,5 +124,7 @@ private:
   ResourceId m_Resource;
   ResourceListItemModel *m_ResourceModel;
   int m_ResourceCacheID = -1;
-  QCollatorSortFilterProxyModel *m_FilterModel;
+  ResourceSorterModel *m_FilterModel;
+  StructuredDataItemModel *m_ChunksModel;
+  RichTextViewDelegate *m_delegate;
 };

@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -24,7 +24,7 @@
 
 #include "d3d11_test.h"
 
-TEST(D3D11_Stripped_Shaders, D3D11GraphicsTest)
+RD_TEST(D3D11_Stripped_Shaders, D3D11GraphicsTest)
 {
   static constexpr const char *Description =
       "Tests shaders with their debug/reflection info stripped out and stored in separate blobs";
@@ -35,16 +35,16 @@ TEST(D3D11_Stripped_Shaders, D3D11GraphicsTest)
     if(!Init())
       return 3;
 
-    ID3DBlobPtr vsblobUnstripped = NULL;
-    ID3DBlobPtr psblobUnstripped = NULL;
+    ID3DBlobPtr vsblob = Compile(D3DDefaultVertex, "main", "vs_5_0");
+    ID3DBlobPtr psblob = Compile(D3DDefaultPixel, "main", "ps_5_0");
 
-    ID3DBlobPtr vsblob = Compile(D3DDefaultVertex, "main", "vs_5_0", &vsblobUnstripped);
-    ID3DBlobPtr psblob = Compile(D3DDefaultPixel, "main", "ps_5_0", &psblobUnstripped);
+    WriteBlob(GetCWD() + "/shader_debug.vs", vsblob, false);
+    WriteBlob(GetCWD() + "/shader_debug.ps", psblob, true);
 
-    WriteBlob(GetCWD() + "/shader_debug.vs", vsblobUnstripped, false);
-    WriteBlob(GetCWD() + "/shader_debug.ps", psblobUnstripped, true);
+    Strip(vsblob);
+    Strip(psblob);
 
-    vsblob = SetBlobPath(GetCWD() + "/shader_debug.vs", vsblob);
+    SetBlobPath(GetCWD() + "/shader_debug.vs", vsblob);
 
     CreateDefaultInputLayout(vsblob);
 
@@ -57,7 +57,7 @@ TEST(D3D11_Stripped_Shaders, D3D11GraphicsTest)
 
     while(Running())
     {
-      ClearRenderTargetView(bbRTV, {0.4f, 0.5f, 0.6f, 1.0f});
+      ClearRenderTargetView(bbRTV, {0.2f, 0.2f, 0.2f, 1.0f});
 
       IASetVertexBuffer(vb, sizeof(DefaultA2V), 0);
       ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);

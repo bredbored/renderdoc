@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -25,14 +25,16 @@
 #include <algorithm>
 #include <iterator>
 #include "driver/ihv/amd/amd_counters.h"
+#include "driver/ihv/arm/arm_counters.h"
 #include "driver/ihv/intel/intel_gl_counters.h"
+#include "driver/ihv/nv/nv_gl_counters.h"
 #include "gl_driver.h"
 #include "gl_replay.h"
 #include "gl_resources.h"
 
-std::vector<GPUCounter> GLReplay::EnumerateCounters()
+rdcarray<GPUCounter> GLReplay::EnumerateCounters()
 {
-  std::vector<GPUCounter> ret;
+  rdcarray<GPUCounter> ret;
 
   if(HasExt[ARB_timer_query])
     ret.push_back(GPUCounter::EventGPUDuration);
@@ -57,15 +59,25 @@ std::vector<GPUCounter> GLReplay::EnumerateCounters()
 
   if(m_pAMDCounters)
   {
-    std::vector<GPUCounter> amdCounters = m_pAMDCounters->GetPublicCounterIds();
-    ret.insert(ret.end(), amdCounters.begin(), amdCounters.end());
+    ret.append(m_pAMDCounters->GetPublicCounterIds());
   }
 
   if(m_pIntelCounters)
   {
-    std::vector<GPUCounter> intelCounters = m_pIntelCounters->GetPublicCounterIds();
-    ret.insert(ret.end(), intelCounters.begin(), intelCounters.end());
+    ret.append(m_pIntelCounters->GetPublicCounterIds());
   }
+
+  if(m_pARMCounters)
+  {
+    ret.append(m_pARMCounters->GetPublicCounterIds());
+  }
+
+#if DISABLED(RDOC_ANDROID) && DISABLED(RDOC_APPLE)
+  if(m_pNVCounters)
+  {
+    ret.append(m_pNVCounters->EnumerateCounters());
+  }
+#endif
 
   return ret;
 }
@@ -98,6 +110,19 @@ CounterDescription GLReplay::DescribeCounter(GPUCounter counterID)
     }
   }
 
+  if(IsARMCounter(counterID) && m_pARMCounters)
+  {
+    return m_pARMCounters->GetCounterDescription(counterID);
+  }
+
+#if DISABLED(RDOC_ANDROID) && DISABLED(RDOC_APPLE)
+  /////NVIDIA/////
+  if(m_pNVCounters && m_pNVCounters->HasCounter(counterID))
+  {
+    return m_pNVCounters->DescribeCounter(counterID);
+  }
+#endif
+
   // FFBA5548-FBF8-405D-BA18-F0329DA370A0
   desc.uuid.words[0] = 0xFFBA5548;
   desc.uuid.words[1] = 0xFBF8405D;
@@ -113,7 +138,7 @@ CounterDescription GLReplay::DescribeCounter(GPUCounter counterID)
       desc.description =
           "Time taken for this event on the GPU, as measured by delta between two GPU timestamps.";
       desc.resultByteWidth = 8;
-      desc.resultType = CompType::Double;
+      desc.resultType = CompType::Float;
       desc.unit = CounterUnit::Seconds;
       break;
     case GPUCounter::InputVerticesRead:
@@ -214,14 +239,14 @@ CounterDescription GLReplay::DescribeCounter(GPUCounter counterID)
 
 struct GPUQueries
 {
-  GLuint obj[ENUM_ARRAY_SIZE(GPUCounter)];
+  GLuint obj[arraydim<GPUCounter>()];
   uint32_t eventId;
 };
 
 struct GLCounterContext
 {
   uint32_t eventStart;
-  std::vector<GPUQueries> queries;
+  rdcarray<GPUQueries> queries;
 };
 
 GLenum glCounters[] = {
@@ -241,18 +266,19 @@ GLenum glCounters[] = {
     eGL_COMPUTE_SHADER_INVOCATIONS_ARB             // GPUCounter::CSInvocations
 };
 
-void GLReplay::FillTimers(GLCounterContext &ctx, const DrawcallDescription &drawnode,
-                          const std::vector<GPUCounter> &counters)
+void GLReplay::FillTimers(GLCounterContext &ctx, const ActionDescription &actionnode,
+                          const rdcarray<GPUCounter> &counters)
 {
-  if(drawnode.children.empty())
+  if(actionnode.children.empty())
     return;
 
-  for(size_t i = 0; i < drawnode.children.size(); i++)
+  for(size_t i = 0; i < actionnode.children.size(); i++)
   {
-    const DrawcallDescription &d = drawnode.children[i];
-    FillTimers(ctx, drawnode.children[i], counters);
+    const ActionDescription &a = actionnode.children[i];
+    FillTimers(ctx, a, counters);
 
-    if(d.events.empty())
+    // for marker regions and multi-actions, don't fetch counters for them, only their children
+    if(!a.children.empty())
       continue;
 
     GPUQueries *queries = NULL;
@@ -261,19 +287,19 @@ void GLReplay::FillTimers(GLCounterContext &ctx, const DrawcallDescription &draw
       ctx.queries.push_back(GPUQueries());
 
       queries = &ctx.queries.back();
-      queries->eventId = d.eventId;
+      queries->eventId = a.eventId;
       for(auto q : indices<GPUCounter>())
         queries->obj[q] = 0;
 
       for(uint32_t c = 0; c < counters.size(); c++)
       {
         m_pDriver->glGenQueries(1, &queries->obj[(uint32_t)counters[c]]);
-        if(m_pDriver->glGetError())
+        if(m_pDriver->glGetError() != eGL_NONE)
           queries->obj[(uint32_t)counters[c]] = 0;
       }
     }
 
-    m_pDriver->ReplayLog(ctx.eventStart, d.eventId, eReplay_WithoutDraw);
+    m_pDriver->ReplayLog(ctx.eventStart, a.eventId, eReplay_WithoutDraw);
 
     ClearGLErrors();
 
@@ -283,7 +309,7 @@ void GLReplay::FillTimers(GLCounterContext &ctx, const DrawcallDescription &draw
       if(queries->obj[q])
       {
         m_pDriver->glBeginQuery(glCounters[q], queries->obj[q]);
-        if(m_pDriver->glGetError())
+        if(m_pDriver->glGetError() != eGL_NONE)
         {
           m_pDriver->glDeleteQueries(1, &queries->obj[q]);
           queries->obj[q] = 0;
@@ -291,51 +317,52 @@ void GLReplay::FillTimers(GLCounterContext &ctx, const DrawcallDescription &draw
       }
     }
 
-    m_pDriver->ReplayLog(ctx.eventStart, d.eventId, eReplay_OnlyDraw);
+    m_pDriver->ReplayLog(ctx.eventStart, a.eventId, eReplay_OnlyDraw);
 
     for(auto q : indices<GPUCounter>())
       if(queries->obj[q])
         m_pDriver->glEndQuery(glCounters[q]);
 
-    ctx.eventStart = d.eventId + 1;
+    ctx.eventStart = a.eventId + 1;
   }
 }
 
 void GLReplay::FillTimersAMD(uint32_t *eventStartID, uint32_t *sampleIndex,
-                             std::vector<uint32_t> *eventIDs, const DrawcallDescription &drawnode)
+                             rdcarray<uint32_t> *eventIDs, const ActionDescription &actionnode)
 {
-  if(drawnode.children.empty())
+  if(actionnode.children.empty())
     return;
 
-  for(size_t i = 0; i < drawnode.children.size(); i++)
+  for(size_t i = 0; i < actionnode.children.size(); i++)
   {
-    const DrawcallDescription &d = drawnode.children[i];
+    const ActionDescription &a = actionnode.children[i];
 
-    FillTimersAMD(eventStartID, sampleIndex, eventIDs, drawnode.children[i]);
+    FillTimersAMD(eventStartID, sampleIndex, eventIDs, actionnode.children[i]);
 
-    if(d.events.empty())
+    if(a.events.empty() ||
+       (a.flags & (ActionFlags::PushMarker | ActionFlags::SetMarker | ActionFlags::PopMarker)))
       continue;
 
-    eventIDs->push_back(d.eventId);
+    eventIDs->push_back(a.eventId);
 
-    m_pDriver->ReplayLog(*eventStartID, d.eventId, eReplay_WithoutDraw);
+    m_pDriver->ReplayLog(*eventStartID, a.eventId, eReplay_WithoutDraw);
 
     m_pAMDCounters->BeginSample(*sampleIndex);
 
-    m_pDriver->ReplayLog(*eventStartID, d.eventId, eReplay_OnlyDraw);
+    m_pDriver->ReplayLog(*eventStartID, a.eventId, eReplay_OnlyDraw);
 
     m_pAMDCounters->EndSample();
 
-    *eventStartID = d.eventId + 1;
+    *eventStartID = a.eventId + 1;
     ++*sampleIndex;
   }
 }
 
-std::vector<CounterResult> GLReplay::FetchCountersAMD(const std::vector<GPUCounter> &counters)
+rdcarray<CounterResult> GLReplay::FetchCountersAMD(const rdcarray<GPUCounter> &counters)
 {
   if(!m_pAMDCounters->BeginMeasurementMode(AMDCounters::ApiType::Ogl, m_ReplayCtx.ctx))
   {
-    return std::vector<CounterResult>();
+    return rdcarray<CounterResult>();
   }
 
   uint32_t sessionID = m_pAMDCounters->CreateSession();
@@ -356,7 +383,7 @@ std::vector<CounterResult> GLReplay::FetchCountersAMD(const std::vector<GPUCount
 
   uint32_t sampleIndex = 0;
 
-  std::vector<uint32_t> eventIDs;
+  rdcarray<uint32_t> eventIDs;
 
   m_pDriver->ReplayMarkers(false);
 
@@ -370,7 +397,7 @@ std::vector<CounterResult> GLReplay::FetchCountersAMD(const std::vector<GPUCount
 
     eventIDs.clear();
 
-    FillTimersAMD(&eventStartID, &sampleIndex, &eventIDs, m_pDriver->GetRootDraw());
+    FillTimersAMD(&eventStartID, &sampleIndex, &eventIDs, m_pDriver->GetRootAction());
     m_pAMDCounters->EndCommandList();
     m_pAMDCounters->EndPass();
   }
@@ -379,7 +406,7 @@ std::vector<CounterResult> GLReplay::FetchCountersAMD(const std::vector<GPUCount
 
   m_pAMDCounters->EndSesssion(sessionID);
 
-  std::vector<CounterResult> ret =
+  rdcarray<CounterResult> ret =
       m_pAMDCounters->GetCounterData(sessionID, sampleIndex, eventIDs, counters);
 
   m_pAMDCounters->EndMeasurementMode();
@@ -388,36 +415,36 @@ std::vector<CounterResult> GLReplay::FetchCountersAMD(const std::vector<GPUCount
 }
 
 void GLReplay::FillTimersIntel(uint32_t *eventStartID, uint32_t *sampleIndex,
-                               std::vector<uint32_t> *eventIDs, const DrawcallDescription &drawnode)
+                               rdcarray<uint32_t> *eventIDs, const ActionDescription &actionnode)
 {
-  if(drawnode.children.empty())
+  if(actionnode.children.empty())
     return;
 
-  for(size_t i = 0; i < drawnode.children.size(); i++)
+  for(size_t i = 0; i < actionnode.children.size(); i++)
   {
-    const DrawcallDescription &d = drawnode.children[i];
+    const ActionDescription &a = actionnode.children[i];
 
-    FillTimersIntel(eventStartID, sampleIndex, eventIDs, drawnode.children[i]);
+    FillTimersIntel(eventStartID, sampleIndex, eventIDs, actionnode.children[i]);
 
-    if(d.events.empty())
+    if(a.events.empty())
       continue;
 
-    eventIDs->push_back(d.eventId);
+    eventIDs->push_back(a.eventId);
 
-    m_pDriver->ReplayLog(*eventStartID, d.eventId, eReplay_WithoutDraw);
+    m_pDriver->ReplayLog(*eventStartID, a.eventId, eReplay_WithoutDraw);
 
     m_pIntelCounters->BeginSample(*sampleIndex);
 
-    m_pDriver->ReplayLog(*eventStartID, d.eventId, eReplay_OnlyDraw);
+    m_pDriver->ReplayLog(*eventStartID, a.eventId, eReplay_OnlyDraw);
 
     m_pIntelCounters->EndSample();
 
-    *eventStartID = d.eventId + 1;
+    *eventStartID = a.eventId + 1;
     ++*sampleIndex;
   }
 }
 
-std::vector<CounterResult> GLReplay::FetchCountersIntel(const std::vector<GPUCounter> &counters)
+rdcarray<CounterResult> GLReplay::FetchCountersIntel(const rdcarray<GPUCounter> &counters)
 {
   m_pIntelCounters->DisableAllCounters();
 
@@ -436,7 +463,7 @@ std::vector<CounterResult> GLReplay::FetchCountersIntel(const std::vector<GPUCou
 
   uint32_t sampleIndex = 0;
 
-  std::vector<uint32_t> eventIDs;
+  rdcarray<uint32_t> eventIDs;
 
   m_pDriver->ReplayMarkers(false);
 
@@ -450,22 +477,100 @@ std::vector<CounterResult> GLReplay::FetchCountersIntel(const std::vector<GPUCou
 
     eventIDs.clear();
 
-    FillTimersIntel(&eventStartID, &sampleIndex, &eventIDs, m_pDriver->GetRootDraw());
+    FillTimersIntel(&eventStartID, &sampleIndex, &eventIDs, m_pDriver->GetRootAction());
     m_pIntelCounters->EndPass();
   }
 
   m_pDriver->ReplayMarkers(true);
 
-  std::vector<CounterResult> ret = m_pIntelCounters->GetCounterData(sampleIndex, eventIDs, counters);
+  rdcarray<CounterResult> ret = m_pIntelCounters->GetCounterData(sampleIndex, eventIDs, counters);
 
   m_pIntelCounters->EndSession();
 
   return ret;
 }
 
-std::vector<CounterResult> GLReplay::FetchCounters(const std::vector<GPUCounter> &allCounters)
+void GLReplay::FillTimersARM(uint32_t *eventStartID, uint32_t *sampleIndex,
+                             rdcarray<uint32_t> *eventIDs, const ActionDescription &actionnode)
 {
-  std::vector<CounterResult> ret;
+  if(actionnode.children.empty())
+    return;
+
+  for(size_t i = 0; i < actionnode.children.size(); i++)
+  {
+    const ActionDescription &a = actionnode.children[i];
+
+    FillTimersARM(eventStartID, sampleIndex, eventIDs, actionnode.children[i]);
+
+    if(a.events.empty())
+      continue;
+
+    eventIDs->push_back(a.eventId);
+
+    m_pDriver->ReplayLog(*eventStartID, a.eventId, eReplay_WithoutDraw);
+
+    m_pARMCounters->BeginSample(a.eventId);
+
+    m_pDriver->ReplayLog(*eventStartID, a.eventId, eReplay_OnlyDraw);
+
+    // wait for the GPU to process all commands
+    GLsync sync = GL.glFenceSync(eGL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+    GL.glClientWaitSync(sync, eGL_SYNC_FLUSH_COMMANDS_BIT, GL_TIMEOUT_IGNORED);
+
+    m_pARMCounters->EndSample();
+
+    GL.glDeleteSync(sync);
+
+    *eventStartID = a.eventId + 1;
+    ++*sampleIndex;
+  }
+}
+
+rdcarray<CounterResult> GLReplay::FetchCountersARM(const rdcarray<GPUCounter> &counters)
+{
+  m_pARMCounters->DisableAllCounters();
+
+  // enable counters it needs
+  for(size_t i = 0; i < counters.size(); i++)
+  {
+    // This function is only called internally, and violating this assertion means our
+    // caller has invoked this method incorrectly
+    RDCASSERT(IsARMCounter(counters[i]));
+    m_pARMCounters->EnableCounter(counters[i]);
+  }
+
+  uint32_t passCount = m_pARMCounters->GetPassCount();
+
+  uint32_t sampleIndex = 0;
+
+  rdcarray<uint32_t> eventIDs;
+
+  m_pDriver->ReplayMarkers(false);
+
+  for(uint32_t p = 0; p < passCount; p++)
+  {
+    m_pARMCounters->BeginPass(p);
+
+    uint32_t eventStartID = 0;
+
+    sampleIndex = 0;
+
+    eventIDs.clear();
+
+    FillTimersARM(&eventStartID, &sampleIndex, &eventIDs, m_pDriver->GetRootAction());
+
+    m_pARMCounters->EndPass();
+  }
+  m_pDriver->ReplayMarkers(true);
+
+  rdcarray<CounterResult> ret = m_pARMCounters->GetCounterData(eventIDs, counters);
+
+  return ret;
+}
+
+rdcarray<CounterResult> GLReplay::FetchCounters(const rdcarray<GPUCounter> &allCounters)
+{
+  rdcarray<CounterResult> ret;
 
   if(allCounters.empty())
   {
@@ -475,14 +580,16 @@ std::vector<CounterResult> GLReplay::FetchCounters(const std::vector<GPUCounter>
 
   MakeCurrentReplayContext(&m_ReplayCtx);
 
-  std::vector<GPUCounter> counters;
+  rdcarray<GPUCounter> counters;
   std::copy_if(allCounters.begin(), allCounters.end(), std::back_inserter(counters),
                [](const GPUCounter &c) { return IsGenericCounter(c); });
+
+  m_pDriver->SetFetchCounters(true);
 
   if(m_pAMDCounters)
   {
     // Filter out the AMD counters
-    std::vector<GPUCounter> amdCounters;
+    rdcarray<GPUCounter> amdCounters;
     std::copy_if(allCounters.begin(), allCounters.end(), std::back_inserter(amdCounters),
                  [](const GPUCounter &c) { return IsAMDCounter(c); });
 
@@ -495,7 +602,7 @@ std::vector<CounterResult> GLReplay::FetchCounters(const std::vector<GPUCounter>
   if(m_pIntelCounters)
   {
     // Filter out the Intel counters
-    std::vector<GPUCounter> intelCounters;
+    rdcarray<GPUCounter> intelCounters;
     std::copy_if(allCounters.begin(), allCounters.end(), std::back_inserter(intelCounters),
                  [](const GPUCounter &c) { return IsIntelCounter(c); });
 
@@ -504,6 +611,33 @@ std::vector<CounterResult> GLReplay::FetchCounters(const std::vector<GPUCounter>
       ret = FetchCountersIntel(intelCounters);
     }
   }
+
+  if(m_pARMCounters)
+  {
+    rdcarray<GPUCounter> armCounters;
+    std::copy_if(allCounters.begin(), allCounters.end(), std::back_inserter(armCounters),
+                 [](const GPUCounter &c) { return IsARMCounter(c); });
+
+    if(!armCounters.empty())
+      ret = FetchCountersARM(armCounters);
+  }
+
+#if DISABLED(RDOC_ANDROID) && DISABLED(RDOC_APPLE)
+  if(m_pNVCounters)
+  {
+    // Filter out the NVIDIA counters
+    rdcarray<GPUCounter> nvCounters;
+    std::copy_if(allCounters.begin(), allCounters.end(), std::back_inserter(nvCounters),
+                 [=](const GPUCounter &c) { return m_pNVCounters->HasCounter(c); });
+    if(!nvCounters.empty())
+    {
+      rdcarray<CounterResult> results = m_pNVCounters->FetchCounters(nvCounters, m_pDriver);
+      ret.append(results);
+    }
+  }
+#endif
+
+  m_pDriver->SetFetchCounters(false);
 
   if(counters.empty())
   {
@@ -516,7 +650,7 @@ std::vector<CounterResult> GLReplay::FetchCounters(const std::vector<GPUCounter>
   m_pDriver->ReplayMarkers(false);
 
   m_pDriver->SetFetchCounters(true);
-  FillTimers(ctx, m_pDriver->GetRootDraw(), counters);
+  FillTimers(ctx, m_pDriver->GetRootAction(), counters);
   m_pDriver->SetFetchCounters(false);
 
   m_pDriver->ReplayMarkers(true);
@@ -542,7 +676,7 @@ std::vector<CounterResult> GLReplay::FetchCounters(const std::vector<GPUCounter>
 
         double duration = double(data) * nanosToSecs;
 
-        if(m_pDriver->glGetError())
+        if(m_pDriver->glGetError() != eGL_NONE)
         {
           data = (uint64_t)-1;
           duration = -1;

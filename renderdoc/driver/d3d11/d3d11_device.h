@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  * Copyright (c) 2014 Crytek
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -27,22 +27,38 @@
 
 #include <stdint.h>
 #include <map>
-#include "api/replay/renderdoc_replay.h"
 #include "common/threading.h"
 #include "common/timing.h"
 #include "core/core.h"
 #include "driver/dxgi/dxgi_wrapped.h"
+#include "driver/ihv/amd/ags_wrapper.h"
+#include "driver/ihv/nv/nvapi_wrapper.h"
 #include "d3d11_common.h"
 #include "d3d11_manager.h"
-#include "d3d11_replay.h"
 #include "d3d11_video.h"
 
+class D3D11DebugManager;
 class D3D11TextRenderer;
 class D3D11ShaderCache;
+class D3D11Replay;
 
 #ifndef D3D11_1_UAV_SLOT_COUNT
 #define D3D11_1_UAV_SLOT_COUNT 64
 #endif
+
+struct StreamOutData
+{
+  ID3D11Query *query = NULL;
+  bool running = false;
+  uint64_t numPrims = 0;
+  uint32_t stride = 0;
+};
+
+struct SOShaderData
+{
+  uint32_t rastStream = 0;
+  uint32_t strides[4] = {};
+};
 
 enum TextureDisplayType
 {
@@ -54,16 +70,19 @@ enum TextureDisplayType
 
 struct D3D11InitParams
 {
-  D3D11InitParams();
+  D3D_DRIVER_TYPE DriverType = D3D_DRIVER_TYPE_UNKNOWN;
+  UINT Flags = 0;
+  UINT SDKVersion = D3D11_SDK_VERSION;
+  UINT NumFeatureLevels = 0;
+  D3D_FEATURE_LEVEL FeatureLevels[16] = {};
 
-  D3D_DRIVER_TYPE DriverType;
-  UINT Flags;
-  UINT SDKVersion;
-  UINT NumFeatureLevels;
-  D3D_FEATURE_LEVEL FeatureLevels[16];
+  DXGI_ADAPTER_DESC AdapterDesc = {};
+
+  GPUVendor VendorExtensions = GPUVendor::Unknown;
+  uint32_t VendorUAV = ~0U;
 
   // check if a frame capture section version is supported
-  static const uint64_t CurrentVersion = 0x10;
+  static const uint64_t CurrentVersion = 0x13;
   static bool IsSupportedVersion(uint64_t ver);
 };
 
@@ -144,6 +163,59 @@ struct WrappedID3D11Debug : public ID3D11Debug
   }
 };
 
+struct WrappedNVAPI11 : public INVAPID3DDevice
+{
+private:
+  WrappedID3D11Device &m_pDevice;
+
+public:
+  WrappedNVAPI11(WrappedID3D11Device &dev) : m_pDevice(dev) {}
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppvObject);
+  ULONG STDMETHODCALLTYPE AddRef();
+  ULONG STDMETHODCALLTYPE Release();
+  virtual BOOL STDMETHODCALLTYPE SetReal(IUnknown *);
+  virtual IUnknown *STDMETHODCALLTYPE GetReal();
+  virtual BOOL STDMETHODCALLTYPE SetShaderExtUAV(DWORD space, DWORD reg, BOOL global);
+  virtual void STDMETHODCALLTYPE UnwrapDesc(D3D12_GRAPHICS_PIPELINE_STATE_DESC *pDesc) {}
+  virtual void STDMETHODCALLTYPE UnwrapDesc(D3D12_COMPUTE_PIPELINE_STATE_DESC *pDesc) {}
+  virtual ID3D12PipelineState *STDMETHODCALLTYPE
+  ProcessCreatedGraphicsPipelineState(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *pDesc, uint32_t reg,
+                                      uint32_t space, ID3D12PipelineState *realPSO)
+  {
+    return NULL;
+  }
+  virtual ID3D12PipelineState *STDMETHODCALLTYPE
+  ProcessCreatedComputePipelineState(const D3D12_COMPUTE_PIPELINE_STATE_DESC *pDesc, uint32_t reg,
+                                     uint32_t space, ID3D12PipelineState *realPSO)
+  {
+    return NULL;
+  }
+};
+
+struct WrappedAGS11 : public IAGSD3DDevice
+{
+private:
+  WrappedID3D11Device &m_pDevice;
+
+public:
+  WrappedAGS11(WrappedID3D11Device &dev) : m_pDevice(dev) {}
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppvObject);
+  ULONG STDMETHODCALLTYPE AddRef();
+  ULONG STDMETHODCALLTYPE Release();
+  virtual IUnknown *STDMETHODCALLTYPE GetReal();
+  virtual BOOL STDMETHODCALLTYPE SetShaderExtUAV(DWORD space, DWORD reg);
+
+  virtual HRESULT STDMETHODCALLTYPE CreateD3D11(IDXGIAdapter *, D3D_DRIVER_TYPE, HMODULE, UINT,
+                                                CONST D3D_FEATURE_LEVEL *, UINT FeatureLevels, UINT,
+                                                CONST DXGI_SWAP_CHAIN_DESC *, IDXGISwapChain **,
+                                                ID3D11Device **, D3D_FEATURE_LEVEL *,
+                                                ID3D11DeviceContext **);
+  virtual HRESULT STDMETHODCALLTYPE CreateD3D12(IUnknown *pAdapter,
+                                                D3D_FEATURE_LEVEL MinimumFeatureLevel, REFIID riid,
+                                                void **ppDevice);
+  virtual BOOL STDMETHODCALLTYPE ExtensionsSupported();
+};
+
 // give every impression of working but do nothing.
 // Just allow the user to call functions so that they don't
 // have to check for E_NOINTERFACE when they expect an infoqueue to be there
@@ -154,7 +226,7 @@ struct DummyID3D11InfoQueue : public ID3D11InfoQueue
   DummyID3D11InfoQueue() : m_pDevice(NULL) {}
   //////////////////////////////
   // implement IUnknown
-  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppvObject) { return E_NOINTERFACE; }
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppvObject);
   ULONG STDMETHODCALLTYPE AddRef();
   ULONG STDMETHODCALLTYPE Release();
 
@@ -242,6 +314,151 @@ struct DummyID3D11InfoQueue : public ID3D11InfoQueue
   virtual BOOL STDMETHODCALLTYPE GetMuteDebugOutput() { return TRUE; }
 };
 
+// This one actually works and requires a special GUID to access. We only wrap it
+// so we can keep the refcounting on our own device
+struct WrappedID3D11InfoQueue : public ID3D11InfoQueue
+{
+  WrappedID3D11Device *m_pDevice = NULL;
+  ID3D11InfoQueue *m_pReal = NULL;
+
+  //////////////////////////////
+  // implement IUnknown
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppvObject);
+  ULONG STDMETHODCALLTYPE AddRef();
+  ULONG STDMETHODCALLTYPE Release();
+
+  //////////////////////////////
+  // implement ID3D11InfoQueue
+  virtual HRESULT STDMETHODCALLTYPE SetMessageCountLimit(UINT64 MessageCountLimit)
+  {
+    return m_pReal->SetMessageCountLimit(MessageCountLimit);
+  }
+  virtual void STDMETHODCALLTYPE ClearStoredMessages() { return m_pReal->ClearStoredMessages(); }
+  virtual HRESULT STDMETHODCALLTYPE GetMessage(UINT64 MessageIndex, D3D11_MESSAGE *pMessage,
+                                               SIZE_T *pMessageByteLength)
+  {
+    return m_pReal->GetMessage(MessageIndex, pMessage, pMessageByteLength);
+  }
+  virtual UINT64 STDMETHODCALLTYPE GetNumMessagesAllowedByStorageFilter()
+  {
+    return m_pReal->GetNumMessagesAllowedByStorageFilter();
+  }
+  virtual UINT64 STDMETHODCALLTYPE GetNumMessagesDeniedByStorageFilter()
+  {
+    return m_pReal->GetNumMessagesDeniedByStorageFilter();
+  }
+  virtual UINT64 STDMETHODCALLTYPE GetNumStoredMessages()
+  {
+    return m_pReal->GetNumStoredMessages();
+  }
+  virtual UINT64 STDMETHODCALLTYPE GetNumStoredMessagesAllowedByRetrievalFilter()
+  {
+    return m_pReal->GetNumStoredMessagesAllowedByRetrievalFilter();
+  }
+  virtual UINT64 STDMETHODCALLTYPE GetNumMessagesDiscardedByMessageCountLimit()
+  {
+    return m_pReal->GetNumMessagesDiscardedByMessageCountLimit();
+  }
+  virtual UINT64 STDMETHODCALLTYPE GetMessageCountLimit()
+  {
+    return m_pReal->GetMessageCountLimit();
+  }
+  virtual HRESULT STDMETHODCALLTYPE AddStorageFilterEntries(D3D11_INFO_QUEUE_FILTER *pFilter)
+  {
+    return m_pReal->AddStorageFilterEntries(pFilter);
+  }
+  virtual HRESULT STDMETHODCALLTYPE GetStorageFilter(D3D11_INFO_QUEUE_FILTER *pFilter,
+                                                     SIZE_T *pFilterByteLength)
+  {
+    return m_pReal->GetStorageFilter(pFilter, pFilterByteLength);
+  }
+  virtual void STDMETHODCALLTYPE ClearStorageFilter() { return m_pReal->ClearStorageFilter(); }
+  virtual HRESULT STDMETHODCALLTYPE PushEmptyStorageFilter()
+  {
+    return m_pReal->PushEmptyStorageFilter();
+  }
+  virtual HRESULT STDMETHODCALLTYPE PushCopyOfStorageFilter()
+  {
+    return m_pReal->PushCopyOfStorageFilter();
+  }
+  virtual HRESULT STDMETHODCALLTYPE PushStorageFilter(D3D11_INFO_QUEUE_FILTER *pFilter)
+  {
+    return m_pReal->PushStorageFilter(pFilter);
+  }
+  virtual void STDMETHODCALLTYPE PopStorageFilter() { return m_pReal->PopStorageFilter(); }
+  virtual UINT STDMETHODCALLTYPE GetStorageFilterStackSize()
+  {
+    return m_pReal->GetStorageFilterStackSize();
+  }
+  virtual HRESULT STDMETHODCALLTYPE AddRetrievalFilterEntries(D3D11_INFO_QUEUE_FILTER *pFilter)
+  {
+    return m_pReal->AddRetrievalFilterEntries(pFilter);
+  }
+  virtual HRESULT STDMETHODCALLTYPE GetRetrievalFilter(D3D11_INFO_QUEUE_FILTER *pFilter,
+                                                       SIZE_T *pFilterByteLength)
+  {
+    return m_pReal->GetRetrievalFilter(pFilter, pFilterByteLength);
+  }
+  virtual void STDMETHODCALLTYPE ClearRetrievalFilter() { return m_pReal->ClearRetrievalFilter(); }
+  virtual HRESULT STDMETHODCALLTYPE PushEmptyRetrievalFilter()
+  {
+    return m_pReal->PushEmptyRetrievalFilter();
+  }
+  virtual HRESULT STDMETHODCALLTYPE PushCopyOfRetrievalFilter()
+  {
+    return m_pReal->PushCopyOfRetrievalFilter();
+  }
+  virtual HRESULT STDMETHODCALLTYPE PushRetrievalFilter(D3D11_INFO_QUEUE_FILTER *pFilter)
+  {
+    return m_pReal->PushRetrievalFilter(pFilter);
+  }
+  virtual void STDMETHODCALLTYPE PopRetrievalFilter() { return m_pReal->PopRetrievalFilter(); }
+  virtual UINT STDMETHODCALLTYPE GetRetrievalFilterStackSize()
+  {
+    return m_pReal->GetRetrievalFilterStackSize();
+  }
+  virtual HRESULT STDMETHODCALLTYPE AddMessage(D3D11_MESSAGE_CATEGORY Category,
+                                               D3D11_MESSAGE_SEVERITY Severity, D3D11_MESSAGE_ID ID,
+                                               LPCSTR pDescription)
+  {
+    return m_pReal->AddMessage(Category, Severity, ID, pDescription);
+  }
+  virtual HRESULT STDMETHODCALLTYPE AddApplicationMessage(D3D11_MESSAGE_SEVERITY Severity,
+                                                          LPCSTR pDescription)
+  {
+    return m_pReal->AddApplicationMessage(Severity, pDescription);
+  }
+  virtual HRESULT STDMETHODCALLTYPE SetBreakOnCategory(D3D11_MESSAGE_CATEGORY Category, BOOL bEnable)
+  {
+    return m_pReal->SetBreakOnCategory(Category, bEnable);
+  }
+  virtual HRESULT STDMETHODCALLTYPE SetBreakOnSeverity(D3D11_MESSAGE_SEVERITY Severity, BOOL bEnable)
+  {
+    return m_pReal->SetBreakOnSeverity(Severity, bEnable);
+  }
+  virtual HRESULT STDMETHODCALLTYPE SetBreakOnID(D3D11_MESSAGE_ID ID, BOOL bEnable)
+  {
+    return m_pReal->SetBreakOnID(ID, bEnable);
+  }
+  virtual BOOL STDMETHODCALLTYPE GetBreakOnCategory(D3D11_MESSAGE_CATEGORY Category)
+  {
+    return m_pReal->GetBreakOnCategory(Category);
+  }
+  virtual BOOL STDMETHODCALLTYPE GetBreakOnSeverity(D3D11_MESSAGE_SEVERITY Severity)
+  {
+    return m_pReal->GetBreakOnSeverity(Severity);
+  }
+  virtual BOOL STDMETHODCALLTYPE GetBreakOnID(D3D11_MESSAGE_ID ID)
+  {
+    return m_pReal->GetBreakOnID(ID);
+  }
+  virtual void STDMETHODCALLTYPE SetMuteDebugOutput(BOOL bMute)
+  {
+    return m_pReal->SetMuteDebugOutput(bMute);
+  }
+  virtual BOOL STDMETHODCALLTYPE GetMuteDebugOutput() { return m_pReal->GetMuteDebugOutput(); }
+};
+
 // give every impression of working but do nothing.
 // Same idea as DummyID3D11InfoQueue above, a dummy interface so that users
 // expecting a ID3D11Debug don't get confused if we have turned off the debug
@@ -291,21 +508,26 @@ private:
     eInitialContents_ClearDSV = 2,
   };
 
-  D3D11Replay m_Replay;
+  D3D11Replay *m_Replay;
 
   WrappedD3D11Multithread m_WrappedMultithread;
   DummyID3D11InfoQueue m_DummyInfoQueue;
+  WrappedID3D11InfoQueue m_WrappedInfoQueue;
   DummyID3D11Debug m_DummyDebug;
   WrappedID3D11Debug m_WrappedDebug;
   WrappedID3D11VideoDevice2 m_WrappedVideo;
+  WrappedNVAPI11 m_WrappedNVAPI;
+  WrappedAGS11 m_WrappedAGS;
 
   ID3DUserDefinedAnnotation *m_RealAnnotations;
   int m_ReplayEventCount;
 
-  unsigned int m_InternalRefcount;
-  RefCounter m_RefCounter;
-  RefCounter m_SoftRefCounter;
-  bool m_Alive;
+  // the device only has one refcount, all device childs take precisely one when they have external
+  // references (if they lose their external references they release it) and when it reaches 0 the
+  // device is deleted.
+  int32_t m_RefCount;
+
+  rdcarray<ID3D11DeviceChild *> m_DeadObjects;
 
   int32_t m_ChunkAtomic;
 
@@ -314,10 +536,9 @@ private:
   D3D11ShaderCache *m_ShaderCache = NULL;
   D3D11ResourceManager *m_ResourceManager = NULL;
 
-  std::vector<std::string> m_ShaderSearchPaths;
-
   D3D11InitParams m_InitParams;
   uint64_t m_SectionVersion;
+  ReplayOptions m_ReplayOptions;
 
   ResourceId m_BBID;
 
@@ -330,6 +551,12 @@ private:
   ID3D11InfoQueue *m_pInfoQueue;
   WrappedID3D11DeviceContext *m_pImmediateContext;
 
+  uint32_t m_GlobalEXTUAV = ~0U;
+  uint64_t m_ThreadLocalEXTUAVSlot = ~0ULL;
+  GPUVendor m_VendorEXT = GPUVendor::Unknown;
+  INVAPID3DDevice *m_ReplayNVAPI = NULL;
+  IAGSD3DDevice *m_ReplayAGS = NULL;
+
   // ensure all calls in via the D3D wrapped interface are thread safe
   // protects wrapped resource creation and serialiser access
   Threading::CriticalSection m_D3DLock;
@@ -338,15 +565,18 @@ private:
   bool m_D3DThreadSafe = false;
 
   WriteSerialiser m_ScratchSerialiser;
-  std::set<std::string> m_StringDB;
+  std::set<rdcstr> m_StringDB;
 
   ResourceId m_ResourceID;
   D3D11ResourceRecord *m_DeviceRecord;
 
   CaptureState m_State;
-  bool m_AppControlledCapture;
+  void *m_FirstFrameCaptureWindow = NULL;
+  bool m_AppControlledCapture = false;
 
-  ReplayStatus m_FailedReplayStatus = ReplayStatus::APIReplayFailed;
+  PerformanceTimer m_CaptureTimer;
+
+  RDResult m_FailedReplayResult = ResultCode::APIReplayFailed;
 
   std::set<ID3D11DeviceChild *> m_CachedStateObjects;
 
@@ -362,41 +592,55 @@ private:
   // rarely kick in - only in the case where a lot of unique state objects are
   // created then released and never re-used.
   //
-  // Must be called while m_D3DLock is held.
+  // Internally locks m_D3DLock
   void CachedObjectsGarbageCollect();
 
   std::set<WrappedID3D11DeviceContext *> m_DeferredContexts;
-  std::map<ID3D11InputLayout *, std::vector<D3D11_INPUT_ELEMENT_DESC> > m_LayoutDescs;
+  std::map<ID3D11InputLayout *, rdcarray<D3D11_INPUT_ELEMENT_DESC> > m_LayoutDescs;
   std::map<ID3D11InputLayout *, WrappedShader *> m_LayoutShaders;
+
+  std::map<ResourceId, StreamOutData> m_StreamOutCounters;
+  std::map<ResourceId, SOShaderData> m_SOShaders;
 
   static WrappedID3D11Device *m_pCurrentWrappedDevice;
 
-  std::map<WrappedIDXGISwapChain4 *, ID3D11RenderTargetView *> m_SwapChains;
+  std::map<IDXGISwapper *, ID3D11RenderTargetView *> m_SwapChains;
 
-  uint32_t m_FrameCounter;
-  uint32_t m_FailedFrame;
+  IDXGISwapper *m_LastSwap = NULL;
+
+  uint32_t m_FrameCounter = 0;
+  uint32_t m_FailedFrame = 0;
   CaptureFailReason m_FailedReason;
-  uint32_t m_Failures;
+  uint32_t m_Failures = 0;
 
+  uint64_t m_TimeBase = 0;
+  double m_TimeFrequency = 1.0f;
   SDFile *m_StructuredFile = NULL;
-  SDFile m_StoredStructuredData;
+  SDFile *m_StoredStructuredData;
 
-  std::vector<DebugMessage> m_DebugMessages;
+  int m_OOMHandler = 0;
+  rdcarray<DebugMessage> m_DebugMessages;
+  RDResult m_FatalError = ResultCode::Succeeded;
 
-  std::vector<FrameDescription> m_CapturedFrames;
-  FrameRecord m_FrameRecord;
-  std::vector<DrawcallDescription *> m_Drawcalls;
+  rdcarray<FrameDescription> m_CapturedFrames;
+  rdcarray<ActionDescription *> m_Actions;
+
+  void MaskResourceMiscFlags(UINT &MiscFlags);
 
 public:
-  static const int AllocPoolCount = 4;
-  ALLOCATE_WITH_WRAPPED_POOL(WrappedID3D11Device, AllocPoolCount);
+  ALLOCATE_WITH_WRAPPED_POOL(WrappedID3D11Device);
 
   WrappedID3D11Device(ID3D11Device *realDevice, D3D11InitParams params);
-  void SetInitParams(const D3D11InitParams &params, uint64_t sectionVersion)
+  void SetInitParams(const D3D11InitParams &params, uint64_t sectionVersion,
+                     const ReplayOptions &opts, INVAPID3DDevice *nvapi, IAGSD3DDevice *ags)
   {
     m_InitParams = params;
     m_SectionVersion = sectionVersion;
+    m_ReplayOptions = opts;
+    m_ReplayNVAPI = nvapi;
+    m_ReplayAGS = ags;
   }
+  const ReplayOptions &GetReplayOptions() { return m_ReplayOptions; }
   uint64_t GetLogVersion() { return m_SectionVersion; }
   virtual ~WrappedID3D11Device();
 
@@ -411,11 +655,11 @@ public:
   void AddResourceCurChunk(ResourceId id);
 
   ID3D11Device *GetReal() { return m_pDevice; }
-  static std::string GetChunkName(uint32_t idx);
+  static rdcstr GetChunkName(uint32_t idx);
   D3D11ShaderCache *GetShaderCache() { return m_ShaderCache; }
   D3D11ResourceManager *GetResourceManager() { return m_ResourceManager; }
   D3D11DebugManager *GetDebugManager() { return m_DebugManager; }
-  D3D11Replay *GetReplay() { return &m_Replay; }
+  D3D11Replay *GetReplay() { return m_Replay; }
   Threading::CriticalSection &D3DLock() { return m_D3DLock; }
   bool D3DThreadSafe() const { return m_D3DThreadSafe; }
   void SetD3DThreadSafe(bool safe) { m_D3DThreadSafe = safe; }
@@ -425,12 +669,13 @@ public:
   void RemoveDeferredContext(WrappedID3D11DeviceContext *defctx);
   WrappedID3D11DeviceContext *GetDeferredContext(size_t idx);
 
-  void ReleaseResource(ID3D11DeviceChild *pResource);
-
+  const std::map<ResourceId, StreamOutData> &GetSOHiddenCounters() { return m_StreamOutCounters; }
+  StreamOutData &GetSOHiddenCounterForBuffer(ResourceId id) { return m_StreamOutCounters[id]; }
+  const SOShaderData &GetSOShaderData(ResourceId id) { return m_SOShaders[id]; }
   ResourceId GetResourceID() { return m_ResourceID; }
-  FrameRecord &GetFrameRecord() { return m_FrameRecord; }
-  FrameStatistics &GetFrameStats() { return m_FrameRecord.frameInfo.stats; }
-  const DrawcallDescription *GetDrawcall(uint32_t eventId);
+  const ActionDescription *GetAction(uint32_t eventId);
+  ResourceDescription &GetResourceDesc(ResourceId id);
+  FrameStatistics &GetFrameStats();
 
   void ReplayPushEvent() { m_ReplayEventCount++; }
   void ReplayPopEvent() { m_ReplayEventCount = RDCMAX(0, m_ReplayEventCount - 1); }
@@ -439,34 +684,56 @@ public:
   void LockForChunkRemoval();
   void UnlockForChunkRemoval();
 
-  SDFile &GetStructuredFile() { return *m_StructuredFile; }
-  void FirstFrame(WrappedIDXGISwapChain4 *swapChain);
+  SDFile *GetStructuredFile() { return m_StructuredFile; }
+  SDFile *DetachStructuredFile()
+  {
+    SDFile *ret = m_StoredStructuredData;
+    m_StoredStructuredData = m_StructuredFile = NULL;
+    return ret;
+  }
+  uint64_t GetTimeBase() { return m_TimeBase; }
+  double GetTimeFrequency() { return m_TimeFrequency; }
+  void FirstFrame(IDXGISwapper *swapper);
 
-  std::vector<DebugMessage> GetDebugMessages();
+  void HandleOOM(bool handle)
+  {
+    if(handle)
+      m_OOMHandler++;
+    else
+      m_OOMHandler--;
+  }
+  void CheckHRESULT(HRESULT hr);
+  void ReportFatalError(RDResult error) { m_FatalError = error; }
+  RDResult FatalErrorCheck() { return m_FatalError; }
+  bool HasFatalError() { return m_FatalError != ResultCode::Succeeded; }
+  rdcarray<DebugMessage> GetDebugMessages();
   void AddDebugMessage(DebugMessage msg);
-  void AddDebugMessage(MessageCategory c, MessageSeverity sv, MessageSource src, std::string d);
-  const std::vector<D3D11_INPUT_ELEMENT_DESC> &GetLayoutDesc(ID3D11InputLayout *layout)
+  void AddDebugMessage(MessageCategory c, MessageSeverity sv, MessageSource src, rdcstr d);
+  const rdcarray<D3D11_INPUT_ELEMENT_DESC> &GetLayoutDesc(ID3D11InputLayout *layout)
   {
     return m_LayoutDescs[layout];
   }
 
-  std::vector<std::string> *GetShaderDebugInfoSearchPaths() { return &m_ShaderSearchPaths; }
   template <typename SerialiserType>
   bool Serialise_CaptureScope(SerialiserType &ser);
 
-  void StartFrameCapture(void *dev, void *wnd);
-  bool EndFrameCapture(void *dev, void *wnd);
-  bool DiscardFrameCapture(void *dev, void *wnd);
+  RDCDriver GetFrameCaptureDriver() { return RDCDriver::D3D11; }
+  void StartFrameCapture(DeviceOwnedWindow devWnd);
+  bool EndFrameCapture(DeviceOwnedWindow devWnd);
+  bool DiscardFrameCapture(DeviceOwnedWindow devWnd);
 
   ID3DUserDefinedAnnotation *GetAnnotations() { return m_RealAnnotations; }
+  ID3D11InfoQueue *GetInfoQueue() { return m_pInfoQueue; }
   // interface for DXGI
   virtual IUnknown *GetRealIUnknown() { return GetReal(); }
+  void *GetFrameCapturerDevice() { return (ID3D11Device *)this; }
+  virtual IFrameCapturer *GetFrameCapturer() { return this; }
   virtual IID GetBackbufferUUID() { return __uuidof(ID3D11Texture2D); }
   virtual bool IsDeviceUUID(REFIID iid)
   {
     if(iid == __uuidof(ID3D11Device) || iid == __uuidof(ID3D11Device1) ||
        iid == __uuidof(ID3D11Device2) || iid == __uuidof(ID3D11Device3) ||
-       iid == __uuidof(ID3D11Device4))
+       iid == __uuidof(ID3D11Device4) || iid == __uuidof(ID3D11Device5))
       return true;
 
     return false;
@@ -483,6 +750,8 @@ public:
       return (ID3D11Device3 *)this;
     else if(iid == __uuidof(ID3D11Device4))
       return (ID3D11Device4 *)this;
+    else if(iid == __uuidof(ID3D11Device5))
+      return (ID3D11Device5 *)this;
 
     RDCERR("Requested unknown device interface %s", ToStr(iid).c_str());
 
@@ -505,7 +774,7 @@ public:
     m_SectionVersion = sectionVersion;
     m_State = CaptureState::StructuredExport;
   }
-  ReplayStatus ReadLogInitialisation(RDCFile *rdc, bool storeStructuredBuffers);
+  RDResult ReadLogInitialisation(RDCFile *rdc, bool storeStructuredBuffers);
   bool ProcessChunk(ReadSerialiser &ser, D3D11Chunk context);
   void ReplayLog(uint32_t startEventID, uint32_t endEventID, ReplayLogType replayType);
 
@@ -518,9 +787,13 @@ public:
   IMPLEMENT_FUNCTION_SERIALISED(HRESULT, SetShaderDebugPath, ID3D11DeviceChild *pResource,
                                 const char *Path);
 
+  // IHV APIs
+  IMPLEMENT_FUNCTION_SERIALISED(void, SetShaderExtUAV, GPUVendor vendor, uint32_t reg, bool global);
+  uint32_t GetShaderExtUAV();
+
   // Swap Chain
-  IMPLEMENT_FUNCTION_SERIALISED(IUnknown *, WrapSwapchainBuffer, WrappedIDXGISwapChain4 *swap,
-                                DXGI_SWAP_CHAIN_DESC *desc, UINT buffer, IUnknown *realSurface);
+  IMPLEMENT_FUNCTION_SERIALISED(IUnknown *, WrapSwapchainBuffer, IDXGISwapper *swapper,
+                                DXGI_FORMAT bufferFormat, UINT buffer, IUnknown *realSurface);
 
 // this is defined as a macro so that we can re-use it to explicitly instantiate these functions as
 // templates in the wrapper definition file.
@@ -536,23 +809,19 @@ public:
 
   SERIALISED_ID3D11DEVICE_FAKE_FUNCTIONS();
 
-  HRESULT Present(WrappedIDXGISwapChain4 *swap, UINT SyncInterval, UINT Flags);
+  HRESULT Present(IDXGISwapper *swapper, UINT SyncInterval, UINT Flags);
 
   void NewSwapchainBuffer(IUnknown *backbuffer);
 
-  void ReleaseSwapchainResources(WrappedIDXGISwapChain4 *swap, UINT QueueCount,
+  void ReleaseSwapchainResources(IDXGISwapper *swapper, UINT QueueCount,
                                  IUnknown *const *ppPresentQueue, IUnknown **unwrappedQueues);
 
+  virtual IDXGIResource *WrapExternalDXGIResource(IDXGIResource *res);
+
   ResourceId GetBackbufferResourceID() { return m_BBID; }
-  void InternalRef() { InterlockedIncrement(&m_InternalRefcount); }
-  void InternalRelease() { InterlockedDecrement(&m_InternalRefcount); }
-  void SoftRef() { m_SoftRefCounter.AddRef(); }
-  void SoftRelease()
-  {
-    m_SoftRefCounter.Release();
-    CheckForDeath();
-  }
-  void CheckForDeath();
+  void ReportDeath(ID3D11DeviceChild *obj);
+  void FlushPendingDead();
+  void Resurrect(ID3D11DeviceChild *obj);
 
   ////////////////////////////////////////////////////////////////
   // Functions for D3D9 hooks to call into (D3DPERF api)
@@ -563,12 +832,22 @@ public:
 
   //////////////////////////////
   // implement IUnknown
-  ULONG STDMETHODCALLTYPE AddRef() { return m_RefCounter.AddRef(); }
+  ULONG STDMETHODCALLTYPE AddRef()
+  {
+    Atomic::Inc32(&m_RefCount);
+    return (ULONG)m_RefCount;
+  }
   ULONG STDMETHODCALLTYPE Release()
   {
-    unsigned int ret = m_RefCounter.Release();
-    CheckForDeath();
-    return ret;
+    Atomic::Dec32(&m_RefCount);
+    ASSERT_REFCOUNT(m_RefCount);
+    if(m_RefCount == 0)
+    {
+      FlushPendingDead();
+      delete this;
+      return 0;
+    }
+    return (ULONG)m_RefCount;
   }
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppvObject);
 
@@ -598,9 +877,12 @@ public:
   }
 
   template <typename SerialiserType>
-  std::vector<D3D11_SUBRESOURCE_DATA> Serialise_CreateTextureData(
+  rdcarray<D3D11_SUBRESOURCE_DATA> Serialise_CreateTextureData(
       SerialiserType &ser, ID3D11Resource *tex, ResourceId id, const D3D11_SUBRESOURCE_DATA *data,
       UINT w, UINT h, UINT d, DXGI_FORMAT fmt, UINT mips, UINT arr, bool HasData);
+
+  HRESULT STDMETHODCALLTYPE OpenSharedResourceInternal(D3D11Chunk chunkType,
+                                                       REFIID ReturnedInterface, void **ppResource);
 
 // this is defined as a macro so that we can re-use it to explicitly instantiate these functions as
 // templates in the wrapper definition file.

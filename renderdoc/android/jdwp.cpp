@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2018-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -32,7 +32,7 @@
 namespace JDWP
 {
 void InjectVulkanLayerSearchPath(Connection &conn, threadID thread, int32_t slotIdx,
-                                 const std::string &libPath)
+                                 const rdcstr &libPath)
 {
   referenceTypeID stringClass = conn.GetType("Ljava/lang/String;");
   methodID stringConcat = conn.GetMethod(stringClass, "concat");
@@ -42,13 +42,13 @@ void InjectVulkanLayerSearchPath(Connection &conn, threadID thread, int32_t slot
 
   if(!stringClass || !stringConcat)
   {
-    RDCERR("Couldn't find java.lang.String (%llu) or java.lang.String.concat() (%llu)", stringClass,
-           stringConcat);
+    RDCERR("Couldn't find java.lang.String (%llu) or java.lang.String.concat() (%llu)",
+           (uint64_t)stringClass, (uint64_t)stringConcat);
     return;
   }
 
   // get the callstack frames
-  std::vector<StackFrame> stack = conn.GetCallStack(thread);
+  rdcarray<StackFrame> stack = conn.GetCallStack(thread);
 
   if(stack.empty())
   {
@@ -96,7 +96,7 @@ void InjectVulkanLayerSearchPath(Connection &conn, threadID thread, int32_t slot
   conn.SetLocalValue(thread, stack[0].id, slotIdx, temp);
 }
 
-bool InjectLibraries(const std::string &deviceID, Network::Socket *sock)
+bool InjectLibraries(const rdcstr &deviceID, Network::Socket *sock)
 {
   Connection conn(sock);
 
@@ -146,7 +146,7 @@ bool InjectLibraries(const std::string &deviceID, Network::Socket *sock)
     abi = Android::ABI::armeabi_v7a;
   }
 
-  std::string libPath = Android::GetPathForPackage(deviceID, Android::GetRenderDocPackageForABI(abi));
+  rdcstr libPath = Android::GetPathForPackage(deviceID, Android::GetRenderDocPackageForABI(abi));
 
   switch(abi)
   {
@@ -213,8 +213,30 @@ bool InjectLibraries(const std::string &deviceID, Network::Socket *sock)
 
     if(vulkanLoaderMethod)
     {
-      int32_t slotIdx =
-          conn.GetLocalVariable(vulkanLoaderClass, vulkanLoaderMethod, "librarySearchPath");
+      rdcarray<VariableSlot> slots = conn.GetLocalVariables(vulkanLoaderClass, vulkanLoaderMethod);
+
+      int32_t slotIdx = -1, thisSlotIdx = -1;
+      bool slot4Exists = false;
+
+      for(const VariableSlot &s : slots)
+      {
+        if(s.name == "librarySearchPath")
+        {
+          slotIdx = s.slot;
+          break;
+        }
+        else if(s.name == "this")
+        {
+          thisSlotIdx = s.slot;
+        }
+
+        if(s.slot == 4)
+          slot4Exists = true;
+      }
+
+      // on some newer devices slots are not 0-based, try an offset from this if there is no slot 4
+      if(slotIdx == -1 && thisSlotIdx != -1 && !slot4Exists)
+        slotIdx = thisSlotIdx + 4;
 
       // as a default, use the 4th slot as it's the 4th argument argument (0 is this), if symbols
       // weren't available we can't identify the variable by name
@@ -225,8 +247,8 @@ bool InjectLibraries(const std::string &deviceID, Network::Socket *sock)
       // (re-suspended) when the first event occurs that matches the filter function
       Event evData =
           conn.WaitForEvent(EventKind::MethodEntry, {{ModifierKind::ClassOnly, vulkanLoaderClass}},
-                            [vulkanLoaderMethod](const Event &evData) {
-                              return evData.MethodEntry.location.meth == vulkanLoaderMethod;
+                            [vulkanLoaderMethod](const Event &ev) {
+                              return ev.MethodEntry.location.meth == vulkanLoaderMethod;
                             });
 
       // if we successfully hit the event, try to inject
@@ -268,10 +290,9 @@ bool InjectLibraries(const std::string &deviceID, Network::Socket *sock)
 
   // wait until we hit the constructor of android.app.Application
   {
-    Event evData = conn.WaitForEvent(EventKind::MethodEntry, {{ModifierKind::ClassOnly, androidApp}},
-                                     [appConstruct](const Event &evData) {
-                                       return evData.MethodEntry.location.meth == appConstruct;
-                                     });
+    Event evData = conn.WaitForEvent(
+        EventKind::MethodEntry, {{ModifierKind::ClassOnly, androidApp}},
+        [appConstruct](const Event &ev) { return ev.MethodEntry.location.meth == appConstruct; });
 
     if(evData.eventKind == EventKind::MethodEntry)
       thread = evData.MethodEntry.thread;
@@ -284,7 +305,7 @@ bool InjectLibraries(const std::string &deviceID, Network::Socket *sock)
   }
 
   // get the callstack frames
-  std::vector<StackFrame> stack = conn.GetCallStack(thread);
+  rdcarray<StackFrame> stack = conn.GetCallStack(thread);
 
   if(stack.empty())
   {
@@ -349,11 +370,9 @@ bool InjectLibraries(const std::string &deviceID, Network::Socket *sock)
   {
     thread = 0;
 
-    Event evData =
-        conn.WaitForEvent(EventKind::MethodEntry, {{ModifierKind::ClassOnly, onCreateClass}},
-                          [onCreateMethod](const Event &evData) {
-                            return evData.MethodEntry.location.meth == onCreateMethod;
-                          });
+    Event evData = conn.WaitForEvent(
+        EventKind::MethodEntry, {{ModifierKind::ClassOnly, onCreateClass}},
+        [onCreateMethod](const Event &ev) { return ev.MethodEntry.location.meth == onCreateMethod; });
 
     if(evData.eventKind == EventKind::MethodEntry)
       thread = evData.MethodEntry.thread;
@@ -381,7 +400,7 @@ bool InjectLibraries(const std::string &deviceID, Network::Socket *sock)
   if(getRuntime == 0 || load == 0)
   {
     RDCERR("Couldn't find java.lang.Runtime.getRuntime() %llu or java.lang.Runtime.load() %llu",
-           getRuntime, load);
+           (uint64_t)getRuntime, (uint64_t)load);
     return false;
   }
 
@@ -390,7 +409,7 @@ bool InjectLibraries(const std::string &deviceID, Network::Socket *sock)
 
   if(runtimeObject.tag != Tag::Object || runtimeObject.Object == 0)
   {
-    RDCERR("Failed to call getClass!");
+    RDCERR("Failed to call getRuntime!");
     return false;
   }
 
@@ -412,7 +431,7 @@ bool InjectLibraries(const std::string &deviceID, Network::Socket *sock)
 
 namespace Android
 {
-bool InjectWithJDWP(const std::string &deviceID, uint16_t jdwpport)
+bool InjectWithJDWP(const rdcstr &deviceID, uint16_t jdwpport)
 {
   Network::Socket *sock = Network::CreateClientSocket("localhost", jdwpport, 500);
 

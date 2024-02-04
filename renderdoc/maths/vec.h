@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  * Copyright (c) 2014 Crytek
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -25,8 +25,12 @@
 
 #pragma once
 
-#include <math.h>
 #include <stdint.h>
+
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable : 4201)
+#endif
 
 struct Vec2f
 {
@@ -35,8 +39,15 @@ struct Vec2f
     x = X;
     y = Y;
   }
-  float x;
-  float y;
+
+  union
+  {
+    struct
+    {
+      float x, y;
+    };
+    float fv[2];
+  };
 };
 
 class Vec3f
@@ -49,7 +60,7 @@ public:
     return Vec3f(y * o.z - z * o.y, z * o.x - x * o.z, x * o.y - y * o.x);
   }
 
-  inline float Length() const { return sqrtf(Dot(*this)); }
+  float Length() const;
   inline void Normalise()
   {
     float l = Length();
@@ -58,8 +69,17 @@ public:
     z /= l;
   }
 
-  float x, y, z;
+  union
+  {
+    struct
+    {
+      float x, y, z;
+    };
+    float fv[3];
+  };
 };
+
+struct FloatVector;
 
 struct Vec4f
 {
@@ -70,8 +90,17 @@ struct Vec4f
     z = Z;
     w = W;
   }
+  Vec4f(const FloatVector &v);
   operator Vec3f() const { return Vec3f(x, y, z); }
-  float x, y, z, w;
+  operator FloatVector() const;
+  union
+  {
+    struct
+    {
+      float x, y, z, w;
+    };
+    float fv[4];
+  };
 };
 
 inline Vec3f operator*(const Vec3f &a, const float b)
@@ -106,6 +135,38 @@ inline Vec3f operator+=(Vec3f &a, const Vec3f &b)
   return a;
 }
 
+inline Vec4f operator*(const Vec4f &a, const float b)
+{
+  return Vec4f(a.x * b, a.y * b, a.z * b, a.w * b);
+}
+
+inline Vec4f operator+(const Vec4f &a, const Vec4f &b)
+{
+  return Vec4f(a.x + b.x, a.y + b.y, a.z + b.z, a.w + b.w);
+}
+
+inline Vec4f operator-(const Vec4f &a)
+{
+  return Vec4f(-a.x, -a.y, -a.z, -a.w);
+}
+
+inline Vec4f operator-(const Vec4f &a, const Vec4f &b)
+{
+  return a + (-b);
+}
+
+inline Vec4f operator-=(Vec4f &a, const Vec4f &b)
+{
+  a = a - b;
+  return a;
+}
+
+inline Vec4f operator+=(Vec4f &a, const Vec4f &b)
+{
+  a = a + b;
+  return a;
+}
+
 struct Vec4u
 {
   Vec4u(uint32_t X = 0, uint32_t Y = 0, uint32_t Z = 0, uint32_t W = 0)
@@ -115,5 +176,35 @@ struct Vec4u
     z = Z;
     w = W;
   }
-  uint32_t x, y, z, w;
+  union
+  {
+    struct
+    {
+      uint32_t x, y, z, w;
+    };
+    uint32_t uv[4];
+  };
 };
+
+struct Vec4i
+{
+  Vec4i(int32_t X = 0, int32_t Y = 0, int32_t Z = 0, int32_t W = 0)
+  {
+    x = X;
+    y = Y;
+    z = Z;
+    w = W;
+  }
+  union
+  {
+    struct
+    {
+      int32_t x, y, z, w;
+    };
+    int32_t uv[4];
+  };
+};
+
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif

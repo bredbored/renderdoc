@@ -5,8 +5,11 @@ How do I ...?
 
 	how_capture_frame
 	how_android_capture
+	how_filter_events
 	how_debug_shader
+	how_shader_debug_info
 	how_inspect_pixel
+	how_buffer_format
 	how_view_texture
 	how_object_details
 	how_capture_callstack
@@ -17,3 +20,4 @@ How do I ...?
 	how_import_export
 	how_rgp_profile
 	how_python_extension
+	how_control_replay

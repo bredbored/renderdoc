@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  * Copyright (c) 2014 Crytek
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -26,17 +26,21 @@
 #pragma once
 
 #include "core/resource_manager.h"
-#include "driver/gl/gl_common.h"
+#include "gl_common.h"
 
 size_t GetCompressedByteSize(GLsizei w, GLsizei h, GLsizei d, GLenum internalformat);
+rdcfixedarray<uint32_t, 3> GetCompressedBlockSize(GLenum internalformat);
 size_t GetByteSize(GLsizei w, GLsizei h, GLsizei d, GLenum format, GLenum type);
 GLenum GetBaseFormat(GLenum internalFormat);
 GLenum GetDataType(GLenum internalFormat);
-void GetFramebufferMipAndLayer(GLenum framebuffer, GLenum attachment, GLint *mip, GLint *layer);
+void GetFramebufferMipAndLayer(GLuint framebuffer, GLenum attachment, GLint *mip, GLint *layer);
 void GetTextureSwizzle(GLuint tex, GLenum target, GLenum *swizzleRGBA);
 void SetTextureSwizzle(GLuint tex, GLenum target, const GLenum *swizzleRGBA);
 
+rdcstr GetTextureCompleteStatus(GLenum target, GLuint tex, GLuint sampler);
+
 bool EmulateLuminanceFormat(GLuint tex, GLenum target, GLenum &internalFormat, GLenum &dataFormat);
+GLenum GetSizedFormat(GLenum internalFormat);
 
 inline void EmulateGLClamp(GLenum pname, GLenum param)
 {
@@ -51,6 +55,8 @@ bool IsDepthStencilFormat(GLenum internalFormat);
 bool IsUIntFormat(GLenum internalFormat);
 bool IsSIntFormat(GLenum internalFormat);
 bool IsSRGBFormat(GLenum internalFormat);
+
+GLenum GetViewCastedFormat(GLenum internalFormat, CompType typeCast);
 
 bool IsCubeFace(GLenum target);
 GLint CubeTargetIndex(GLenum face);
@@ -245,23 +251,25 @@ struct GLResourceRecord : public ResourceRecord
 #if ENABLED(RDOC_DEVEL)
     if(target == eGL_NONE)
       return;    // target == GL_NONE means ARB_dsa, target was omitted
-    if(datatype == eGL_NONE)
-      datatype = TextureBinding(target);
-    else
+    if(datatype != eGL_NONE)
       RDCASSERT(datatype == TextureBinding(target));
 #endif
   }
 
   bool AlreadyDataType(GLenum target) { return datatype == TextureBinding(target); }
-  GLenum datatype;
+  union
+  {
+    GLenum datatype;
+    uint32_t age;
+  };
   GLenum usage;
 
-  // for texture buffers and texture views, this points from the data texture (or buffer)
-  // to the view texture. When preparing resource initial states, we force initial states
-  // for anything that is viewed if the viewer is frame referenced. Otherwise we might
-  // lose the underlying data for the view.
-  // Since it's 1-to-many, we keep a set here.
-  std::set<ResourceId> viewTextures;
+  // for texture buffers, this points from the texture to the real buffer, for texture views this
+  // points to the texture that's being viewed (the actual data source).
+  // When we mark a resource as dirty or frame referenced, we also mark the underlyingData resource
+  // the same, so that if we dirty the texture then we dirty the buffer/real texture, and so that if
+  // the texture is used then we bring the buffer/real texture into the frame.
+  ResourceId viewSource;
 
   GLResource Resource;
 
@@ -284,10 +292,10 @@ struct GLResourceRecord : public ResourceRecord
 
   bool VerifyShadowStorage()
   {
-    if(ShadowPtr[0] && memcmp(ShadowPtr[0] + ShadowSize, markerValue, sizeof(markerValue)))
+    if(ShadowPtr[0] && memcmp(ShadowPtr[0] + ShadowSize, markerValue, sizeof(markerValue)) != 0)
       return false;
 
-    if(ShadowPtr[1] && memcmp(ShadowPtr[1] + ShadowSize, markerValue, sizeof(markerValue)))
+    if(ShadowPtr[1] && memcmp(ShadowPtr[1] + ShadowSize, markerValue, sizeof(markerValue)) != 0)
       return false;
 
     return true;

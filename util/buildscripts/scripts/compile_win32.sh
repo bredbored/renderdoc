@@ -6,10 +6,10 @@ mkdir -p "${REPO_ROOT}/dist"
 pushd "${REPO_ROOT}"
 
 # Build 32-bit Release
-MSYS2_ARG_CONV_EXCL="*" msbuild.exe /nologo /fl4 /flp4':Verbosity=minimal;Encoding=ASCII' renderdoc.sln /t:Rebuild /p:'Configuration=Release;Platform=x86'
+MSYS2_ARG_CONV_EXCL="*" msbuild.exe /nologo /m /fl4 /flp4':Verbosity=minimal;Encoding=ASCII;logfile=dist/build32.log' renderdoc.sln /t:Rebuild /p:'Configuration=Release;Platform=x86'
 
 # Build 64-bit Release
-MSYS2_ARG_CONV_EXCL="*" msbuild.exe /nologo /fl4 /flp4':Verbosity=minimal;Encoding=ASCII' renderdoc.sln /t:Rebuild /p:'Configuration=Release;Platform=x64'
+MSYS2_ARG_CONV_EXCL="*" msbuild.exe /nologo /m /fl4 /flp4':Verbosity=minimal;Encoding=ASCII;logfile=dist/build64.log' renderdoc.sln /t:Rebuild /p:'Configuration=Release;Platform=x64'
 
 # Step into the docs folder and build
 pushd docs
@@ -85,6 +85,7 @@ if [ "$VERSION32" == "$GITTAG" ]; then
 else
 
 	# Build the arm32 variant
+	rm -rf build-android-arm32
 	mkdir -p build-android-arm32
 	pushd build-android-arm32
 
@@ -105,6 +106,7 @@ if [ "$VERSION64" == "$GITTAG" ]; then
 
 else
 
+	rm -rf build-android-arm64
 	mkdir -p build-android-arm64
 	pushd build-android-arm64
 

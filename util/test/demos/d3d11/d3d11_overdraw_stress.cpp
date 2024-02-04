@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -24,7 +24,7 @@
 
 #include "d3d11_test.h"
 
-TEST(D3D11_Overdraw_Stress, D3D11GraphicsTest)
+RD_TEST(D3D11_Overdraw_Stress, D3D11GraphicsTest)
 {
   static constexpr const char *Description = "Renders a lot of overlapping triangles";
 
@@ -95,7 +95,7 @@ TEST(D3D11_Overdraw_Stress, D3D11GraphicsTest)
 
     while(Running())
     {
-      ClearRenderTargetView(bbRTV, {0.4f, 0.5f, 0.6f, 1.0f});
+      ClearRenderTargetView(bbRTV, {0.2f, 0.2f, 0.2f, 1.0f});
 
       ctx->ClearDepthStencilView(bbDSV, D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
 

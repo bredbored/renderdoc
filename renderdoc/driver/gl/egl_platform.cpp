@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2018-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -23,18 +23,33 @@
  ******************************************************************************/
 
 #include "core/plugins.h"
-#include "driver/gl/egl_dispatch_table.h"
-#include "driver/gl/gl_common.h"
+#include "strings/string_utils.h"
+#include "egl_dispatch_table.h"
+#include "gl_common.h"
 
 static void *GetEGLHandle()
 {
 #if ENABLED(RDOC_WIN32)
-  return Process::LoadModule(LocatePluginFile("gles", "libEGL.dll").c_str());
+  rdcstr libEGL = LocatePluginFile("gles", "libEGL.dll");
+
+  // refuse to load libEGL.dll globally, as this is too likely to pick up ANGLE from some program
+  // with poor PATH control. Instead try to explicitly load it from next to the DLL in case someone
+  // has put it there.
+  if(libEGL == "libEGL.dll")
+  {
+    rdcstr libpath;
+    FileIO::GetLibraryFilename(libpath);
+    libpath = get_dirname(libpath);
+
+    libEGL = libpath + "/libEGL.dll";
+  }
+
+  return Process::LoadModule(libEGL);
 #else
-  void *handle = Process::LoadModule("libEGL.so");
+  void *handle = Process::LoadModule("libEGL.so.1");
 
   if(!handle)
-    handle = Process::LoadModule("libEGL.so.1");
+    handle = Process::LoadModule("libEGL.so");
 
   return handle;
 #endif
@@ -42,6 +57,8 @@ static void *GetEGLHandle()
 
 class EGLPlatform : public GLPlatform
 {
+  RDCDriver m_API = RDCDriver::OpenGLES;
+
   bool MakeContextCurrent(GLWindowingData data)
   {
     if(EGL.MakeCurrent)
@@ -62,6 +79,22 @@ class EGLPlatform : public GLPlatform
                               EGL_CONTEXT_OPENGL_DEBUG_BIT_KHR, EGL_NONE};
 
       ret.egl_ctx = EGL.CreateContext(share.egl_dpy, share.egl_cfg, share.egl_ctx, baseAttribs);
+
+      if(ret.egl_ctx == EGL_NO_CONTEXT)
+      {
+        EGLint err = EGL.GetError();
+        EGL.QueryContext(share.egl_dpy, share.egl_ctx, eEGL_CONTEXT_CLIENT_VERSION, &baseAttribs[1]);
+
+        RDCWARN(
+            "Creating cloned context failed (%x). Trying again with queried old EGL client "
+            "version: %d",
+            err, baseAttribs[1]);
+
+        ret.egl_ctx = EGL.CreateContext(share.egl_dpy, share.egl_cfg, share.egl_ctx, baseAttribs);
+        err = EGL.GetError();
+        if(ret.egl_ctx == EGL_NO_CONTEXT)
+          RDCERR("Cloned context failed again (%x). Capture will likely fail", err);
+      }
     }
 
     return ret;
@@ -113,6 +146,7 @@ class EGLPlatform : public GLPlatform
   bool IsOutputWindowVisible(GLWindowingData context) { return true; }
   GLWindowingData MakeOutputWindow(WindowingData window, bool depth, GLWindowingData share_context)
   {
+    EGLNativeDisplayType display = EGL_DEFAULT_DISPLAY;
     EGLNativeWindowType win = 0;
 
     switch(window.system)
@@ -122,7 +156,32 @@ class EGLPlatform : public GLPlatform
 #elif ENABLED(RDOC_ANDROID)
       case WindowingSystem::Android: win = window.android.window; break;
 #elif ENABLED(RDOC_LINUX)
-      case WindowingSystem::Xlib: win = window.xlib.window; break;
+      case WindowingSystem::Xlib:
+      {
+        Display *xlibDisplay = RenderDoc::Inst().GetGlobalEnvironment().xlibDisplay;
+
+        display = (EGLNativeDisplayType)window.xlib.display;
+        win = (EGLNativeWindowType)window.xlib.window;
+
+        // ensure we're using the same display as the share context, and the same as our global
+        // display that we used at init time to create the share context's display
+        RDCASSERT((void *)display == (void *)xlibDisplay && display != NULL, (void *)display,
+                  (void *)xlibDisplay);
+        break;
+      }
+      case WindowingSystem::Wayland:
+      {
+        wl_display *waylandDisplay = RenderDoc::Inst().GetGlobalEnvironment().waylandDisplay;
+
+        display = (EGLNativeDisplayType)window.wayland.display;
+        win = (EGLNativeWindowType)window.wayland.window;
+
+        // ensure we're using the same display as the share context, and the same as our global
+        // display
+        RDCASSERT((void *)display == (void *)waylandDisplay && display != NULL, (void *)display,
+                  (void *)waylandDisplay);
+        break;
+      }
 #endif
       case WindowingSystem::Unknown:
       case WindowingSystem::Headless:
@@ -131,39 +190,55 @@ class EGLPlatform : public GLPlatform
       default: RDCERR("Unexpected window system %u", window.system); break;
     }
 
-    EGLDisplay eglDisplay = EGL.GetDisplay(EGL_DEFAULT_DISPLAY);
+    EGLDisplay eglDisplay = NULL;
+
+    if(share_context.egl_dpy)
+      eglDisplay = share_context.egl_dpy;
+    else
+      eglDisplay = EGL.GetDisplay(display);
+
     RDCASSERT(eglDisplay);
 
-    return CreateWindowingData(eglDisplay, share_context.ctx, win);
+    int major, minor;
+    EGL.Initialize(eglDisplay, &major, &minor);
+
+    return CreateWindowingData(eglDisplay, share_context.ctx, win, false);
   }
 
   GLWindowingData CreateWindowingData(EGLDisplay eglDisplay, EGLContext share_ctx,
-                                      EGLNativeWindowType window)
+                                      EGLNativeWindowType window, bool debug)
   {
+#if ENABLED(RDOC_DEVEL)
+    debug = true;
+#endif
+
     GLWindowingData ret;
     ret.egl_dpy = eglDisplay;
     ret.egl_ctx = NULL;
     ret.egl_wnd = NULL;
 
     EGLint surfaceType = (window == 0) ? EGL_PBUFFER_BIT : EGL_WINDOW_BIT;
-    const EGLint configAttribs[] = {EGL_RED_SIZE,
-                                    8,
-                                    EGL_GREEN_SIZE,
-                                    8,
-                                    EGL_BLUE_SIZE,
-                                    8,
-                                    EGL_RENDERABLE_TYPE,
-                                    EGL_OPENGL_ES3_BIT,
-                                    EGL_CONFORMANT,
-                                    EGL_OPENGL_ES3_BIT,
-                                    EGL_SURFACE_TYPE,
-                                    surfaceType,
-                                    EGL_COLOR_BUFFER_TYPE,
-                                    EGL_RGB_BUFFER,
-                                    EGL_NONE};
+    const EGLint configAttribs[] = {
+        EGL_RED_SIZE,
+        8,
+        EGL_GREEN_SIZE,
+        8,
+        EGL_BLUE_SIZE,
+        8,
+        EGL_RENDERABLE_TYPE,
+        m_API == RDCDriver::OpenGLES ? EGL_OPENGL_ES3_BIT : EGL_OPENGL_BIT,
+        EGL_CONFORMANT,
+        m_API == RDCDriver::OpenGLES ? EGL_OPENGL_ES3_BIT : EGL_OPENGL_BIT,
+        EGL_SURFACE_TYPE,
+        surfaceType,
+        EGL_COLOR_BUFFER_TYPE,
+        EGL_RGB_BUFFER,
+        EGL_NONE,
+    };
 
-    EGLint numConfigs;
-    if(!EGL.ChooseConfig(eglDisplay, configAttribs, &ret.egl_cfg, 1, &numConfigs))
+    EGLint numConfigs = 0;
+    EGLBoolean success = EGL.ChooseConfig(eglDisplay, configAttribs, &ret.egl_cfg, 1, &numConfigs);
+    if(!success || numConfigs == 0)
     {
       RDCERR("Couldn't find a suitable EGL config");
       return ret;
@@ -176,6 +251,9 @@ class EGLPlatform : public GLPlatform
     // first we try with the debug bit set, then if that fails we try without debug
     for(int debugPass = 0; debugPass < 2; debugPass++)
     {
+      if(!debug && debugPass == 0)
+        continue;
+
       // don't change this ar ray without changing indices in the loop below
       EGLint verAttribs[] = {
           EGL_CONTEXT_MAJOR_VERSION_KHR,
@@ -187,7 +265,7 @@ class EGLPlatform : public GLPlatform
           EGL_NONE,
       };
 
-      std::vector<GLVersion> versions = GetReplayVersions(RDCDriver::OpenGLES);
+      rdcarray<GLVersion> versions = GetReplayVersions(RDCDriver::OpenGLES);
 
       for(GLVersion v : versions)
       {
@@ -264,6 +342,30 @@ class EGLPlatform : public GLPlatform
     return ret;
   }
 
+  bool CanCreateGLContext()
+  {
+#if ENABLED(RDOC_ANDROID)
+    // we don't trust the EGL API query to work reliably on Android, so treat
+    // it as special case
+    return false;
+#else
+    bool success = EGL.PopulateForReplay();
+
+    // if we can't populate our functions we bail now.
+    if(!success)
+      return false;
+
+    EGLenum previousAPI = EGL.QueryAPI();
+    EGLBoolean supportsGL = EGL.BindAPI(EGL_OPENGL_API);
+
+    // restore previous API
+    if(previousAPI != EGL_NONE)
+      EGL.BindAPI(previousAPI);
+
+    return supportsGL == EGL_TRUE;
+#endif
+  }
+
   bool CanCreateGLESContext()
   {
     // as long as we can get libEGL we're fine
@@ -271,34 +373,48 @@ class EGLPlatform : public GLPlatform
   }
 
   bool PopulateForReplay() { return EGL.PopulateForReplay(); }
-  ReplayStatus InitialiseAPI(GLWindowingData &replayContext, RDCDriver api)
+  void SetDriverType(RDCDriver api) { m_API = api; }
+  RDResult InitialiseAPI(GLWindowingData &replayContext, RDCDriver api, bool debug)
   {
-    // we only support replaying GLES through EGL
-    RDCASSERT(api == RDCDriver::OpenGLES);
+    Display *xlibDisplay = RenderDoc::Inst().GetGlobalEnvironment().xlibDisplay;
+    wl_display *waylandDisplay = RenderDoc::Inst().GetGlobalEnvironment().waylandDisplay;
 
-    EGL.BindAPI(EGL_OPENGL_ES_API);
+    // we support replaying both GLES and GL through EGL
+    RDCASSERT(api == RDCDriver::OpenGLES || api == RDCDriver::OpenGL);
 
-    EGLDisplay eglDisplay = EGL.GetDisplay(EGL_DEFAULT_DISPLAY);
+    m_API = api;
+
+    if(api == RDCDriver::OpenGLES)
+      EGL.BindAPI(EGL_OPENGL_ES_API);
+    else
+      EGL.BindAPI(EGL_OPENGL_API);
+
+    EGLNativeDisplayType display = EGL_DEFAULT_DISPLAY;
+    if(waylandDisplay)
+      display = (EGLNativeDisplayType)waylandDisplay;
+    else if(xlibDisplay)
+      display = (EGLNativeDisplayType)xlibDisplay;
+
+    EGLDisplay eglDisplay = EGL.GetDisplay(display);
     if(!eglDisplay)
     {
-      RDCERR("Couldn't open default EGL display");
-      return ReplayStatus::APIInitFailed;
+      RETURN_ERROR_RESULT(ResultCode::APIInitFailed, "Couldn't open default EGL display");
     }
 
     int major, minor;
     EGL.Initialize(eglDisplay, &major, &minor);
 
-    replayContext = CreateWindowingData(eglDisplay, EGL_NO_CONTEXT, 0);
+    replayContext = CreateWindowingData(eglDisplay, EGL_NO_CONTEXT, 0, debug);
 
     if(!replayContext.ctx)
     {
-      RDCERR("Couldn't create OpenGL ES 3.x replay context - required for replay");
       DeleteReplayContext(replayContext);
       RDCEraseEl(replayContext);
-      return ReplayStatus::APIHardwareUnsupported;
+      RETURN_ERROR_RESULT(ResultCode::APIHardwareUnsupported,
+                          "Couldn't create OpenGL ES 3.x replay context - required for replay");
     }
 
-    return ReplayStatus::Succeeded;
+    return ResultCode::Succeeded;
   }
 
   void *GetReplayFunction(const char *funcname)
@@ -317,7 +433,9 @@ class EGLPlatform : public GLPlatform
 #define LIBSUFFIX ".so"
 #endif
     const char *libs[] = {
-        "libGLESv3" LIBSUFFIX, "libGLESv2" LIBSUFFIX ".2", "libGLESv2" LIBSUFFIX,
+        "libGLESv3" LIBSUFFIX,
+        "libGLESv2" LIBSUFFIX ".2",
+        "libGLESv2" LIBSUFFIX,
         "libGLESv1_CM" LIBSUFFIX,
     };
 
@@ -330,7 +448,7 @@ class EGLPlatform : public GLPlatform
 
     return NULL;
   }
-  void DrawQuads(float width, float height, const std::vector<Vec4f> &vertices)
+  void DrawQuads(float width, float height, const rdcarray<Vec4f> &vertices)
   {
     // legacy quad rendering is not supported on GLES
   }
@@ -359,15 +477,16 @@ bool EGLDispatchTable::PopulateForReplay()
 
   bool symbols_ok = true;
 
-#define LOAD_FUNC(func, isext)                                                                      \
+#define LOAD_FUNC(func, isext, replayrequired)                                                      \
   if(!this->func)                                                                                   \
     this->func = (CONCAT(PFN_egl, func))Process::GetFunctionAddress(handle, "egl" STRINGIZE(func)); \
   if(!this->func && CheckConstParam(isext))                                                         \
-    this->func = (CONCAT(PFN_egl, func)) this->GetProcAddress("egl" STRINGIZE(func));               \
+    this->func = (CONCAT(PFN_egl, func))this->GetProcAddress("egl" STRINGIZE(func));                \
                                                                                                     \
   if(!this->func && !CheckConstParam(isext))                                                        \
   {                                                                                                 \
-    symbols_ok = false;                                                                             \
+    if(CheckConstParam(replayrequired))                                                             \
+      symbols_ok = false;                                                                           \
     RDCWARN("Unable to load '%s'", STRINGIZE(func));                                                \
   }
 

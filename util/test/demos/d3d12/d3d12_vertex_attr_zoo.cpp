@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2018-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -24,7 +24,7 @@
 
 #include "d3d12_test.h"
 
-TEST(D3D12_Vertex_Attr_Zoo, D3D12GraphicsTest)
+RD_TEST(D3D12_Vertex_Attr_Zoo, D3D12GraphicsTest)
 {
   static constexpr const char *Description =
       "Draws a triangle but using different kinds of vertex attributes, including doubles, arrays, "
@@ -165,36 +165,76 @@ void main(triangle v2f input[3], inout TriangleStream<v2f> TriStream)
 
     ID3D12PipelineStatePtr pso = MakePSO().RootSig(sig).VS(vsblob).PS(psblob).GS(gsblob).InputLayout({
         {
-            "SNORM", 0, DXGI_FORMAT_R16G16B16A16_SNORM, 0, offsetof(vertin, i16),
-            D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0,
+            "SNORM",
+            0,
+            DXGI_FORMAT_R16G16B16A16_SNORM,
+            0,
+            offsetof(vertin, i16),
+            D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
+            0,
         },
         {
-            "UNORM", 0, DXGI_FORMAT_R16G16B16A16_UNORM, 0, offsetof(vertin, u16),
-            D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0,
+            "UNORM",
+            0,
+            DXGI_FORMAT_R16G16B16A16_UNORM,
+            0,
+            offsetof(vertin, u16),
+            D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
+            0,
         },
         {
-            "UINT", 0, DXGI_FORMAT_R16G16B16A16_UINT, 0, offsetof(vertin, u16),
-            D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0,
+            "UINT",
+            0,
+            DXGI_FORMAT_R16G16B16A16_UINT,
+            0,
+            offsetof(vertin, u16),
+            D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
+            0,
         },
         {
-            "ARRAY", 0, DXGI_FORMAT_R32G32_FLOAT, 0, offsetof(vertin, arr0),
-            D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0,
+            "ARRAY",
+            0,
+            DXGI_FORMAT_R32G32_FLOAT,
+            0,
+            offsetof(vertin, arr0),
+            D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
+            0,
         },
         {
-            "ARRAY", 1, DXGI_FORMAT_R32G32_FLOAT, 0, offsetof(vertin, arr1),
-            D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0,
+            "ARRAY",
+            1,
+            DXGI_FORMAT_R32G32_FLOAT,
+            0,
+            offsetof(vertin, arr1),
+            D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
+            0,
         },
         {
-            "ARRAY", 2, DXGI_FORMAT_R32G32_FLOAT, 0, offsetof(vertin, arr2),
-            D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0,
+            "ARRAY",
+            2,
+            DXGI_FORMAT_R32G32_FLOAT,
+            0,
+            offsetof(vertin, arr2),
+            D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
+            0,
         },
         {
-            "MATRIX", 0, DXGI_FORMAT_R32G32_FLOAT, 0, offsetof(vertin, mat0),
-            D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0,
+            "MATRIX",
+            0,
+            DXGI_FORMAT_R32G32_FLOAT,
+            0,
+            offsetof(vertin, mat0),
+            D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
+            0,
         },
         {
-            "MATRIX", 1, DXGI_FORMAT_R32G32_FLOAT, 0, offsetof(vertin, mat1),
-            D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0,
+            "MATRIX",
+            1,
+            DXGI_FORMAT_R32G32_FLOAT,
+            0,
+            offsetof(vertin, mat1),
+            D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
+            0,
         },
     });
 
@@ -211,7 +251,7 @@ void main(triangle v2f input[3], inout TriangleStream<v2f> TriStream)
       D3D12_CPU_DESCRIPTOR_HANDLE rtv =
           MakeRTV(bb).Format(DXGI_FORMAT_R8G8B8A8_UNORM_SRGB).CreateCPU(0);
 
-      ClearRenderTargetView(cmd, rtv, {0.4f, 0.5f, 0.6f, 1.0f});
+      ClearRenderTargetView(cmd, rtv, {0.2f, 0.2f, 0.2f, 1.0f});
 
       cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 

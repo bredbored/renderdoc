@@ -2,21 +2,51 @@ import rdtest
 import renderdoc as rd
 
 
-class VK_Overlay_Test(rdtest.TestCase):
+class VK_Overlay_Test(rdtest.Overlay_Test):
     demos_test_name = 'VK_Overlay_Test'
+    internal = False
 
     def check_capture(self):
-        self.check_final_backbuffer()
+        # Check clear-before-action when first selecting a action, to ensure that bindless feedback doesn't interfere
+        out = self.controller.CreateOutput(rd.CreateHeadlessWindowingData(100, 100), rd.ReplayOutputType.Texture)
 
-        out: rd.ReplayOutput = self.controller.CreateOutput(rd.CreateHeadlessWindowingData(100, 100), rd.ReplayOutputType.Texture)
+        setup_marker = self.find_action("Setup")
+        self.controller.SetFrameEvent(setup_marker.next.eventId, True)
 
-        self.check(out is not None)
+        pipe = self.controller.GetPipelineState()
 
-        test_marker: rd.DrawcallDescription = self.find_draw("Test")
+        tex = rd.TextureDisplay()
+        tex.resourceId = pipe.GetOutputTargets()[0].resourceId
 
-        self.controller.SetFrameEvent(test_marker.next.eventId, True)
+        tex.overlay = rd.DebugOverlay.ClearBeforeDraw
+        out.SetTextureDisplay(tex)
 
-        pipe: rd.PipeState = self.controller.GetPipelineState()
+        out.Display()
+
+        # Select the next setup action
+        self.controller.SetFrameEvent(setup_marker.next.eventId, True)
+
+        # Select the real action for the first time
+        self.controller.SetFrameEvent(self.find_action("Normal Test").next.eventId, True)
+
+        self.check_pixel_value(tex.resourceId, 180, 150, [0.0, 0.0, 0.0, 0.0])
+        self.check_pixel_value(tex.resourceId, 50, 50, [0.0, 0.0, 0.0, 0.0])
+        self.check_pixel_value(tex.resourceId, 200, 64, [1.0, 1.0, 0.0, 1.0])
+
+        # Clear the overlay to reset to a sensible state
+        tex.overlay = rd.DebugOverlay.NoOverlay
+        out.SetTextureDisplay(tex)
+
+        out.Display()
+
+        super(VK_Overlay_Test, self).check_capture()
+
+        # Don't check any pixel values, but ensure all overlays at least work with rasterizer discard and no
+        # viewport/scissor bound
+        sub_marker = self.find_action("Discard Test")
+        self.controller.SetFrameEvent(sub_marker.next.eventId, True)
+
+        pipe = self.controller.GetPipelineState()
 
         tex = rd.TextureDisplay()
         tex.resourceId = pipe.GetOutputTargets()[0].resourceId
@@ -29,66 +59,18 @@ class VK_Overlay_Test(rdtest.TestCase):
             if overlay == rd.DebugOverlay.NaN or overlay == rd.DebugOverlay.Clipping:
                 continue
 
-            # Unfortunately line-fill rendering seems to vary too much by IHV, so gives inconsistent results
-            if overlay == rd.DebugOverlay.Wireframe:
+            if overlay == rd.DebugOverlay.ClearBeforeDraw or overlay == rd.DebugOverlay.ClearBeforePass:
                 continue
+
+            rdtest.log.success("Checking overlay {} with rasterizer discard".format(str(overlay)))
 
             tex.overlay = overlay
             out.SetTextureDisplay(tex)
 
-            overlay_path = rdtest.get_tmp_path(str(overlay) + '.png')
-            ref_path = self.get_ref_path(str(overlay) + '.png')
+            out.Display()
 
-            save_data = rd.TextureSave()
-            save_data.resourceId = out.GetDebugOverlayTexID()
-            save_data.destType = rd.FileType.PNG
+            overlay_id: rd.ResourceId = out.GetDebugOverlayTexID()
 
-            save_data.comp.blackPoint = 0.0
-            save_data.comp.whitePoint = 1.0
-
-            tolerance = 2
-
-            # These overlays return grayscale above 1, so rescale to an expected range.
-            if (overlay == rd.DebugOverlay.QuadOverdrawDraw or overlay == rd.DebugOverlay.QuadOverdrawPass or
-                    overlay == rd.DebugOverlay.TriangleSizeDraw or overlay == rd.DebugOverlay.TriangleSizePass):
-                save_data.comp.whitePoint = 10.0
-
-            # These overlays modify the underlying texture, so we need to save it out instead of the overlay
-            if overlay == rd.DebugOverlay.ClearBeforeDraw or overlay == rd.DebugOverlay.ClearBeforePass:
-                save_data.resourceId = tex.resourceId
-
-            self.controller.SaveTexture(save_data, overlay_path)
-
-            if not rdtest.png_compare(overlay_path, ref_path, tolerance):
-                raise rdtest.TestFailureException("Reference and output image differ for overlay {}".format(str(overlay)), overlay_path, ref_path)
-
-            rdtest.log.success("Reference and output image are identical for {}".format(str(overlay)))
-
-        save_data = rd.TextureSave()
-        save_data.resourceId = pipe.GetDepthTarget().resourceId
-        save_data.destType = rd.FileType.PNG
-        save_data.channelExtract = 0
-
-        tmp_path = rdtest.get_tmp_path('depth.png')
-        ref_path = self.get_ref_path('depth.png')
-
-        self.controller.SaveTexture(save_data, tmp_path)
-
-        if not rdtest.png_compare(tmp_path, ref_path):
-            raise rdtest.TestFailureException("Reference and output image differ for depth {}", tmp_path, ref_path)
-
-        rdtest.log.success("Reference and output image are identical for depth")
-
-        save_data.channelExtract = 1
-
-        tmp_path = rdtest.get_tmp_path('stencil.png')
-        ref_path = self.get_ref_path('stencil.png')
-
-        self.controller.SaveTexture(save_data, tmp_path)
-
-        if not rdtest.png_compare(tmp_path, ref_path):
-            raise rdtest.TestFailureException("Reference and output image differ for stencil {}", tmp_path, ref_path)
-
-        rdtest.log.success("Reference and output image are identical for stencil")
+            rdtest.log.success("Overlay {} rendered with rasterizer discard".format(str(overlay)))
 
         out.Shutdown()

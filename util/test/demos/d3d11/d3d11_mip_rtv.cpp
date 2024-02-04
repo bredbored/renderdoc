@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -24,7 +24,7 @@
 
 #include "d3d11_test.h"
 
-TEST(D3D11_Mip_RTV, D3D11GraphicsTest)
+RD_TEST(D3D11_Mip_RTV, D3D11GraphicsTest)
 {
   static constexpr const char *Description = "Test rendering into RTV mip levels";
 
@@ -54,9 +54,11 @@ float4 main() : SV_Target0
     ID3D11VertexShaderPtr vs = CreateVS(vsblob);
     ID3D11PixelShaderPtr ps = CreatePS(psblob);
 
-    ID3D11Texture2DPtr rt = MakeTexture(DXGI_FORMAT_R8G8B8A8_UNORM, 1024, 1024);
+    ID3D11Texture2DPtr rt = MakeTexture(DXGI_FORMAT_R8G8B8A8_UNORM, 1024, 1024).RTV().Mips(6);
     ID3D11RenderTargetViewPtr rtv[4] = {
-        MakeRTV(rt).FirstMip(0), MakeRTV(rt).FirstMip(1), MakeRTV(rt).FirstMip(2),
+        MakeRTV(rt).FirstMip(0),
+        MakeRTV(rt).FirstMip(1),
+        MakeRTV(rt).FirstMip(2),
         MakeRTV(rt).FirstMip(3),
     };
 
@@ -71,9 +73,9 @@ float4 main() : SV_Target0
 
     while(Running())
     {
-      ClearRenderTargetView(bbRTV, {0.4f, 0.5f, 0.6f, 1.0f});
+      ClearRenderTargetView(bbRTV, {0.2f, 0.2f, 0.2f, 1.0f});
       for(int i = 0; i < 4; i++)
-        ClearRenderTargetView(rtv[i], {0.4f, 0.5f, 0.6f, 1.0f});
+        ClearRenderTargetView(rtv[i], {0.2f, 0.2f, 0.2f, 1.0f});
 
       ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
 

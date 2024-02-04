@@ -7,16 +7,11 @@ class D3D11_Vertex_Attr_Zoo(rdtest.TestCase):
     demos_test_name = 'D3D11_Vertex_Attr_Zoo'
 
     def check_capture(self):
-        draw = self.find_draw("Draw")
+        action = self.find_action("Draw")
 
-        self.check(draw is not None)
+        self.check(action is not None)
 
-        self.controller.SetFrameEvent(draw.eventId, False)
-
-        # Make an output so we can pick pixels
-        out: rd.ReplayOutput = self.controller.CreateOutput(rd.CreateHeadlessWindowingData(100, 100), rd.ReplayOutputType.Texture)
-
-        self.check(out is not None)
+        self.controller.SetFrameEvent(action.eventId, False)
 
         ref = {
             0: {
@@ -64,31 +59,19 @@ class D3D11_Vertex_Attr_Zoo(rdtest.TestCase):
         vsout_ref[2]['SV_Position'] = [0.5, 0.5, 0.0, 1.0]
         gsout_ref[2]['SV_Position'] = [0.5, 0.5, 0.4, 1.2]
 
-        self.check_mesh_data(in_ref, self.get_vsin(draw))
+        self.check_mesh_data(in_ref, self.get_vsin(action))
         rdtest.log.success("Vertex input data is as expected")
 
-        self.check_mesh_data(vsout_ref, self.get_postvs(rd.MeshDataStage.VSOut))
+        self.check_mesh_data(vsout_ref, self.get_postvs(action, rd.MeshDataStage.VSOut))
 
         rdtest.log.success("Vertex output data is as expected")
 
-        self.check_mesh_data(gsout_ref, self.get_postvs(rd.MeshDataStage.GSOut))
+        self.check_mesh_data(gsout_ref, self.get_postvs(action, rd.MeshDataStage.GSOut))
 
         rdtest.log.success("Geometry output data is as expected")
 
         pipe: rd.PipeState = self.controller.GetPipelineState()
 
-        tex = rd.TextureDisplay()
-        tex.resourceId = pipe.GetOutputTargets()[0].resourceId
-        out.SetTextureDisplay(tex)
-
-        texdetails = self.get_texture(tex.resourceId)
-
-        picked: rd.PixelValue = out.PickPixel(tex.resourceId, False,
-                                              int(texdetails.width / 2), int(texdetails.height / 2), 0, 0, 0)
-
-        if not rdtest.value_compare(picked.floatValue, [0.0, 1.0, 0.0, 1.0]):
-            raise rdtest.TestFailureException("Picked value {} doesn't match expectation".format(picked.floatValue))
+        self.check_pixel_value(pipe.GetOutputTargets()[0].resourceId, 0.5, 0.5, [0.0, 1.0, 0.0, 1.0])
 
         rdtest.log.success("Triangle picked value is as expected")
-
-        out.Shutdown()

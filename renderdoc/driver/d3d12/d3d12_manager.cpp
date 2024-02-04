@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2016-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -23,18 +23,44 @@
  ******************************************************************************/
 
 #include "d3d12_manager.h"
+#include <algorithm>
 #include "driver/dxgi/dxgi_common.h"
 #include "d3d12_command_list.h"
 #include "d3d12_command_queue.h"
 #include "d3d12_device.h"
 #include "d3d12_resources.h"
 
-void D3D12Descriptor::Init(const D3D12_SAMPLER_DESC *pDesc)
+void D3D12Descriptor::Init(const D3D12_SAMPLER_DESC2 *pDesc)
 {
   if(pDesc)
-    data.samp.desc = *pDesc;
+    data.samp.desc.Init(*pDesc);
   else
     RDCEraseEl(data.samp.desc);
+}
+
+void D3D12Descriptor::Init(const D3D12_SAMPLER_DESC *pDesc)
+{
+  if(!pDesc)
+  {
+    RDCEraseEl(data.samp.desc);
+    return;
+  }
+
+  D3D12_SAMPLER_DESC2 desc;
+  desc.Filter = pDesc->Filter;
+  desc.Filter = pDesc->Filter;
+  desc.AddressU = pDesc->AddressU;
+  desc.AddressV = pDesc->AddressV;
+  desc.AddressW = pDesc->AddressW;
+  desc.ComparisonFunc = pDesc->ComparisonFunc;
+  desc.MipLODBias = pDesc->MipLODBias;
+  desc.MaxAnisotropy = pDesc->MaxAnisotropy;
+  memcpy(desc.UintBorderColor, pDesc->BorderColor, sizeof(desc.UintBorderColor));
+  desc.MinLOD = pDesc->MinLOD;
+  desc.MaxLOD = pDesc->MaxLOD;
+  desc.Flags = D3D12_SAMPLER_FLAG_NONE;
+
+  data.samp.desc.Init(desc);
 }
 
 void D3D12Descriptor::Init(const D3D12_CONSTANT_BUFFER_VIEW_DESC *pDesc)
@@ -145,7 +171,17 @@ void D3D12Descriptor::Create(D3D12_DESCRIPTOR_HEAP_TYPE heapType, WrappedID3D12D
   {
     case D3D12DescriptorType::Sampler:
     {
-      dev->CreateSampler(&data.samp.desc, handle);
+      D3D12_SAMPLER_DESC2 desc = data.samp.desc.AsDesc();
+      if(desc.Flags == D3D12_SAMPLER_FLAG_NONE)
+      {
+        D3D12_SAMPLER_DESC desc1;
+        memcpy(&desc1, &desc, sizeof(desc1));
+        dev->CreateSampler(&desc1, handle);
+      }
+      else
+      {
+        dev->CreateSampler2(&desc, handle);
+      }
       break;
     }
     case D3D12DescriptorType::CBV:
@@ -495,12 +531,10 @@ void D3D12Descriptor::GetRefIDs(ResourceId &id, ResourceId &id2, FrameRefType &r
       // nothing to do - no resource here
       break;
     case D3D12DescriptorType::CBV:
-      id = WrappedID3D12Resource1::GetResIDFromAddr(data.nonsamp.cbv.BufferLocation);
+      id = WrappedID3D12Resource::GetResIDFromAddr(data.nonsamp.cbv.BufferLocation);
       break;
     case D3D12DescriptorType::SRV: id = data.nonsamp.resource; break;
-    case D3D12DescriptorType::UAV:
-      id2 = data.nonsamp.counterResource;
-    // deliberate fall-through
+    case D3D12DescriptorType::UAV: id2 = data.nonsamp.counterResource; DELIBERATE_FALLTHROUGH();
     case D3D12DescriptorType::RTV:
     case D3D12DescriptorType::DSV:
       ref = eFrameRef_PartialWrite;
@@ -630,10 +664,8 @@ D3D12Descriptor *DescriptorFromPortableHandle(D3D12ResourceManager *manager, Por
   if(handle.heap == ResourceId())
     return NULL;
 
-  if(!manager->HasLiveResource(handle.heap))
-    return NULL;
-
-  WrappedID3D12DescriptorHeap *heap = manager->GetLiveAs<WrappedID3D12DescriptorHeap>(handle.heap);
+  WrappedID3D12DescriptorHeap *heap =
+      manager->GetLiveAs<WrappedID3D12DescriptorHeap>(handle.heap, true);
 
   if(heap)
     return heap->GetDescriptors() + handle.index;
@@ -650,46 +682,227 @@ D3D12Descriptor *DescriptorFromPortableHandle(D3D12ResourceManager *manager, Por
 #define BARRIER_ASSERT(...)
 #endif
 
-void D3D12ResourceManager::ApplyBarriers(std::vector<D3D12_RESOURCE_BARRIER> &barriers,
+void D3D12ResourceManager::ApplyBarriers(BarrierSet &barriers,
                                          std::map<ResourceId, SubresourceStateVector> &states)
 {
-  for(size_t b = 0; b < barriers.size(); b++)
+  for(size_t b = 0; b < barriers.barriers.size(); b++)
   {
-    D3D12_RESOURCE_TRANSITION_BARRIER &trans = barriers[b].Transition;
+    const D3D12_RESOURCE_TRANSITION_BARRIER &trans = barriers.barriers[b].Transition;
     ResourceId id = GetResID(trans.pResource);
-    SubresourceStateVector &st = states[id];
+
+    auto it = states.find(id);
+    if(it == states.end())
+      return;
+
+    SubresourceStateVector &st = it->second;
 
     // skip non-transitions, or begin-halves of transitions
-    if(barriers[b].Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION ||
-       (barriers[b].Flags & D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY))
+    if(barriers.barriers[b].Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION ||
+       (barriers.barriers[b].Flags & D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY))
       continue;
 
+    size_t first = trans.Subresource;
     if(trans.Subresource == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES)
+      first = 0;
+
+    for(size_t i = first; i < st.size(); i++)
     {
-      for(size_t i = 0; i < st.size(); i++)
+      // layout must either match StateBefore or else be in the common layout
+      BARRIER_ASSERT("Mismatching before state",
+                     (st[i].IsStates() && st[i].ToStates() == trans.StateBefore) ||
+                         (st[i].IsLayout() && st[i].ToLayout() == D3D12_BARRIER_LAYOUT_COMMON),
+                     st[i], trans.StateBefore, i);
+      st[i] = D3D12ResourceLayout::FromStates(trans.StateAfter);
+
+      if(trans.Subresource != D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES)
+        break;
+    }
+  }
+
+  for(size_t b = 0; b < barriers.newBarriers.size(); b++)
+  {
+    const D3D12_TEXTURE_BARRIER &trans = barriers.newBarriers[b];
+    ResourceId id = GetResID(trans.pResource);
+
+    auto it = states.find(id);
+    if(it == states.end())
+      return;
+
+    SubresourceStateVector &st = it->second;
+
+    // skip begin-halves of split transitions
+    if(trans.SyncBefore == D3D12_BARRIER_SYNC_SPLIT)
+      continue;
+
+    // skip non-layout barriers (including UNDEFINED-UNDEFINED)
+    if(trans.LayoutBefore == trans.LayoutAfter)
+      continue;
+
+    if(trans.Subresources.NumMipLevels == 0)
+    {
+      size_t first = 0;
+      if(trans.Subresources.IndexOrFirstMipLevel == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES)
+        first = 0;
+
+      for(size_t sub = first; sub < st.size(); sub++)
       {
-        BARRIER_ASSERT("Mismatching before state", st[i] == trans.StateBefore, st[i],
-                       trans.StateBefore, i);
-        st[i] = trans.StateAfter;
+        // layout must either match StateBefore, be undefined, or else be in the common state
+        BARRIER_ASSERT("Mismatching before state",
+                       (st[sub].IsLayout() && st[sub].ToLayout() == trans.LayoutBefore) ||
+                           trans.LayoutBefore == D3D12_BARRIER_LAYOUT_UNDEFINED ||
+                           (st[sub].IsStates() && st[sub].ToStates() == D3D12_RESOURCE_STATE_COMMON),
+                       st[sub], trans.LayoutBefore, sub);
+        st[sub] = D3D12ResourceLayout::FromLayout(trans.LayoutAfter);
+
+        if(trans.Subresources.IndexOrFirstMipLevel != D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES)
+          break;
+      }
+    }
+
+    D3D12_RESOURCE_DESC desc = trans.pResource->GetDesc();
+
+    UINT arrays = RDCMAX((UINT16)1, desc.DepthOrArraySize);
+    if(desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D)
+      arrays = 1;
+    UINT mips = RDCMAX((UINT16)1, desc.MipLevels);
+
+    for(UINT p = trans.Subresources.FirstPlane; p < trans.Subresources.NumPlanes; p++)
+    {
+      for(UINT a = trans.Subresources.FirstArraySlice; a < trans.Subresources.NumArraySlices; a++)
+      {
+        for(UINT m = trans.Subresources.IndexOrFirstMipLevel; m < trans.Subresources.NumMipLevels; m++)
+        {
+          UINT sub = ((p * arrays) + a) * mips + m;
+
+          // layout must either match StateBefore, be undefined, or else be in the common state
+          BARRIER_ASSERT(
+              "Mismatching before state",
+              (st[sub].IsLayout() && st[sub].ToLayout() == trans.LayoutBefore) ||
+                  trans.LayoutBefore == D3D12_BARRIER_LAYOUT_UNDEFINED ||
+                  (st[sub].IsStates() && st[sub].ToStates() == D3D12_RESOURCE_STATE_COMMON),
+              st[sub], trans.LayoutBefore, sub);
+          st[sub] = D3D12ResourceLayout::FromLayout(trans.LayoutAfter);
+        }
+      }
+    }
+  }
+}
+
+void AddStateResetBarrier(D3D12ResourceLayout srcState, D3D12ResourceLayout dstState,
+                          ID3D12Resource *res, UINT subresource, BarrierSet &barriers)
+{
+  if(srcState.IsStates() && dstState.IsStates())
+  {
+    D3D12_RESOURCE_BARRIER b;
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+    b.Transition.pResource = res;
+    b.Transition.Subresource = (UINT)subresource;
+    b.Transition.StateBefore = srcState.ToStates();
+    b.Transition.StateAfter = dstState.ToStates();
+
+    barriers.barriers.push_back(b);
+  }
+  else if(srcState.IsLayout() && dstState.IsLayout())
+  {
+    D3D12_TEXTURE_BARRIER b = {};
+
+    b.LayoutBefore = srcState.ToLayout();
+    b.AccessBefore = D3D12_BARRIER_ACCESS_COMMON;
+    b.SyncBefore = D3D12_BARRIER_SYNC_ALL;
+    b.AccessAfter = D3D12_BARRIER_ACCESS_COMMON;
+    b.SyncAfter = D3D12_BARRIER_SYNC_ALL;
+    b.LayoutAfter = dstState.ToLayout();
+    if(b.LayoutBefore == D3D12_BARRIER_LAYOUT_UNDEFINED)
+      b.AccessBefore = D3D12_BARRIER_ACCESS_NO_ACCESS;
+    if(b.LayoutAfter == D3D12_BARRIER_LAYOUT_UNDEFINED)
+      b.AccessAfter = D3D12_BARRIER_ACCESS_NO_ACCESS;
+    b.Subresources.IndexOrFirstMipLevel = (UINT)subresource;
+    b.pResource = res;
+
+    barriers.newBarriers.push_back(b);
+  }
+  else
+  {
+    // difficult case, moving between barrier types and need to go to common in between
+
+    if(srcState.IsStates())
+    {
+      if(srcState.ToStates() != D3D12_RESOURCE_STATE_COMMON)
+      {
+        D3D12_RESOURCE_BARRIER b;
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+        b.Transition.pResource = res;
+        b.Transition.Subresource = (UINT)subresource;
+        b.Transition.StateBefore = srcState.ToStates();
+        b.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+
+        barriers.barriers.push_back(b);
+      }
+
+      {
+        D3D12_TEXTURE_BARRIER b = {};
+
+        b.LayoutBefore = D3D12_BARRIER_LAYOUT_COMMON;
+        b.AccessBefore = D3D12_BARRIER_ACCESS_COMMON;
+        b.SyncBefore = D3D12_BARRIER_SYNC_ALL;
+        b.AccessAfter = D3D12_BARRIER_ACCESS_COMMON;
+        b.SyncAfter = D3D12_BARRIER_SYNC_ALL;
+        b.LayoutAfter = dstState.ToLayout();
+        if(b.LayoutBefore == D3D12_BARRIER_LAYOUT_UNDEFINED)
+          b.AccessBefore = D3D12_BARRIER_ACCESS_NO_ACCESS;
+        if(b.LayoutAfter == D3D12_BARRIER_LAYOUT_UNDEFINED)
+          b.AccessAfter = D3D12_BARRIER_ACCESS_NO_ACCESS;
+        b.Subresources.IndexOrFirstMipLevel = (UINT)subresource;
+        b.pResource = res;
+
+        barriers.newBarriers.push_back(b);
       }
     }
     else
     {
-      BARRIER_ASSERT("Mismatching before state", st[trans.Subresource] == trans.StateBefore,
-                     st[trans.Subresource], trans.StateBefore, trans.Subresource);
-      st[trans.Subresource] = trans.StateAfter;
+      {
+        D3D12_TEXTURE_BARRIER b = {};
+
+        b.LayoutBefore = srcState.ToLayout();
+        b.AccessBefore = D3D12_BARRIER_ACCESS_COMMON;
+        b.SyncBefore = D3D12_BARRIER_SYNC_ALL;
+        b.AccessAfter = D3D12_BARRIER_ACCESS_COMMON;
+        b.SyncAfter = D3D12_BARRIER_SYNC_ALL;
+        b.LayoutAfter = D3D12_BARRIER_LAYOUT_COMMON;
+        b.Subresources.IndexOrFirstMipLevel = (UINT)subresource;
+        b.pResource = res;
+
+        barriers.newBarriers.push_back(b);
+      }
+
+      if(dstState.ToStates() != D3D12_RESOURCE_STATE_COMMON)
+      {
+        D3D12_RESOURCE_BARRIER b;
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+        b.Transition.pResource = res;
+        b.Transition.Subresource = (UINT)subresource;
+        b.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+        b.Transition.StateAfter = dstState.ToStates();
+
+        barriers.newToOldBarriers.push_back(b);
+      }
     }
   }
 }
 
 template <typename SerialiserType>
-void D3D12ResourceManager::SerialiseResourceStates(SerialiserType &ser,
-                                                   std::vector<D3D12_RESOURCE_BARRIER> &barriers,
-                                                   std::map<ResourceId, SubresourceStateVector> &states)
+void D3D12ResourceManager::SerialiseResourceStates(
+    SerialiserType &ser, BarrierSet &barriers, std::map<ResourceId, SubresourceStateVector> &states,
+    const std::map<ResourceId, SubresourceStateVector> &initialStates)
 {
   SERIALISE_ELEMENT_LOCAL(NumMems, (uint32_t)states.size());
 
   auto srcit = states.begin();
+
+  std::unordered_set<ResourceId> processed;
 
   for(uint32_t i = 0; i < NumMems; i++)
   {
@@ -702,17 +915,15 @@ void D3D12ResourceManager::SerialiseResourceStates(SerialiserType &ser,
 
     if(IsReplayingAndReading() && liveid != ResourceId())
     {
+      processed.insert(liveid);
+
       for(size_t m = 0; m < States.size(); m++)
       {
-        D3D12_RESOURCE_BARRIER b;
-        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        b.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
-        b.Transition.pResource = (ID3D12Resource *)GetCurrentResource(liveid);
-        b.Transition.Subresource = (UINT)m;
-        b.Transition.StateBefore = states[liveid][m];
-        b.Transition.StateAfter = States[m];
-
-        barriers.push_back(b);
+        const D3D12ResourceLayout srcState = states[liveid][m];
+        const D3D12ResourceLayout dstState = States[m];
+        if(srcState != dstState)
+          AddStateResetBarrier(srcState, dstState, (ID3D12Resource *)GetCurrentResource(liveid),
+                               (UINT)m, barriers);
       }
     }
 
@@ -720,24 +931,39 @@ void D3D12ResourceManager::SerialiseResourceStates(SerialiserType &ser,
       srcit++;
   }
 
-  // erase any do-nothing barriers
-  for(auto it = barriers.begin(); it != barriers.end();)
+  // for any resources that didn't have a recorded state, use the initialStates we're given and
+  // restore them if needed
+  if(IsReplayingAndReading())
   {
-    if(it->Transition.StateBefore == it->Transition.StateAfter)
-      it = barriers.erase(it);
-    else
-      ++it;
+    for(auto it = initialStates.begin(); it != initialStates.end(); ++it)
+    {
+      // ignore internal resources, we only care about restoring states for captured resources
+      if(GetOriginalID(it->first) == it->first)
+        continue;
+
+      if(processed.find(it->first) == processed.end())
+      {
+        for(size_t m = 0; m < it->second.size(); m++)
+        {
+          const D3D12ResourceLayout srcState = states[it->first][m];
+          const D3D12ResourceLayout dstState = it->second[m];
+          if(srcState != dstState)
+            AddStateResetBarrier(srcState, dstState,
+                                 (ID3D12Resource *)GetCurrentResource(it->first), (UINT)m, barriers);
+        }
+      }
+    }
   }
 
   ApplyBarriers(barriers, states);
 }
 
 template void D3D12ResourceManager::SerialiseResourceStates(
-    ReadSerialiser &ser, std::vector<D3D12_RESOURCE_BARRIER> &barriers,
-    std::map<ResourceId, SubresourceStateVector> &states);
+    ReadSerialiser &ser, BarrierSet &barriers, std::map<ResourceId, SubresourceStateVector> &states,
+    const std::map<ResourceId, SubresourceStateVector> &initialStates);
 template void D3D12ResourceManager::SerialiseResourceStates(
-    WriteSerialiser &ser, std::vector<D3D12_RESOURCE_BARRIER> &barriers,
-    std::map<ResourceId, SubresourceStateVector> &states);
+    WriteSerialiser &ser, BarrierSet &barriers, std::map<ResourceId, SubresourceStateVector> &states,
+    const std::map<ResourceId, SubresourceStateVector> &initialStates);
 
 void D3D12ResourceManager::SetInternalResource(ID3D12DeviceChild *res)
 {
@@ -760,4 +986,98 @@ bool D3D12ResourceManager::ResourceTypeRelease(ID3D12DeviceChild *res)
     res->Release();
 
   return true;
+}
+
+void GPUAddressRangeTracker::AddTo(const GPUAddressRange &range)
+{
+  SCOPED_WRITELOCK(addressLock);
+  auto it = std::lower_bound(addresses.begin(), addresses.end(), range.start);
+
+  addresses.insert(it - addresses.begin(), range);
+}
+
+void GPUAddressRangeTracker::RemoveFrom(const GPUAddressRange &range)
+{
+  {
+    SCOPED_WRITELOCK(addressLock);
+    size_t i = std::lower_bound(addresses.begin(), addresses.end(), range.start) - addresses.begin();
+
+    // there might be multiple buffers with the same range start, find the exact range for this
+    // buffer
+    while(i < addresses.size() && addresses[i].start == range.start)
+    {
+      if(addresses[i].id == range.id)
+      {
+        addresses.erase(i);
+        return;
+      }
+
+      ++i;
+    }
+  }
+
+  RDCERR("Couldn't find matching range to remove for %s", ToStr(range.id).c_str());
+}
+
+void GPUAddressRangeTracker::GetResIDFromAddr(D3D12_GPU_VIRTUAL_ADDRESS addr, ResourceId &id,
+                                              UINT64 &offs)
+{
+  id = ResourceId();
+  offs = 0;
+
+  if(addr == 0)
+    return;
+
+  GPUAddressRange range;
+
+  // this should really be a read-write lock
+  {
+    SCOPED_READLOCK(addressLock);
+
+    auto it = std::lower_bound(addresses.begin(), addresses.end(), addr);
+    if(it == addresses.end())
+      return;
+
+    range = *it;
+  }
+
+  if(addr < range.start || addr >= range.realEnd)
+    return;
+
+  id = range.id;
+  offs = addr - range.start;
+}
+
+void GPUAddressRangeTracker::GetResIDFromAddrAllowOutOfBounds(D3D12_GPU_VIRTUAL_ADDRESS addr,
+                                                              ResourceId &id, UINT64 &offs)
+{
+  id = ResourceId();
+  offs = 0;
+
+  if(addr == 0)
+    return;
+
+  GPUAddressRange range;
+
+  // this should really be a read-write lock
+  {
+    SCOPED_READLOCK(addressLock);
+
+    auto it = std::lower_bound(addresses.begin(), addresses.end(), addr);
+    if(it == addresses.end())
+      return;
+
+    range = *it;
+  }
+
+  if(addr < range.start)
+    return;
+
+  // still enforce the OOB end on ranges - which is the remaining range in the backing store.
+  // Otherwise we could end up passing through invalid addresses stored in stale descriptors
+  if(addr >= range.oobEnd)
+    return;
+
+  id = range.id;
+  offs = addr - range.start;
 }

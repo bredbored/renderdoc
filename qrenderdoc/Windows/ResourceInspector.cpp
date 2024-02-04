@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2017-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -25,12 +25,15 @@
 #include "ResourceInspector.h"
 #include <QCollator>
 #include <QKeyEvent>
-#include "3rdparty/toolwindowmanager/ToolWindowManagerArea.h"
+#include <QMenu>
+#include "Code/Resources.h"
 #include "Widgets/Extended/RDHeaderView.h"
+#include "toolwindowmanager/ToolWindowManagerArea.h"
 #include "ui_ResourceInspector.h"
 
 static const int ResourceIdRole = Qt::UserRole;
 static const int FilterRole = Qt::UserRole + 1;
+static const int LastAccessSortRole = Qt::UserRole + 2;
 
 class ResourceListItemModel : public QAbstractItemModel
 {
@@ -44,6 +47,13 @@ public:
   {
     emit beginResetModel();
     emit endResetModel();
+  }
+
+  void bumpLastUse(ResourceId id) { m_LastUse[id] = ++m_LastUseIdx; }
+  void resetLastUse()
+  {
+    m_LastUseIdx = 1;
+    m_LastUse.clear();
   }
 
   QModelIndex index(int row, int column, const QModelIndex &parent = QModelIndex()) const override
@@ -86,6 +96,9 @@ public:
 
         if(role == FilterRole)
           return ToQStr(desc.type) + lit(" ") + m_Ctx.GetResourceName(desc.resourceId);
+
+        if(role == LastAccessSortRole)
+          return m_LastUse[desc.resourceId];
       }
     }
 
@@ -94,14 +107,40 @@ public:
 
 private:
   ICaptureContext &m_Ctx;
+
+  QMap<ResourceId, uint32_t> m_LastUse;
+  uint32_t m_LastUseIdx = 1;
 };
+
+bool ResourceSorterModel::lessThan(const QModelIndex &source_left, const QModelIndex &source_right) const
+{
+  if(m_Sort == SortType::Creation)
+  {
+    return source_left.data(ResourceIdRole).value<ResourceId>() <
+           source_right.data(ResourceIdRole).value<ResourceId>();
+  }
+  else if(m_Sort == SortType::LastAccess)
+  {
+    uint a = source_left.data(LastAccessSortRole).toUInt();
+    uint b = source_right.data(LastAccessSortRole).toUInt();
+
+    // if they're different, sort by access. Otherwise fall through to alphabetical
+    // we invert the reason, so that high values (recent access) are first
+    if(a != b)
+      return a > b;
+
+    return QCollatorSortFilterProxyModel::lessThan(source_left, source_right);
+  }
+
+  return QCollatorSortFilterProxyModel::lessThan(source_left, source_right);
+}
 
 ResourceInspector::ResourceInspector(ICaptureContext &ctx, QWidget *parent)
     : QFrame(parent), ui(new Ui::ResourceInspector), m_Ctx(ctx)
 {
   ui->setupUi(this);
 
-  ui->resourceName->setText(tr("No Resource Selected"));
+  SetResourceNameDisplay(tr("No Resource Selected"));
 
   ui->resetName->hide();
   ui->resourceNameEdit->hide();
@@ -111,7 +150,7 @@ ResourceInspector::ResourceInspector(ICaptureContext &ctx, QWidget *parent)
 
   m_ResourceModel = new ResourceListItemModel(this, m_Ctx);
 
-  m_FilterModel = new QCollatorSortFilterProxyModel(this);
+  m_FilterModel = new ResourceSorterModel(this);
   m_FilterModel->setSourceModel(m_ResourceModel);
   m_FilterModel->setFilterCaseSensitivity(Qt::CaseInsensitive);
   m_FilterModel->setFilterRole(FilterRole);
@@ -119,9 +158,20 @@ ResourceInspector::ResourceInspector(ICaptureContext &ctx, QWidget *parent)
   m_FilterModel->collator()->setNumericMode(true);
   m_FilterModel->collator()->setCaseSensitivity(Qt::CaseInsensitive);
 
+  ui->sortType->addItems(
+      {tr("Sort alphabetically"), tr("Sort by creation time"), tr("Sort by recently viewed")});
+  ui->sortType->adjustSize();
+
   ui->resourceList->setModel(m_FilterModel);
 
-  ui->initChunks->setColumns({lit("Parameter"), tr("Value")});
+  m_ChunksModel = new StructuredDataItemModel(this);
+  ui->initChunks->setModel(m_ChunksModel);
+  m_ChunksModel->setColumns({tr("Parameter"), tr("Value")},
+                            {StructuredDataItemModel::Name, StructuredDataItemModel::Value});
+
+  m_delegate = new RichTextViewDelegate(ui->initChunks);
+  ui->initChunks->setItemDelegate(m_delegate);
+
   ui->initChunks->header()->resizeSection(0, 200);
 
   ui->initChunks->setFont(Formatter::PreferredFont());
@@ -184,6 +234,8 @@ ResourceInspector::ResourceInspector(ICaptureContext &ctx, QWidget *parent)
   vertical->addWidget(ui->titleWidget);
   vertical->addWidget(ui->dockarea);
 
+  ui->resourceListFilter->setPlaceholderText(tr("Filter..."));
+
   Inspect(ResourceId());
 
   m_Ctx.AddCaptureViewer(this);
@@ -201,6 +253,10 @@ void ResourceInspector::Inspect(ResourceId id)
   if(m_Resource == id)
     return;
 
+  // cancel any rename in progress
+  ui->resourceNameEdit->hide();
+  ui->resourceName->show();
+
   if(m_Resource != ResourceId())
     ui->initChunks->saveExpansion(ui->initChunks->getInternalExpansion(qHash(ToQStr(m_Resource))), 0);
 
@@ -216,13 +272,17 @@ void ResourceInspector::Inspect(ResourceId id)
     m_ResourceModel->reset();
   }
 
+  m_ResourceModel->bumpLastUse(id);
+
+  m_FilterModel->invalidate();
+  m_FilterModel->sort(0);
+
   if(m_Ctx.HasResourceCustomName(id))
     ui->resetName->show();
   else
     ui->resetName->hide();
 
   ui->initChunks->setUpdatesEnabled(false);
-  ui->initChunks->clear();
   ui->resourceUsage->clear();
 
   const SDFile &file = m_Ctx.GetStructuredFile();
@@ -234,7 +294,6 @@ void ResourceInspector::Inspect(ResourceId id)
     rdcarray<ShaderEntryPoint> entries = r->GetShaderEntryPoints(id);
 
     GUIInvoke::call(this, [this, entries, usage] {
-
       if(!entries.isEmpty())
       {
         m_Entries = entries;
@@ -267,7 +326,7 @@ void ResourceInspector::Inspect(ResourceId id)
   {
     ANALYTIC_SET(UIFeatures.ResourceInspect, true);
 
-    ui->resourceName->setText(m_Ctx.GetResourceName(id));
+    SetResourceNameDisplay(m_Ctx.GetResourceName(id));
 
     ui->relatedResources->beginUpdate();
     ui->relatedResources->clear();
@@ -299,32 +358,22 @@ void ResourceInspector::Inspect(ResourceId id)
     }
     ui->relatedResources->endUpdate();
 
+    rdcarray<SDObject *> objs;
+
     for(uint32_t chunk : desc->initialisationChunks)
     {
-      RDTreeWidgetItem *root = new RDTreeWidgetItem({QString(), QString()});
-
       if(chunk < file.chunks.size())
-      {
-        SDChunk *chunkObj = file.chunks[chunk];
-
-        root->setText(0, chunkObj->name);
-
-        addStructuredObjects(root, chunkObj->data.children, false);
-      }
+        objs.push_back(file.chunks[chunk]);
       else
-      {
-        root->setText(1, tr("Invalid chunk index %1").arg(chunk));
-      }
-
-      ui->initChunks->addTopLevelItem(root);
-
-      ui->initChunks->setSelectedItem(root);
+        qCritical() << "Invalid chunk index" << chunk;
     }
+
+    m_ChunksModel->setObjects(objs);
   }
   else
   {
     m_Resource = ResourceId();
-    ui->resourceName->setText(tr("No Resource Selected"));
+    SetResourceNameDisplay(tr("No Resource Selected"));
   }
 
   ui->initChunks->setUpdatesEnabled(true);
@@ -332,6 +381,58 @@ void ResourceInspector::Inspect(ResourceId id)
   if(m_Resource != ResourceId())
     ui->initChunks->applyExpansion(ui->initChunks->getInternalExpansion(qHash(ToQStr(m_Resource))),
                                    0);
+}
+
+void ResourceInspector::RevealParameter(SDObject *param)
+{
+  if(!param)
+    return;
+
+  rdcarray<SDObject *> hierarchy;
+  while(param)
+  {
+    hierarchy.push_back(param);
+    param = param->GetParent();
+  }
+
+  SDObject *current = hierarchy.back();
+  hierarchy.pop_back();
+
+  int rootIdx = m_ChunksModel->objects().indexOf(current);
+
+  if(rootIdx >= 0)
+  {
+    QModelIndex parent = m_ChunksModel->index(rootIdx, 0);
+
+    while(parent.isValid())
+    {
+      ui->initChunks->expand(parent);
+
+      SDObject *next = hierarchy.back();
+      hierarchy.pop_back();
+
+      QModelIndex item;
+
+      for(size_t i = 0; i < current->NumChildren(); i++)
+      {
+        if(current->GetChild(i) == next)
+        {
+          current = next;
+          item = parent.child((int)i, 0);
+          break;
+        }
+      }
+
+      parent = item;
+
+      if(hierarchy.empty())
+        break;
+    }
+
+    ui->initChunks->selectionModel()->select(
+        parent, QItemSelectionModel::ClearAndSelect | QItemSelectionModel::Rows);
+    ui->initChunks->scrollTo(parent);
+  }
 }
 
 void ResourceInspector::OnCaptureLoaded()
@@ -342,23 +443,36 @@ void ResourceInspector::OnCaptureLoaded()
   m_ResourceCacheID = m_Ctx.ResourceNameCacheID();
 }
 
+void ResourceInspector::SetResourceNameDisplay(const QString &name)
+{
+#if defined(RELEASE)
+  ui->resourceName->setText(name);
+#else
+  if(m_Resource != ResourceId())
+    ui->resourceName->setText(name + QFormatStr(" (%1)").arg(ToQStr(m_Resource)));
+  else
+    ui->resourceName->setText(name);
+#endif
+}
+
 void ResourceInspector::OnCaptureClosed()
 {
+  m_Resource = ResourceId();
+
   ui->renameResource->setEnabled(false);
   ui->resetName->hide();
 
-  ui->resourceName->setText(tr("No Resource Selected"));
+  SetResourceNameDisplay(tr("No Resource Selected"));
 
   ui->viewContents->hide();
 
   m_ResourceModel->reset();
+  m_ResourceModel->resetLastUse();
 
-  ui->initChunks->clear();
+  m_ChunksModel->setObjects({});
   ui->initChunks->clearInternalExpansions();
   ui->relatedResources->clear();
   ui->resourceUsage->clear();
-
-  m_Resource = ResourceId();
 }
 
 void ResourceInspector::OnEventChanged(uint32_t eventId)
@@ -369,6 +483,7 @@ void ResourceInspector::OnEventChanged(uint32_t eventId)
   {
     m_ResourceCacheID = m_Ctx.ResourceNameCacheID();
     m_ResourceModel->reset();
+    SetResourceNameDisplay(m_Ctx.GetResourceName(m_Resource));
   }
 }
 
@@ -376,21 +491,24 @@ void ResourceInspector::on_renameResource_clicked()
 {
   if(!ui->resourceNameEdit->isVisible())
   {
-    ui->resourceNameEdit->setText(ui->resourceName->text());
+    ui->resourceNameEdit->setText(m_Ctx.GetResourceNameUnsuffixed(m_Resource).trimmed());
     ui->resourceName->hide();
     ui->resourceNameEdit->show();
     ui->resourceNameEdit->setFocus();
   }
   else
   {
+    QString name = ui->resourceNameEdit->text();
+
     // apply the edit
-    ui->resourceName->setText(ui->resourceNameEdit->text());
+    m_Ctx.SetResourceCustomName(m_Resource, name);
+
+    SetResourceNameDisplay(m_Ctx.GetResourceName(m_Resource));
+
     ui->resourceNameEdit->hide();
     ui->resourceName->show();
 
     ui->resetName->show();
-
-    m_Ctx.SetResourceCustomName(m_Resource, ui->resourceName->text());
   }
 }
 
@@ -411,16 +529,21 @@ void ResourceInspector::on_resourceNameEdit_keyPress(QKeyEvent *event)
 
 void ResourceInspector::on_resetName_clicked()
 {
-  ui->resourceName->setText(m_Ctx.GetResourceName(m_Resource));
+  m_Ctx.SetResourceCustomName(m_Resource, QString());
+
+  SetResourceNameDisplay(m_Ctx.GetResourceName(m_Resource));
 
   ui->resetName->hide();
-
-  m_Ctx.SetResourceCustomName(m_Resource, QString());
 
   // force a refresh to pick up the new name
   ResourceId id = m_Resource;
   m_Resource = ResourceId();
   Inspect(id);
+}
+
+void ResourceInspector::on_sortType_currentIndexChanged(int index)
+{
+  m_FilterModel->setSortType((ResourceSorterModel::SortType)index);
 }
 
 void ResourceInspector::on_cancelResourceListFilter_clicked()
@@ -451,7 +574,7 @@ void ResourceInspector::on_viewContents_clicked()
     if(tex->type == TextureType::Buffer)
     {
       IBufferViewer *viewer = m_Ctx.ViewTextureAsBuffer(
-          0, 0, tex->resourceId, FormatElement::GenerateTextureBufferFormat(*tex));
+          tex->resourceId, Subresource(), BufferFormatter::GetTextureFormatString(*tex));
 
       m_Ctx.AddDockWindow(viewer->Widget(), DockReference::AddTo, this);
     }
@@ -460,7 +583,7 @@ void ResourceInspector::on_viewContents_clicked()
       if(!m_Ctx.HasTextureViewer())
         m_Ctx.ShowTextureViewer();
       ITextureViewer *viewer = m_Ctx.GetTextureViewer();
-      viewer->ViewTexture(tex->resourceId, true);
+      viewer->ViewTexture(tex->resourceId, CompType::Typeless, true);
     }
   }
   else if(buf)
@@ -478,10 +601,12 @@ void ResourceInspector::on_viewContents_clicked()
       // TODO need to let the user choose the entry point
     }
 
+    // TODO allow choosing parent pipeline?
+    ResourceId pipeid;
     ResourceId id = m_Resource;
     ICaptureContext *ctx = &m_Ctx;
-    m_Ctx.Replay().AsyncInvoke([this, ctx, id, entry](IReplayController *r) {
-      ShaderReflection *refl = r->GetShader(id, entry);
+    m_Ctx.Replay().AsyncInvoke([this, ctx, pipeid, id, entry](IReplayController *r) {
+      const ShaderReflection *refl = r->GetShader(pipeid, id, entry);
 
       if(!refl)
         return;

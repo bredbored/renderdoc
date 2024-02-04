@@ -6,15 +6,19 @@ class GL_Simple_Triangle(rdtest.TestCase):
     demos_test_name = 'GL_Simple_Triangle'
 
     def check_capture(self):
-        self.check_final_backbuffer()
+        last_action: rd.ActionDescription = self.get_last_action()
+
+        self.controller.SetFrameEvent(last_action.eventId, True)
+
+        self.check_triangle(out=last_action.copyDestination)
 
         self.check_export(self.capture_filename)
 
-        draw = self.find_draw("Draw")
+        action = self.find_action("Draw")
 
-        self.controller.SetFrameEvent(draw.eventId, False)
+        self.controller.SetFrameEvent(action.eventId, False)
 
-        postvs_data = self.get_postvs(rd.MeshDataStage.VSOut, 0, draw.numIndices)
+        postvs_data = self.get_postvs(action, rd.MeshDataStage.VSOut, 0, action.numIndices)
 
         postvs_ref = {
             0: {
@@ -22,7 +26,7 @@ class GL_Simple_Triangle(rdtest.TestCase):
                 'idx': 0,
                 'gl_Position': [-0.5, -0.5, 0.0, 1.0],
                 'v2f_block.pos': [-0.5, -0.5, 0.0, 1.0],
-                'v2f_block.col': [1.0, 0.0, 0.0, 1.0],
+                'v2f_block.col': [0.0, 1.0, 0.0, 1.0],
                 'v2f_block.uv': [0.0, 0.0, 0.0, 1.0],
             },
             1: {
@@ -38,9 +42,25 @@ class GL_Simple_Triangle(rdtest.TestCase):
                 'idx': 2,
                 'gl_Position': [0.5, -0.5, 0.0, 1.0],
                 'v2f_block.pos': [0.5, -0.5, 0.0, 1.0],
-                'v2f_block.col': [0.0, 0.0, 1.0, 1.0],
+                'v2f_block.col': [0.0, 1.0, 0.0, 1.0],
                 'v2f_block.uv': [1.0, 0.0, 0.0, 1.0],
             },
         }
 
         self.check_mesh_data(postvs_ref, postvs_data)
+
+        save_data = rd.TextureSave()
+        save_data.destType = rd.FileType.DDS
+        path = rdtest.get_tmp_path('temp.dds')
+
+        # Check that nothing breaks if we call typical enumeration functions on resources
+        for res in self.controller.GetResources():
+            res: rd.ResourceDescription
+
+            save_data.resourceId = res.resourceId
+
+            self.controller.GetShaderEntryPoints(res.resourceId)
+            self.controller.GetUsage(res.resourceId)
+            self.controller.GetBufferData(res.resourceId, 0, 0)
+            self.controller.GetTextureData(res.resourceId, rd.Subresource())
+            self.controller.SaveTexture(save_data, path)

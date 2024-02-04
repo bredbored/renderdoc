@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2018-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -22,13 +22,15 @@
  * THE SOFTWARE.
  ******************************************************************************/
 
-#include "driver/gl/gl_common.h"
-#include "driver/gl/wgl_dispatch_table.h"
+#include "gl_common.h"
+#include "wgl_dispatch_table.h"
 
 #define WINDOW_CLASS_NAME L"renderdocGLclass"
 
 class WGLPlatform : public GLPlatform
 {
+  RDCDriver m_API = RDCDriver::OpenGL;
+
   bool MakeContextCurrent(GLWindowingData data)
   {
     if(WGL.wglMakeCurrent)
@@ -37,6 +39,50 @@ class WGLPlatform : public GLPlatform
     return false;
   }
 
+  // pushing/popping contexts is complex on windows due to the really awful rules for DC lifetimes.
+  // Changing to the child context is easy, but getting back to where we started is hard. The
+  // 'current' DC may no longer be valid, as it may have been released in the meantime (while
+  // rendering is still A-OK). We check that the window behind the DC is valid, stored the 'wnd'
+  // member. If that window is valid then we use GetDC() to get a temporary DC and bind that,
+  // assuming all will be well. If the window isn't valid then we can't get a valid DC so we can't
+  // rebind the context exactly as it was, however we assume that rendering to that setup was broken
+  // (because the bound DC wasn't pointing to a valid window) so instead we just bind the old
+  // context but with our DC.
+
+  virtual bool PushChildContext(GLWindowingData existing, GLWindowingData newChild,
+                                GLWindowingData *saved)
+  {
+    bool success = MakeContextCurrent(newChild);
+    *saved = existing;
+    if(existing.ctx)
+    {
+      if(::IsWindow(existing.wnd))
+      {
+        saved->DC = GetDC(existing.wnd);
+      }
+      else
+      {
+        saved->wnd = newChild.wnd;
+        saved->DC = newChild.DC;
+      }
+    }
+
+    return success;
+  }
+  virtual void PopChildContext(GLWindowingData existing, GLWindowingData newChild,
+                               GLWindowingData saved)
+  {
+    // if possible we want to use the existing DC so that we have a valid DC for further work (the
+    // cloned one we're making is going to be destroyed). First try to rebind the existing as-is,
+    // and only if that fails - e.g. due to a stale DC - use our cloned one to rebind the context
+    if(!MakeContextCurrent(existing))
+    {
+      MakeContextCurrent(saved);
+      // release the DC now, if we didn't use our own because theirs was invalid
+      if(saved.DC != newChild.DC)
+        ::ReleaseDC(saved.wnd, saved.DC);
+    }
+  }
   GLWindowingData CloneTemporaryContext(GLWindowingData share)
   {
     GLWindowingData ret = share;
@@ -44,6 +90,28 @@ class WGLPlatform : public GLPlatform
 
     if(!WGL.wglCreateContextAttribsARB)
       return ret;
+
+    // the reason we have to create an entire window and DC is because the share DC (and window)
+    // can be destroyed after we make a clone, which causes the DC (and window) we hold on to,
+    // to become invalid.
+    if(!RegisterClass())
+      return ret;
+
+    HWND wnd =
+        CreateWindowW(WINDOW_CLASS_NAME, L"", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
+                      CW_USEDEFAULT, CW_USEDEFAULT, NULL, NULL, GetModuleHandle(NULL), NULL);
+
+    HDC dc = GetDC(wnd);
+
+    int pf = GetPixelFormat(share.DC);
+
+    PIXELFORMATDESCRIPTOR pfd;
+    DescribePixelFormat(share.DC, pf, sizeof(PIXELFORMATDESCRIPTOR), &pfd);
+
+    SetPixelFormat(dc, pf, &pfd);
+
+    int profile = m_API == RDCDriver::OpenGLES ? WGL_CONTEXT_ES2_PROFILE_BIT_EXT
+                                               : WGL_CONTEXT_CORE_PROFILE_BIT_ARB;
 
     const int attribs[] = {
         WGL_CONTEXT_MAJOR_VERSION_ARB,
@@ -53,12 +121,18 @@ class WGLPlatform : public GLPlatform
         WGL_CONTEXT_FLAGS_ARB,
         0,
         WGL_CONTEXT_PROFILE_MASK_ARB,
-        WGL_CONTEXT_CORE_PROFILE_BIT_ARB,
+        profile,
         0,
         0,
     };
 
-    ret.ctx = WGL.wglCreateContextAttribsARB(share.DC, share.ctx, attribs);
+    HGLRC rc = WGL.wglCreateContextAttribsARB(dc, share.ctx, attribs);
+
+    ShowWindow(wnd, SW_HIDE);
+
+    ret.wnd = wnd;
+    ret.DC = dc;
+    ret.ctx = rc;
 
     return ret;
   }
@@ -66,7 +140,11 @@ class WGLPlatform : public GLPlatform
   void DeleteClonedContext(GLWindowingData context)
   {
     if(context.ctx && WGL.wglDeleteContext)
+    {
       WGL.wglDeleteContext(context.ctx);
+      ::ReleaseDC(context.wnd, context.DC);
+      ::DestroyWindow(context.wnd);
+    }
   }
 
   void DeleteReplayContext(GLWindowingData context)
@@ -216,7 +294,8 @@ class WGLPlatform : public GLPlatform
     attribs[i++] = 0;
 #endif
     attribs[i++] = WGL_CONTEXT_PROFILE_MASK_ARB;
-    attribs[i++] = WGL_CONTEXT_CORE_PROFILE_BIT_ARB;
+    attribs[i++] = m_API == RDCDriver::OpenGLES ? WGL_CONTEXT_ES2_PROFILE_BIT_EXT
+                                                : WGL_CONTEXT_CORE_PROFILE_BIT_ARB;
 
     HGLRC rc = WGL.wglCreateContextAttribsARB(DC, share_context.ctx, attribs);
     if(rc == NULL)
@@ -245,6 +324,7 @@ class WGLPlatform : public GLPlatform
     return Process::GetFunctionAddress(Process::LoadModule("opengl32.dll"), funcname);
   }
 
+  bool CanCreateGLContext() { return true; }
   bool CanCreateGLESContext()
   {
     bool success = WGL.PopulateForReplay();
@@ -291,14 +371,22 @@ class WGLPlatform : public GLPlatform
   }
 
   bool PopulateForReplay() { return WGL.PopulateForReplay(); }
-  ReplayStatus InitialiseAPI(GLWindowingData &replayContext, RDCDriver api)
+  void SetDriverType(RDCDriver api) { m_API = api; }
+  RDResult InitialiseAPI(GLWindowingData &replayContext, RDCDriver api, bool debug)
   {
+// force debug in development builds
+#if ENABLED(RDOC_DEVEL)
+    debug = true;
+#endif
+
     RDCASSERT(api == RDCDriver::OpenGL || api == RDCDriver::OpenGLES);
+
+    m_API = api;
 
     bool success = RegisterClass();
 
     if(!success)
-      return ReplayStatus::APIInitFailed;
+      RETURN_ERROR_RESULT(ResultCode::APIInitFailed, "Couldn't register window class");
 
     HWND w = NULL;
     HDC dc = NULL;
@@ -307,7 +395,8 @@ class WGLPlatform : public GLPlatform
     success = CreateTrampolineContext(w, dc, rc);
 
     if(!success)
-      return ReplayStatus::APIInitFailed;
+      RETURN_ERROR_RESULT(ResultCode::APIInitFailed,
+                          "Couldn't create unextended trampoline context");
 
     if(!WGL.wglCreateContextAttribsARB || !WGL.wglGetPixelFormatAttribivARB)
     {
@@ -315,8 +404,8 @@ class WGLPlatform : public GLPlatform
       WGL.wglDeleteContext(rc);
       ReleaseDC(w, dc);
       DestroyWindow(w);
-      RDCERR("RenderDoc requires WGL_ARB_create_context and WGL_ARB_pixel_format");
-      return ReplayStatus::APIHardwareUnsupported;
+      RETURN_ERROR_RESULT(ResultCode::APIHardwareUnsupported,
+                          "RenderDoc requires WGL_ARB_create_context and WGL_ARB_pixel_format");
     }
 
     WGL.wglMakeCurrent(NULL, NULL);
@@ -345,19 +434,17 @@ class WGLPlatform : public GLPlatform
     int pf = ChoosePixelFormat(dc, &pfd);
     if(pf == 0)
     {
-      RDCERR("Couldn't choose pixel format");
       ReleaseDC(w, dc);
       DestroyWindow(w);
-      return ReplayStatus::APIInitFailed;
+      RETURN_ERROR_RESULT(ResultCode::APIInitFailed, "Couldn't choose pixel format");
     }
 
     BOOL res = SetPixelFormat(dc, pf, &pfd);
     if(res == FALSE)
     {
-      RDCERR("Couldn't set pixel format");
       ReleaseDC(w, dc);
       DestroyWindow(w);
-      return ReplayStatus::APIInitFailed;
+      RETURN_ERROR_RESULT(ResultCode::APIInitFailed, "Couldn't set pixel format");
     }
 
     int attribs[64] = {0};
@@ -370,18 +457,14 @@ class WGLPlatform : public GLPlatform
     int &minor = attribs[i];
     attribs[i++] = 0;
     attribs[i++] = WGL_CONTEXT_FLAGS_ARB;
-#if ENABLED(RDOC_DEVEL)
-    attribs[i++] = WGL_CONTEXT_DEBUG_BIT_ARB;
-#else
-    attribs[i++] = 0;
-#endif
+    attribs[i++] = debug ? WGL_CONTEXT_DEBUG_BIT_ARB : 0;
     attribs[i++] = WGL_CONTEXT_PROFILE_MASK_ARB;
     attribs[i++] = api == RDCDriver::OpenGLES ? WGL_CONTEXT_ES2_PROFILE_BIT_EXT
                                               : WGL_CONTEXT_CORE_PROFILE_BIT_ARB;
 
     rc = NULL;
 
-    std::vector<GLVersion> versions = GetReplayVersions(api);
+    rdcarray<GLVersion> versions = GetReplayVersions(api);
 
     for(GLVersion v : versions)
     {
@@ -395,10 +478,11 @@ class WGLPlatform : public GLPlatform
 
     if(rc == NULL)
     {
-      RDCERR("Couldn't create at least 3.2 context - RenderDoc requires OpenGL 3.2 availability");
       ReleaseDC(w, dc);
       DestroyWindow(w);
-      return ReplayStatus::APIHardwareUnsupported;
+      RETURN_ERROR_RESULT(
+          ResultCode::APIHardwareUnsupported,
+          "Couldn't create at least 3.2 context - RenderDoc requires OpenGL 3.2 availability");
     }
 
     GLCoreVersion = major * 10 + minor;
@@ -406,19 +490,18 @@ class WGLPlatform : public GLPlatform
     res = WGL.wglMakeCurrent(dc, rc);
     if(res == FALSE)
     {
-      RDCERR("Couldn't make 3.2 RC current");
       WGL.wglMakeCurrent(NULL, NULL);
       WGL.wglDeleteContext(rc);
       ReleaseDC(w, dc);
       DestroyWindow(w);
-      return ReplayStatus::APIInitFailed;
+      RETURN_ERROR_RESULT(ResultCode::APIInitFailed, "Couldn't make modern OpenGL context current");
     }
 
     replayContext.DC = dc;
     replayContext.ctx = rc;
     replayContext.wnd = w;
 
-    return ReplayStatus::Succeeded;
+    return ResultCode::Succeeded;
   }
 
   bool CreateTrampolineContext(HWND &w, HDC &dc, HGLRC &rc)
@@ -519,7 +602,7 @@ class WGLPlatform : public GLPlatform
     return true;
   }
 
-  void DrawQuads(float width, float height, const std::vector<Vec4f> &vertices)
+  void DrawQuads(float width, float height, const rdcarray<Vec4f> &vertices)
   {
     ::DrawQuads(WGL, width, height, vertices);
   }

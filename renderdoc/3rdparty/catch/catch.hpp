@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2018 Baldur Karlsson
+ * Copyright (c) 2018-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -25,12 +25,34 @@
 // this file exists just to wrap the *real* catch.hpp and define any configuration defines we always
 // want on.
 
-#define CATCH_CONFIG_FALLBACK_STRINGIFIER ToStr
+#define CATCH_CONFIG_FALLBACK_STRINGIFIER ToStrAsStdString
 #define CATCH_CONFIG_FORCE_FALLBACK_STRINGIFIER
 #define CATCH_CONFIG_INLINE_DEBUG_BREAK
 
-#include "api/replay/basic_types.h"
+// define the debugbreak to not be in a lambda, so that we get the right stack frame!
+#define CATCH_BREAK_INTO_DEBUGGER() \
+  if(Catch::isDebuggerActive())     \
+  {                                 \
+    CATCH_TRAP();                   \
+  }
+
+#include "api/replay/rdcstr.h"
 #include "api/replay/stringise.h"
+
+#include <ostream>
+#include <string>
+
+template <typename T>
+std::string ToStrAsStdString(const T &el)
+{
+  rdcstr s = ToStr(el);
+  return std::string(s.begin(), s.end());
+}
+
+inline std::ostream &operator<<(std::ostream &os, rdcstr const &str)
+{
+  return os << std::string(str.begin(), str.end());
+}
 
 #include "official/catch.hpp"
 
@@ -39,6 +61,9 @@ namespace Catch
 template <>
 struct StringMaker<rdcstr>
 {
-  static std::string convert(rdcstr const &value) { return value; }
+  static std::string convert(rdcstr const &value)
+  {
+    return std::string(value.begin(), value.end());
+  }
 };
 }

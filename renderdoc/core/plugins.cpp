@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2017-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -26,15 +26,15 @@
 #include "os/os_specific.h"
 #include "strings/string_utils.h"
 
-std::string LocatePluginFile(const std::string &path, const std::string &fileName)
+rdcstr LocatePluginFile(const rdcstr &path, const rdcstr &fileName)
 {
-  std::string ret;
+  rdcstr ret;
 
-  std::string libpath;
+  rdcstr libpath;
   FileIO::GetLibraryFilename(libpath);
   libpath = get_dirname(libpath);
 
-  std::vector<std::string> paths;
+  rdcarray<rdcstr> paths;
 
 #if defined(RENDERDOC_PLUGINS_PATH)
   string customPath(RENDERDOC_PLUGINS_PATH);
@@ -72,8 +72,8 @@ std::string LocatePluginFile(const std::string &path, const std::string &fileNam
 
   for(uint32_t i = 0; i < paths.size(); i++)
   {
-    std::string check = paths[i] + "/" + path + "/" + fileName;
-    if(FileIO::exists(check.c_str()))
+    rdcstr check = paths[i] + "/" + path + "/" + fileName;
+    if(FileIO::exists(check))
     {
       ret = check;
       break;

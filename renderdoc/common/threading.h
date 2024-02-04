@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  * Copyright (c) 2014 Crytek
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -25,6 +25,7 @@
 
 #pragma once
 
+#include "common/common.h"
 #include "os/os_specific.h"
 
 namespace Threading
@@ -78,16 +79,36 @@ public:
   bool Trylock() { return Atomic::CmpExch32(&val, 0, 1) == 0; }
   void Unlock() { Atomic::CmpExch32(&val, 1, 0); }
 private:
-  volatile int32_t val = 0;
+  int32_t val = 0;
 };
 
 class ScopedSpinLock
 {
 public:
+  ScopedSpinLock() = default;
   ScopedSpinLock(SpinLock &spin) : m_Spin(&spin) { m_Spin->Lock(); }
-  ~ScopedSpinLock() { m_Spin->Unlock(); }
+  ScopedSpinLock(const ScopedSpinLock &) = delete;
+  ScopedSpinLock &operator=(const ScopedSpinLock &) = delete;
+  ScopedSpinLock &operator=(ScopedSpinLock &&other)
+  {
+    if(m_Spin != NULL)
+      m_Spin->Unlock();
+    m_Spin = other.m_Spin;
+    other.m_Spin = NULL;
+    return *this;
+  }
+  ScopedSpinLock(ScopedSpinLock &&other) : m_Spin(other.m_Spin) { other.m_Spin = NULL; }
+  ~ScopedSpinLock()
+  {
+    if(m_Spin != NULL)
+    {
+      m_Spin->Unlock();
+      m_Spin = NULL;
+    }
+  }
+
 private:
-  SpinLock *m_Spin;
+  SpinLock *m_Spin = NULL;
 };
 };
 
@@ -98,4 +119,4 @@ private:
 #define SCOPED_READLOCK(rw) Threading::ScopedReadLock CONCAT(scopedlock, __LINE__)(rw);
 #define SCOPED_WRITELOCK(rw) Threading::ScopedWriteLock CONCAT(scopedlock, __LINE__)(rw);
 
-#define SCOPED_SPINLOCK(cs) Threading::SpinLock CONCAT(scopedlock, __LINE__)(cs);
+#define SCOPED_SPINLOCK(cs) Threading::ScopedSpinLock CONCAT(scopedlock, __LINE__)(cs);

@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  * Copyright (c) 2014 Crytek
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -31,7 +31,7 @@
 #include <functional>
 #include <map>
 #include <set>
-#include <vector>
+#include "common/common.h"
 #include "common/threading.h"
 #include "hooks/hooks.h"
 #include "os/os_specific.h"
@@ -63,9 +63,7 @@ bool ApplyHook(FunctionHook &hook, void **IATentry, bool &already)
       s_InstalledHooks[IATentry] = *IATentry;
   }
 
-  BOOL success = TRUE;
-
-  success = VirtualProtect(IATentry, sizeof(void *), PAGE_READWRITE, &oldProtection);
+  BOOL success = VirtualProtect(IATentry, sizeof(void *), PAGE_READWRITE, &oldProtection);
   if(!success)
   {
     RDCERR("Failed to make IAT entry writeable 0x%p", IATentry);
@@ -90,11 +88,11 @@ struct DllHookset
   bool hooksfetched = false;
   // if we have multiple copies of the dll loaded (unlikely), the other module handles will be
   // stored here
-  std::vector<HMODULE> altmodules;
-  std::vector<FunctionHook> FunctionHooks;
+  rdcarray<HMODULE> altmodules;
+  rdcarray<FunctionHook> FunctionHooks;
   DWORD OrdinalBase = 0;
-  std::vector<std::string> OrdinalNames;
-  std::vector<FunctionLoadCallback> Callbacks;
+  rdcarray<rdcstr> OrdinalNames;
+  rdcarray<FunctionLoadCallback> Callbacks;
   Threading::CriticalSection ordinallock;
 
   void FetchOrdinalNames()
@@ -150,23 +148,19 @@ struct DllHookset
 
 struct CachedHookData
 {
-  CachedHookData()
-  {
-    ownmodule = NULL;
-    missedOrdinals = false;
-    RDCEraseEl(lowername);
-  }
+  bool hookAll = true;
 
-  std::map<std::string, DllHookset> DllHooks;
-  HMODULE ownmodule;
+  std::map<rdcstr, DllHookset> DllHooks;
+  HMODULE ownmodule = NULL;
   Threading::CriticalSection lock;
-  char lowername[512];
+  char lowername[512] = {};
 
-  std::set<std::string> ignores;
+  std::set<rdcstr> ignores;
 
-  bool missedOrdinals;
+  bool missedOrdinals = false;
+  std::function<HMODULE(const rdcstr &, HANDLE, DWORD)> libraryIntercept;
 
-  volatile int32_t posthooking = 0;
+  int32_t posthooking = 0;
 
   void ApplyHooks(const char *modName, HMODULE module)
   {
@@ -193,7 +187,7 @@ struct CachedHookData
     // Also we exclude ourselves here - just in case the application has already loaded
     // renderdoc.dll, or tries to load it.
     if(strstr(lowername, "fraps") || strstr(lowername, "gameoverlayrenderer") ||
-       strstr(lowername, STRINGIZE(RDOC_DLL_FILE) ".dll") == lowername)
+       strstr(lowername, STRINGIZE(RDOC_BASE_NAME) ".dll") == lowername)
       return;
 
     // set module pointer if we are hooking exports from this module
@@ -242,7 +236,7 @@ struct CachedHookData
           DWORD err = GetLastError();
           char *slash = strrchr(filename, L'\\');
 
-          std::string basename = slash ? strlower(std::string(slash + 1)) : "";
+          rdcstr basename = slash ? strlower(rdcstr(slash + 1)) : "";
 
           if(err == 0 && basename == it->first)
           {
@@ -273,7 +267,9 @@ struct CachedHookData
     if(!_stricmp(modName, "kernel32.dll") || !_stricmp(modName, "powrprof.dll") ||
        !_stricmp(modName, "CoreMessaging.dll") || !_stricmp(modName, "opengl32.dll") ||
        !_stricmp(modName, "gdi32.dll") || !_stricmp(modName, "gdi32full.dll") ||
-       !_stricmp(modName, "nvoglv32.dll") || !_stricmp(modName, "nvoglv64.dll") ||
+       !_stricmp(modName, "windows.storage.dll") || !_stricmp(modName, "nvoglv32.dll") ||
+       !_stricmp(modName, "nvoglv64.dll") || !_stricmp(modName, "vulkan-1.dll") ||
+       !_stricmp(modName, "atio6axx.dll") || !_stricmp(modName, "atioglxx.dll") ||
        !_stricmp(modName, "nvcuda.dll") || strstr(lowername, "cudart") == lowername ||
        strstr(lowername, "msvcr") == lowername || strstr(lowername, "msvcp") == lowername ||
        strstr(lowername, "nv-vk") == lowername || strstr(lowername, "amdvlk") == lowername ||
@@ -338,7 +334,7 @@ struct CachedHookData
         if(!_stricmp(it->first.c_str(), dllName))
           hookset = &it->second;
 
-      if(hookset && importDesc->OriginalFirstThunk > 0 && importDesc->FirstThunk > 0)
+      if(hookset && importDesc->OriginalFirstThunk > 0)
       {
         IMAGE_THUNK_DATA *origFirst =
             (IMAGE_THUNK_DATA *)(baseAddress + importDesc->OriginalFirstThunk);
@@ -556,18 +552,19 @@ static void ForAllModules(std::function<void(const MODULEENTRY32 &me32)> callbac
     return;
   }
 
-  uintptr_t ret = 0;
-
   do
   {
     callback(me32);
-  } while(ret == 0 && Module32Next(hModuleSnap, &me32));
+  } while(Module32Next(hModuleSnap, &me32));
 
   CloseHandle(hModuleSnap);
 }
 
 static void HookAllModules()
 {
+  if(!s_HookData->hookAll)
+    return;
+
   ForAllModules(
       [](const MODULEENTRY32 &me32) { s_HookData->ApplyHooks(me32.szModule, me32.hModule); });
 
@@ -596,7 +593,7 @@ static void HookAllModules()
       }
     }
 
-    std::vector<FunctionLoadCallback> callbacks;
+    rdcarray<FunctionLoadCallback> callbacks;
     // don't call callbacks next time
     callbacks.swap(it->second.Callbacks);
 
@@ -627,16 +624,28 @@ static bool IsAPISet(const wchar_t *filename)
 
 static bool IsAPISet(const char *filename)
 {
-  std::wstring wfn;
+  size_t len = strlen(filename);
+  rdcwstr wfn(len);
+
   // assume ASCII not UTF, just upcast plainly to wchar_t
-  while(*filename)
-    wfn.push_back(wchar_t(*filename++));
+  for(size_t i = 0; i < len; i++)
+    wfn[i] = wchar_t(filename[i]);
+
   return IsAPISet(wfn.c_str());
 }
 
 HMODULE WINAPI Hooked_LoadLibraryExA(LPCSTR lpLibFileName, HANDLE fileHandle, DWORD flags)
 {
   bool dohook = true;
+
+  if(s_HookData->libraryIntercept)
+  {
+    HMODULE ret = s_HookData->libraryIntercept(lpLibFileName, fileHandle, flags);
+    if(ret)
+      return ret;
+    dohook = false;
+  }
+
   if(flags == 0 && GetModuleHandleA(lpLibFileName))
     dohook = false;
 
@@ -663,7 +672,20 @@ HMODULE WINAPI Hooked_LoadLibraryExA(LPCSTR lpLibFileName, HANDLE fileHandle, DW
 HMODULE WINAPI Hooked_LoadLibraryExW(LPCWSTR lpLibFileName, HANDLE fileHandle, DWORD flags)
 {
   bool dohook = true;
+
+  if(s_HookData->libraryIntercept)
+  {
+    HMODULE ret =
+        s_HookData->libraryIntercept(StringFormat::Wide2UTF8(lpLibFileName), fileHandle, flags);
+    if(ret)
+      return ret;
+    dohook = false;
+  }
+
   if(flags == 0 && GetModuleHandleW(lpLibFileName))
+    dohook = false;
+
+  if(flags & (LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_DATAFILE_EXCLUSIVE))
     dohook = false;
 
   SetLastError(S_OK);
@@ -703,10 +725,7 @@ static bool OrdinalAsString(void *func)
 
 FARPROC WINAPI Hooked_GetProcAddress(HMODULE mod, LPCSTR func)
 {
-  if(mod == NULL || func == NULL)
-    return (FARPROC)NULL;
-
-  if(mod == s_HookData->ownmodule)
+  if(mod == NULL || func == NULL || mod == s_HookData->ownmodule)
     return GetProcAddress(mod, func);
 
 #if ENABLED(VERBOSE_DEBUG_HOOK)
@@ -815,6 +834,46 @@ FARPROC WINAPI Hooked_GetProcAddress(HMODULE mod, LPCSTR func)
 
   return GetProcAddress(mod, func);
 }
+static void InitHookData()
+{
+  if(!s_HookData)
+  {
+    s_HookData = new CachedHookData;
+
+    RDCASSERT(s_HookData->DllHooks.empty());
+    s_HookData->DllHooks["kernel32.dll"].FunctionHooks.push_back(
+        FunctionHook("LoadLibraryA", NULL, &Hooked_LoadLibraryA));
+    s_HookData->DllHooks["kernel32.dll"].FunctionHooks.push_back(
+        FunctionHook("LoadLibraryW", NULL, &Hooked_LoadLibraryW));
+    s_HookData->DllHooks["kernel32.dll"].FunctionHooks.push_back(
+        FunctionHook("LoadLibraryExA", NULL, &Hooked_LoadLibraryExA));
+    s_HookData->DllHooks["kernel32.dll"].FunctionHooks.push_back(
+        FunctionHook("LoadLibraryExW", NULL, &Hooked_LoadLibraryExW));
+    s_HookData->DllHooks["kernel32.dll"].FunctionHooks.push_back(
+        FunctionHook("GetProcAddress", NULL, &Hooked_GetProcAddress));
+
+    for(const char *apiset :
+        {"api-ms-win-core-libraryloader-l1-1-0.dll", "api-ms-win-core-libraryloader-l1-1-1.dll",
+         "api-ms-win-core-libraryloader-l1-1-2.dll", "api-ms-win-core-libraryloader-l1-2-0.dll",
+         "api-ms-win-core-libraryloader-l1-2-1.dll"})
+    {
+      s_HookData->DllHooks[apiset].FunctionHooks.push_back(
+          FunctionHook("LoadLibraryA", NULL, &Hooked_LoadLibraryA));
+      s_HookData->DllHooks[apiset].FunctionHooks.push_back(
+          FunctionHook("LoadLibraryW", NULL, &Hooked_LoadLibraryW));
+      s_HookData->DllHooks[apiset].FunctionHooks.push_back(
+          FunctionHook("LoadLibraryExA", NULL, &Hooked_LoadLibraryExA));
+      s_HookData->DllHooks[apiset].FunctionHooks.push_back(
+          FunctionHook("LoadLibraryExW", NULL, &Hooked_LoadLibraryExW));
+      s_HookData->DllHooks[apiset].FunctionHooks.push_back(
+          FunctionHook("GetProcAddress", NULL, &Hooked_GetProcAddress));
+    }
+
+    GetModuleHandleEx(
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        (LPCTSTR)&s_HookData, &s_HookData->ownmodule);
+  }
+}
 
 void LibraryHooks::RegisterFunctionHook(const char *libraryName, const FunctionHook &hook)
 {
@@ -828,17 +887,17 @@ void LibraryHooks::RegisterFunctionHook(const char *libraryName, const FunctionH
       return;
     }
   }
-  s_HookData->DllHooks[strlower(std::string(libraryName))].FunctionHooks.push_back(hook);
+  s_HookData->DllHooks[strlower(rdcstr(libraryName))].FunctionHooks.push_back(hook);
 }
 
 void LibraryHooks::RegisterLibraryHook(const char *libraryName, FunctionLoadCallback loadedCallback)
 {
-  s_HookData->DllHooks[strlower(std::string(libraryName))].Callbacks.push_back(loadedCallback);
+  s_HookData->DllHooks[strlower(rdcstr(libraryName))].Callbacks.push_back(loadedCallback);
 }
 
 void LibraryHooks::IgnoreLibrary(const char *libraryName)
 {
-  std::string lowername = libraryName;
+  rdcstr lowername = libraryName;
 
   for(size_t i = 0; i < lowername.size(); i++)
     lowername[i] = (char)tolower(lowername[i]);
@@ -848,39 +907,7 @@ void LibraryHooks::IgnoreLibrary(const char *libraryName)
 
 void LibraryHooks::BeginHookRegistration()
 {
-  s_HookData = new CachedHookData;
-  RDCASSERT(s_HookData->DllHooks.empty());
-  s_HookData->DllHooks["kernel32.dll"].FunctionHooks.push_back(
-      FunctionHook("LoadLibraryA", NULL, &Hooked_LoadLibraryA));
-  s_HookData->DllHooks["kernel32.dll"].FunctionHooks.push_back(
-      FunctionHook("LoadLibraryW", NULL, &Hooked_LoadLibraryW));
-  s_HookData->DllHooks["kernel32.dll"].FunctionHooks.push_back(
-      FunctionHook("LoadLibraryExA", NULL, &Hooked_LoadLibraryExA));
-  s_HookData->DllHooks["kernel32.dll"].FunctionHooks.push_back(
-      FunctionHook("LoadLibraryExW", NULL, &Hooked_LoadLibraryExW));
-  s_HookData->DllHooks["kernel32.dll"].FunctionHooks.push_back(
-      FunctionHook("GetProcAddress", NULL, &Hooked_GetProcAddress));
-
-  for(const char *apiset :
-      {"api-ms-win-core-libraryloader-l1-1-0.dll", "api-ms-win-core-libraryloader-l1-1-1.dll",
-       "api-ms-win-core-libraryloader-l1-1-2.dll", "api-ms-win-core-libraryloader-l1-2-0.dll",
-       "api-ms-win-core-libraryloader-l1-2-1.dll"})
-  {
-    s_HookData->DllHooks[apiset].FunctionHooks.push_back(
-        FunctionHook("LoadLibraryA", NULL, &Hooked_LoadLibraryA));
-    s_HookData->DllHooks[apiset].FunctionHooks.push_back(
-        FunctionHook("LoadLibraryW", NULL, &Hooked_LoadLibraryW));
-    s_HookData->DllHooks[apiset].FunctionHooks.push_back(
-        FunctionHook("LoadLibraryExA", NULL, &Hooked_LoadLibraryExA));
-    s_HookData->DllHooks[apiset].FunctionHooks.push_back(
-        FunctionHook("LoadLibraryExW", NULL, &Hooked_LoadLibraryExW));
-    s_HookData->DllHooks[apiset].FunctionHooks.push_back(
-        FunctionHook("GetProcAddress", NULL, &Hooked_GetProcAddress));
-  }
-
-  GetModuleHandleEx(
-      GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-      (LPCTSTR)&s_HookData, &s_HookData->ownmodule);
+  InitHookData();
 }
 
 // hook all functions for currently loaded modules.
@@ -915,16 +942,21 @@ void LibraryHooks::Refresh()
   // don't need to refresh on windows
 }
 
+void LibraryHooks::ReplayInitialise()
+{
+}
+
 void LibraryHooks::RemoveHooks()
 {
+  LibraryHooks::RemoveHookCallbacks();
+
   for(auto it = s_InstalledHooks.begin(); it != s_InstalledHooks.end(); ++it)
   {
     DWORD oldProtection = PAGE_EXECUTE;
-    BOOL success = TRUE;
 
     void **IATentry = it->first;
 
-    success = VirtualProtect(IATentry, sizeof(void *), PAGE_READWRITE, &oldProtection);
+    BOOL success = VirtualProtect(IATentry, sizeof(void *), PAGE_READWRITE, &oldProtection);
     if(!success)
     {
       RDCERR("Failed to make IAT entry writeable 0x%p", IATentry);
@@ -950,6 +982,36 @@ bool LibraryHooks::Detect(const char *identifier)
       ret = true;
   });
   return ret;
+}
+
+void Win32_RegisterManualModuleHooking()
+{
+  InitHookData();
+
+  s_HookData->hookAll = false;
+}
+
+void Win32_InterceptLibraryLoads(std::function<HMODULE(const rdcstr &, HANDLE, DWORD)> callback)
+{
+  s_HookData->libraryIntercept = callback;
+}
+
+void Win32_ManualHookModule(rdcstr modName, HMODULE module)
+{
+  for(auto it = s_HookData->DllHooks.begin(); it != s_HookData->DllHooks.end(); ++it)
+    std::sort(it->second.FunctionHooks.begin(), it->second.FunctionHooks.end());
+
+  modName = strlower(modName);
+
+  s_HookData->DllHooks[modName].module = module;
+
+  for(FunctionHook &hook : s_HookData->DllHooks[modName].FunctionHooks)
+  {
+    if(hook.orig)
+      *hook.orig = GetProcAddress(module, hook.function.c_str());
+  }
+
+  s_HookData->ApplyHooks(modName.c_str(), module);
 }
 
 // android only hooking functions, not used on win32

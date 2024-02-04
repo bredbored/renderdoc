@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2017-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -23,11 +23,14 @@
  ******************************************************************************/
 
 #include <utility>
+#include "api/replay/structured_data.h"
 #include "common/common.h"
+#include "common/formatting.h"
 #include "serialise/rdcfile.h"
+#include "strings/string_utils.h"
 
-#include "3rdparty/miniz/miniz.h"
-#include "3rdparty/pugixml/pugixml.hpp"
+#include "miniz/miniz.h"
+#include "pugixml/pugixml.hpp"
 
 struct ThumbTypeAndData
 {
@@ -40,8 +43,39 @@ static const char *typeNames[] = {
     "uint",  "int",    "float", "bool", "char",   "ResourceId",
 };
 
+struct LiteralFileSection
+{
+  SectionType type;
+  rdcstr filename;
+  rdcstr chunkName;
+  SectionFlags sectionFlags;
+};
+
+static const LiteralFileSection literalFileSections[] = {
+    {SectionType::EmbeddedLogfile, "diagnostic.log", "diagnostic_log", SectionFlags::LZ4Compressed},
+    {SectionType::D3D12Core, "D3D12Core.dll", "d3d12core", SectionFlags::ZstdCompressed},
+    {SectionType::D3D12SDKLayers, "D3D12SDKLayers.dll", "d3d12sdklayers",
+     SectionFlags::ZstdCompressed},
+};
+
+static bool isLiteralFileChunkName(const rdcstr &chunkName)
+{
+  for(const LiteralFileSection &section : literalFileSections)
+    if(chunkName == section.chunkName)
+      return true;
+  return false;
+}
+
+static bool isLiteralFileFileName(const rdcstr &filename)
+{
+  for(const LiteralFileSection &section : literalFileSections)
+    if(filename == section.filename)
+      return true;
+  return false;
+}
+
 template <typename inttype>
-std::string GetBufferName(inttype i)
+rdcstr GetBufferName(inttype i)
 {
   return StringFormat::Fmt("%06u", (uint32_t)i);
 }
@@ -60,7 +94,8 @@ struct xml_file_writer : pugi::xml_writer
 {
   StreamWriter stream;
 
-  xml_file_writer(const char *filename) : stream(FileIO::fopen(filename, "wb"), Ownership::Stream)
+  xml_file_writer(const rdcstr &filename)
+      : stream(FileIO::fopen(filename, FileIO::WriteBinary), Ownership::Stream)
   {
   }
 
@@ -86,7 +121,7 @@ static constexpr byte FromHex(const char c)
                                      : (c >= 'a' && c <= 'f' ? byte(c - 'a') + 10 : 0));
 }
 
-static void HexEncode(const std::vector<byte> &in, std::string &out)
+static void HexEncode(const bytebuf &in, rdcstr &out)
 {
   const size_t bytesPerLine = 32;
   const size_t bytesPerGroup = 4;
@@ -103,7 +138,7 @@ static void HexEncode(const std::vector<byte> &in, std::string &out)
   out = "\n";
 
   // accumulate ascii representation for each line
-  std::string ascii;
+  rdcstr ascii;
 
   size_t i = 0;
   for(byte c : in)
@@ -149,7 +184,7 @@ static void HexEncode(const std::vector<byte> &in, std::string &out)
   }
 }
 
-static void HexDecode(const char *str, const char *end, std::vector<byte> &out)
+static void HexDecode(const char *str, const char *end, bytebuf &out)
 {
   out.reserve((end - str) / 2);
 
@@ -160,7 +195,7 @@ static void HexDecode(const char *str, const char *end, std::vector<byte> &out)
   {
     if(IsHex(str[0]) && IsHex(str[1]))
     {
-      out.push_back((FromHex(str[0]) << 4) | FromHex(str[1]));
+      out.push_back(byte((FromHex(str[0]) << 4) | FromHex(str[1])));
 
       str += 2;
 
@@ -186,7 +221,7 @@ static void HexDecode(const char *str, const char *end, std::vector<byte> &out)
   }
 }
 
-static void Obj2XML(pugi::xml_node &parent, SDObject &child)
+static bool Obj2XML(pugi::xml_node &parent, SDObject &child)
 {
   pugi::xml_node obj = parent.append_child(typeNames[(uint32_t)child.type.basetype]);
 
@@ -197,7 +232,7 @@ static void Obj2XML(pugi::xml_node &parent, SDObject &child)
 
   if(child.type.basetype == SDBasic::UnsignedInteger ||
      child.type.basetype == SDBasic::SignedInteger || child.type.basetype == SDBasic::Float ||
-     child.type.basetype == SDBasic::Resource)
+     child.type.basetype == SDBasic::Resource || child.type.basetype == SDBasic::Enum)
   {
     obj.append_attribute("width") = child.type.byteSize;
   }
@@ -217,9 +252,19 @@ static void Obj2XML(pugi::xml_node &parent, SDObject &child)
   if(child.type.flags & SDTypeFlags::Union)
     obj.append_attribute("union") = true;
 
+  if(child.type.flags & SDTypeFlags::Important)
+    obj.append_attribute("important") = true;
+
+  if(child.type.flags & SDTypeFlags::ImportantChildren)
+    obj.append_attribute("importantchildren") = true;
+
+  if(child.type.flags & SDTypeFlags::HiddenChildren)
+    obj.append_attribute("hiddenchildren") = true;
+
   if(child.type.basetype == SDBasic::Chunk)
   {
-    RDCFATAL("Nested chunks!");
+    RDCERR("Cannot contain a chunk within a chunk");
+    return false;
   }
   else if(child.type.basetype == SDBasic::Null)
   {
@@ -228,12 +273,13 @@ static void Obj2XML(pugi::xml_node &parent, SDObject &child)
   }
   else if(child.type.basetype == SDBasic::Struct || child.type.basetype == SDBasic::Array)
   {
-    if(child.type.basetype == SDBasic::Array && !child.data.children.empty())
+    if(child.type.basetype == SDBasic::Array && child.NumChildren() > 0)
       obj.remove_attribute("typename");
 
-    for(size_t o = 0; o < child.data.children.size(); o++)
+    for(size_t o = 0; o < child.NumChildren(); o++)
     {
-      Obj2XML(obj, *child.data.children[o]);
+      if(!Obj2XML(obj, *child.GetChild(o)))
+        return false;
 
       if(child.type.basetype == SDBasic::Array)
         obj.last_child().remove_attribute("name");
@@ -269,11 +315,12 @@ static void Obj2XML(pugi::xml_node &parent, SDObject &child)
       default: RDCERR("Unexpected case");
     }
   }
+
+  return true;
 }
 
-static ReplayStatus Structured2XML(const char *filename, const RDCFile &file, uint64_t version,
-                                   const StructuredChunkList &chunks,
-                                   RENDERDOC_ProgressCallback progress)
+static RDResult Structured2XML(const rdcstr &filename, const RDCFile &file, uint64_t version,
+                               const StructuredChunkList &chunks, RENDERDOC_ProgressCallback progress)
 {
   pugi::xml_document doc;
 
@@ -293,7 +340,7 @@ static ReplayStatus Structured2XML(const char *filename, const RDCFile &file, ui
     pugi::xml_node xThumbnail = xHeader.append_child("thumbnail");
 
     const RDCThumb &th = file.GetThumbnail();
-    if(th.pixels && th.len > 0 && th.width > 0 && th.height > 0)
+    if(!th.pixels.empty() && th.width > 0 && th.height > 0)
     {
       xThumbnail.append_attribute("width") = th.width;
       xThumbnail.append_attribute("height") = th.height;
@@ -307,6 +354,11 @@ static ReplayStatus Structured2XML(const char *filename, const RDCFile &file, ui
       else
         RDCERR("Unexpected thumbnail format %s", ToStr(th.format).c_str());
     }
+
+    pugi::xml_node xTimebase = xHeader.append_child("timebase");
+
+    xTimebase.append_attribute("base") = file.GetTimestampBase();
+    xTimebase.append_attribute("frequency") = file.GetTimestampFrequency();
   }
 
   if(progress)
@@ -351,6 +403,25 @@ static ReplayStatus Structured2XML(const char *filename, const RDCFile &file, ui
       delete reader;
       continue;
     }
+    else
+    {
+      bool literalSection = false;
+
+      for(const LiteralFileSection &section : literalFileSections)
+      {
+        if(section.type == props.type)
+        {
+          pugi::xml_node xFile = xRoot.append_child(section.chunkName.c_str());
+          xFile.text() = section.filename.c_str();
+
+          delete reader;
+          literalSection = true;
+        }
+      }
+
+      if(literalSection)
+        continue;
+    }
 
     pugi::xml_node xSection = xRoot.append_child("section");
 
@@ -370,7 +441,7 @@ static ReplayStatus Structured2XML(const char *filename, const RDCFile &file, ui
     pugi::xml_node type = xSection.append_child("type");
     type.text() = (uint32_t)props.type;
 
-    std::vector<byte> contents;
+    bytebuf contents;
     contents.resize((size_t)reader->GetSize());
     reader->Read(contents.data(), reader->GetSize());
 
@@ -384,7 +455,7 @@ static ReplayStatus Structured2XML(const char *filename, const RDCFile &file, ui
     else
     {
       // encode to simple hex. Not efficient, but easy.
-      std::string hexdata;
+      rdcstr hexdata;
       hexdata.reserve(contents.size() * 2);
       HexEncode(contents, hexdata);
       data.text().set(hexdata.c_str());
@@ -428,15 +499,22 @@ static ReplayStatus Structured2XML(const char *filename, const RDCFile &file, ui
     {
       xChunk.append_attribute("opaque") = true;
 
-      RDCASSERT(!chunk->data.children.empty());
+      RDCASSERT(chunk->NumChildren() > 0);
       pugi::xml_node opaque = xChunk.append_child("buffer");
-      opaque.append_attribute("byteLength") = chunk->data.children[0]->type.byteSize;
-      opaque.text() = chunk->data.children[0]->data.basic.u;
+      opaque.append_attribute("byteLength") = chunk->GetChild(0)->type.byteSize;
+      opaque.text() = chunk->GetChild(0)->data.basic.u;
     }
     else
     {
-      for(size_t o = 0; o < chunk->data.children.size(); o++)
-        Obj2XML(xChunk, *chunk->data.children[o]);
+      for(size_t o = 0; o < chunk->NumChildren(); o++)
+      {
+        if(!Obj2XML(xChunk, *chunk->GetChild(o)))
+        {
+          RETURN_ERROR_RESULT(ResultCode::FileCorrupted,
+                              "Malformed structured data, couldn't encode chunk child %s",
+                              chunk->GetChild(o)->name.c_str());
+        }
+      }
     }
 
     if(progress)
@@ -446,15 +524,15 @@ static ReplayStatus Structured2XML(const char *filename, const RDCFile &file, ui
   xml_file_writer writer(filename);
   doc.save(writer);
 
-  return writer.stream.IsErrored() ? ReplayStatus::FileIOFailed : ReplayStatus::Succeeded;
+  return writer.stream.GetError();
 }
 
 static SDObject *XML2Obj(pugi::xml_node &obj)
 {
-  SDObject *ret =
-      new SDObject(obj.attribute("name").as_string(), obj.attribute("typename").as_string());
+  SDObject *ret = new SDObject(rdcstr(obj.attribute("name").as_string()),
+                               rdcstr(obj.attribute("typename").as_string()));
 
-  std::string name = obj.name();
+  rdcstr name = obj.name();
 
   for(size_t i = 0; i < ARRAY_COUNT(typeNames); i++)
   {
@@ -465,10 +543,11 @@ static SDObject *XML2Obj(pugi::xml_node &obj)
     }
   }
 
-  if(ret->type.basetype == SDBasic::UnsignedInteger || ret->type.basetype == SDBasic::SignedInteger ||
-     ret->type.basetype == SDBasic::Float || ret->type.basetype == SDBasic::Resource)
+  if(ret->type.basetype == SDBasic::UnsignedInteger ||
+     ret->type.basetype == SDBasic::SignedInteger || ret->type.basetype == SDBasic::Float ||
+     ret->type.basetype == SDBasic::Resource || ret->type.basetype == SDBasic::Enum)
   {
-    ret->type.byteSize = obj.attribute("width").as_uint();
+    ret->type.byteSize = obj.attribute("width").as_uint(4);
   }
 
   if(obj.attribute("hidden"))
@@ -483,6 +562,15 @@ static SDObject *XML2Obj(pugi::xml_node &obj)
   if(obj.attribute("union"))
     ret->type.flags |= SDTypeFlags::Union;
 
+  if(obj.attribute("important"))
+    ret->type.flags |= SDTypeFlags::Important;
+
+  if(obj.attribute("importantchildren"))
+    ret->type.flags |= SDTypeFlags::ImportantChildren;
+
+  if(obj.attribute("hiddenchildren"))
+    ret->type.flags |= SDTypeFlags::HiddenChildren;
+
   if(obj.attribute("typename"))
     ret->type.name = obj.attribute("typename").as_string();
 
@@ -490,7 +578,9 @@ static SDObject *XML2Obj(pugi::xml_node &obj)
 
   if(ret->type.basetype == SDBasic::Chunk)
   {
-    RDCFATAL("Nested chunks!");
+    RDCERR("Cannot contain a chunk within a chunk");
+    delete ret;
+    return NULL;
   }
   else if(ret->type.basetype == SDBasic::Null)
   {
@@ -500,14 +590,20 @@ static SDObject *XML2Obj(pugi::xml_node &obj)
   {
     for(pugi::xml_node child = obj.first_child(); child; child = child.next_sibling())
     {
-      ret->data.children.push_back(XML2Obj(child));
+      SDObject *c = XML2Obj(child);
+      if(!c)
+      {
+        delete ret;
+        return NULL;
+      }
+      ret->AddAndOwnChild(c);
 
       if(ret->type.basetype == SDBasic::Array)
-        ret->data.children.back()->name = "$el";
+        c->name = "$el";
     }
 
-    if(ret->type.basetype == SDBasic::Array && !ret->data.children.empty())
-      ret->type.name = ret->data.children.back()->type.name;
+    if(ret->type.basetype == SDBasic::Array && ret->NumChildren() > 0)
+      ret->type.name = ret->GetChild(0)->type.name;
   }
   else if(ret->type.basetype == SDBasic::Buffer)
   {
@@ -542,43 +638,37 @@ static SDObject *XML2Obj(pugi::xml_node &obj)
   return ret;
 }
 
-static ReplayStatus XML2Structured(const char *xml, const ThumbTypeAndData &thumb,
-                                   const ThumbTypeAndData &extThumb,
-                                   const StructuredBufferList &buffers, RDCFile *rdc,
-                                   uint64_t &version, StructuredChunkList &chunks,
-                                   RENDERDOC_ProgressCallback progress)
+static RDResult XML2Structured(const rdcstr &xml, const ThumbTypeAndData &thumb,
+                               const ThumbTypeAndData &extThumb,
+                               const std::map<SectionType, bytebuf> &literalFiles,
+                               const StructuredBufferList &buffers, RDCFile *rdc, uint64_t &version,
+                               StructuredChunkList &chunks, RENDERDOC_ProgressCallback progress)
 {
   pugi::xml_document doc;
-  doc.load_string(xml);
+  doc.load_string(xml.c_str());
 
   pugi::xml_node root = doc.child("rdc");
 
   if(!root)
-  {
-    RDCERR("Malformed document, expected rdc node");
-    return ReplayStatus::FileCorrupted;
-  }
+    RETURN_ERROR_RESULT(ResultCode::FileCorrupted,
+                        "Malformed xml document, couldn't get root <rdc> node");
 
   pugi::xml_node xHeader = root.first_child();
 
-  if(strcmp(xHeader.name(), "header"))
-  {
-    RDCERR("Malformed document, expected header node");
-    return ReplayStatus::FileCorrupted;
-  }
+  if(strcmp(xHeader.name(), "header") != 0)
+    RETURN_ERROR_RESULT(ResultCode::FileCorrupted,
+                        "Malformed xml document, expected <header> node got <%s>", xHeader.name());
 
   // process the header and push meta-data into RDC
   {
     pugi::xml_node xDriver = xHeader.first_child();
 
-    if(strcmp(xDriver.name(), "driver"))
-    {
-      RDCERR("Malformed document, expected driver node");
-      return ReplayStatus::FileCorrupted;
-    }
+    if(strcmp(xDriver.name(), "driver") != 0)
+      RETURN_ERROR_RESULT(ResultCode::FileCorrupted,
+                          "Malformed xml document, expected <driver> node got <%s>", xDriver.name());
 
     RDCDriver driver = (RDCDriver)xDriver.attribute("id").as_uint();
-    std::string driverName = xDriver.text().as_string();
+    rdcstr driverName = xDriver.text().as_string();
 
     pugi::xml_node xIdent = xDriver.next_sibling();
 
@@ -586,10 +676,26 @@ static ReplayStatus XML2Structured(const char *xml, const ThumbTypeAndData &thum
 
     pugi::xml_node xThumbnail = xIdent.next_sibling();
 
-    if(strcmp(xThumbnail.name(), "thumbnail"))
+    if(strcmp(xThumbnail.name(), "thumbnail") != 0)
+      RETURN_ERROR_RESULT(ResultCode::FileCorrupted,
+                          "Malformed xml document, expected <thumbnail> node got <%s>",
+                          xThumbnail.name());
+
+    pugi::xml_node xTimebase = xThumbnail.next_sibling();
+
+    uint64_t timeBase = 0;
+    double timeFreq = 1.0;
+
+    // newer XML documents have the timebase here, allow conversion without it
+    if(xTimebase)
     {
-      RDCERR("Malformed document, expected driver node");
-      return ReplayStatus::FileCorrupted;
+      if(strcmp(xTimebase.name(), "timebase") != 0)
+        RETURN_ERROR_RESULT(ResultCode::FileCorrupted,
+                            "Malformed xml document, expected <timebase> node got <%s>",
+                            xTimebase.name());
+
+      timeBase = xTimebase.attribute("base").as_ullong();
+      timeFreq = xTimebase.attribute("frequency").as_double();
     }
 
     RDCThumb th;
@@ -601,12 +707,11 @@ static ReplayStatus XML2Structured(const char *xml, const ThumbTypeAndData &thum
 
     if(th.width > 0 && th.height > 0 && !thumb.data.empty())
     {
-      th.pixels = thumb.data.data();
-      th.len = (uint32_t)thumb.data.size();
+      th.pixels = thumb.data;
       rdcthumb = &th;
     }
 
-    rdc->SetData(driver, driverName.c_str(), machineIdent, rdcthumb);
+    rdc->SetData(driver, driverName.c_str(), machineIdent, rdcthumb, timeBase, timeFreq);
   }
 
   if(progress)
@@ -615,7 +720,8 @@ static ReplayStatus XML2Structured(const char *xml, const ThumbTypeAndData &thum
   // push in other sections
   pugi::xml_node xSection = xHeader.next_sibling();
 
-  while(!strcmp(xSection.name(), "section") || !strcmp(xSection.name(), "extended_thumbnail"))
+  while(!strcmp(xSection.name(), "section") || !strcmp(xSection.name(), "extended_thumbnail") ||
+        isLiteralFileChunkName(xSection.name()))
   {
     if(!strcmp(xSection.name(), "extended_thumbnail"))
     {
@@ -638,6 +744,37 @@ static ReplayStatus XML2Structured(const char *xml, const ThumbTypeAndData &thum
 
       xSection = xSection.next_sibling();
       continue;
+    }
+    else
+    {
+      bool literalSection = false;
+
+      for(const LiteralFileSection &section : literalFileSections)
+      {
+        if(section.chunkName == xSection.name())
+        {
+          auto litIt = literalFiles.find(section.type);
+          if(litIt != literalFiles.end())
+          {
+            SectionProperties props = {};
+            props.type = section.type;
+            props.version = 1;
+            props.flags = section.sectionFlags;
+
+            StreamWriter *w = rdc->WriteSection(props);
+            w->Write(litIt->second.data(), litIt->second.size());
+            w->Finish();
+
+            delete w;
+
+            xSection = xSection.next_sibling();
+            literalSection = true;
+          }
+        }
+      }
+
+      if(literalSection)
+        continue;
     }
 
     SectionProperties props;
@@ -695,7 +832,7 @@ static ReplayStatus XML2Structured(const char *xml, const ThumbTypeAndData &thum
     }
     else
     {
-      std::vector<byte> decoded;
+      bytebuf decoded;
       HexDecode(str, str + len, decoded);
       writer->Write(decoded.data(), decoded.size());
     }
@@ -711,17 +848,13 @@ static ReplayStatus XML2Structured(const char *xml, const ThumbTypeAndData &thum
 
   pugi::xml_node xChunks = xSection;
 
-  if(strcmp(xSection.name(), "chunks"))
-  {
-    RDCERR("Malformed document, expected chunks node");
-    return ReplayStatus::FileCorrupted;
-  }
+  if(strcmp(xSection.name(), "chunks") != 0)
+    RETURN_ERROR_RESULT(ResultCode::FileCorrupted,
+                        "Malformed xml document, expected <chunks> node, got <%s>", xSection.name());
 
   if(!xChunks.attribute("version"))
-  {
-    RDCERR("Malformed document, expected version attribute");
-    return ReplayStatus::FileCorrupted;
-  }
+    RETURN_ERROR_RESULT(ResultCode::FileCorrupted,
+                        "Malformed xml document, expected version attribute");
 
   version = xChunks.attribute("version").as_ullong();
 
@@ -730,10 +863,12 @@ static ReplayStatus XML2Structured(const char *xml, const ThumbTypeAndData &thum
 
   for(pugi::xml_node xChunk = xChunks.first_child(); xChunk; xChunk = xChunk.next_sibling())
   {
-    if(strcmp(xChunk.name(), "chunk"))
-      return ReplayStatus::FileCorrupted;
+    if(strcmp(xChunk.name(), "chunk") != 0)
+      RETURN_ERROR_RESULT(ResultCode::FileCorrupted,
+                          "Malformed xml document, expected <chunk> child under <chunks>, got <%s>",
+                          xChunk.name());
 
-    SDChunk *chunk = new SDChunk(xChunk.attribute("name").as_string());
+    SDChunk *chunk = new SDChunk(rdcstr(xChunk.attribute("name").as_string()));
 
     chunk->metadata.chunkID = xChunk.attribute("id").as_uint();
     chunk->metadata.length = xChunk.attribute("length").as_uint();
@@ -757,24 +892,32 @@ static ReplayStatus XML2Structured(const char *xml, const ThumbTypeAndData &thum
       }
     }
 
+    chunks.push_back(chunk);
+
     if(xChunk.attribute("opaque"))
     {
       pugi::xml_node opaque = xChunk.child("buffer");
 
       chunk->metadata.flags |= SDChunkFlags::OpaqueChunk;
 
-      chunk->data.children.push_back(new SDObject("Opaque chunk"_lit, "Byte Buffer"_lit));
-      chunk->data.children[0]->type.basetype = SDBasic::Buffer;
-      chunk->data.children[0]->type.byteSize = opaque.attribute("byteLength").as_ullong();
-      chunk->data.children[0]->data.basic.u = opaque.text().as_ullong();
+      SDObject *buf = chunk->AddAndOwnChild(new SDObject("Opaque chunk"_lit, "Byte Buffer"_lit));
+      buf->type.basetype = SDBasic::Buffer;
+      buf->type.byteSize = opaque.attribute("byteLength").as_ullong();
+      buf->data.basic.u = opaque.text().as_ullong();
     }
     else
     {
       for(pugi::xml_node child = xChunk.first_child(); child; child = child.next_sibling())
-        chunk->data.children.push_back(XML2Obj(child));
+      {
+        SDObject *obj = XML2Obj(child);
+        if(!obj)
+        {
+          RETURN_ERROR_RESULT(ResultCode::FileCorrupted,
+                              "Malformed xml document, converting chunk child <%s>", child.name());
+        }
+        chunk->AddAndOwnChild(obj);
+      }
     }
-
-    chunks.push_back(chunk);
 
     if(progress)
       progress(StructuredProgress(0.2f + 0.8f * (float(chunkIdx) / float(numChunks))));
@@ -782,15 +925,13 @@ static ReplayStatus XML2Structured(const char *xml, const ThumbTypeAndData &thum
     chunkIdx++;
   }
 
-  return ReplayStatus::Succeeded;
+  return ResultCode::Succeeded;
 }
 
-static ReplayStatus Buffers2ZIP(const std::string &filename, const RDCFile &file,
-                                const StructuredBufferList &buffers,
-                                RENDERDOC_ProgressCallback progress)
+static RDResult Buffers2ZIP(const rdcstr &filename, const RDCFile &file,
+                            const StructuredBufferList &buffers, RENDERDOC_ProgressCallback progress)
 {
-  std::string zipFile = filename;
-  zipFile.erase(zipFile.size() - 4);    // remove the .xml, leave only the .zip
+  rdcstr zipFile = strip_extension(filename);
 
   mz_zip_archive zip;
   memset(&zip, 0, sizeof(zip));
@@ -799,8 +940,8 @@ static ReplayStatus Buffers2ZIP(const std::string &filename, const RDCFile &file
 
   if(!b)
   {
-    RDCERR("Failed to open .zip file '%s'", zipFile.c_str());
-    return ReplayStatus::FileIOFailed;
+    RETURN_ERROR_RESULT(ResultCode::FileIOFailed, "Failed to open .zip file '%s': %s",
+                        zipFile.c_str(), mz_zip_get_error_string(zip.m_last_error));
   }
 
   for(size_t i = 0; i < buffers.size(); i++)
@@ -812,14 +953,17 @@ static ReplayStatus Buffers2ZIP(const std::string &filename, const RDCFile &file
   }
 
   const RDCThumb &th = file.GetThumbnail();
-  if(th.pixels && th.len > 0 && th.width > 0 && th.height > 0)
+  if(!th.pixels.empty() && th.width > 0 && th.height > 0)
   {
     if(th.format == FileType::JPG)
-      mz_zip_writer_add_mem(&zip, "thumb.jpg", th.pixels, th.len, MZ_BEST_COMPRESSION);
+      mz_zip_writer_add_mem(&zip, "thumb.jpg", th.pixels.data(), th.pixels.size(),
+                            MZ_BEST_COMPRESSION);
     else if(th.format == FileType::PNG)
-      mz_zip_writer_add_mem(&zip, "thumb.png", th.pixels, th.len, MZ_BEST_COMPRESSION);
+      mz_zip_writer_add_mem(&zip, "thumb.png", th.pixels.data(), th.pixels.size(),
+                            MZ_BEST_COMPRESSION);
     else if(th.format == FileType::Raw)
-      mz_zip_writer_add_mem(&zip, "thumb.raw", th.pixels, th.len, MZ_BEST_COMPRESSION);
+      mz_zip_writer_add_mem(&zip, "thumb.raw", th.pixels.data(), th.pixels.size(),
+                            MZ_BEST_COMPRESSION);
     else
       RDCERR("Unexpected thumbnail format %s", ToStr(th.format).c_str());
   }
@@ -857,27 +1001,46 @@ static ReplayStatus Buffers2ZIP(const std::string &filename, const RDCFile &file
       }
 
       delete reader;
-      break;
+      continue;
+    }
+    else
+    {
+      for(const LiteralFileSection &section : literalFileSections)
+      {
+        if(section.type == props.type)
+        {
+          StreamReader *reader = file.ReadSection(i);
+
+          bytebuf literalFile;
+          literalFile.resize((size_t)reader->GetSize());
+          reader->Read(literalFile.data(), literalFile.size());
+
+          mz_zip_writer_add_mem(&zip, section.filename.c_str(), literalFile.data(),
+                                literalFile.size(), MZ_BEST_SPEED);
+
+          delete reader;
+          break;
+        }
+      }
     }
   }
 
   mz_zip_writer_finalize_archive(&zip);
   mz_zip_writer_end(&zip);
 
-  return ReplayStatus::Succeeded;
+  return ResultCode::Succeeded;
 }
 
-static bool ZIP2Buffers(const std::string &filename, ThumbTypeAndData &thumb,
-                        ThumbTypeAndData &extThumb, StructuredBufferList &buffers,
-                        RENDERDOC_ProgressCallback progress)
+static RDResult ZIP2Buffers(const rdcstr &filename, ThumbTypeAndData &thumb,
+                            ThumbTypeAndData &extThumb, std::map<SectionType, bytebuf> &literalFiles,
+                            StructuredBufferList &buffers, RENDERDOC_ProgressCallback progress)
 {
-  std::string zipFile = filename;
-  zipFile.erase(zipFile.size() - 4);    // remove the .xml, leave only the .zip
+  rdcstr zipFile = strip_extension(filename);
 
-  if(!FileIO::exists(zipFile.c_str()))
+  if(!FileIO::exists(zipFile))
   {
-    RDCERR("Expected to file zip for %s at %s", filename.c_str(), zipFile.c_str());
-    return false;
+    RETURN_ERROR_RESULT(ResultCode::FileIOFailed, "Expected to find zip for %s at %s",
+                        filename.c_str(), zipFile.c_str());
   }
 
   mz_zip_archive zip;
@@ -920,6 +1083,15 @@ static bool ZIP2Buffers(const std::string &filename, ThumbTypeAndData &thumb,
           thumb.data.assign(buf, sz);
         }
       }
+      else if(isLiteralFileFileName(zstat.m_filename))
+      {
+        // same for literal files (log file, D3D12 dlls, etc)
+        for(const LiteralFileSection &section : literalFileSections)
+        {
+          if(section.filename == zstat.m_filename)
+            literalFiles[section.type].assign(buf, sz);
+        }
+      }
       else
       {
         int bufname = atoi(zstat.m_filename);
@@ -931,6 +1103,8 @@ static bool ZIP2Buffers(const std::string &filename, ThumbTypeAndData &thumb,
         }
       }
 
+      free(buf);
+
       if(progress)
         progress(BufferProgress(float(i) / float(numfiles)));
     }
@@ -938,45 +1112,42 @@ static bool ZIP2Buffers(const std::string &filename, ThumbTypeAndData &thumb,
 
   mz_zip_reader_end(&zip);
 
-  return true;
+  return ResultCode::Succeeded;
 }
 
-ReplayStatus importXMLZ(const char *filename, StreamReader &reader, RDCFile *rdc,
-                        SDFile &structData, RENDERDOC_ProgressCallback progress)
+RDResult importXMLZ(const rdcstr &filename, StreamReader &reader, RDCFile *rdc, SDFile &structData,
+                    RENDERDOC_ProgressCallback progress)
 {
   ThumbTypeAndData thumb, extThumb;
-  if(filename)
+  std::map<SectionType, bytebuf> literalFiles;
+  if(!filename.empty())
   {
-    bool success = ZIP2Buffers(filename, thumb, extThumb, structData.buffers, progress);
-    if(!success)
-    {
-      RDCERR("Couldn't load zip to go with %s", filename);
-      return ReplayStatus::FileCorrupted;
-    }
+    RDResult res = ZIP2Buffers(filename, thumb, extThumb, literalFiles, structData.buffers, progress);
+    if(res != ResultCode::Succeeded)
+      return res;
   }
 
-  uint64_t len = reader.GetSize();
-  char *buf = new char[(size_t)len + 1];
-  reader.Read(buf, (size_t)len);
-  buf[len] = 0;
+  rdcstr buf;
+  buf.resize((size_t)reader.GetSize());
+  reader.Read(buf.data(), buf.size());
 
-  return XML2Structured(buf, thumb, extThumb, structData.buffers, rdc, structData.version,
-                        structData.chunks, progress);
+  return XML2Structured(buf.c_str(), thumb, extThumb, literalFiles, structData.buffers, rdc,
+                        structData.version, structData.chunks, progress);
 }
 
-ReplayStatus exportXMLZ(const char *filename, const RDCFile &rdc, const SDFile &structData,
-                        RENDERDOC_ProgressCallback progress)
+RDResult exportXMLZ(const rdcstr &filename, const RDCFile &rdc, const SDFile &structData,
+                    RENDERDOC_ProgressCallback progress)
 {
-  ReplayStatus ret = Buffers2ZIP(filename, rdc, structData.buffers, progress);
+  RDResult ret = Buffers2ZIP(filename, rdc, structData.buffers, progress);
 
-  if(ret != ReplayStatus::Succeeded)
+  if(ret != ResultCode::Succeeded)
     return ret;
 
   return Structured2XML(filename, rdc, structData.version, structData.chunks, progress);
 }
 
-ReplayStatus exportXMLOnly(const char *filename, const RDCFile &rdc, const SDFile &structData,
-                           RENDERDOC_ProgressCallback progress)
+RDResult exportXMLOnly(const rdcstr &filename, const RDCFile &rdc, const SDFile &structData,
+                       RENDERDOC_ProgressCallback progress)
 {
   return Structured2XML(filename, rdc, structData.version, structData.chunks, progress);
 }
@@ -984,7 +1155,8 @@ ReplayStatus exportXMLOnly(const char *filename, const RDCFile &rdc, const SDFil
 static ConversionRegistration XMLZIPConversionRegistration(
     &importXMLZ, &exportXMLZ,
     {
-        "zip.xml", "XML+ZIP capture",
+        "zip.xml",
+        "XML+ZIP capture",
         R"(Stores the structured data in an xml tree, with large buffer data stored in indexed blobs in
 similarly named zip file.)",
         true,
@@ -993,8 +1165,70 @@ similarly named zip file.)",
 static ConversionRegistration XMLOnlyConversionRegistration(
     &exportXMLOnly,
     {
-        "xml", "XML capture",
+        "xml",
+        "XML capture",
         R"(Stores the structured data in an xml tree, with large buffer data omitted - that makes it
 easier to work with but it cannot then be imported.)",
         false,
     });
+
+#if ENABLED(ENABLE_UNIT_TESTS)
+
+#include "catch/catch.hpp"
+
+TEST_CASE("XML/SDObject round trip", "[xml serialiser]")
+{
+  pugi::xml_document doc;
+  pugi::xml_node xRoot = doc.append_child("root");
+
+  rdcarray<SDObject *> objs;
+  SDObject *obj;
+
+  obj = new SDObject("Enum64Test"_lit, "enum64"_lit);
+  obj->type.basetype = SDBasic::Enum;
+  obj->type.byteSize = 8;
+  obj->data.basic.u = UINT64_MAX;
+  objs.push_back(obj);
+
+  obj = new SDObject("Enum32Test"_lit, "enum32"_lit);
+  obj->type.basetype = SDBasic::Enum;
+  obj->type.byteSize = 4;
+  obj->data.basic.u = UINT32_MAX;
+  objs.push_back(obj);
+
+  obj = new SDObject("Enum16Test"_lit, "enum16"_lit);
+  obj->type.basetype = SDBasic::Enum;
+  obj->type.byteSize = 2;
+  obj->data.basic.u = UINT16_MAX;
+  objs.push_back(obj);
+
+  obj = new SDObject("Enum8Test"_lit, "enum8"_lit);
+  obj->type.basetype = SDBasic::Enum;
+  obj->type.byteSize = 1;
+  obj->data.basic.u = UINT8_MAX;
+  objs.push_back(obj);
+
+  for(int i = 0; i < objs.count(); ++i)
+  {
+    Obj2XML(xRoot, *objs[i]);
+  }
+
+  for(pugi::xml_node xChild = xRoot.last_child(); xChild; xChild = xChild.previous_sibling())
+  {
+    SDObject *newObj = XML2Obj(xChild);
+    obj = objs.back();
+    objs.pop_back();
+
+    CHECK(newObj->type.basetype == obj->type.basetype);
+    CHECK(newObj->type.byteSize == obj->type.byteSize);
+    CHECK(newObj->type.name == obj->type.name);
+    CHECK(newObj->type.flags == obj->type.flags);
+    CHECK(newObj->data.basic.i == obj->data.basic.i);
+    CHECK(newObj->data.str == obj->data.str);
+
+    delete newObj;
+    delete obj;
+  }
+}
+
+#endif    // ENABLED(ENABLE_UNIT_TESTS)

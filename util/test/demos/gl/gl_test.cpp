@@ -1,29 +1,83 @@
 /******************************************************************************
-* The MIT License (MIT)
-*
-* Copyright (c) 2015-2019 Baldur Karlsson
-*
-* Permission is hereby granted, free of charge, to any person obtaining a copy
-* of this software and associated documentation files (the "Software"), to deal
-* in the Software without restriction, including without limitation the rights
-* to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-* copies of the Software, and to permit persons to whom the Software is
-* furnished to do so, subject to the following conditions:
-*
-* The above copyright notice and this permission notice shall be included in
-* all copies or substantial portions of the Software.
-*
-* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-* AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-* OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-* THE SOFTWARE.
-******************************************************************************/
+ * The MIT License (MIT)
+ *
+ * Copyright (c) 2019-2023 Baldur Karlsson
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ ******************************************************************************/
 
 #include "gl_test.h"
 #include <stdio.h>
+
+#if defined(ANDROID)
+static std::string version = "#version 320 es";
+#else
+static std::string version = "#version 410 core";
+#endif
+
+static std::string common = version + R"EOSHADER(
+
+
+#if defined(GL_ES)
+precision highp float;
+precision highp int;
+#endif
+
+#define v2f v2f_block \
+{                     \
+	vec4 pos;           \
+	vec4 col;           \
+	vec4 uv;            \
+}
+
+)EOSHADER";
+
+std::string GLDefaultVertex = common + R"EOSHADER(
+
+layout(location = 0) in vec3 Position;
+layout(location = 1) in vec4 Color;
+layout(location = 2) in vec2 UV;
+
+out v2f vertOut;
+
+void main()
+{
+	vertOut.pos = vec4(Position.xyz, 1);
+	gl_Position = vertOut.pos;
+	vertOut.col = Color;
+	vertOut.uv = vec4(UV.xy, 0, 1);
+}
+
+)EOSHADER";
+
+std::string GLDefaultPixel = common + R"EOSHADER(
+
+in v2f vertIn;
+
+layout(location = 0) out vec4 Color;
+
+void main()
+{
+	Color = vertIn.col;
+}
+
+)EOSHADER";
 
 static void APIENTRY debugCallback(GLenum source, GLenum type, GLuint id, GLenum severity,
                                    GLsizei length, const GLchar *message, const void *userParam)
@@ -48,10 +102,29 @@ void OpenGLGraphicsTest::PostInit()
 
   TEST_LOG("Running GL test on %s / %s / %s", glGetString(GL_VENDOR), glGetString(GL_RENDERER),
            glGetString(GL_VERSION));
+
+  swapBlitFBO = MakeFBO();
+
+  DefaultTriVB = MakeBuffer();
+  glBindBuffer(GL_ARRAY_BUFFER, DefaultTriVB);
+  glBufferData(GL_ARRAY_BUFFER, sizeof(DefaultTri), DefaultTri, GL_STATIC_DRAW);
+
+  DefaultTriVAO = MakeVAO();
+  glBindVertexArray(DefaultTriVAO);
+  ConfigureDefaultVAO();
+
+  glBindVertexArray(0);
+  glBindBuffer(GL_ARRAY_BUFFER, 0);
+
+  DefaultTriProgram = MakeProgram(GLDefaultVertex, GLDefaultPixel);
 }
 
 void OpenGLGraphicsTest::Shutdown()
 {
+  ActivateContext(mainWindow, mainContext);
+
+  glDeleteFramebuffers(1, &swapBlitFBO);
+
   if(!managedResources.bufs.empty())
     glDeleteBuffers((GLsizei)managedResources.bufs.size(), &managedResources.bufs[0]);
   if(!managedResources.texs.empty())
@@ -66,8 +139,8 @@ void OpenGLGraphicsTest::Shutdown()
   for(GLuint p : managedResources.progs)
     glDeleteProgram(p);
 
-  delete mainWindow;
   DestroyContext(mainContext);
+  delete mainWindow;
 }
 
 GLuint OpenGLGraphicsTest::MakeProgram(std::string vertSrc, std::string fragSrc, std::string geomSrc)
@@ -193,6 +266,58 @@ GLuint OpenGLGraphicsTest::MakeProgram(std::string vertSrc, std::string fragSrc,
   return program;
 }
 
+GLuint OpenGLGraphicsTest::MakeProgram(std::string compSrc)
+{
+  GLuint cs = glCreateShader(GL_COMPUTE_SHADER);
+
+  const char *cstr = NULL;
+
+  if(cs)
+  {
+    cstr = compSrc.c_str();
+    glShaderSource(cs, 1, &cstr, NULL);
+    glCompileShader(cs);
+  }
+
+  char buffer[1024];
+  GLint status = 0;
+
+  if(cs)
+    glGetShaderiv(cs, GL_COMPILE_STATUS, &status);
+  else
+    status = 1;
+
+  if(status == 0)
+  {
+    glGetShaderInfoLog(cs, 1024, NULL, buffer);
+    TEST_ERROR("Shader error: %s", buffer);
+    glDeleteShader(cs);
+    return 0;
+  }
+
+  GLuint program = glCreateProgram();
+  glAttachShader(program, cs);
+  glLinkProgram(program);
+
+  glGetProgramiv(program, GL_LINK_STATUS, &status);
+  if(status == 0)
+  {
+    glGetProgramInfoLog(program, 1024, NULL, buffer);
+    TEST_ERROR("Link error: %s", buffer);
+
+    glDeleteProgram(program);
+    program = 0;
+  }
+
+  glDetachShader(program, cs);
+  glDeleteShader(cs);
+
+  if(program)
+    managedResources.progs.push_back(program);
+
+  return program;
+}
+
 GLuint OpenGLGraphicsTest::MakeProgram()
 {
   GLuint program = glCreateProgram();
@@ -245,6 +370,18 @@ GLuint OpenGLGraphicsTest::MakeFBO()
   return fbos[fbos.size() - 1];
 }
 
+void OpenGLGraphicsTest::ConfigureDefaultVAO()
+{
+  glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(DefaultA2V), (void *)(0));
+  glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, sizeof(DefaultA2V), (void *)(sizeof(Vec3f)));
+  glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, sizeof(DefaultA2V),
+                        (void *)(sizeof(Vec3f) + sizeof(Vec4f)));
+
+  glEnableVertexAttribArray(0);
+  glEnableVertexAttribArray(1);
+  glEnableVertexAttribArray(2);
+}
+
 void OpenGLGraphicsTest::pushMarker(const std::string &name)
 {
   if(glPushDebugGroup)
@@ -262,6 +399,24 @@ void OpenGLGraphicsTest::popMarker()
 {
   if(glPopDebugGroup)
     glPopDebugGroup();
+}
+
+void OpenGLGraphicsTest::blitToSwap(GLuint tex)
+{
+  GLint oldRead = 0, oldDraw = 0;
+  glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &oldRead);
+  glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &oldDraw);
+
+  glBindFramebuffer(GL_READ_FRAMEBUFFER, swapBlitFBO);
+  glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+
+  glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+
+  glBlitFramebuffer(0, 0, screenWidth, screenHeight, 0, 0, screenWidth, screenHeight,
+                    GL_COLOR_BUFFER_BIT, GL_NEAREST);
+
+  glBindFramebuffer(GL_READ_FRAMEBUFFER, oldRead);
+  glBindFramebuffer(GL_DRAW_FRAMEBUFFER, oldDraw);
 }
 
 bool OpenGLGraphicsTest::Running()

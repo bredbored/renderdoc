@@ -8,13 +8,20 @@ A lot of the tests rely on a 'demos' program which contains small self-contained
 
 To build on windows, open `demos.sln` and compile. There are no required external dependencies
 
-To build on linux, compile using cmake with `demos/CMakeLists.txt`. You'll need `libX11`, `libxcb`, and `libX11-xcb`. These are all needed to build RenderDoc with GL support so you likely have them already.
+To build on linux or Apple, compile using cmake with `demos/CMakeLists.txt` ie.
+
+```
+cmake -Bbuild -Hdemos
+make -C build
+```
+
+For linux you'll need `libX11`, `libxcb`, and `libX11-xcb`. These are all needed to build RenderDoc with GL support so you likely have them already.
 
 **NOTE:** Currently there is one soft external dependency. If shaderc is not linked into the demos program, it expects to be able to run `glslc` at runtime to compile shaders to SPIR-V. Without this, some tests will be disabled.
 
 Currently only windows supports linking shaderc, which happens automatically if it's found relative to the `$VULKAN_SDK` environment variable.
 
-On linux to run the tests you'll need to modify your `PATH` variable to include wherever `demos_x64` was built to.
+On linux or Apple to run the tests you'll need to modify your `PATH` variable to include wherever `demos_x64` was built to, alternatively the `--demos-binary` option can be used to specific the filepath of `demos_x64`.
 
 ## Running tests
 
@@ -33,7 +40,8 @@ Then running the tests means invoking `run_tests.py` with any options you need:
 * `--data` the path to the reference data folder, by default the `data/` here next to the script.
 * `--artifacts` the path to the output artifacts folder, by default `artifacts/` here next to the script.
 * `--temp` the path to the temporary working folder, by default `tmp/` here next to the script.
-* `--data-extra` the path to the extra data folder. Some tests may reference captures which can'tbe committed to the repository here and are distributed separately or added custom by the user. By default refers to `data_extra/` here next to the script.
+* `--data-extra` the path to the extra data folder. Some tests may reference captures which can't be committed to the repository here and are distributed separately or added custom by the user. By default refers to `data_extra/` here next to the script.
+* `--demos-binary` the path to the built demos binary.
 
 **NOTE:** When run, the temporary and artifacts folders will be erased.
 
@@ -44,6 +52,8 @@ After a run, the artifacts folder contains the output log. It's mostly plaintext
 The demos project contains helper libraries, so the best way to get started is to copy-paste an existing test and modify it to your needs. Avoid uber-demos, try to do only one simple thing.
 
 Similarly for tests, which often come 1:1 with demos, you can copy-paste an existing test and add your own checks.
+
+When adding a test that needs to compare against a reference image, first run the first without a reference image. It will output the image that it would compare against. Run this image through pngcrush (ensuring that RGBA output is preserved) to reduce repository bloat.
 
 License
 --------------

@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2016-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -129,11 +129,10 @@ HANDLE WrappedOpenGL::wglDXRegisterObjectNV(HANDLE hDevice, void *dxObject, GLui
     uint32_t width = 0, height = 0, depth = 0, mips = 0, layers = 0, samples = 0;
     GetDXTextureProperties(dxObject, fmt, width, height, depth, mips, layers, samples);
 
-    // defined as arrays mostly for Coverity code analysis to stay calm about passing
-    // them to the *TexParameter* functions
-    GLint maxlevel[4] = {GLint(mips - 1), 0, 0, 0};
-
     GL.glTextureParameteriEXT(wrapped->res.name, type, eGL_TEXTURE_MAX_LEVEL, GLint(mips - 1));
+
+    // consume any errors
+    ClearGLErrors();
 
     ResourceId texId = record->GetResourceID();
     m_Textures[texId].resource = wrapped->res;
@@ -191,7 +190,7 @@ BOOL WrappedOpenGL::wglDXLockObjectsNV(HANDLE hDevice, GLint count, HANDLE *hObj
       Serialise_wglDXLockObjectsNV(ser, w->res);
 
       GetContextRecord()->AddChunk(scope.Get());
-      GetResourceManager()->MarkResourceFrameReferenced(GetResourceManager()->GetID(w->res),
+      GetResourceManager()->MarkResourceFrameReferenced(GetResourceManager()->GetResID(w->res),
                                                         eFrameRef_Read);
     }
   }
@@ -270,6 +269,9 @@ bool WrappedOpenGL::Serialise_wglDXRegisterObjectNV(SerialiserType &ser, GLResou
     GetDXTextureProperties(dxObject, format, width, height, depth, mips, layers, samples);
     if(type != eGL_NONE)
       internalFormat = MakeGLFormat(format);
+    // desktop GL doesn't support BGRA8 as an internal format for some reason
+    if(internalFormat == eGL_BGRA8_EXT)
+      internalFormat = eGL_RGBA8;
 #else
     RDCERR("Should never happen - cannot serialise wglDXRegisterObjectNV, interop is disabled");
 #endif
@@ -329,7 +331,7 @@ bool WrappedOpenGL::Serialise_wglDXRegisterObjectNV(SerialiserType &ser, GLResou
 
     if(type != eGL_NONE)
     {
-      ResourceId liveId = GetResourceManager()->GetID(Resource);
+      ResourceId liveId = GetResourceManager()->GetResID(Resource);
       m_Textures[liveId].curType = type;
       m_Textures[liveId].width = width;
       m_Textures[liveId].height = height;
@@ -345,6 +347,12 @@ bool WrappedOpenGL::Serialise_wglDXRegisterObjectNV(SerialiserType &ser, GLResou
       m_Textures[liveId].mipsValid = (1 << mips) - 1;
     }
 
+    if(type == eGL_NONE || type == eGL_TEXTURE_BUFFER)
+    {
+      ResourceId liveId = GetResourceManager()->GetResID(Resource);
+      m_Buffers[liveId].size = width;
+    }
+
     AddResourceInitChunk(Resource);
   }
 
@@ -357,7 +365,7 @@ bool WrappedOpenGL::Serialise_wglDXLockObjectsNV(SerialiserType &ser, GLResource
   SERIALISE_ELEMENT(Resource);
   SERIALISE_ELEMENT_LOCAL(textype, Resource.Namespace == eResBuffer
                                        ? eGL_NONE
-                                       : m_Textures[GetResourceManager()->GetID(Resource)].curType)
+                                       : m_Textures[GetResourceManager()->GetResID(Resource)].curType)
       .Hidden();
 
   // buffer contents are easier to save
@@ -418,7 +426,7 @@ bool WrappedOpenGL::Serialise_wglDXLockObjectsNV(SerialiserType &ser, GLResource
       ResetPixelUnpackState(false, 1);
     }
 
-    TextureData &details = m_Textures[GetResourceManager()->GetID(Resource)];
+    TextureData &details = m_Textures[GetResourceManager()->GetResID(Resource)];
     GLuint tex = Resource.name;
 
     // serialise the metadata for convenience
@@ -427,10 +435,13 @@ bool WrappedOpenGL::Serialise_wglDXLockObjectsNV(SerialiserType &ser, GLResource
     SERIALISE_ELEMENT_LOCAL(height, details.height).Hidden();
     SERIALISE_ELEMENT_LOCAL(depth, details.depth).Hidden();
 
-    RDCASSERT(internalFormat == details.internalFormat, internalFormat, details.internalFormat);
-    RDCASSERT(width == details.width, width, details.width);
-    RDCASSERT(height == details.height, height, details.height);
-    RDCASSERT(depth == details.depth, depth, details.depth);
+    if(!IsStructuredExporting(m_State))
+    {
+      RDCASSERT(internalFormat == details.internalFormat, internalFormat, details.internalFormat);
+      RDCASSERT(width == details.width, width, details.width);
+      RDCASSERT(height == details.height, height, details.height);
+      RDCASSERT(depth == details.depth, depth, details.depth);
+    }
 
     GLenum fmt = GetBaseFormat(internalFormat);
     GLenum type = GetDataType(internalFormat);
@@ -534,14 +545,14 @@ bool WrappedOpenGL::Serialise_glCreateMemoryObjectsEXT(SerialiserType &ser, GLsi
                                                        GLuint *memoryObjects)
 {
   SERIALISE_ELEMENT(n);
-  SERIALISE_ELEMENT_LOCAL(memory, GetResourceManager()->GetID(ExtMemRes(GetCtx(), *memoryObjects)))
+  SERIALISE_ELEMENT_LOCAL(memory, GetResourceManager()->GetResID(ExtMemRes(GetCtx(), *memoryObjects)))
       .TypedAs("GLResource"_lit);
 
   SERIALISE_CHECK_READ_ERRORS();
 
   if(IsReplayingAndReading())
   {
-    CheckReplayFunctionPresent(GL.glCreateMemoryObjectsEXT);
+    CheckReplayFunctionPresent(glCreateMemoryObjectsEXT);
 
     GLuint real = 0;
     GL.glCreateMemoryObjectsEXT(1, &real);
@@ -623,7 +634,7 @@ bool WrappedOpenGL::Serialise_glMemoryObjectParameterivEXT(SerialiserType &ser,
 
   if(IsReplayingAndReading())
   {
-    CheckReplayFunctionPresent(GL.glMemoryObjectParameterivEXT);
+    CheckReplayFunctionPresent(glMemoryObjectParameterivEXT);
 
     GL.glMemoryObjectParameterivEXT(memoryObject.name, pname, params);
 
@@ -809,14 +820,14 @@ template <typename SerialiserType>
 bool WrappedOpenGL::Serialise_glGenSemaphoresEXT(SerialiserType &ser, GLsizei n, GLuint *semaphores)
 {
   SERIALISE_ELEMENT(n);
-  SERIALISE_ELEMENT_LOCAL(semaphore, GetResourceManager()->GetID(ExtSemRes(GetCtx(), *semaphores)))
+  SERIALISE_ELEMENT_LOCAL(semaphore, GetResourceManager()->GetResID(ExtSemRes(GetCtx(), *semaphores)))
       .TypedAs("GLResource"_lit);
 
   SERIALISE_CHECK_READ_ERRORS();
 
   if(IsReplayingAndReading())
   {
-    CheckReplayFunctionPresent(GL.glGenSemaphoresEXT);
+    CheckReplayFunctionPresent(glGenSemaphoresEXT);
 
     GLuint real = 0;
     GL.glGenSemaphoresEXT(1, &real);
@@ -898,7 +909,7 @@ bool WrappedOpenGL::Serialise_glSemaphoreParameterui64vEXT(SerialiserType &ser,
 
   if(IsReplayingAndReading())
   {
-    CheckReplayFunctionPresent(GL.glSemaphoreParameterui64vEXT);
+    CheckReplayFunctionPresent(glSemaphoreParameterui64vEXT);
 
     GL.glSemaphoreParameterui64vEXT(semaphore.name, pname, params);
 
@@ -1084,7 +1095,7 @@ bool WrappedOpenGL::Serialise_glWaitSemaphoreEXT(SerialiserType &ser, GLuint sem
                                                  const GLenum *srcLayouts)
 {
   // can't serialise arrays of GL handles since they're not wrapped or typed :(.
-  std::vector<GLResource> buffers, textures;
+  rdcarray<GLResource> buffers, textures;
 
   if(ser.IsWriting())
   {
@@ -1153,7 +1164,7 @@ bool WrappedOpenGL::Serialise_glSignalSemaphoreEXT(SerialiserType &ser, GLuint s
                                                    const GLenum *dstLayouts)
 {
   // can't serialise arrays of GL handles since they're not wrapped or typed :(.
-  std::vector<GLResource> buffers, textures;
+  rdcarray<GLResource> buffers, textures;
 
   if(ser.IsWriting())
   {
@@ -1296,9 +1307,9 @@ bool WrappedOpenGL::Serialise_glNamedBufferStorageMemEXT(SerialiserType &ser, GL
                                                          GLuint64 offset)
 {
   SERIALISE_ELEMENT_LOCAL(buffer, BufferRes(GetCtx(), bufferHandle));
-  SERIALISE_ELEMENT_LOCAL(size, (uint64_t)sizeptr);
+  SERIALISE_ELEMENT_LOCAL(size, (uint64_t)sizeptr).OffsetOrSize();
   SERIALISE_ELEMENT_LOCAL(memory, ExtMemRes(GetCtx(), memoryHandle));
-  SERIALISE_ELEMENT(offset);
+  SERIALISE_ELEMENT(offset).OffsetOrSize();
 
   SERIALISE_CHECK_READ_ERRORS();
 
@@ -1313,7 +1324,7 @@ bool WrappedOpenGL::Serialise_glNamedBufferStorageMemEXT(SerialiserType &ser, GL
 
     GL.glNamedBufferStorageEXT(buffer.name, (GLsizeiptr)size, NULL, flags);
 
-    ResourceId id = GetResourceManager()->GetID(buffer);
+    ResourceId id = GetResourceManager()->GetResID(buffer);
 
     m_Buffers[id].size = size;
 
@@ -1412,14 +1423,14 @@ bool WrappedOpenGL::Serialise_glTextureStorageMem1DEXT(SerialiserType &ser, GLui
   SERIALISE_ELEMENT(internalFormat);
   SERIALISE_ELEMENT(width);
   SERIALISE_ELEMENT_LOCAL(memory, ExtMemRes(GetCtx(), memoryHandle));
-  SERIALISE_ELEMENT(offset);
+  SERIALISE_ELEMENT(offset).OffsetOrSize();
 
   SERIALISE_CHECK_READ_ERRORS();
 
   if(IsReplayingAndReading())
   {
     // Replay external texture storage backed by external memory as just a plain texture.
-    ResourceId liveId = GetResourceManager()->GetID(texture);
+    ResourceId liveId = GetResourceManager()->GetResID(texture);
     m_Textures[liveId].width = width;
     m_Textures[liveId].height = 1;
     m_Textures[liveId].depth = 1;
@@ -1521,14 +1532,14 @@ bool WrappedOpenGL::Serialise_glTextureStorageMem2DEXT(SerialiserType &ser, GLui
   SERIALISE_ELEMENT(width);
   SERIALISE_ELEMENT(height);
   SERIALISE_ELEMENT_LOCAL(memory, ExtMemRes(GetCtx(), memoryHandle));
-  SERIALISE_ELEMENT(offset);
+  SERIALISE_ELEMENT(offset).OffsetOrSize();
 
   SERIALISE_CHECK_READ_ERRORS();
 
   if(IsReplayingAndReading())
   {
     // Replay external texture storage backed by external memory as just a plain texture.
-    ResourceId liveId = GetResourceManager()->GetID(texture);
+    ResourceId liveId = GetResourceManager()->GetResID(texture);
     m_Textures[liveId].width = width;
     m_Textures[liveId].height = height;
     m_Textures[liveId].depth = 1;
@@ -1635,7 +1646,7 @@ bool WrappedOpenGL::Serialise_glTextureStorageMem2DMultisampleEXT(
   SERIALISE_ELEMENT(height);
   SERIALISE_ELEMENT_TYPED(bool, fixedSampleLocations);
   SERIALISE_ELEMENT_LOCAL(memory, ExtMemRes(GetCtx(), memoryHandle));
-  SERIALISE_ELEMENT(offset);
+  SERIALISE_ELEMENT(offset).OffsetOrSize();
 
   SERIALISE_CHECK_READ_ERRORS();
 
@@ -1643,10 +1654,10 @@ bool WrappedOpenGL::Serialise_glTextureStorageMem2DMultisampleEXT(
   {
     // the DSA function is emulated if not present, but we need to check the underlying function is
     // present
-    CheckReplayFunctionPresent(GL.glTexStorage2DMultisample);
+    CheckReplayFunctionPresent(glTexStorage2DMultisample);
 
     // Replay external texture storage backed by external memory as just a plain texture.
-    ResourceId liveId = GetResourceManager()->GetID(texture);
+    ResourceId liveId = GetResourceManager()->GetResID(texture);
     m_Textures[liveId].width = width;
     m_Textures[liveId].height = height;
     m_Textures[liveId].depth = 1;
@@ -1760,14 +1771,14 @@ bool WrappedOpenGL::Serialise_glTextureStorageMem3DEXT(SerialiserType &ser, GLui
   SERIALISE_ELEMENT(height);
   SERIALISE_ELEMENT(depth);
   SERIALISE_ELEMENT_LOCAL(memory, ExtMemRes(GetCtx(), memoryHandle));
-  SERIALISE_ELEMENT(offset);
+  SERIALISE_ELEMENT(offset).OffsetOrSize();
 
   SERIALISE_CHECK_READ_ERRORS();
 
   if(IsReplayingAndReading())
   {
     // Replay external texture storage backed by external memory as just a plain texture.
-    ResourceId liveId = GetResourceManager()->GetID(texture);
+    ResourceId liveId = GetResourceManager()->GetResID(texture);
     m_Textures[liveId].width = width;
     m_Textures[liveId].height = height;
     m_Textures[liveId].depth = depth;
@@ -1874,14 +1885,14 @@ bool WrappedOpenGL::Serialise_glTextureStorageMem3DMultisampleEXT(
   SERIALISE_ELEMENT(depth);
   SERIALISE_ELEMENT_TYPED(bool, fixedSampleLocations);
   SERIALISE_ELEMENT_LOCAL(memory, ExtMemRes(GetCtx(), memoryHandle));
-  SERIALISE_ELEMENT(offset);
+  SERIALISE_ELEMENT(offset).OffsetOrSize();
 
   SERIALISE_CHECK_READ_ERRORS();
 
   if(IsReplayingAndReading())
   {
     // Replay external texture storage backed by external memory as just a plain texture.
-    ResourceId liveId = GetResourceManager()->GetID(texture);
+    ResourceId liveId = GetResourceManager()->GetResID(texture);
     m_Textures[liveId].width = width;
     m_Textures[liveId].height = height;
     m_Textures[liveId].depth = depth;

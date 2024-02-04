@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  * Copyright (c) 2014 Crytek
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -24,36 +24,48 @@
  ******************************************************************************/
 
 #include "os/os_specific.h"
-#include <stdarg.h>
+#include "api/replay/control_types.h"
+#include "common/formatting.h"
 #include "strings/string_utils.h"
 
-int utf8printf(char *buf, size_t bufsize, const char *fmt, va_list args);
+int utf8printv(char *buf, size_t bufsize, const char *fmt, va_list args);
+int utf8printf_custom(char *buf, size_t bufSize, const char *fmt, StringFormat::Args &args);
+
+bool Network::ParseIPRangeCIDR(const rdcstr &str, uint32_t &ip, uint32_t &mask)
+{
+  uint32_t a = 0, b = 0, c = 0, d = 0, num = 0;
+
+#if ENABLED(RDOC_WIN32)
+  int ret = sscanf_s(str.c_str(), "%u.%u.%u.%u/%u", &a, &b, &c, &d, &num);
+#else
+  int ret = sscanf(str.c_str(), "%u.%u.%u.%u/%u", &a, &b, &c, &d, &num);
+#endif
+
+  if(ret != 5 || a > 255 || b > 255 || c > 255 || d > 255 || num > 32)
+  {
+    ip = 0;
+    mask = 0;
+    return false;
+  }
+
+  ip = MakeIP(a, b, c, d);
+
+  if(num == 0)
+  {
+    mask = 0;
+  }
+  else
+  {
+    num = 32 - num;
+    mask = ((~0U) >> num) << num;
+  }
+
+  return true;
+}
 
 namespace StringFormat
 {
-int snprintf(char *str, size_t bufSize, const char *fmt, ...)
-{
-  va_list args;
-  va_start(args, fmt);
-
-  int ret = StringFormat::vsnprintf(str, bufSize, fmt, args);
-
-  va_end(args);
-
-  return ret;
-}
-
-void sntimef(char *str, size_t bufSize, const char *format)
-{
-  StringFormat::sntimef(Timing::GetUTCTime(), str, bufSize, format);
-}
-
-int vsnprintf(char *str, size_t bufSize, const char *format, va_list args)
-{
-  return ::utf8printf(str, bufSize, format, args);
-}
-
-std::string Fmt(const char *format, ...)
+rdcstr Fmt(const char *format, ...)
 {
   va_list args;
   va_start(args, format);
@@ -61,85 +73,66 @@ std::string Fmt(const char *format, ...)
   va_list args2;
   va_copy(args2, args);
 
-  int size = StringFormat::vsnprintf(NULL, 0, format, args2);
+  int size = ::utf8printv(NULL, 0, format, args2);
 
-  char *buf = new char[size + 1];
-  StringFormat::vsnprintf(buf, size + 1, format, args);
-  buf[size] = 0;
+  rdcstr ret;
+  ret.resize(size);
+  ::utf8printv(ret.data(), size + 1, format, args);
 
   va_end(args);
   va_end(args2);
 
-  std::string ret = buf;
+  return ret;
+}
 
-  delete[] buf;
+rdcstr Fmt(rdcliteral format, ...)
+{
+  // optimisation - if there are no format specifiers hence no arguments, preserve and return the
+  // literal
+  if(strchr(format.c_str(), '%') == NULL)
+    return format;
+
+  va_list args;
+  va_start(args, format);
+
+  va_list args2;
+  va_copy(args2, args);
+
+  int size = ::utf8printv(NULL, 0, format.c_str(), args2);
+
+  rdcstr ret;
+  ret.resize(size);
+  ::utf8printv(ret.data(), size + 1, format.c_str(), args);
+
+  va_end(args);
+  va_end(args2);
 
   return ret;
 }
 
-int Wide2UTF8(wchar_t chr, char mbchr[4])
+rdcstr FmtArgs(const char *format, Args &args)
 {
-  // U+00000 -> U+00007F 1 byte  0xxxxxxx
-  // U+00080 -> U+0007FF 2 bytes 110xxxxx 10xxxxxx
-  // U+00800 -> U+00FFFF 3 bytes 1110xxxx 10xxxxxx 10xxxxxx
-  // U+10000 -> U+1FFFFF 4 bytes 11110xxx 10xxxxxx 10xxxxxx 10xxxxxx
+  int size = ::utf8printf_custom(NULL, 0, format, args);
 
-  // upcast to uint32_t, so we do the same processing on windows where
-  // sizeof(wchar_t) == 2
-  uint32_t wc = (uint32_t)chr;
+  args.reset();
 
-  if(wc > 0x10FFFF)
-    wc = 0xFFFD;    // replacement character
+  rdcstr ret;
+  ret.resize(size);
+  ::utf8printf_custom(ret.data(), size + 1, format, args);
 
-  if(wc <= 0x7f)
-  {
-    mbchr[0] = (char)wc;
-    return 1;
-  }
-  else if(wc <= 0x7ff)
-  {
-    mbchr[1] = 0x80 | (char)(wc & 0x3f);
-    wc >>= 6;
-    mbchr[0] = 0xC0 | (char)(wc & 0x1f);
-    return 2;
-  }
-  else if(wc <= 0xffff)
-  {
-    mbchr[2] = 0x80 | (char)(wc & 0x3f);
-    wc >>= 6;
-    mbchr[1] = 0x80 | (char)(wc & 0x3f);
-    wc >>= 6;
-    mbchr[0] = 0xE0 | (char)(wc & 0x0f);
-    wc >>= 4;
-    return 3;
-  }
-  else
-  {
-    // invalid codepoints above 0x10FFFF were replaced above
-    mbchr[3] = 0x80 | (char)(wc & 0x3f);
-    wc >>= 6;
-    mbchr[2] = 0x80 | (char)(wc & 0x3f);
-    wc >>= 6;
-    mbchr[1] = 0x80 | (char)(wc & 0x3f);
-    wc >>= 6;
-    mbchr[0] = 0xF0 | (char)(wc & 0x07);
-    wc >>= 3;
-    return 4;
-  }
+  return ret;
 }
 
 };    // namespace StringFormat
 
-std::string Callstack::AddressDetails::formattedString(const char *commonPath)
+rdcstr Callstack::AddressDetails::formattedString(const rdcstr &commonPath)
 {
-  char fmt[512] = {0};
-
   const char *f = filename.c_str();
 
-  if(commonPath)
+  if(!commonPath.empty())
   {
-    std::string common = strlower(std::string(commonPath));
-    std::string fn = strlower(filename.substr(0, common.length()));
+    rdcstr common = strlower(commonPath);
+    rdcstr fn = strlower(filename.substr(0, common.length()));
 
     if(common == fn)
     {
@@ -148,16 +141,14 @@ std::string Callstack::AddressDetails::formattedString(const char *commonPath)
   }
 
   if(line > 0)
-    StringFormat::snprintf(fmt, 511, "%s line %d", function.c_str(), line);
+    return StringFormat::Fmt("%s line %d", function.c_str(), line);
   else
-    StringFormat::snprintf(fmt, 511, "%s", function.c_str());
-
-  return fmt;
+    return function;
 }
 
-std::string OSUtility::MakeMachineIdentString(uint64_t ident)
+rdcstr OSUtility::MakeMachineIdentString(uint64_t ident)
 {
-  std::string ret = "";
+  rdcstr ret = "";
 
   if(ident & MachineIdent_Windows)
     ret += "Windows ";
@@ -198,32 +189,28 @@ std::string OSUtility::MakeMachineIdentString(uint64_t ident)
 
 #if ENABLED(ENABLE_UNIT_TESTS)
 
-#include "3rdparty/catch/catch.hpp"
+#include "catch/catch.hpp"
 
 TEST_CASE("Test OS-specific functions", "[osspecific]")
 {
   SECTION("GetLibraryFilename")
   {
-    std::string libPath;
+    rdcstr libPath;
     FileIO::GetLibraryFilename(libPath);
     CHECK_FALSE(libPath.empty());
   }
   SECTION("Environment Variables")
   {
-    const char *var = Process::GetEnvVariable("TMP");
+    rdcstr var = Process::GetEnvVariable("TMP");
+    var = Process::GetEnvVariable("TEMP");
+    var = Process::GetEnvVariable("HOME");
 
-    if(!var)
-      var = Process::GetEnvVariable("TEMP");
-
-    if(!var)
-      var = Process::GetEnvVariable("HOME");
-
-    CHECK(var);
-    CHECK(strlen(var) > 1);
+    CHECK(!var.empty());
+    CHECK(var.length() > 1);
 
     var = Process::GetEnvVariable("__renderdoc__unit_test_var");
 
-    CHECK_FALSE(var);
+    CHECK(var.empty());
 
     EnvironmentModification mod;
     mod.name = "__renderdoc__unit_test_var";
@@ -236,16 +223,14 @@ TEST_CASE("Test OS-specific functions", "[osspecific]")
 
     var = Process::GetEnvVariable("__renderdoc__unit_test_var");
 
-    CHECK(var);
-    CHECK(var == std::string("test_value"));
+    CHECK(var == "test_value");
 
     Process::RegisterEnvironmentModification(mod);
     Process::ApplyEnvironmentModification();
 
     var = Process::GetEnvVariable("__renderdoc__unit_test_var");
 
-    CHECK(var);
-    CHECK(var == std::string("test_value;test_value"));
+    CHECK(var == rdcstr("test_value;test_value"));
 
     mod.sep = EnvSep::Colon;
 
@@ -254,8 +239,7 @@ TEST_CASE("Test OS-specific functions", "[osspecific]")
 
     var = Process::GetEnvVariable("__renderdoc__unit_test_var");
 
-    CHECK(var);
-    CHECK(var == std::string("test_value;test_value:test_value"));
+    CHECK(var == rdcstr("test_value;test_value:test_value"));
 
     mod.value = "prepend";
     mod.sep = EnvSep::SemiColon;
@@ -266,8 +250,7 @@ TEST_CASE("Test OS-specific functions", "[osspecific]")
 
     var = Process::GetEnvVariable("__renderdoc__unit_test_var");
 
-    CHECK(var);
-    CHECK(var == std::string("prepend;test_value;test_value:test_value"));
+    CHECK(var == rdcstr("prepend;test_value;test_value:test_value"));
 
     mod.value = "reset";
     mod.sep = EnvSep::SemiColon;
@@ -278,8 +261,26 @@ TEST_CASE("Test OS-specific functions", "[osspecific]")
 
     var = Process::GetEnvVariable("__renderdoc__unit_test_var");
 
-    CHECK(var);
-    CHECK(var == std::string("reset"));
+    CHECK(var == rdcstr("reset"));
+  };
+
+  SECTION("UTF-8 to wide conversion")
+  {
+    const rdcstr s = "ελληνικά";
+
+    rdcwstr ws = StringFormat::UTF82Wide(s);
+
+    CHECK(ws.length() == 8);
+    CHECK(ws[0] == L'\x3b5');
+    CHECK(ws[ws.length() - 1] == L'\x3ac');
+    CHECK(ws[ws.length()] == L'\0');
+
+    rdcstr s2 = StringFormat::Wide2UTF8(ws);
+
+    CHECK(s == s2);
+
+    CHECK(StringFormat::UTF82Wide(rdcstr()).length() == 0);
+    CHECK(StringFormat::UTF82Wide(rdcstr()).c_str()[0] == 0);
   };
 
   SECTION("Timing")
@@ -304,7 +305,7 @@ TEST_CASE("Test OS-specific functions", "[osspecific]")
       CHECK(milliseconds1 < 1.0);
 
       CHECK(milliseconds2 > 1480.0);
-      CHECK(milliseconds2 < 1650.0);
+      CHECK(milliseconds2 < 1675.0);
     }
 
     // timestamp as of the creation of this test
@@ -320,6 +321,8 @@ TEST_CASE("Test OS-specific functions", "[osspecific]")
       {
         INFO("val is " << val);
         CHECK(Bits::CountLeadingZeroes(val) == 32);
+        CHECK(Bits::CountTrailingZeroes(val) == 32);
+        CHECK(Bits::CountOnes(val) == 0);
       }
 
       val = 1;
@@ -327,6 +330,8 @@ TEST_CASE("Test OS-specific functions", "[osspecific]")
       {
         INFO("val is " << val);
         CHECK(Bits::CountLeadingZeroes(val) == 31);
+        CHECK(Bits::CountTrailingZeroes(val) == 0);
+        CHECK(Bits::CountOnes(val) == 1);
       }
 
       val <<= 1;
@@ -334,6 +339,8 @@ TEST_CASE("Test OS-specific functions", "[osspecific]")
       {
         INFO("val is " << val);
         CHECK(Bits::CountLeadingZeroes(val) == 30);
+        CHECK(Bits::CountTrailingZeroes(val) == 1);
+        CHECK(Bits::CountOnes(val) == 1);
       }
 
       val <<= 4;
@@ -341,6 +348,8 @@ TEST_CASE("Test OS-specific functions", "[osspecific]")
       {
         INFO("val is " << val);
         CHECK(Bits::CountLeadingZeroes(val) == 26);
+        CHECK(Bits::CountTrailingZeroes(val) == 5);
+        CHECK(Bits::CountOnes(val) == 1);
       }
 
       val++;
@@ -348,6 +357,8 @@ TEST_CASE("Test OS-specific functions", "[osspecific]")
       {
         INFO("val is " << val);
         CHECK(Bits::CountLeadingZeroes(val) == 26);
+        CHECK(Bits::CountTrailingZeroes(val) == 0);
+        CHECK(Bits::CountOnes(val) == 2);
       }
 
       val += 5;
@@ -355,6 +366,8 @@ TEST_CASE("Test OS-specific functions", "[osspecific]")
       {
         INFO("val is " << val);
         CHECK(Bits::CountLeadingZeroes(val) == 26);
+        CHECK(Bits::CountTrailingZeroes(val) == 1);
+        CHECK(Bits::CountOnes(val) == 3);
       }
 
       val += 1000;
@@ -362,6 +375,8 @@ TEST_CASE("Test OS-specific functions", "[osspecific]")
       {
         INFO("val is " << val);
         CHECK(Bits::CountLeadingZeroes(val) == 21);
+        CHECK(Bits::CountTrailingZeroes(val) == 1);
+        CHECK(Bits::CountOnes(val) == 4);
       }
 
       val *= 3;
@@ -369,6 +384,8 @@ TEST_CASE("Test OS-specific functions", "[osspecific]")
       {
         INFO("val is " << val);
         CHECK(Bits::CountLeadingZeroes(val) == 20);
+        CHECK(Bits::CountTrailingZeroes(val) == 1);
+        CHECK(Bits::CountOnes(val) == 5);
       }
 
       val *= 200000;
@@ -376,6 +393,17 @@ TEST_CASE("Test OS-specific functions", "[osspecific]")
       {
         INFO("val is " << val);
         CHECK(Bits::CountLeadingZeroes(val) == 2);
+        CHECK(Bits::CountTrailingZeroes(val) == 7);
+        CHECK(Bits::CountOnes(val) == 12);
+      }
+
+      val |= 0xFFFFFFFFu;
+
+      {
+        INFO("val is " << val);
+        CHECK(Bits::CountLeadingZeroes(val) == 0);
+        CHECK(Bits::CountTrailingZeroes(val) == 0);
+        CHECK(Bits::CountOnes(val) == 32);
       }
     };
 
@@ -387,6 +415,8 @@ TEST_CASE("Test OS-specific functions", "[osspecific]")
       {
         INFO("val is " << val);
         CHECK(Bits::CountLeadingZeroes(val) == 64);
+        CHECK(Bits::CountTrailingZeroes(val) == 64);
+        CHECK(Bits::CountOnes(val) == 0);
       }
 
       val = 1;
@@ -394,6 +424,8 @@ TEST_CASE("Test OS-specific functions", "[osspecific]")
       {
         INFO("val is " << val);
         CHECK(Bits::CountLeadingZeroes(val) == 63);
+        CHECK(Bits::CountTrailingZeroes(val) == 0);
+        CHECK(Bits::CountOnes(val) == 1);
       }
 
       val <<= 1;
@@ -401,6 +433,8 @@ TEST_CASE("Test OS-specific functions", "[osspecific]")
       {
         INFO("val is " << val);
         CHECK(Bits::CountLeadingZeroes(val) == 62);
+        CHECK(Bits::CountTrailingZeroes(val) == 1);
+        CHECK(Bits::CountOnes(val) == 1);
       }
 
       val <<= 4;
@@ -408,6 +442,8 @@ TEST_CASE("Test OS-specific functions", "[osspecific]")
       {
         INFO("val is " << val);
         CHECK(Bits::CountLeadingZeroes(val) == 58);
+        CHECK(Bits::CountTrailingZeroes(val) == 5);
+        CHECK(Bits::CountOnes(val) == 1);
       }
 
       val++;
@@ -415,6 +451,8 @@ TEST_CASE("Test OS-specific functions", "[osspecific]")
       {
         INFO("val is " << val);
         CHECK(Bits::CountLeadingZeroes(val) == 58);
+        CHECK(Bits::CountTrailingZeroes(val) == 0);
+        CHECK(Bits::CountOnes(val) == 2);
       }
 
       val += 5;
@@ -422,6 +460,8 @@ TEST_CASE("Test OS-specific functions", "[osspecific]")
       {
         INFO("val is " << val);
         CHECK(Bits::CountLeadingZeroes(val) == 58);
+        CHECK(Bits::CountTrailingZeroes(val) == 1);
+        CHECK(Bits::CountOnes(val) == 3);
       }
 
       val += 1000;
@@ -429,6 +469,8 @@ TEST_CASE("Test OS-specific functions", "[osspecific]")
       {
         INFO("val is " << val);
         CHECK(Bits::CountLeadingZeroes(val) == 53);
+        CHECK(Bits::CountTrailingZeroes(val) == 1);
+        CHECK(Bits::CountOnes(val) == 4);
       }
 
       val *= 3;
@@ -436,6 +478,8 @@ TEST_CASE("Test OS-specific functions", "[osspecific]")
       {
         INFO("val is " << val);
         CHECK(Bits::CountLeadingZeroes(val) == 52);
+        CHECK(Bits::CountTrailingZeroes(val) == 1);
+        CHECK(Bits::CountOnes(val) == 5);
       }
 
       val *= 200000;
@@ -443,6 +487,8 @@ TEST_CASE("Test OS-specific functions", "[osspecific]")
       {
         INFO("val is " << val);
         CHECK(Bits::CountLeadingZeroes(val) == 34);
+        CHECK(Bits::CountTrailingZeroes(val) == 7);
+        CHECK(Bits::CountOnes(val) == 12);
       }
 
       val *= 1000000;
@@ -450,6 +496,17 @@ TEST_CASE("Test OS-specific functions", "[osspecific]")
       {
         INFO("val is " << val);
         CHECK(Bits::CountLeadingZeroes(val) == 14);
+        CHECK(Bits::CountTrailingZeroes(val) == 13);
+        CHECK(Bits::CountOnes(val) == 19);
+      }
+
+      val |= 0xFFFFFFFFFFFFFFFFull;
+
+      {
+        INFO("val is " << val);
+        CHECK(Bits::CountLeadingZeroes(val) == 0);
+        CHECK(Bits::CountTrailingZeroes(val) == 0);
+        CHECK(Bits::CountOnes(val) == 64);
       }
     };
 #endif
@@ -506,7 +563,7 @@ TEST_CASE("Test OS-specific functions", "[osspecific]")
 
   SECTION("Atomics")
   {
-    volatile int32_t value = 0;
+    int32_t value = 0;
 
     // check that thread atomics work on multiple overlapping threads
     Threading::ThreadHandle threads[numThreads];

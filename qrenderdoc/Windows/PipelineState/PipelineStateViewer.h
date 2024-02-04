@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2016-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -27,6 +27,7 @@
 #include <QFrame>
 #include <QLabel>
 #include "Code/Interface/QRDInterface.h"
+#include "Widgets/Extended/RDTreeView.h"
 
 namespace Ui
 {
@@ -38,11 +39,40 @@ class QXmlStreamWriter;
 class QToolButton;
 class QMenu;
 class RDLabel;
+class RDTreeWidgetItem;
+class RDTreeWidget;
+class CustomPaintWidget;
 
 class D3D11PipelineStateViewer;
 class D3D12PipelineStateViewer;
 class GLPipelineStateViewer;
 class VulkanPipelineStateViewer;
+
+class PipelineStateViewer;
+
+class RDPreviewTooltip : public QFrame, public ITreeViewTipDisplay
+{
+private:
+  Q_OBJECT
+
+  PipelineStateViewer *pipe = NULL;
+  QLabel *title = NULL;
+  QLabel *label = NULL;
+  ICaptureContext &m_Ctx;
+
+public:
+  explicit RDPreviewTooltip(PipelineStateViewer *parent, CustomPaintWidget *thumbnail,
+                            ICaptureContext &ctx);
+
+  void hideTip();
+  QSize configureTip(QWidget *widget, QModelIndex idx, QString text);
+  void showTip(QPoint pos);
+  bool forceTip(QWidget *widget, QModelIndex idx);
+
+protected:
+  void paintEvent(QPaintEvent *);
+  void resizeEvent(QResizeEvent *);
+};
 
 class PipelineStateViewer : public QFrame, public IPipelineStateViewer, public ICaptureViewer
 {
@@ -57,6 +87,7 @@ public:
   // IPipelineStateViewer
   QWidget *Widget() override { return this; }
   bool SaveShaderFile(const ShaderReflection *shader) override;
+  void SelectPipelineStage(PipelineStage stage) override;
 
   // ICaptureViewer
   void OnCaptureLoaded() override;
@@ -67,16 +98,24 @@ public:
   QVariant persistData();
   void setPersistData(const QVariant &persistData);
 
+  void SetStencilLabelValue(QLabel *label, uint8_t value);
+  void SetStencilTreeItemValue(RDTreeWidgetItem *item, int column, uint8_t value);
+
   void SetupShaderEditButton(QToolButton *button, ResourceId pipelineId, ResourceId shaderId,
+                             const ShaderBindpointMapping &bindpointMapping,
                              const ShaderReflection *shaderDetails);
 
-  QString GenerateBufferFormatter(const ShaderResource &res, const ResourceFormat &viewFormat,
-                                  uint64_t &baseByteOffset);
+  void SetupResourceView(RDTreeWidget *view);
 
   QString GetVBufferFormatString(uint32_t slot);
 
+  QColor GetViewDetailsColor();
+
   void setTopologyDiagram(QLabel *diagram, Topology topo);
   void setMeshViewPixmap(RDLabel *meshView);
+
+  ResourceId updateThumbnail(QWidget *widget, QModelIndex idx);
+  bool hasThumbnail(QWidget *widget, QModelIndex idx);
 
   QXmlStreamWriter *beginHTMLExport();
   void exportHTMLTable(QXmlStreamWriter &xml, const QStringList &cols,
@@ -88,18 +127,29 @@ public slots:
   void shaderEdit_clicked();
 
 private:
+  void showEvent(QShowEvent *event) override;
+
   Ui::PipelineStateViewer *ui;
   ICaptureContext &m_Ctx;
 
-  QMenu *editMenus[6] = {};
+  QMenu *editMenus[NumShaderStages] = {};
 
-  QString declareStruct(QList<QString> &declaredStructs, const QString &name,
-                        const rdcarray<ShaderConstant> &members, uint32_t requiredByteStride);
+  RDPreviewTooltip *m_Tooltip = NULL;
 
-  QString GenerateHLSLStub(const ShaderReflection *shaderDetails, const QString &entryFunc);
+  TextureDisplay m_TexDisplay;
+  IReplayOutput *m_Output = NULL;
+
+  void RT_UpdateAndDisplay(IReplayController *r);
+
+  void AddResourceUsageEntry(QMenu &menu, uint32_t start, uint32_t end, ResourceUsage usage);
+  void ShowResourceContextMenu(RDTreeWidget *widget, const QPoint &pos, ResourceId id,
+                               const rdcarray<EventUsage> &usage);
+
+  QString GenerateHLSLStub(const ShaderBindpointMapping &bindpointMapping,
+                           const ShaderReflection *shaderDetails, const QString &entryFunc);
   IShaderViewer *EditShader(ResourceId id, ShaderStage shaderType, const rdcstr &entry,
-                            ShaderCompileFlags compileFlags, ShaderEncoding encoding,
-                            const rdcstrpairs &files);
+                            ShaderCompileFlags compileFlags, KnownShaderTool knownTool,
+                            ShaderEncoding shaderEncoding, const rdcstrpairs &files);
   IShaderViewer *EditOriginalShaderSource(ResourceId id, const ShaderReflection *shaderDetails);
   IShaderViewer *EditDecompiledSource(const ShaderProcessingTool &tool, ResourceId id,
                                       const ShaderReflection *shaderDetails);

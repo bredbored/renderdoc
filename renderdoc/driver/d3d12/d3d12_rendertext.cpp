@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2018-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -27,6 +27,8 @@
 #include "maths/matrix.h"
 #include "maths/vec.h"
 #include "stb/stb_truetype.h"
+#include "strings/string_utils.h"
+#include "d3d12_command_list.h"
 #include "d3d12_device.h"
 #include "d3d12_shader_cache.h"
 
@@ -116,7 +118,7 @@ D3D12TextRenderer::D3D12TextRenderer(WrappedID3D12Device *wrapper)
 
   rm->SetInternalResource(Tex);
 
-  std::string font = GetEmbeddedResource(sourcecodepro_ttf);
+  rdcstr font = GetEmbeddedResource(sourcecodepro_ttf);
   byte *ttfdata = (byte *)font.c_str();
 
   const int firstChar = int(' ') + 1;
@@ -131,7 +133,7 @@ D3D12TextRenderer::D3D12TextRenderer(WrappedID3D12Device *wrapper)
   stbtt_BakeFontBitmap(ttfdata, 0, pixelHeight, buf, width, height, firstChar, numChars, chardata);
 
   CharSize = pixelHeight;
-  CharAspect = chardata->xadvance / pixelHeight;
+  CharAspect = chardata[0].xadvance / pixelHeight;
 
   stbtt_fontinfo f = {0};
   stbtt_InitFont(&f, ttfdata, 0);
@@ -288,7 +290,7 @@ D3D12TextRenderer::D3D12TextRenderer(WrappedID3D12Device *wrapper)
 
   ConstRingIdx = 0;
 
-  std::vector<D3D12_ROOT_PARAMETER1> rootSig;
+  rdcarray<D3D12_ROOT_PARAMETER1> rootSig;
   D3D12_ROOT_PARAMETER1 param = {};
 
   // Constants
@@ -323,21 +325,41 @@ D3D12TextRenderer::D3D12TextRenderer(WrappedID3D12Device *wrapper)
 
   D3D12ShaderCache *shaderCache = wrapper->GetShaderCache();
 
-  const D3D12_STATIC_SAMPLER_DESC samplers[2] = {
+  const D3D12_STATIC_SAMPLER_DESC1 samplers[2] = {
       // point
       {
-          D3D12_FILTER_MIN_MAG_MIP_POINT, D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
-          D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP, 0.0f, 1,
-          D3D12_COMPARISON_FUNC_ALWAYS, D3D12_STATIC_BORDER_COLOR_OPAQUE_BLACK, 0.0f, FLT_MAX, 0, 0,
+          D3D12_FILTER_MIN_MAG_MIP_POINT,
+          D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+          D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+          D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+          0.0f,
+          1,
+          D3D12_COMPARISON_FUNC_ALWAYS,
+          D3D12_STATIC_BORDER_COLOR_OPAQUE_BLACK,
+          0.0f,
+          FLT_MAX,
+          0,
+          0,
           D3D12_SHADER_VISIBILITY_PIXEL,
+          D3D12_SAMPLER_FLAG_NONE,
       },
 
       // linear
       {
-          D3D12_FILTER_MIN_MAG_MIP_LINEAR, D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
-          D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP, 0.0f, 1,
-          D3D12_COMPARISON_FUNC_ALWAYS, D3D12_STATIC_BORDER_COLOR_OPAQUE_BLACK, 0.0f, FLT_MAX, 1, 0,
+          D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+          D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+          D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+          D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+          0.0f,
+          1,
+          D3D12_COMPARISON_FUNC_ALWAYS,
+          D3D12_STATIC_BORDER_COLOR_OPAQUE_BLACK,
+          0.0f,
+          FLT_MAX,
+          1,
+          0,
           D3D12_SHADER_VISIBILITY_PIXEL,
+          D3D12_SAMPLER_FLAG_NONE,
       },
   };
 
@@ -356,14 +378,14 @@ D3D12TextRenderer::D3D12TextRenderer(WrappedID3D12Device *wrapper)
 
   SAFE_RELEASE(root);
 
-  std::string hlsl = GetEmbeddedResource(text_hlsl);
+  rdcstr hlsl = GetEmbeddedResource(text_hlsl);
 
   ID3DBlob *TextVS = NULL;
   ID3DBlob *TextPS = NULL;
 
-  shaderCache->GetShaderBlob(hlsl.c_str(), "RENDERDOC_TextVS", D3DCOMPILE_WARNINGS_ARE_ERRORS,
+  shaderCache->GetShaderBlob(hlsl.c_str(), "RENDERDOC_TextVS", D3DCOMPILE_WARNINGS_ARE_ERRORS, {},
                              "vs_5_0", &TextVS);
-  shaderCache->GetShaderBlob(hlsl.c_str(), "RENDERDOC_TextPS", D3DCOMPILE_WARNINGS_ARE_ERRORS,
+  shaderCache->GetShaderBlob(hlsl.c_str(), "RENDERDOC_TextPS", D3DCOMPILE_WARNINGS_ARE_ERRORS, {},
                              "ps_5_0", &TextPS);
 
   RDCASSERT(TextVS);
@@ -444,35 +466,25 @@ D3D12TextRenderer::~D3D12TextRenderer()
 }
 
 void D3D12TextRenderer::RenderText(ID3D12GraphicsCommandList *list, float x, float y,
-                                   const char *textfmt, ...)
+                                   const rdcstr &text)
 {
-  static char tmpBuf[4096];
+  rdcarray<rdcstr> lines;
+  split(text, lines, '\n');
 
-  va_list args;
-  va_start(args, textfmt);
-  StringFormat::vsnprintf(tmpBuf, 4095, textfmt, args);
-  tmpBuf[4095] = '\0';
-  va_end(args);
-
-  RenderTextInternal(list, x, y, tmpBuf);
+  for(const rdcstr &line : lines)
+  {
+    RenderTextInternal(list, x, y, line);
+    y += 1.0f;
+  }
 }
 
 void D3D12TextRenderer::RenderTextInternal(ID3D12GraphicsCommandList *list, float x, float y,
-                                           const char *text)
+                                           const rdcstr &text)
 {
-  if(char *t = strchr((char *)text, '\n'))
-  {
-    *t = 0;
-    RenderTextInternal(list, x, y, text);
-    RenderTextInternal(list, x, y + 1.0f, t + 1);
-    *t = '\n';
-    return;
-  }
-
-  if(strlen(text) == 0)
+  if(text.empty())
     return;
 
-  RDCASSERT(strlen(text) < FONT_MAX_CHARS);
+  RDCASSERT(text.size() < FONT_MAX_CHARS);
 
   FontCBuffer data = {};
 
@@ -508,7 +520,7 @@ void D3D12TextRenderer::RenderTextInternal(ID3D12GraphicsCommandList *list, floa
     Constants->Unmap(0, &range);
   }
 
-  size_t chars = strlen(text);
+  size_t chars = text.size();
 
   size_t charOffset = CharOffset;
 
@@ -530,13 +542,15 @@ void D3D12TextRenderer::RenderTextInternal(ID3D12GraphicsCommandList *list, floa
 
   texs += charOffset * 4;
 
-  for(size_t i = 0; i < strlen(text); i++)
+  for(size_t i = 0; i < chars; i++)
     texs[i * 4] = (text[i] - ' ');
 
   CharBuffer->Unmap(0, NULL);
 
+  // the list is used unwrapped to avoid weird ordering bugs and potentially 'poisoning' the
+  // resource record on 12On7 with our own rendering
   {
-    list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+    Unwrap(list)->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
 
     D3D12_VIEWPORT view;
     view.TopLeftX = 0;
@@ -545,25 +559,27 @@ void D3D12TextRenderer::RenderTextInternal(ID3D12GraphicsCommandList *list, floa
     view.Height = (float)GetHeight();
     view.MinDepth = 0.0f;
     view.MaxDepth = 1.0f;
-    list->RSSetViewports(1, &view);
+    Unwrap(list)->RSSetViewports(1, &view);
 
     D3D12_RECT scissor = {0, 0, GetWidth(), GetHeight()};
-    list->RSSetScissorRects(1, &scissor);
+    Unwrap(list)->RSSetScissorRects(1, &scissor);
 
-    list->SetPipelineState(Pipe[m_BBFmtIdx]);
-    list->SetGraphicsRootSignature(RootSig);
+    Unwrap(list)->SetPipelineState(Unwrap(Pipe[m_BBFmtIdx]));
+    Unwrap(list)->SetGraphicsRootSignature(Unwrap(RootSig));
 
     // Set the descriptor heap containing the texture srv
-    list->SetDescriptorHeaps(1, &descHeap);
+    ID3D12DescriptorHeap *unwrappedHeap = Unwrap(descHeap);
+    Unwrap(list)->SetDescriptorHeaps(1, &unwrappedHeap);
 
-    list->SetGraphicsRootConstantBufferView(
+    Unwrap(list)->SetGraphicsRootConstantBufferView(
         0, Constants->GetGPUVirtualAddress() + ConstRingIdx * constantAlignment);
-    list->SetGraphicsRootConstantBufferView(1, GlyphData->GetGPUVirtualAddress());
-    list->SetGraphicsRootConstantBufferView(
+    Unwrap(list)->SetGraphicsRootConstantBufferView(1, GlyphData->GetGPUVirtualAddress());
+    Unwrap(list)->SetGraphicsRootConstantBufferView(
         2, CharBuffer->GetGPUVirtualAddress() + charOffset * sizeof(Vec4f));
-    list->SetGraphicsRootDescriptorTable(3, descHeap->GetGPUDescriptorHandleForHeapStart());
+    Unwrap(list)->SetGraphicsRootDescriptorTable(
+        3, Unwrap(descHeap->GetGPUDescriptorHandleForHeapStart()));
 
-    list->DrawInstanced(4, (uint32_t)strlen(text), 0, 0);
+    Unwrap(list)->DrawInstanced(4, (uint32_t)chars, 0, 0);
   }
 
   ConstRingIdx++;

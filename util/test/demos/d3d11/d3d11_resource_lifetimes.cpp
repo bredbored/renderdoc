@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -24,7 +24,7 @@
 
 #include "d3d11_test.h"
 
-TEST(D3D11_Resource_Lifetimes, D3D11GraphicsTest)
+RD_TEST(D3D11_Resource_Lifetimes, D3D11GraphicsTest)
 {
   static constexpr const char *Description =
       "Test various edge-case resource lifetimes: a resource that is first dirtied within a frame "
@@ -42,7 +42,8 @@ struct v2f
 
 Texture2D smiley : register(t0);
 Texture2D checker : register(t1);
-SamplerState samp : register(s0);
+SamplerState smileysamp : register(s0);
+SamplerState checkersamp : register(s1);
 
 cbuffer consts : register(b0)
 {
@@ -54,7 +55,9 @@ float4 main(v2f IN) : SV_Target0
   if(flags.x != 1.0f || flags.y != 2.0f || flags.z != 4.0f || flags.w != 8.0f)
     return float4(1.0f, 0.0f, 1.0f, 1.0f);
 
-	return smiley.Sample(samp, IN.uv * 2.0f) * checker.Sample(samp, IN.uv * 5.0f);
+	float4 col = smiley.Sample(smileysamp, IN.uv * 2.0f) * checker.Sample(checkersamp, IN.uv * 5.0f);
+  col.w = 1.0f;
+  return col;
 }
 
 )EOSHADER";
@@ -84,7 +87,13 @@ float4 main(v2f IN) : SV_Target0
 
     ctx->UpdateSubresource(smiley, 0, NULL, rgba8.data.data(), rgba8.width * sizeof(uint32_t), 0);
 
-    ID3D11SamplerStatePtr samp = MakeSampler().Address(D3D11_TEXTURE_ADDRESS_WRAP);
+    ID3D11SamplerStatePtr smileysamp = MakeSampler()
+                                           .AddressU(D3D11_TEXTURE_ADDRESS_CLAMP)
+                                           .AddressV(D3D11_TEXTURE_ADDRESS_WRAP)
+                                           .AddressW(D3D11_TEXTURE_ADDRESS_WRAP)
+                                           .Filter(D3D11_FILTER_MIN_MAG_MIP_POINT);
+    ID3D11SamplerStatePtr checkersamp =
+        MakeSampler().Address(D3D11_TEXTURE_ADDRESS_WRAP).Filter(D3D11_FILTER_MIN_MAG_MIP_POINT);
 
     auto SetupBuf = [this]() {
       const Vec4f flags = {1.0f, 2.0f, 4.0f, 8.0f};
@@ -127,13 +136,25 @@ float4 main(v2f IN) : SV_Target0
 
       const uint32_t checker[4 * 4] = {
           // X X O O
-          0xffffffff, 0xffffffff, 0, 0,
+          0xffffffff,
+          0xffffffff,
+          0,
+          0,
           // X X O O
-          0xffffffff, 0xffffffff, 0, 0,
+          0xffffffff,
+          0xffffffff,
+          0,
+          0,
           // O O X X
-          0, 0, 0xffffffff, 0xffffffff,
+          0,
+          0,
+          0xffffffff,
+          0xffffffff,
           // O O X X
-          0, 0, 0xffffffff, 0xffffffff,
+          0,
+          0,
+          0xffffffff,
+          0xffffffff,
       };
 
       ctx->UpdateSubresource(tex, 0, NULL, checker, 4 * sizeof(uint32_t), 0);
@@ -155,16 +176,20 @@ float4 main(v2f IN) : SV_Target0
       srv = NULL;
     };
 
-    ID3D11ShaderResourceView *srvs[2] = {smileysrv};
+    ID3D11Texture2DPtr clearTex = MakeTexture(DXGI_FORMAT_R8G8B8A8_UNORM, 128, 128).RTV();
+    ID3D11RenderTargetViewPtr clearRTV = MakeRTV(clearTex);
 
-    ctx->PSSetSamplers(0, 1, &samp.GetInterfacePtr());
+    ID3D11ShaderResourceView *srvs[2] = {smileysrv};
+    ID3D11SamplerState *samps[2] = {smileysamp, checkersamp};
+
+    ctx->PSSetSamplers(0, 2, samps);
 
     ID3D11BufferPtr cb = SetupBuf();
     ID3D11ShaderResourceViewPtr srv = SetupSRV();
     srvs[1] = srv;
     while(Running())
     {
-      ClearRenderTargetView(bbRTV, {0.4f, 0.5f, 0.6f, 1.0f});
+      ClearRenderTargetView(bbRTV, {0.2f, 0.2f, 0.2f, 1.0f});
 
       IASetVertexBuffer(vb, sizeof(DefaultA2V), 0);
       ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -173,6 +198,12 @@ float4 main(v2f IN) : SV_Target0
       ctx->VSSetShader(vs, NULL, 0);
       ctx->PSSetShader(ps, NULL, 0);
       ctx->OMSetRenderTargets(1, &bbRTV.GetInterfacePtr(), NULL);
+
+      // lazy partial clears!
+      ClearRenderTargetView(clearRTV, {0.0f, 1.0f, 0.0f, 1.0f});
+      ctx->CopySubresourceRegion(bbTex, 0, 0, 0, 0, clearTex, 0, NULL);
+      ClearRenderTargetView(clearRTV, {0.0f, 0.0f, 1.0f, 1.0f});
+      ctx->CopySubresourceRegion(bbTex, 0, 128, 0, 0, clearTex, 0, NULL);
 
       // render with last frame's resources
       RSSetViewport({0.0f, 0.0f, 128.0f, 128.0f, 0.0f, 1.0f});

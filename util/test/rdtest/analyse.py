@@ -6,15 +6,19 @@ import renderdoc
 rd = renderdoc
 
 
-def open_capture(filename="", cap: rd.CaptureFile=None):
+def open_capture(filename="", cap: rd.CaptureFile=None, opts: rd.ReplayOptions=None):
     """
     Opens a capture file and begins a replay.
 
     :param filename: The filename to open, or empty if cap is used.
     :param cap: The capture file to use, or ``None`` if a filename is given.
+    :param opts: The replay options to use, or ``None`` to use the default options.
     :return: A replay controller for the capture
     :rtype: renderdoc.ReplayController
     """
+
+    if opts is None:
+        opts = rd.ReplayOptions()
 
     # Open a capture file handle
     own_cap = False
@@ -26,12 +30,12 @@ def open_capture(filename="", cap: rd.CaptureFile=None):
         cap = rd.OpenCaptureFile()
 
         # Open a particular file
-        status = cap.OpenFile(filename, '', None)
+        result = cap.OpenFile(filename, '', None)
 
         # Make sure the file opened successfully
-        if status != rd.ReplayStatus.Succeeded:
+        if result != rd.ResultCode.Succeeded:
             cap.Shutdown()
-            raise RuntimeError("Couldn't open '{}': {}".format(filename, str(status)))
+            raise RuntimeError("Couldn't open '{}': {}".format(filename, str(result)))
 
         api = cap.DriverName()
 
@@ -40,40 +44,64 @@ def open_capture(filename="", cap: rd.CaptureFile=None):
             cap.Shutdown()
             raise RuntimeError("{} capture cannot be replayed".format(api))
 
-    status, controller = cap.OpenCapture(None)
+    result, controller = cap.OpenCapture(opts, None)
 
     if own_cap:
         cap.Shutdown()
 
-    if status != rd.ReplayStatus.Succeeded:
-        raise RuntimeError("Couldn't initialise replay for {}: {}".format(api, str(rd.ReplayStatus(status))))
+    if result != rd.ResultCode.Succeeded:
+        raise RuntimeError("Couldn't initialise replay for {}: {}".format(api, str(result)))
 
     return controller
 
 
-def fetch_indices(controller: rd.ReplayController, mesh: rd.MeshFormat, index_offset: int, first_index: int, num_indices: int):
-    # Get the character for the width of index
-    index_fmt = 'B'
-    if mesh.indexByteStride == 2:
-        index_fmt = 'H'
-    elif mesh.indexByteStride == 4:
-        index_fmt = 'I'
+def fetch_indices(controller: rd.ReplayController, action: rd.ActionDescription, mesh: rd.MeshFormat, index_offset: int, first_index: int, num_indices: int):
 
-    # Duplicate the format by the number of indices
-    index_fmt = '=' + str(num_indices) + index_fmt
+    pipe = controller.GetPipelineState()
+    restart_idx = pipe.GetRestartIndex() & ((1 << (mesh.indexByteStride*8)) - 1)
+    restart_enabled = pipe.IsRestartEnabled()
 
     # If we have an index buffer
     if mesh.indexResourceId != rd.ResourceId.Null():
+        offset = mesh.indexByteStride*(first_index + index_offset)
+
+        avail_bytes = mesh.indexByteSize
+        if avail_bytes > offset:
+            avail_bytes = avail_bytes - offset
+        else:
+            avail_bytes = 0
+
+        read_bytes = min([avail_bytes, mesh.indexByteStride*num_indices])
+
         # Fetch the data
-        ibdata = controller.GetBufferData(mesh.indexResourceId,
-                                          mesh.indexByteOffset + mesh.indexByteStride*(first_index + index_offset),
-                                          mesh.indexByteStride*num_indices)
+        if read_bytes > 0:
+            ibdata = controller.GetBufferData(mesh.indexResourceId,
+                                              mesh.indexByteOffset + offset,
+                                              read_bytes)
+        else:
+            ibdata = bytes()
+
+        # Get the character for the width of index
+        index_fmt = 'B'
+        if mesh.indexByteStride == 2:
+            index_fmt = 'H'
+        elif mesh.indexByteStride == 4:
+            index_fmt = 'I'
+
+        avail_indices = int(len(ibdata) / mesh.indexByteStride)
+
+        # Duplicate the format by the number of indices
+        index_fmt = '=' + str(min([avail_indices, num_indices])) + index_fmt
 
         # Unpack all the indices
-        indices = struct.unpack(index_fmt, ibdata)
+        indices = struct.unpack_from(index_fmt, ibdata)
+
+        extra = []
+        if avail_indices < num_indices:
+            extra = [None] * (num_indices - avail_indices)
 
         # Apply the baseVertex offset
-        return [i + mesh.baseVertex for i in indices]
+        return [i if restart_enabled and i == restart_idx else i + mesh.baseVertex for i in indices] + extra
     else:
         # With no index buffer, just generate a range
         return tuple(range(first_index, first_index + num_indices))
@@ -84,7 +112,7 @@ class MeshAttribute:
     name: str
 
 
-def get_vsin_attrs(controller: rd.ReplayController, index_mesh: rd.MeshFormat):
+def get_vsin_attrs(controller: rd.ReplayController, vertexOffset: int, index_mesh: rd.MeshFormat):
     pipe: rd.PipeState = controller.GetPipelineState()
     inputs: List[rd.VertexInputAttribute] = pipe.GetVertexInputs()
 
@@ -103,7 +131,11 @@ def get_vsin_attrs(controller: rd.ReplayController, index_mesh: rd.MeshFormat):
         attr.mesh.instStepRate = a.instanceRate
         attr.mesh.instanced = a.perInstance
         attr.mesh.vertexResourceId = vbs[a.vertexBuffer].resourceId
-        attr.mesh.vertexByteOffset = vbs[a.vertexBuffer].byteOffset + a.byteOffset
+
+        offs = a.byteOffset + vertexOffset * attr.mesh.vertexByteStride
+
+        attr.mesh.vertexByteOffset = vbs[a.vertexBuffer].byteOffset + offs
+        attr.mesh.vertexByteSize = max([0, vbs[a.vertexBuffer].byteSize - offs])
 
         attr.mesh.format = a.format
 
@@ -129,11 +161,18 @@ def get_postvs_attrs(controller: rd.ReplayController, mesh: rd.MeshFormat, data_
         attr = MeshAttribute()
         attr.mesh = rd.MeshFormat(mesh)
 
+        if pipe.GetRasterizedStream() >= 0:
+            if sig.stream != pipe.GetRasterizedStream():
+                continue
+        else:
+            if sig.stream != 0:
+                continue
+
         # Construct a resource format for this element
         attr.mesh.format = rd.ResourceFormat()
-        attr.mesh.format.compByteWidth = 8 if sig.compType == rd.CompType.Double else 4
+        attr.mesh.format.compByteWidth = rd.VarTypeByteSize(sig.varType)
         attr.mesh.format.compCount = sig.compCount
-        attr.mesh.format.compType = sig.compType
+        attr.mesh.format.compType = rd.VarTypeCompType(sig.varType)
         attr.mesh.format.type = rd.ResourceFormatType.Regular
 
         attr.name = sig.semanticIdxName if sig.varName == '' else sig.varName
@@ -156,7 +195,7 @@ def get_postvs_attrs(controller: rd.ReplayController, mesh: rd.MeshFormat, data_
         # while others will tightly pack
         fmt = attrs[i].mesh.format
 
-        elem_size = (8 if fmt.compType == rd.CompType.Double else 4)
+        elem_size = (8 if fmt.compByteWidth > 4 else 4)
 
         alignment = elem_size
         if fmt.compCount == 2:
@@ -167,7 +206,7 @@ def get_postvs_attrs(controller: rd.ReplayController, mesh: rd.MeshFormat, data_
         if pipe.HasAlignedPostVSData(data_stage) and (accum_offset % alignment) != 0:
             accum_offset += alignment - (accum_offset % alignment)
 
-        attrs[i].mesh.vertexByteOffset = accum_offset
+        attrs[i].mesh.vertexByteOffset += accum_offset
 
         accum_offset += elem_size * fmt.compCount
 
@@ -182,8 +221,8 @@ def unpack_data(fmt: rd.ResourceFormat, data: bytes, data_offset: int):
 
     format_chars = {
         #                   012345678
-        rd.CompType.UInt:  "xBHxIxxxL",
-        rd.CompType.SInt:  "xbhxixxxl",
+        rd.CompType.UInt:  "xBHxIxxxQ",
+        rd.CompType.SInt:  "xbhxixxxq",
         rd.CompType.Float: "xxexfxxxd",  # only 2, 4 and 8 are valid
     }
 
@@ -192,10 +231,12 @@ def unpack_data(fmt: rd.ResourceFormat, data: bytes, data_offset: int):
     format_chars[rd.CompType.UScaled] = format_chars[rd.CompType.UInt]
     format_chars[rd.CompType.SNorm] = format_chars[rd.CompType.SInt]
     format_chars[rd.CompType.SScaled] = format_chars[rd.CompType.SInt]
-    format_chars[rd.CompType.Double] = format_chars[rd.CompType.Float]
 
     # We need to fetch compCount components
     vertex_format = '=' + str(fmt.compCount) + format_chars[fmt.compType][fmt.compByteWidth]
+
+    if data_offset >= len(data):
+        return None
 
     # Unpack the data
     try:
@@ -221,33 +262,55 @@ def unpack_data(fmt: rd.ResourceFormat, data: bytes, data_offset: int):
     return value
 
 
-def decode_mesh_data(controller: rd.ReplayController, indices: List[int], attrs: List[MeshAttribute], instance: int=0):
-    buffer_cache = {}
+def decode_mesh_data(controller: rd.ReplayController, indices: List[int], display_indices: List[int],
+                     attrs: List[MeshAttribute], instance: int = 0, indexOffset: int = 0):
     ret = []
+
+    buffer_ranges = {}
+    for attr in attrs:
+        begin = attr.mesh.vertexByteOffset
+        end = min(begin + attr.mesh.vertexByteSize, 0xffffffffffffffff)
+
+        # This could be more optimal if we figure out the lower/upper bounds of any attribute and only fetch the
+        # data we need. For each referenced buffer, pick the attribute that references the largest range and fetch that
+        if attr.mesh.vertexResourceId in buffer_ranges:
+            buf_range = buffer_ranges[attr.mesh.vertexResourceId]
+
+            if buf_range[0] < begin:
+                begin = buf_range[0]
+            if buf_range[1] > end:
+                end = buf_range[1]
+
+        buffer_ranges[attr.mesh.vertexResourceId] = (begin, end)
+
+    buffer_data = {}
+    for buf, buf_range in buffer_ranges.items():
+        buffer_data[buf] = controller.GetBufferData(buf, buf_range[0], buf_range[1] - buf_range[0])
 
     # Calculate the strip restart index for this index width
     striprestart_index = None
-    if controller.GetPipelineState().IsStripRestartEnabled() and attrs[0].mesh.indexResourceId != rd.ResourceId.Null():
-        striprestart_index = (controller.GetPipelineState().GetStripRestartIndex() &
+    if controller.GetPipelineState().IsRestartEnabled() and attrs[0].mesh.indexResourceId != rd.ResourceId.Null():
+        striprestart_index = (controller.GetPipelineState().GetRestartIndex() &
                               ((1 << (attrs[0].mesh.indexByteStride*8)) - 1))
 
     for i,idx in enumerate(indices):
-        vertex = {'vtx': i, 'idx': idx}
+        vertex = {'vtx': i, 'idx': display_indices[i]}
 
         if striprestart_index is None or idx != striprestart_index:
             for attr in attrs:
-                offset = attr.mesh.vertexByteOffset + attr.mesh.vertexByteStride * idx
+                if idx is None:
+                    vertex[attr.name] = None
+                    continue
+
+                offset = attr.mesh.vertexByteStride * idx
 
                 if attr.mesh.instanced:
                     offset = (attr.mesh.vertexByteStride +
-                              attr.mesh.vertexByteStride * (instance / max(attr.mesh.instStepRate, 1)))
+                              attr.mesh.vertexByteStride * int(instance / max(attr.mesh.instStepRate, 1)))
 
-                # This could be more optimal if we figure out the lower/upper bounds of any attribute and only fetch the
-                # data we need.
-                if attr.mesh.vertexResourceId not in buffer_cache:
-                    buffer_cache[attr.mesh.vertexResourceId] = controller.GetBufferData(attr.mesh.vertexResourceId, 0, 0)
-
-                vertex[attr.name] = unpack_data(attr.mesh.format, buffer_cache[attr.mesh.vertexResourceId], offset)
+                vertex[attr.name] = unpack_data(attr.mesh.format, buffer_data[attr.mesh.vertexResourceId],
+                                                attr.mesh.vertexByteOffset + offset -
+                                                buffer_ranges[attr.mesh.vertexResourceId][0])
 
         ret.append(vertex)
 

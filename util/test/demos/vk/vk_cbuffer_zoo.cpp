@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2018-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -24,51 +24,38 @@
 
 #include "vk_test.h"
 
-TEST(VK_CBuffer_Zoo, VulkanGraphicsTest)
+RD_TEST(VK_CBuffer_Zoo, VulkanGraphicsTest)
 {
   static constexpr const char *Description =
       "Tests every kind of constant that can be in a cbuffer to make sure it's decoded correctly.";
 
-  std::string common = R"EOSHADER(
-
-#version 430 core
-
-struct v2f
-{
-	vec4 pos;
-	vec4 col;
-	vec4 uv;
-};
-
-)EOSHADER";
-
-  std::string vertex = R"EOSHADER(
-
-layout(location = 0) in vec3 Position;
-layout(location = 1) in vec4 Color;
-layout(location = 2) in vec2 UV;
-
-layout(location = 0) out v2f vertOut;
-
-void main()
-{
-	vertOut.pos = vec4(Position.xyz, 1);
-	gl_Position = vertOut.pos;
-	vertOut.col = Color;
-	vertOut.uv = vec4(UV.xy, 0, 1);
-}
-
-)EOSHADER";
-
   std::string glslpixel = R"EOSHADER(
-
-layout(location = 0) in v2f vertIn;
+#version 460 core
 
 layout(location = 0, index = 0) out vec4 Color;
 
 struct vec3_1 { vec3 a; float b; };
 
 struct nested { vec3_1 a; vec4 b[4]; vec3_1 c[4]; };
+
+struct float2_struct { float x; float y; };
+
+struct nested_with_padding
+{
+  float a;                              // 0, <1, 2, 3>
+  vec4 b;                               // {4, 5, 6, 7}
+  float c;                              // 8, <9, 10, 11>
+  vec3 d[4];                            // [0]: {12, 13, 14}, <15>
+                                        // [1]: {16, 17, 18}, <19>
+                                        // [2]: {20, 21, 22}, <23>
+                                        // [3]: {24, 25, 26}, <27>
+};
+
+struct misaligned_struct
+{
+  vec4 a;
+  vec2 b;
+};
 
 layout(set = 0, binding = 0, std140) uniform constsbuf
 {
@@ -256,7 +243,40 @@ layout(set = 0, binding = 0, std140) uniform constsbuf
                                         //         <435, 439>
                                         // }
 
-  vec4 test;                            // {440, 441, 442, 443}
+  nested_with_padding ak[2];            // 440 - 467, 468 - 495
+
+  vec4 dummy12;                         // forces no trailing overlap with ak
+
+  float al;                             // {500}, <501, 502, 503>
+
+  // struct is always float4 aligned, can't be packed with al
+  float2_struct am;                     // {504, 505}, <506, 507>
+
+  // struct doesn't allow trailing things into padding
+  float an;                             // {508}
+
+  vec4 dummy13[2];                      // empty structs on D3D
+
+  misaligned_struct ao[2];              // [0] = {
+                                        //   .a = { 520, 521, 522, 523 }
+                                        //   .b = { 524, 525 } <526, 527>
+                                        // }
+                                        // [1] = {
+                                        //   .a = { 528, 529, 530, 531 }
+                                        //   .b = { 532, 533 } <534, 535>
+                                        // }
+
+  vec4 test;                            // {536, 537, 538, 539}
+};
+
+// this comes from inline uniform block data, where available
+
+layout(set = 0, binding = 1, std140) uniform inlineconsts
+{
+  vec4 inline_zero;
+  vec4 inline_a;
+  vec2 inline_b, inline_c;
+  vec3_1 inline_d;
 };
 
 layout (constant_id = 0) const int A = 10;
@@ -265,7 +285,7 @@ layout (constant_id = 3) const bool C = false;
 
 void main()
 {
-  Color = test + vec4(0.1f, 0.0f, 0.0f, 0.0f);
+  Color = test + inline_zero + vec4(0.1f, 0.0f, 0.0f, 0.0f);
 }
 
 )EOSHADER";
@@ -275,6 +295,25 @@ void main()
 struct float3_1 { float3 a; float b; };
 
 struct nested { float3_1 a; float4 b[4]; float3_1 c[4]; };
+
+struct float2_struct { float x; float y; };
+
+struct nested_with_padding
+{
+  float a;                              // 0, <1, 2, 3>
+  float4 b;                             // {4, 5, 6, 7}
+  float c;                              // 8, <9, 10, 11>
+  float3 d[4];                          // [0]: {12, 13, 14}, <15>
+                                        // [1]: {16, 17, 18}, <19>
+                                        // [2]: {20, 21, 22}, <23>
+                                        // [3]: {24, 25, 26}, <27>
+};
+
+struct misaligned_struct
+{
+  float4 a;
+  float2 b;
+};
 
 layout(set = 0, binding = 0) cbuffer consts
 {
@@ -471,22 +510,80 @@ layout(set = 0, binding = 0) cbuffer consts
                                           //         <434, 438>
                                           //         <435, 439>
                                           // }
+                                          
+  nested_with_padding ak[2];              // 440 - 467, 468 - 494
+  
+  float4 dummy14;                         // forces no trailing overlap with ak
 
-  float4 test;                            // {440, 441, 442, 443}
+  float al;                               // {500}, <501, 502, 503>
+
+  // struct is always float4 aligned, can't be packed with al
+  float2_struct am;                       // {504, 505}, <506, 507>
+
+  // struct doesn't allow trailing things into padding
+  float an;                               // {508}
+  
+  float4 dummy15[2];                      // empty structs on D3D
+
+  misaligned_struct ao[2];                // [0] = {
+                                          //   .a = { 520, 521, 522, 523 }
+                                          //   .b = { 524, 525 } <526, 527>
+                                          // }
+                                          // [1] = {
+                                          //   .a = { 528, 529, 530, 531 }
+                                          //   .b = { 532, 533 } <534, 535>
+                                          // }
+
+  float4 test;                            // {536, 537, 538, 539}
+};
+
+// this comes from inline uniform block data, where available
+layout(set = 0, binding = 1) cbuffer inlineconsts
+{
+  float4 inline_zero;
+  float4 inline_a;
+  float2 inline_b, inline_c;
+  float3_1 inline_d;
 };
 
 float4 main() : SV_Target0
 {
-	return test + float4(0.1f, 0.0f, 0.0f, 0.0f);
+	return test + inline_zero + float4(0.1f, 0.0f, 0.0f, 0.0f);
 }
 
 )EOSHADER";
 
+  struct float3_1
+  {
+    float a[3];
+    float b;
+  };
+
+  struct InlineData
+  {
+    float inline_zero[4];
+    float inline_a[4];
+    float inline_b[2], inline_c[2];
+    float3_1 inline_d;
+  };
+
   void Prepare(int argc, char **argv)
   {
     devExts.push_back(VK_KHR_RELAXED_BLOCK_LAYOUT_EXTENSION_NAME);
+    optDevExts.push_back(VK_EXT_INLINE_UNIFORM_BLOCK_EXTENSION_NAME);
 
     VulkanGraphicsTest::Prepare(argc, argv);
+
+    static VkPhysicalDeviceInlineUniformBlockFeaturesEXT inlineFeats = {
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INLINE_UNIFORM_BLOCK_FEATURES_EXT,
+    };
+
+    if(hasExt(VK_EXT_INLINE_UNIFORM_BLOCK_EXTENSION_NAME))
+    {
+      inlineFeats.inlineUniformBlock = VK_TRUE;
+      inlineFeats.pNext = (void *)devInfoNext;
+      devInfoNext = &inlineFeats;
+    }
   }
 
   int main()
@@ -495,16 +592,27 @@ float4 main() : SV_Target0
     if(!Init())
       return 3;
 
+    VkDescriptorType descType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    uint32_t descCount = 1;
+
+    if(hasExt(VK_EXT_INLINE_UNIFORM_BLOCK_EXTENSION_NAME))
+    {
+      descType = VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK_EXT;
+      descCount = 16 * sizeof(float);
+    }
+
     VkDescriptorSetLayout setlayout = createDescriptorSetLayout(vkh::DescriptorSetLayoutCreateInfo({
         {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT},
+        {1, descType, descCount, VK_SHADER_STAGE_FRAGMENT_BIT},
     }));
 
     VkPipelineLayout layout = createPipelineLayout(vkh::PipelineLayoutCreateInfo({setlayout}));
 
     AllocatedImage img(
-        allocator,
+        this,
         vkh::ImageCreateInfo(mainWindow->scissor.extent.width, mainWindow->scissor.extent.height, 0,
-                             VK_FORMAT_R32G32B32A32_SFLOAT, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT),
+                             VK_FORMAT_R32G32B32A32_SFLOAT,
+                             VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT),
         VmaAllocationCreateInfo({0, VMA_MEMORY_USAGE_GPU_ONLY}));
 
     VkImageView imgview = createImageView(
@@ -530,13 +638,14 @@ float4 main() : SV_Target0
 
     pipeCreateInfo.vertexInputState.vertexBindingDescriptions = {vkh::vertexBind(0, DefaultA2V)};
     pipeCreateInfo.vertexInputState.vertexAttributeDescriptions = {
-        vkh::vertexAttr(0, 0, DefaultA2V, pos), vkh::vertexAttr(1, 0, DefaultA2V, col),
+        vkh::vertexAttr(0, 0, DefaultA2V, pos),
+        vkh::vertexAttr(1, 0, DefaultA2V, col),
         vkh::vertexAttr(2, 0, DefaultA2V, uv),
     };
 
     pipeCreateInfo.stages = {
-        CompileShaderModule(common + vertex, ShaderLang::glsl, ShaderStage::vert, "main"),
-        CompileShaderModule(common + glslpixel, ShaderLang::glsl, ShaderStage::frag, "main"),
+        CompileShaderModule(VKDefaultVertex, ShaderLang::glsl, ShaderStage::vert, "main"),
+        CompileShaderModule(glslpixel, ShaderLang::glsl, ShaderStage::frag, "main"),
     };
 
     float data[2] = {20.0f, 0.0f};
@@ -546,7 +655,8 @@ float4 main() : SV_Target0
     memcpy(&data[1], &btrue, sizeof(btrue));
 
     VkSpecializationMapEntry specmap[2] = {
-        {1, 0, sizeof(float)}, {3, 4, sizeof(VkBool32)},
+        {1, 0, sizeof(float)},
+        {3, 4, sizeof(VkBool32)},
     };
 
     VkSpecializationInfo spec = {};
@@ -565,31 +675,93 @@ float4 main() : SV_Target0
     VkPipeline hlslpipe = createGraphicsPipeline(pipeCreateInfo);
 
     AllocatedBuffer vb(
-        allocator, vkh::BufferCreateInfo(sizeof(DefaultTri), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
-                                                                 VK_BUFFER_USAGE_TRANSFER_DST_BIT),
+        this,
+        vkh::BufferCreateInfo(sizeof(DefaultTri),
+                              VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT),
         VmaAllocationCreateInfo({0, VMA_MEMORY_USAGE_CPU_TO_GPU}));
 
     vb.upload(DefaultTri);
 
-    Vec4f cbufferdata[512];
+    const size_t bindOffset = 16;
+
+    Vec4f cbufferdata[512 + bindOffset];
+
+    for(int i = 0; i < bindOffset; i++)
+      cbufferdata[i] = Vec4f(-99.9f, -88.8f, -77.7f, -66.6f);
 
     for(int i = 0; i < 512; i++)
-      cbufferdata[i] = Vec4f(float(i * 4 + 0), float(i * 4 + 1), float(i * 4 + 2), float(i * 4 + 3));
+      cbufferdata[i + bindOffset] =
+          Vec4f(float(i * 4 + 0), float(i * 4 + 1), float(i * 4 + 2), float(i * 4 + 3));
 
     AllocatedBuffer cb(
-        allocator, vkh::BufferCreateInfo(sizeof(cbufferdata), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
-                                                                  VK_BUFFER_USAGE_TRANSFER_DST_BIT),
+        this,
+        vkh::BufferCreateInfo(sizeof(cbufferdata), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
+                                                       VK_BUFFER_USAGE_TRANSFER_DST_BIT),
         VmaAllocationCreateInfo({0, VMA_MEMORY_USAGE_CPU_TO_GPU}));
 
     cb.upload(cbufferdata);
+
+    InlineData inlinedata = {};
+
+    inlinedata.inline_a[0] = 10.0f;
+    inlinedata.inline_a[1] = 20.0f;
+    inlinedata.inline_a[2] = 30.0f;
+    inlinedata.inline_a[3] = 40.0f;
+
+    inlinedata.inline_b[0] = 50.0f;
+    inlinedata.inline_b[1] = 60.0f;
+
+    inlinedata.inline_c[0] = 70.0f;
+    inlinedata.inline_c[1] = 80.0f;
+
+    inlinedata.inline_d.a[0] = 90.0f;
+    inlinedata.inline_d.a[1] = 100.0f;
+    inlinedata.inline_d.a[2] = 110.0f;
+    inlinedata.inline_d.b = 120.0f;
+
+    AllocatedBuffer inlinecb(
+        this,
+        vkh::BufferCreateInfo(sizeof(cbufferdata), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
+                                                       VK_BUFFER_USAGE_TRANSFER_DST_BIT),
+        VmaAllocationCreateInfo({0, VMA_MEMORY_USAGE_CPU_TO_GPU}));
+
+    {
+      byte *ptr = inlinecb.map();
+      memcpy(ptr + bindOffset * sizeof(Vec4f), &inlinedata, sizeof(inlinedata));
+      inlinecb.unmap();
+    }
 
     VkDescriptorSet descset = allocateDescriptorSet(setlayout);
 
     vkh::updateDescriptorSets(
         device, {
-                    vkh::WriteDescriptorSet(descset, 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-                                            {vkh::DescriptorBufferInfo(cb.buffer)}),
+                    vkh::WriteDescriptorSet(
+                        descset, 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                        {vkh::DescriptorBufferInfo(cb.buffer, bindOffset * sizeof(Vec4f))}),
                 });
+
+    if(hasExt(VK_EXT_INLINE_UNIFORM_BLOCK_EXTENSION_NAME))
+    {
+      VkWriteDescriptorSetInlineUniformBlockEXT inlineUpdate = {};
+      inlineUpdate.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_INLINE_UNIFORM_BLOCK_EXT;
+      inlineUpdate.pData = &inlinedata;
+      inlineUpdate.dataSize = sizeof(inlinedata);
+      vkh::updateDescriptorSets(
+          device, {
+                      vkh::WriteDescriptorSet(
+                          descset, 1, inlineUpdate,
+                          vkh::DescriptorBufferInfo(cb.buffer, bindOffset * sizeof(Vec4f))),
+                  });
+    }
+    else
+    {
+      vkh::updateDescriptorSets(
+          device, {
+                      vkh::WriteDescriptorSet(
+                          descset, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                          {vkh::DescriptorBufferInfo(inlinecb.buffer, bindOffset * sizeof(Vec4f))}),
+                  });
+    }
 
     while(Running())
     {
@@ -600,12 +772,9 @@ float4 main() : SV_Target0
       VkImage swapimg =
           StartUsingBackbuffer(cmd, VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_GENERAL);
 
-      vkCmdClearColorImage(cmd, swapimg, VK_IMAGE_LAYOUT_GENERAL,
-                           vkh::ClearColorValue(0.4f, 0.5f, 0.6f, 1.0f), 1,
-                           vkh::ImageSubresourceRange());
-
-      vkCmdBeginRenderPass(cmd, vkh::RenderPassBeginInfo(renderPass, framebuffer, mainWindow->scissor,
-                                                         {vkh::ClearValue(0.0f, 0.0f, 0.0f, 1.0f)}),
+      vkCmdBeginRenderPass(cmd,
+                           vkh::RenderPassBeginInfo(renderPass, framebuffer, mainWindow->scissor,
+                                                    {vkh::ClearValue(0.2f, 0.2f, 0.2f, 1.0f)}),
                            VK_SUBPASS_CONTENTS_INLINE);
 
       vkh::cmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, {descset}, {});
@@ -620,6 +789,15 @@ float4 main() : SV_Target0
       vkCmdDraw(cmd, 3, 1, 0, 0);
 
       vkCmdEndRenderPass(cmd);
+
+      vkh::cmdPipelineBarrier(
+          cmd, {
+                   vkh::ImageMemoryBarrier(VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                                           VK_ACCESS_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL,
+                                           VK_IMAGE_LAYOUT_GENERAL, img.image),
+               });
+
+      blitToSwap(cmd, img.image, VK_IMAGE_LAYOUT_GENERAL, swapimg, VK_IMAGE_LAYOUT_GENERAL);
 
       FinishUsingBackbuffer(cmd, VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_GENERAL);
 

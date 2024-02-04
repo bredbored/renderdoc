@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2017-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -39,6 +39,7 @@ class QAction;
 class QMenu;
 class LogItemModel;
 class LogFilterModel;
+class RichTextViewDelegate;
 
 struct LogMessage
 {
@@ -75,14 +76,18 @@ private slots:
   void typeFilter_changed(QStandardItem *item);
 
 private:
+  bool eventFilter(QObject *watched, QEvent *event) override;
+
   Ui::LogView *ui;
   ICaptureContext &m_Ctx;
 
-  size_t prevOffset = 0;
+  uint64_t prevOffset = 0;
 
   QVector<LogMessage> m_Messages;
 
   QList<uint32_t> m_PIDs;
+
+  RichTextViewDelegate *m_delegate = NULL;
 
   LogItemModel *m_ItemModel = NULL;
   LogFilterModel *m_FilterModel = NULL;

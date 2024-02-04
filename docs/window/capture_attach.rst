@@ -91,9 +91,9 @@ This option will cause RenderDoc to save a callstack from user code into the API
 
 ----------
 
-  | :guilabel:`Only Drawcall Callstacks` Default: ``Disabled``
+  | :guilabel:`Only Action Callstacks` Default: ``Disabled``
 
-This option modifies the above capturing of callstacks to only be saved for drawcall-type API calls. This can reduce the CPU load, as well as file-size and memory overhead of capturing callstacks for every API call which may not be desired. Only valid if ``Collect Callstacks`` is enabled.
+This option modifies the above capturing of callstacks to only be saved for action calls. This can reduce the CPU load, as well as file-size and memory overhead of capturing callstacks for every API call which may not be desired. Only valid if ``Collect Callstacks`` is enabled.
 
 ----------
 
@@ -155,6 +155,17 @@ This option is slightly different from the others in that it doesn't change anyt
   | :guilabel:`Queue Capture of Frame` Default: ``Disabled``
 
 This option allows you to queue up a precise capture of a given frame number after the program has started.
+
+Queueing up a capture beginning at frame 0 has a special meaning: Frames are defined as the period between two presents of a window. Frame 0 is defined as starting at initialisation and ending at the first presentation.
+
+The definition of 'initialisation' varies by API, since it can be hard to clearly define initialisation time cleanly:
+
+* On Vulkan, frame 0 begins at the first ``VkDevice`` that is created. Since capture is instance-local, only this device's parent instance will be capturing.
+* On D3D11, frame 0 begins at the first swapchain that is created, since it is common to create and destroy many ``ID3D11Device`` objects for enumeration purposes. Note that since capture is device-local, only the device associated with this first swapchain will be capturing and no frame will be captured if this device or swapchain are destroyed before they is used for presentation.
+* On D3D12, frame 0 begins at the first ``ID3D12Device`` that is created. Since capture is device-local, only this device will be capturing.
+* On OpenGL, frame 0 begins at the first GL context that is created with an ``CreateContextAttribs`` create function such as ``wglCreateContextAttribs`` or ``glXCreateContextAttribs``. This is because many programs create and destroy 'trampoline' GL contexts before creating their first real context. Since capture is API-wide, the capture will include all work on other contexts up until the first presentation on any context, even if the presentation happens on a different context.
+
+If no presentation happens in the program at all, frame 0 is still undefined and will most likely not capture anything. For purely headless programs you should use the :doc:`in-application API <../in_application_api>` to define the start and end of where you want to capture.
 
 .. _child-process-hook:
 

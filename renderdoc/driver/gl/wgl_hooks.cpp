@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2018-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -22,9 +22,9 @@
  * THE SOFTWARE.
  ******************************************************************************/
 
-#include "driver/gl/gl_driver.h"
-#include "driver/gl/wgl_dispatch_table.h"
 #include "hooks/hooks.h"
+#include "gl_driver.h"
+#include "wgl_dispatch_table.h"
 
 class WGLHook : LibraryHook
 {
@@ -52,7 +52,8 @@ public:
   std::set<HGLRC> contexts;
 
   void RefreshWindowParameters(const GLWindowingData &data);
-  void ProcessSwapBuffers(HDC dc);
+  void ProcessSwapBuffers(GLChunk src, HDC dc);
+  void ProcessContextActivate(HGLRC rc, HDC dc);
   void PopulateFromContext(HDC dc, HGLRC rc);
   GLInitParams GetInitParamsForDC(HDC dc);
 } wglhook;
@@ -83,6 +84,10 @@ void WGLHook::PopulateFromContext(HDC dc, HGLRC rc)
       WGL.wglCreateContextAttribsARB =
           (PFN_wglCreateContextAttribsARB)WGL.wglGetProcAddress("wglCreateContextAttribsARB");
 
+    if(!WGL.wglMakeContextCurrentARB)
+      WGL.wglMakeContextCurrentARB =
+          (PFN_wglMakeContextCurrentARB)WGL.wglGetProcAddress("wglMakeContextCurrentARB");
+
     if(!WGL.wglGetPixelFormatAttribivARB)
       WGL.wglGetPixelFormatAttribivARB =
           (PFN_wglGetPixelFormatAttribivARB)WGL.wglGetProcAddress("wglGetPixelFormatAttribivARB");
@@ -101,7 +106,15 @@ void WGLHook::PopulateFromContext(HDC dc, HGLRC rc)
     });
 
     // restore DC/context
-    WGL.wglMakeCurrent(prevDC, prevContext);
+    if(!WGL.wglMakeCurrent(prevDC, prevContext))
+    {
+      RDCWARN(
+          "Couldn't restore prev context %p with prev DC %p - possibly stale. Using new DC %p to "
+          "ensure context is rebound properly",
+          prevContext, prevDC, dc);
+
+      WGL.wglMakeCurrent(dc, prevContext);
+    }
   }
 }
 
@@ -125,7 +138,7 @@ GLInitParams WGLHook::GetInitParamsForDC(HDC dc)
   ret.width = (r.right - r.left);
   ret.height = (r.bottom - r.top);
 
-  ret.isSRGB = true;
+  ret.isSRGB = 1;
 
   if(WGL.wglGetPixelFormatAttribivARB)
   {
@@ -161,7 +174,7 @@ void WGLHook::RefreshWindowParameters(const GLWindowingData &data)
   }
 }
 
-void WGLHook::ProcessSwapBuffers(HDC dc)
+void WGLHook::ProcessSwapBuffers(GLChunk src, HDC dc)
 {
   if(eglDisabled)
     return;
@@ -179,17 +192,51 @@ void WGLHook::ProcessSwapBuffers(HDC dc)
 
     RefreshWindowParameters(data);
 
+    gl_CurChunk = src;
+
     {
       SCOPED_LOCK(glLock);
-      driver.SwapBuffers(w);
+      driver.SwapBuffers(WindowingSystem::Win32, w);
     }
 
     SetLastError(0);
   }
 }
 
+void WGLHook::ProcessContextActivate(HGLRC rc, HDC dc)
+{
+  SCOPED_LOCK(glLock);
+
+  SetDriverForHooks(&driver);
+
+  if(rc && contexts.find(rc) == contexts.end())
+  {
+    contexts.insert(rc);
+
+    if(FetchEnabledExtensions())
+    {
+      // see gl_emulated.cpp
+      GL.EmulateUnsupportedFunctions();
+      GL.EmulateRequiredExtensions();
+      GL.DriverForEmulation(&driver);
+    }
+  }
+
+  GLWindowingData data;
+  data.DC = dc;
+  data.wnd = WindowFromDC(dc);
+  data.ctx = rc;
+
+  RefreshWindowParameters(data);
+
+  if(haveContextCreation)
+    driver.ActivateContext(data);
+}
+
 static HGLRC WINAPI wglCreateContext_hooked(HDC dc)
 {
+  SCOPED_LOCK(glLock);
+
   if(wglhook.createRecurse || wglhook.eglDisabled)
     return WGL.wglCreateContext(dc);
 
@@ -222,6 +269,8 @@ static HGLRC WINAPI wglCreateContext_hooked(HDC dc)
 
 static BOOL WINAPI wglDeleteContext_hooked(HGLRC rc)
 {
+  SCOPED_LOCK(glLock);
+
   if(wglhook.haveContextCreation && !wglhook.eglDisabled)
   {
     SCOPED_LOCK(glLock);
@@ -236,6 +285,8 @@ static BOOL WINAPI wglDeleteContext_hooked(HGLRC rc)
 
 static HGLRC WINAPI wglCreateLayerContext_hooked(HDC dc, int iLayerPlane)
 {
+  SCOPED_LOCK(glLock);
+
   if(wglhook.createRecurse || wglhook.eglDisabled)
     return WGL.wglCreateLayerContext(dc, iLayerPlane);
 
@@ -271,6 +322,8 @@ static HGLRC WINAPI wglCreateLayerContext_hooked(HDC dc, int iLayerPlane)
 static HGLRC WINAPI wglCreateContextAttribsARB_hooked(HDC dc, HGLRC hShareContext,
                                                       const int *attribList)
 {
+  SCOPED_LOCK(glLock);
+
   // don't recurse
   if(wglhook.createRecurse || wglhook.eglDisabled)
     return WGL.wglCreateContextAttribsARB(dc, hShareContext, attribList);
@@ -280,7 +333,7 @@ static HGLRC WINAPI wglCreateContextAttribsARB_hooked(HDC dc, HGLRC hShareContex
   int defaultAttribList[] = {0};
 
   const int *attribs = attribList ? attribList : defaultAttribList;
-  std::vector<int> attribVec;
+  rdcarray<int> attribVec;
 
   // modify attribs to our liking
   {
@@ -376,6 +429,8 @@ static HGLRC WINAPI wglCreateContextAttribsARB_hooked(HDC dc, HGLRC hShareContex
 
 static BOOL WINAPI wglShareLists_hooked(HGLRC oldContext, HGLRC newContext)
 {
+  SCOPED_LOCK(glLock);
+
   bool ret = WGL.wglShareLists(oldContext, newContext) == TRUE;
 
   DWORD err = GetLastError();
@@ -394,37 +449,33 @@ static BOOL WINAPI wglShareLists_hooked(HGLRC oldContext, HGLRC newContext)
 
 static BOOL WINAPI wglMakeCurrent_hooked(HDC dc, HGLRC rc)
 {
+  SCOPED_LOCK(glLock);
+
   BOOL ret = WGL.wglMakeCurrent(dc, rc);
 
   DWORD err = GetLastError();
 
   if(ret && !wglhook.eglDisabled)
   {
-    SCOPED_LOCK(glLock);
+    wglhook.ProcessContextActivate(rc, dc);
+  }
 
-    SetDriverForHooks(&wglhook.driver);
+  SetLastError(err);
 
-    if(rc && wglhook.contexts.find(rc) == wglhook.contexts.end())
-    {
-      wglhook.contexts.insert(rc);
+  return ret;
+}
 
-      FetchEnabledExtensions();
+static BOOL WINAPI wglMakeContextCurrentARB_hooked(HDC drawDC, HDC readDC, HGLRC rc)
+{
+  SCOPED_LOCK(glLock);
 
-      // see gl_emulated.cpp
-      GL.EmulateUnsupportedFunctions();
-      GL.EmulateRequiredExtensions();
-      GL.DriverForEmulation(&wglhook.driver);
-    }
+  BOOL ret = WGL.wglMakeContextCurrentARB(drawDC, readDC, rc);
 
-    GLWindowingData data;
-    data.DC = dc;
-    data.wnd = WindowFromDC(dc);
-    data.ctx = rc;
+  DWORD err = GetLastError();
 
-    wglhook.RefreshWindowParameters(data);
-
-    if(wglhook.haveContextCreation)
-      wglhook.driver.ActivateContext(data);
+  if(ret && !wglhook.eglDisabled)
+  {
+    wglhook.ProcessContextActivate(rc, drawDC);
   }
 
   SetLastError(err);
@@ -436,7 +487,7 @@ static BOOL WINAPI SwapBuffers_hooked(HDC dc)
 {
   SCOPED_LOCK(glLock);
 
-  wglhook.ProcessSwapBuffers(dc);
+  wglhook.ProcessSwapBuffers(GLChunk::SwapBuffers, dc);
 
   wglhook.swapRecurse = true;
   BOOL ret = WGL.SwapBuffers(dc);
@@ -449,7 +500,7 @@ static BOOL WINAPI wglSwapBuffers_hooked(HDC dc)
 {
   SCOPED_LOCK(glLock);
 
-  wglhook.ProcessSwapBuffers(dc);
+  wglhook.ProcessSwapBuffers(GLChunk::wglSwapBuffers, dc);
 
   wglhook.swapRecurse = true;
   BOOL ret = WGL.wglSwapBuffers(dc);
@@ -462,7 +513,7 @@ static BOOL WINAPI wglSwapLayerBuffers_hooked(HDC dc, UINT planes)
 {
   SCOPED_LOCK(glLock);
 
-  wglhook.ProcessSwapBuffers(dc);
+  wglhook.ProcessSwapBuffers(GLChunk::wglSwapBuffers, dc);
 
   wglhook.swapRecurse = true;
   BOOL ret = WGL.wglSwapLayerBuffers(dc, planes);
@@ -473,8 +524,10 @@ static BOOL WINAPI wglSwapLayerBuffers_hooked(HDC dc, UINT planes)
 
 static BOOL WINAPI wglSwapMultipleBuffers_hooked(UINT numSwaps, CONST WGLSWAP *pSwaps)
 {
+  SCOPED_LOCK(glLock);
+
   for(UINT i = 0; pSwaps && i < numSwaps; i++)
-    wglhook.ProcessSwapBuffers(pSwaps[i].hdc);
+    wglhook.ProcessSwapBuffers(GLChunk::wglSwapBuffers, pSwaps[i].hdc);
 
   wglhook.swapRecurse = true;
   BOOL ret = WGL.wglSwapMultipleBuffers(numSwaps, pSwaps);
@@ -531,6 +584,8 @@ static PROC WINAPI wglGetProcAddress_hooked(const char *func)
     return WGL.wglGetProcAddress(func);
   }
 
+  SCOPED_LOCK(glLock);
+
   PROC realFunc = NULL;
   {
     ScopedSuppressHooking suppress;
@@ -545,6 +600,10 @@ static PROC WINAPI wglGetProcAddress_hooked(const char *func)
   if(realFunc == NULL && !FullyImplementedFunction(func))
     return realFunc;
 
+  // otherwise if we plan to return a hook anyway, ensure we don't leak the implementation's
+  // LastError code
+  SetLastError(0);
+
   if(!strcmp(func, "wglCreateContext"))
     return (PROC)&wglCreateContext_hooked;
   if(!strcmp(func, "wglDeleteContext"))
@@ -553,6 +612,8 @@ static PROC WINAPI wglGetProcAddress_hooked(const char *func)
     return (PROC)&wglCreateLayerContext_hooked;
   if(!strcmp(func, "wglCreateContextAttribsARB"))
     return (PROC)&wglCreateContextAttribsARB_hooked;
+  if(!strcmp(func, "wglMakeContextCurrentARB"))
+    return (PROC)&wglMakeContextCurrentARB_hooked;
   if(!strcmp(func, "wglMakeCurrent"))
     return (PROC)&wglMakeCurrent_hooked;
   if(!strcmp(func, "wglSwapBuffers"))
@@ -566,7 +627,7 @@ static PROC WINAPI wglGetProcAddress_hooked(const char *func)
 
   // assume wgl functions are safe to just pass straight through, but don't pass through the wgl DX
   // interop functions
-  if(!strncmp(func, "wgl", 3) && strncmp(func, "wglDX", 5))
+  if(strncmp(func, "wgl", 3) == 0 && strncmp(func, "wglDX", 5) != 0)
     return realFunc;
 
   // otherwise, consult our database of hooks
@@ -603,11 +664,11 @@ void WGLHook::RegisterHooks()
   LibraryHooks::RegisterLibraryHook("user32.dll", NULL);
 
 // register EGL hooks
-#define WGL_REGISTER(library, func)                                                               \
-  if(CheckConstParam(sizeof(library) > 2))                                                        \
-  {                                                                                               \
-    LibraryHooks::RegisterFunctionHook(library, FunctionHook(STRINGIZE(func), (void **)&WGL.func, \
-                                                             (void *)&CONCAT(func, _hooked)));    \
+#define WGL_REGISTER(library, func)                                                                  \
+  if(CheckConstParam(sizeof(library) > 2))                                                           \
+  {                                                                                                  \
+    LibraryHooks::RegisterFunctionHook(                                                              \
+        library, FunctionHook(STRINGIZE(func), (void **)&WGL.func, (void *)&CONCAT(func, _hooked))); \
   }
   WGL_HOOKED_SYMBOLS(WGL_REGISTER)
 #undef WGL_REGISTER

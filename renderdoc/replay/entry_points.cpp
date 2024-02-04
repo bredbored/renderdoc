@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  * Copyright (c) 2014 Crytek
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -27,11 +27,36 @@
 #include "api/replay/renderdoc_replay.h"
 #include "api/replay/version.h"
 #include "common/common.h"
+#include "common/formatting.h"
+#include "common/threading.h"
 #include "core/core.h"
 #include "maths/camera.h"
 #include "maths/formatpacking.h"
 #include "miniz/miniz.h"
+#include "replay/replay_driver.h"
 #include "strings/string_utils.h"
+#include "superluminal/superluminal.h"
+
+Threading::CriticalSection detailStringLock;
+rdcarray<const rdcstr *> detailStrings;
+
+RDResult::operator ResultDetails() const
+{
+  RDCCOMPILE_ASSERT(ResultCode(0) == ResultCode::Succeeded,
+                    "ResultCode 0 value should be succeeded");
+
+  ResultDetails ret;
+  ret.code = code;
+  ret.internal_msg = NULL;
+  if(!message.empty())
+  {
+    SCOPED_LOCK(detailStringLock);
+    ret.internal_msg = new rdcstr(ToStr(code) + ": " + message);
+    detailStrings.push_back(ret.internal_msg);
+  }
+
+  return ret;
+}
 
 // these entry points are for the replay/analysis side - not for the application.
 
@@ -143,13 +168,13 @@ extern "C" RENDERDOC_API uint32_t RENDERDOC_CC RENDERDOC_VertexOffset(Topology t
     case Topology::LineLoop:
     case Topology::TriangleStrip:
     case Topology::LineStrip_Adj:
+    case Topology::TriangleFan:
       // for strips, each new vertex creates a new primitive
       return primitive;
     case Topology::TriangleStrip_Adj:
       // triangle strip with adjacency is a special case as every other
       // vert is purely for adjacency so it's doubled
       return primitive * 2;
-    case Topology::TriangleFan: RDCERR("Cannot get VertexOffset for triangle fan!"); break;
   }
 
   return primitive * RENDERDOC_NumVerticesPerPrimitive(topology);
@@ -175,6 +200,15 @@ extern "C" RENDERDOC_API const char *RENDERDOC_CC RENDERDOC_GetVersionString()
   return MAJOR_MINOR_VERSION_STRING;
 }
 
+extern "C" RENDERDOC_API bool RENDERDOC_CC RENDERDOC_IsReleaseBuild()
+{
+#if ENABLED(RDOC_RELEASE)
+  return true;
+#else
+  return false;
+#endif
+}
+
 extern "C" RENDERDOC_API const char *RENDERDOC_CC RENDERDOC_GetCommitHash()
 {
   return GitVersionHash;
@@ -190,52 +224,62 @@ extern "C" RENDERDOC_API uint64_t RENDERDOC_CC RENDERDOC_GetCurrentProcessMemory
   return Process::GetMemoryUsage();
 }
 
-extern "C" RENDERDOC_API const char *RENDERDOC_CC RENDERDOC_GetConfigSetting(const char *name)
+extern "C" RENDERDOC_API const SDObject *RENDERDOC_CC RENDERDOC_GetConfigSetting(const rdcstr &name)
 {
-  return RenderDoc::Inst().GetConfigSetting(name).c_str();
+  return RenderDoc::Inst().GetConfigSetting(name);
 }
 
-extern "C" RENDERDOC_API void RENDERDOC_CC RENDERDOC_SetConfigSetting(const char *name,
-                                                                      const char *value)
+extern "C" RENDERDOC_API SDObject *RENDERDOC_CC RENDERDOC_SetConfigSetting(const rdcstr &name)
 {
-  RenderDoc::Inst().SetConfigSetting(name, value);
+  return RenderDoc::Inst().SetConfigSetting(name);
+}
+
+extern "C" RENDERDOC_API void RENDERDOC_CC RENDERDOC_SaveConfigSettings()
+{
+  return RenderDoc::Inst().SaveConfigSettings();
 }
 
 extern "C" RENDERDOC_API void RENDERDOC_CC RENDERDOC_SetColors(FloatVector darkChecker,
                                                                FloatVector lightChecker,
                                                                bool darkTheme)
 {
-  RenderDoc::Inst().SetDarkCheckerboardColor(
-      Vec4f(darkChecker.x, darkChecker.y, darkChecker.z, darkChecker.w));
-  RenderDoc::Inst().SetLightCheckerboardColor(
-      Vec4f(lightChecker.x, lightChecker.y, lightChecker.z, lightChecker.w));
+  RenderDoc::Inst().SetDarkCheckerboardColor(darkChecker);
+  RenderDoc::Inst().SetLightCheckerboardColor(lightChecker);
   RenderDoc::Inst().SetDarkTheme(darkTheme);
 }
 
-extern "C" RENDERDOC_API void RENDERDOC_CC RENDERDOC_SetDebugLogFile(const char *log)
+extern "C" RENDERDOC_API void RENDERDOC_CC RENDERDOC_SetDebugLogFile(const rdcstr &log)
 {
-  if(log)
+  if(!log.empty())
   {
-    RDCLOGFILE(log);
+    RDCLOGFILE(log.c_str());
 
     // need to recreate the crash handler to propagate the new log filename.
-    if(RenderDoc::Inst().GetCrashHandler() != NULL)
-      RenderDoc::Inst().RecreateCrashHandler();
+    RenderDoc::Inst().RecreateCrashHandler();
   }
 }
 
-extern "C" RENDERDOC_API void RENDERDOC_CC RENDERDOC_LogText(const char *text)
+extern "C" RENDERDOC_API void RENDERDOC_CC RENDERDOC_LogMessage(LogType type, const rdcstr &project,
+                                                                const rdcstr &file,
+                                                                unsigned int line, const rdcstr &text)
 {
-  rdclog_direct(Timing::GetUTCTime(), Process::GetCurrentPID(), LogType::Comment, "EXT", "external",
-                0, "%s", text);
-}
+  rdclog_direct(FILL_AUTO_VALUE, FILL_AUTO_VALUE, type, project.c_str(), file.c_str(), line, "%s",
+                text.c_str());
 
-extern "C" RENDERDOC_API void RENDERDOC_CC RENDERDOC_LogMessage(LogType type, const char *project,
-                                                                const char *file, unsigned int line,
-                                                                const char *text)
-{
-  rdclog_direct(Timing::GetUTCTime(), Process::GetCurrentPID(), type, project ? project : "UNK?",
-                file ? file : "unknown", line, "%s", text);
+  // see comment in common.h
+  RDCCOMPILE_ASSERT((uint32_t)LogType::Debug == (uint32_t)LogType__Internal::Debug,
+                    "External and internal LogType enums must match");
+  RDCCOMPILE_ASSERT((uint32_t)LogType::Comment == (uint32_t)LogType__Internal::Comment,
+                    "External and internal LogType enums must match");
+  RDCCOMPILE_ASSERT((uint32_t)LogType::Warning == (uint32_t)LogType__Internal::Warning,
+                    "External and internal LogType enums must match");
+  RDCCOMPILE_ASSERT((uint32_t)LogType::Error == (uint32_t)LogType__Internal::Error,
+                    "External and internal LogType enums must match");
+  RDCCOMPILE_ASSERT((uint32_t)LogType::Fatal == (uint32_t)LogType__Internal::Fatal,
+                    "External and internal LogType enums must match");
+  RDCCOMPILE_ASSERT((uint32_t)LogType::Count == (uint32_t)LogType__Internal::Count,
+                    "External and internal LogType enums must match");
+  RDCCOMPILE_ASSERT(arraydim<LogType>() == 5, "External and internal LogType enums must match");
 
 #if ENABLED(DEBUGBREAK_ON_ERROR_LOG)
   if(type == LogType::Error)
@@ -251,55 +295,53 @@ extern "C" RENDERDOC_API const char *RENDERDOC_CC RENDERDOC_GetLogFile()
   return RDCGETLOGFILE();
 }
 
-extern "C" RENDERDOC_API void RENDERDOC_CC RENDERDOC_GetLogFileContents(rdcstr &logfile)
+extern "C" RENDERDOC_API void RENDERDOC_CC RENDERDOC_GetLogFileContents(uint64_t offset,
+                                                                        rdcstr &logfile)
 {
-  logfile = FileIO::logfile_readall(RDCGETLOGFILE());
+  logfile = FileIO::logfile_readall(offset, RDCGETLOGFILE());
 }
 
-extern "C" RENDERDOC_API void RENDERDOC_CC RENDERDOC_InitGlobalEnv(GlobalEnvironment env,
-                                                                   const rdcarray<rdcstr> &args)
+extern "C" RENDERDOC_API void RENDERDOC_CC RENDERDOC_InitialiseReplay(GlobalEnvironment env,
+                                                                      const rdcarray<rdcstr> &args)
 {
-  std::vector<std::string> argsVec;
-  argsVec.reserve(args.size());
-  for(const rdcstr &a : args)
-    argsVec.push_back(a.c_str());
+  RenderDoc::Inst().InitialiseReplay(env, args);
+}
 
-  RenderDoc::Inst().ProcessGlobalEnvironment(env, argsVec);
-
-  if(RenderDoc::Inst().GetCrashHandler() == NULL)
-    return;
-
-  for(const rdcstr &s : args)
+extern "C" RENDERDOC_API void RENDERDOC_CC RENDERDOC_ShutdownReplay()
+{
   {
-    if(s == "--crash")
-    {
-      RenderDoc::Inst().UnloadCrashHandler();
-      return;
-    }
+    SCOPED_LOCK(detailStringLock);
+    for(const rdcstr *msg : detailStrings)
+      delete msg;
+    detailStrings.clear();
   }
 
-  RenderDoc::Inst().RecreateCrashHandler();
+  RenderDoc::Inst().ShutdownReplay();
 }
 
-extern "C" RENDERDOC_API void RENDERDOC_CC RENDERDOC_CreateBugReport(const char *logfile,
-                                                                     const char *dumpfile,
+extern "C" RENDERDOC_API void RENDERDOC_CC RENDERDOC_CreateBugReport(const rdcstr &logfile,
+                                                                     const rdcstr &dumpfile,
                                                                      rdcstr &report)
 {
   mz_zip_archive zip;
   RDCEraseEl(zip);
 
-  report = FileIO::GetTempFolderFilename() + "/renderdoc_report.zip";
+  if(report.empty())
+  {
+    report = FileIO::GetTempFolderFilename() +
+             StringFormat::sntimef(Timing::GetUTCTime(), "/renderdoc_report_%H%M%S.zip");
+  }
 
-  FileIO::Delete(report.c_str());
+  FileIO::Delete(report);
 
   mz_zip_writer_init_file(&zip, report.c_str(), 0);
 
-  if(dumpfile && dumpfile[0])
-    mz_zip_writer_add_file(&zip, "minidump.dmp", dumpfile, NULL, 0, MZ_BEST_COMPRESSION);
+  if(!dumpfile.empty())
+    mz_zip_writer_add_file(&zip, "minidump.dmp", dumpfile.c_str(), NULL, 0, MZ_BEST_COMPRESSION);
 
-  if(logfile && logfile[0])
+  if(!logfile.empty())
   {
-    std::string contents = FileIO::logfile_readall(logfile);
+    rdcstr contents = FileIO::logfile_readall(0, logfile);
     mz_zip_writer_add_mem(&zip, "error.log", contents.data(), contents.length(), MZ_BEST_COMPRESSION);
   }
 
@@ -309,27 +351,26 @@ extern "C" RENDERDOC_API void RENDERDOC_CC RENDERDOC_CreateBugReport(const char 
 
 extern "C" RENDERDOC_API void RENDERDOC_CC RENDERDOC_RegisterMemoryRegion(void *base, size_t size)
 {
-  ICrashHandler *handler = RenderDoc::Inst().GetCrashHandler();
-
-  if(handler)
-    handler->RegisterMemoryRegion(base, size);
+  RenderDoc::Inst().RegisterMemoryRegion(base, size);
 }
 
 extern "C" RENDERDOC_API void RENDERDOC_CC RENDERDOC_UnregisterMemoryRegion(void *base)
 {
-  ICrashHandler *handler = RenderDoc::Inst().GetCrashHandler();
-
-  if(handler)
-    handler->UnregisterMemoryRegion(base);
+  RenderDoc::Inst().UnregisterMemoryRegion(base);
 }
 
 extern "C" RENDERDOC_API ExecuteResult RENDERDOC_CC
-RENDERDOC_ExecuteAndInject(const char *app, const char *workingDir, const char *cmdLine,
-                           const rdcarray<EnvironmentModification> &env, const char *capturefile,
+RENDERDOC_ExecuteAndInject(const rdcstr &app, const rdcstr &workingDir, const rdcstr &cmdLine,
+                           const rdcarray<EnvironmentModification> &env, const rdcstr &capturefile,
                            const CaptureOptions &opts, bool waitForExit)
 {
-  return Process::LaunchAndInjectIntoProcess(app, workingDir, cmdLine, env, capturefile, opts,
-                                             waitForExit != 0);
+  rdcpair<RDResult, uint32_t> status = Process::LaunchAndInjectIntoProcess(
+      app, workingDir, cmdLine, env, capturefile, opts, waitForExit != 0);
+
+  ExecuteResult ret;
+  ret.result = status.first;
+  ret.ident = status.second;
+  return ret;
 }
 
 extern "C" RENDERDOC_API void RENDERDOC_CC RENDERDOC_GetDefaultCaptureOptions(CaptureOptions *opts)
@@ -337,9 +378,8 @@ extern "C" RENDERDOC_API void RENDERDOC_CC RENDERDOC_GetDefaultCaptureOptions(Ca
   *opts = CaptureOptions();
 }
 
-extern "C" RENDERDOC_API bool RENDERDOC_CC RENDERDOC_StartGlobalHook(const char *pathmatch,
-                                                                     const char *capturefile,
-                                                                     const CaptureOptions &opts)
+extern "C" RENDERDOC_API ResultDetails RENDERDOC_CC RENDERDOC_StartGlobalHook(
+    const rdcstr &pathmatch, const rdcstr &capturefile, const CaptureOptions &opts)
 {
   return Process::StartGlobalHook(pathmatch, capturefile, opts);
 }
@@ -361,27 +401,44 @@ extern "C" RENDERDOC_API bool RENDERDOC_CC RENDERDOC_CanGlobalHook()
 
 extern "C" RENDERDOC_API ExecuteResult RENDERDOC_CC
 RENDERDOC_InjectIntoProcess(uint32_t pid, const rdcarray<EnvironmentModification> &env,
-                            const char *capturefile, const CaptureOptions &opts, bool waitForExit)
+                            const rdcstr &capturefile, const CaptureOptions &opts, bool waitForExit)
 {
-  return Process::InjectIntoProcess(pid, env, capturefile, opts, waitForExit != 0);
+  rdcpair<RDResult, uint32_t> status =
+      Process::InjectIntoProcess(pid, env, capturefile, opts, waitForExit != 0);
+
+  ExecuteResult ret;
+  ret.result = status.first;
+  ret.ident = status.second;
+  return ret;
 }
 
-extern "C" RENDERDOC_API void RENDERDOC_CC RENDERDOC_FreeArrayMem(const void *mem)
+extern "C" RENDERDOC_API void RENDERDOC_CC RENDERDOC_FreeArrayMem(void *mem)
 {
-  free((void *)mem);
+  free(mem);
+}
+
+// not exported, this is needed for calling from the container allocate functions
+void RENDERDOC_OutOfMemory(uint64_t sz)
+{
+  RDCFATAL("Allocation failed for %llu bytes", sz);
 }
 
 extern "C" RENDERDOC_API void *RENDERDOC_CC RENDERDOC_AllocArrayMem(uint64_t sz)
 {
-  return malloc((size_t)sz);
+  void *ret = malloc((size_t)sz);
+  if(ret == NULL)
+    RENDERDOC_OutOfMemory(sz);
+  return ret;
 }
 
-extern "C" RENDERDOC_API uint32_t RENDERDOC_CC RENDERDOC_EnumerateRemoteTargets(const char *host,
+extern "C" RENDERDOC_API uint32_t RENDERDOC_CC RENDERDOC_EnumerateRemoteTargets(const rdcstr &URL,
                                                                                 uint32_t nextIdent)
 {
-  std::string s = "localhost";
-  if(host != NULL && host[0] != '\0')
-    s = host;
+  rdcstr host = "localhost";
+  if(!URL.empty())
+    host = URL;
+
+  rdcstr deviceID = host;
 
   // initial case is we're called with 0, start with the first port.
   // otherwise we're called with the last successful ident, so increment
@@ -391,32 +448,37 @@ extern "C" RENDERDOC_API uint32_t RENDERDOC_CC RENDERDOC_EnumerateRemoteTargets(
   else
     nextIdent++;
 
-  bool isAndroid = false;
-  uint32_t lastIdent = RenderDoc_LastTargetControlPort;
-  if(host != NULL && Android::IsHostADB(host))
+  IDeviceProtocolHandler *protocol = RenderDoc::Inst().GetDeviceProtocol(deviceID);
+
+  if(protocol)
   {
-    int index = 0;
-    std::string deviceID;
-    Android::ExtractDeviceIDAndIndex(host, index, deviceID);
-
-    isAndroid = true;
-
-    // each subsequent device gets a new range of ports. The deviceID isn't needed since we already
-    // forwarded the ports to the right devices.
-    if(nextIdent == RenderDoc_FirstTargetControlPort)
-      nextIdent += RenderDoc_AndroidPortOffset * (index + 1);
-    lastIdent += RenderDoc_AndroidPortOffset * (index + 1);
-
-    s = "127.0.0.1";
+    deviceID = protocol->GetDeviceID(deviceID);
+    host = protocol->RemapHostname(deviceID);
+    if(host.empty())
+      return 0;
+  }
+  else
+  {
+    // hosts specified with a port are supported only for replay, do not enumerate targets on those
+    // hosts
+    if(URL.contains(':'))
+      return 0;
   }
 
-  for(; nextIdent <= lastIdent; nextIdent++)
+  for(; nextIdent <= RenderDoc_LastTargetControlPort; nextIdent++)
   {
-    Network::Socket *sock = Network::CreateClientSocket(s.c_str(), (uint16_t)nextIdent, 250);
+    uint16_t port = (uint16_t)nextIdent;
+    if(protocol)
+      port = protocol->RemapPort(deviceID, port);
+
+    if(port == 0)
+      return 0;
+
+    Network::Socket *sock = Network::CreateClientSocket(host, port, 250);
 
     if(sock)
     {
-      if(isAndroid)
+      if(protocol)
       {
         Threading::Sleep(100);
         (void)sock->IsRecvDataWaiting();
@@ -436,18 +498,22 @@ extern "C" RENDERDOC_API uint32_t RENDERDOC_CC RENDERDOC_EnumerateRemoteTargets(
   return 0;
 }
 
-extern "C" RENDERDOC_API uint32_t RENDERDOC_CC RENDERDOC_GetDefaultRemoteServerPort()
+extern "C" RENDERDOC_API void RENDERDOC_CC
+RENDERDOC_GetSupportedDeviceProtocols(rdcarray<rdcstr> *supportedProtocols)
 {
-  return RenderDoc_RemoteServerPort;
+  *supportedProtocols = RenderDoc::Inst().GetSupportedDeviceProtocols();
+}
+
+extern "C" RENDERDOC_API IDeviceProtocolController *RENDERDOC_CC
+RENDERDOC_GetDeviceProtocolController(const rdcstr &protocol)
+{
+  return RenderDoc::Inst().GetDeviceProtocol(protocol);
 }
 
 extern "C" RENDERDOC_API void RENDERDOC_CC RENDERDOC_BecomeRemoteServer(
-    const char *listenhost, uint32_t port, RENDERDOC_KillCallback killReplay,
+    const rdcstr &listenhost, uint16_t port, RENDERDOC_KillCallback killReplay,
     RENDERDOC_PreviewWindowCallback previewWindow)
 {
-  if(listenhost == NULL || listenhost[0] == 0)
-    listenhost = "0.0.0.0";
-
   // ensure a sensible default if no callback is provided, that just never kills
   if(!killReplay)
     killReplay = []() { return false; };
@@ -460,13 +526,22 @@ extern "C" RENDERDOC_API void RENDERDOC_CC RENDERDOC_BecomeRemoteServer(
     };
 
   if(port == 0)
-    port = RENDERDOC_GetDefaultRemoteServerPort();
+    port = RenderDoc_RemoteServerPort;
 
-  RenderDoc::Inst().BecomeRemoteServer(listenhost, (uint16_t)port, killReplay, previewWindow);
+  RenderDoc::Inst().BecomeRemoteServer(listenhost.empty() ? "0.0.0.0" : listenhost, port,
+                                       killReplay, previewWindow);
 }
 
-extern "C" RENDERDOC_API void RENDERDOC_CC RENDERDOC_StartSelfHostCapture(const char *dllname)
+extern "C" RENDERDOC_API bool RENDERDOC_CC RENDERDOC_CanSelfHostedCapture(const rdcstr &dllname)
 {
+  return Process::IsModuleLoaded(dllname);
+}
+
+extern "C" RENDERDOC_API void RENDERDOC_CC RENDERDOC_StartSelfHostCapture(const rdcstr &dllname)
+{
+  if(!Process::IsModuleLoaded(dllname))
+    return;
+
   void *module = Process::LoadModule(dllname);
 
   if(module == NULL)
@@ -488,8 +563,11 @@ extern "C" RENDERDOC_API void RENDERDOC_CC RENDERDOC_StartSelfHostCapture(const 
   rdoc->StartFrameCapture(NULL, NULL);
 }
 
-extern "C" RENDERDOC_API void RENDERDOC_CC RENDERDOC_EndSelfHostCapture(const char *dllname)
+extern "C" RENDERDOC_API void RENDERDOC_CC RENDERDOC_EndSelfHostCapture(const rdcstr &dllname)
 {
+  if(!Process::IsModuleLoaded(dllname))
+    return;
+
   void *module = Process::LoadModule(dllname);
 
   if(module == NULL)
@@ -515,8 +593,8 @@ extern "C" RENDERDOC_API bool RENDERDOC_CC
 RENDERDOC_NeedVulkanLayerRegistration(VulkanLayerRegistrationInfo *info)
 {
   VulkanLayerFlags flags = VulkanLayerFlags::NoFlags;
-  std::vector<std::string> myJSONs;
-  std::vector<std::string> otherJSONs;
+  rdcarray<rdcstr> myJSONs;
+  rdcarray<rdcstr> otherJSONs;
 
   bool ret = RenderDoc::Inst().NeedVulkanLayerRegistration(flags, myJSONs, otherJSONs);
 
@@ -561,7 +639,7 @@ extern "C" RENDERDOC_API void RENDERDOC_CC RENDERDOC_UpdateInstalledVersionNumbe
   bool done = false;
 
   char guidName[256] = {};
-  for(DWORD idx = 0; ret == ERROR_SUCCESS && !done; idx++)
+  for(DWORD idx = 0; !done; idx++)
   {
     // enumerate all the uninstall keys
     ret = RegEnumKeyA(key, idx, guidName, sizeof(guidName) - 1);
@@ -590,19 +668,13 @@ extern "C" RENDERDOC_API void RENDERDOC_CC RENDERDOC_UpdateInstalledVersionNumbe
 
       // allow the value to silently not exist
       if(ret != ERROR_SUCCESS)
-      {
         DisplayName[0] = 0;
-        ret = ERROR_SUCCESS;
-      }
 
       len = sizeof(Publisher) - 1;
       ret = RegGetValueA(subkey, NULL, "Publisher", RRF_RT_ANY, NULL, Publisher, &len);
 
       if(ret != ERROR_SUCCESS)
-      {
         Publisher[0] = 0;
-        ret = ERROR_SUCCESS;
-      }
 
       // if this is our key, set the version number
       if(!strcmp(DisplayName, "RenderDoc") && !strcmp(Publisher, "Baldur Karlsson"))
@@ -610,7 +682,7 @@ extern "C" RENDERDOC_API void RENDERDOC_CC RENDERDOC_UpdateInstalledVersionNumbe
         DWORD Version = (RENDERDOC_VERSION_MAJOR << 24) | (RENDERDOC_VERSION_MINOR << 16);
         DWORD VersionMajor = RENDERDOC_VERSION_MAJOR;
         DWORD VersionMinor = RENDERDOC_VERSION_MINOR;
-        std::string DisplayVersion = MAJOR_MINOR_VERSION_STRING ".0";
+        rdcstr DisplayVersion = MAJOR_MINOR_VERSION_STRING ".0";
 
         RegSetValueExA(subkey, "Version", 0, REG_DWORD, (const BYTE *)&Version, sizeof(Version));
         RegSetValueExA(subkey, "VersionMajor", 0, REG_DWORD, (const BYTE *)&VersionMajor,
@@ -633,9 +705,9 @@ extern "C" RENDERDOC_API void RENDERDOC_CC RENDERDOC_UpdateInstalledVersionNumbe
 #endif
 }
 
-static std::string ResourceFormatName(const ResourceFormat &fmt)
+static rdcstr ResourceFormatName(const ResourceFormat &fmt)
 {
-  std::string ret;
+  rdcstr ret;
 
   if(fmt.Special())
   {
@@ -687,20 +759,19 @@ static std::string ResourceFormatName(const ResourceFormat &fmt)
         else
           return fmt.SRGBCorrected() ? "ETC2_EAC_RGBA8_SRGB" : "ETC2_EAC_RGBA8_UNORM";
       }
-      case ResourceFormatType::ASTC:
-        return fmt.SRGBCorrected() ? "ASTC_SRGB" : "ASTC_UNORM";
+      case ResourceFormatType::ASTC: return fmt.SRGBCorrected() ? "ASTC_SRGB" : "ASTC_UNORM";
       // 10:10:10 A2 is the only format that can have all the usual format types (unorm, snorm,
       // etc). So we break and handle it like any other format below.
       case ResourceFormatType::R10G10B10A2:
         ret = fmt.BGRAOrder() ? "B10G10R10A2" : "R10G10B10A2";
         break;
       case ResourceFormatType::R11G11B10: return "R11G11B10_FLOAT";
-      case ResourceFormatType::R5G6B5: return fmt.BGRAOrder() ? "R5G6B5_UNORM" : "B5G6R5_UNORM";
+      case ResourceFormatType::R5G6B5: return fmt.BGRAOrder() ? "B5G6R5_UNORM" : "R5G6B5_UNORM";
       case ResourceFormatType::R5G5B5A1:
-        return fmt.BGRAOrder() ? "R5G5B5A1_UNORM" : "B5G5R5A1_UNORM";
+        return fmt.BGRAOrder() ? "B5G5R5A1_UNORM" : "R5G5B5A1_UNORM";
       case ResourceFormatType::R9G9B9E5: return "R9G9B9E5_FLOAT";
       case ResourceFormatType::R4G4B4A4:
-        return fmt.BGRAOrder() ? "R4G4B4A4_UNORM" : "B4G4R4A4_UNORM";
+        return fmt.BGRAOrder() ? "B4G4R4A4_UNORM" : "R4G4B4A4_UNORM";
       case ResourceFormatType::R4G4: return "R4G4_UNORM";
       case ResourceFormatType::D16S8:
         return fmt.compType == CompType::Typeless ? "D16S8_TYPELESS" : "D16S8";
@@ -745,21 +816,21 @@ static std::string ResourceFormatName(const ResourceFormat &fmt)
             else if(planeCount == 2)
               return StringFormat::Fmt("P4%02u", yuvbits);
             else
-              return StringFormat::Fmt("YUV_%uPlane_%ubit", planeCount, yuvbits);
+              return StringFormat::Fmt("YUV444_%uPlane_%ubit", planeCount, yuvbits);
           case 422:
             if(planeCount == 1)
               return StringFormat::Fmt("Y2%02u", yuvbits);
             else if(planeCount == 2)
               return StringFormat::Fmt("P2%02u", yuvbits);
             else
-              return StringFormat::Fmt("YUV_%uPlane_%ubit", planeCount, yuvbits);
+              return StringFormat::Fmt("YUV422_%uPlane_%ubit", planeCount, yuvbits);
           case 420:
             if(planeCount == 1)
               return StringFormat::Fmt("Y0%02u", yuvbits);
             else if(planeCount == 2)
               return StringFormat::Fmt("P0%02u", yuvbits);
             else
-              return StringFormat::Fmt("YUV_%uPlane_%ubit", planeCount, yuvbits);
+              return StringFormat::Fmt("YUV420_%uPlane_%ubit", planeCount, yuvbits);
           default: RDCERR("Unexpected YUV Subsampling amount %u", subsampling);
         }
 
@@ -786,8 +857,7 @@ static std::string ResourceFormatName(const ResourceFormat &fmt)
   switch(fmt.compType)
   {
     case CompType::Typeless: return ret + "_TYPELESS";
-    case CompType::Float:
-    case CompType::Double: return ret + "_FLOAT";
+    case CompType::Float: return ret + "_FLOAT";
     case CompType::UNorm: return ret + "_UNORM";
     case CompType::SNorm: return ret + "_SNORM";
     case CompType::UInt: return ret + "_UINT";
@@ -811,7 +881,7 @@ extern "C" RENDERDOC_API void RENDERDOC_CC RENDERDOC_ResourceFormatName(const Re
   name = ResourceFormatName(fmt);
 }
 
-static void TestPrintMsg(const std::string &msg)
+static void TestPrintMsg(const rdcstr &msg)
 {
   OSUtility::WriteOutput(OSUtility::Output_DebugMon, msg.c_str());
   OSUtility::WriteOutput(OSUtility::Output_StdErr, msg.c_str());
@@ -823,32 +893,36 @@ extern "C" RENDERDOC_API int RENDERDOC_CC RENDERDOC_RunFunctionalTests(int pytho
 #if ENABLED(RDOC_WIN32)
   const char *moduledir = "/pymodules";
   const char *modulename = "renderdoc.pyd";
-  std::string pythonlibs[] = {"python3?.dll"};
+  rdcstr pythonlibs[] = {"python3?.dll"};
 #elif ENABLED(RDOC_LINUX)
   const char *moduledir = "";
   const char *modulename = "renderdoc.so";
   // we don't care about pymalloc or not
-  std::string pythonlibs[] = {"libpython3.?m.so.1.0", "libpython3.?.so.1.0", "libpython3.?m.so",
-                              "libpython3.?.so"};
+  rdcstr pythonlibs[] = {"libpython3.?m.so.1.0", "libpython3.?.so.1.0", "libpython3.?m.so",
+                         "libpython3.?.so"};
+#elif ENABLED(RDOC_APPLE)
+  const char *moduledir = "";
+  const char *modulename = "renderdoc.so";
+  rdcstr pythonlibs[] = {"libpython3.?.dylib"};
 #else
   const char *moduledir = "";
   const char *modulename = "";
-  std::string pythonlibs[] = {};
+  rdcstr pythonlibs[] = {};
   TestPrintMsg(
       "Running functional tests not directly supported on this platform.\n"
       "Try running util/test/run_tests.py manually.\n");
   return 1;
 #endif
 
-  std::string libPath;
+  rdcstr libPath;
   FileIO::GetLibraryFilename(libPath);
 
   libPath = get_dirname(libPath);
-  std::string modulePath = libPath + moduledir;
+  rdcstr modulePath = libPath + moduledir;
 
-  std::string moduleFilename = modulePath + "/" + modulename;
+  rdcstr moduleFilename = modulePath + "/" + modulename;
 
-  if(!FileIO::exists(moduleFilename.c_str()))
+  if(!FileIO::exists(moduleFilename))
   {
     TestPrintMsg(StringFormat::Fmt("Couldn't locate python module at %s\n", moduleFilename.c_str()));
     return 1;
@@ -858,9 +932,9 @@ extern "C" RENDERDOC_API int RENDERDOC_CC RENDERDOC_RunFunctionalTests(int pytho
   // directories from the library will put us at the project root. This is the most common scenario
   // and we don't add handling for locating the script elsewhere as in that case the user can run it
   // directly. This is just intended as a useful shortcut for common cases.
-  std::string scriptPath = libPath + "/../../util/test/run_tests.py";
+  rdcstr scriptPath = libPath + "/../../util/test/run_tests.py";
 
-  if(!FileIO::exists(scriptPath.c_str()))
+  if(!FileIO::exists(scriptPath))
   {
     TestPrintMsg(StringFormat::Fmt("Couldn't locate run_tests.py script at %s\n", scriptPath.c_str()));
     return 1;
@@ -868,13 +942,18 @@ extern "C" RENDERDOC_API int RENDERDOC_CC RENDERDOC_RunFunctionalTests(int pytho
 
   void *handle = NULL;
 
-  for(std::string py : pythonlibs)
+  for(rdcstr py : pythonlibs)
   {
     // patch up the python minor version
-    char *ver = strchr(&py[0], '?');
-    *ver = char('0' + pythonMinorVersion);
+    const int32_t idx = py.find('?');
+    if(idx == -1)
+    {
+      TestPrintMsg(StringFormat::Fmt("Python library pattern missing placeholder: %s\n", py.c_str()));
+      return 1;
+    }
+    py.replace(idx, 1, StringFormat::Fmt("%d", pythonMinorVersion));
 
-    handle = Process::LoadModule(py.c_str());
+    handle = Process::LoadModule(py);
     if(handle)
     {
       RDCLOG("Loaded python from %s", py.c_str());
@@ -898,29 +977,42 @@ extern "C" RENDERDOC_API int RENDERDOC_CC RENDERDOC_RunFunctionalTests(int pytho
     return 1;
   }
 
-  std::vector<std::wstring> wideArgs(args.size());
+  rdcarray<rdcwstr> wideArgs;
+  wideArgs.resize(args.size());
 
   for(size_t i = 0; i < args.size(); i++)
     wideArgs[i] = StringFormat::UTF82Wide(args[i]);
 
   // insert fake arguments to point at the script and our modules
-  wideArgs.insert(wideArgs.begin(),
-                  {
-                      L"python",
-                      // specify script path
-                      StringFormat::UTF82Wide(scriptPath),
-                      // specify native library path
-                      L"--renderdoc", StringFormat::UTF82Wide(libPath),
-                      // specify python module path
-                      L"--pyrenderdoc", StringFormat::UTF82Wide(modulePath),
-                      // force in-process as we can't fork out to python to pass args
-                      L"--in-process",
-                  });
+  wideArgs.insert(0, {
+                         L"python",
+                         // specify script path
+                         StringFormat::UTF82Wide(scriptPath),
+                         // specify native library path
+                         L"--renderdoc",
+                         StringFormat::UTF82Wide(libPath),
+                         // specify python module path
+                         L"--pyrenderdoc",
+                         StringFormat::UTF82Wide(modulePath),
+                         // force in-process as we can't fork out to python to pass args
+                         L"--in-process",
+                     });
 
-  std::vector<wchar_t *> wideArgStrings(wideArgs.size());
+  rdcarray<wchar_t *> wideArgStrings;
+  wideArgStrings.resize(wideArgs.size());
 
   for(size_t i = 0; i < wideArgs.size(); i++)
-    wideArgStrings[i] = &wideArgs[i][0];
+    wideArgStrings[i] = wideArgs[i].data();
 
   return mainFunc((int)wideArgStrings.size(), wideArgStrings.data());
+}
+
+extern "C" RENDERDOC_API void RENDERDOC_CC RENDERDOC_BeginProfileRegion(const rdcstr &name)
+{
+  Superluminal::BeginProfileRange(name);
+}
+
+extern "C" RENDERDOC_API void RENDERDOC_CC RENDERDOC_EndProfileRegion()
+{
+  Superluminal::EndProfileRange();
 }

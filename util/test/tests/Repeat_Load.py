@@ -18,12 +18,14 @@ class Repeat_Load(rdtest.TestCase):
                 rdtest.log.print("Skipping. Can't open {}: {}".format(path, err))
                 return
 
+            rdtest.log.print("Loaded capture.")
+
             # Do nothing, just ensure it's loaded
             memory_usage: int = rd.GetCurrentProcessMemoryUsage()
 
             # We measure the baseline memory usage during the second peak to avoid any persistent caches etc that might
             # not be full
-            if i == 1:
+            if i == 2:
                 memory_baseline = memory_usage
 
             controller.Shutdown()

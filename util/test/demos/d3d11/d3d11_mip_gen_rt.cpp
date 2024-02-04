@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -24,7 +24,7 @@
 
 #include "d3d11_test.h"
 
-TEST(D3D11_Mip_Gen_RT, D3D11GraphicsTest)
+RD_TEST(D3D11_Mip_Gen_RT, D3D11GraphicsTest)
 {
   static constexpr const char *Description =
       "Tests rendering from one mip to another to do a downsample chain";
@@ -115,9 +115,9 @@ float4 main(v2f IN) : SV_Target0
 
     while(Running())
     {
-      ClearRenderTargetView(bbRTV, {0.4f, 0.5f, 0.6f, 1.0f});
+      ClearRenderTargetView(bbRTV, {0.2f, 0.2f, 0.2f, 1.0f});
       for(int i = 0; i < NumMips; i++)
-        ClearRenderTargetView(rtv[i], {0.4f, 0.5f, 0.6f, 1.0f});
+        ClearRenderTargetView(rtv[i], {0.2f, 0.2f, 0.2f, 1.0f});
 
       ctx->UpdateSubresource(rt, 0, NULL, ramp, 1024 * sizeof(uint32_t),
                              1024 * 1024 * sizeof(uint32_t));

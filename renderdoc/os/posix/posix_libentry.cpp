@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2016-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -26,12 +26,12 @@
 #include "hooks/hooks.h"
 #include "os/os_specific.h"
 
-void dlopen_hook_init();
+void ResetHookingEnvVars();
 
 // DllMain equivalent
 void library_loaded()
 {
-  if(LibraryHooks::Detect("renderdoc__replay__marker"))
+  if(LibraryHooks::Detect(STRINGIZE(RDOC_BASE_NAME) "__replay__marker"))
   {
     RDCDEBUG("Not creating hooks - in replay app");
 
@@ -39,16 +39,20 @@ void library_loaded()
 
     RenderDoc::Inst().Initialise();
 
+    LibraryHooks::ReplayInitialise();
+
     return;
   }
   else
   {
     RenderDoc::Inst().Initialise();
 
-    const char *capturefile = Process::GetEnvVariable("RENDERDOC_CAPFILE");
-    const char *opts = Process::GetEnvVariable("RENDERDOC_CAPOPTS");
+    ResetHookingEnvVars();
 
-    if(opts)
+    rdcstr capturefile = Process::GetEnvVariable("RENDERDOC_CAPFILE");
+    rdcstr opts = Process::GetEnvVariable("RENDERDOC_CAPOPTS");
+
+    if(!opts.empty())
     {
       CaptureOptions optstruct;
       optstruct.DecodeFromString(opts);
@@ -58,12 +62,12 @@ void library_loaded()
       RenderDoc::Inst().SetCaptureOptions(optstruct);
     }
 
-    if(capturefile)
+    if(!capturefile.empty())
     {
       RenderDoc::Inst().SetCaptureFileTemplate(capturefile);
     }
 
-    std::string curfile;
+    rdcstr curfile;
     FileIO::GetExecutableFilename(curfile);
 
     RDCLOG("Loading into %s", curfile.c_str());

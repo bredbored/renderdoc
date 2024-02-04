@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  * Copyright (c) 2014 Crytek
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -25,12 +25,15 @@
 
 #include "android/android.h"
 #include "api/replay/renderdoc_replay.h"
+#include "common/threading.h"
 #include "core/core.h"
 #include "jpeg-compressor/jpgd.h"
 #include "os/os_specific.h"
+#include "replay/replay_driver.h"
 #include "serialise/serialiser.h"
+#include "strings/string_utils.h"
 
-static const uint32_t TargetControlProtocolVersion = 5;
+static const uint32_t TargetControlProtocolVersion = 9;
 
 static bool IsProtocolVersionSupported(const uint32_t protocolVersion)
 {
@@ -44,6 +47,22 @@ static bool IsProtocolVersionSupported(const uint32_t protocolVersion)
 
   // 4 -> 5 return frame number with new captures
   if(protocolVersion == 4)
+    return true;
+
+  // 5 -> 6 return byte size with new captures
+  if(protocolVersion == 5)
+    return true;
+
+  // 6 -> 7 add 'request show' packet
+  if(protocolVersion == 6)
+    return true;
+
+  // 7 -> 8 add custom message for unsupported APIs
+  if(protocolVersion == 7)
+    return true;
+
+  // 8 -> 9 add capture titles
+  if(protocolVersion == 8)
     return true;
 
   if(protocolVersion == TargetControlProtocolVersion)
@@ -66,7 +85,8 @@ enum PacketType : uint32_t
   ePacket_NewChild,
   ePacket_CaptureProgress,
   ePacket_CycleActiveWindow,
-  ePacket_CapturableWindowCount
+  ePacket_CapturableWindowCount,
+  ePacket_RequestShow
 };
 
 DECLARE_REFLECTION_ENUM(PacketType);
@@ -98,6 +118,8 @@ rdcstr DoStringise(const PacketType &el)
 
 void RenderDoc::TargetControlClientThread(uint32_t version, Network::Socket *client)
 {
+  Threading::SetCurrentThreadName("TargetControlClientThread");
+
   Threading::KeepModuleAlive();
 
   WriteSerialiser writer(new StreamWriter(client, Ownership::Nothing), Ownership::Stream);
@@ -106,7 +128,7 @@ void RenderDoc::TargetControlClientThread(uint32_t version, Network::Socket *cli
   writer.SetStreamingMode(true);
   reader.SetStreamingMode(true);
 
-  std::string target = RenderDoc::Inst().GetCurrentTarget();
+  rdcstr target = RenderDoc::Inst().GetCurrentTarget();
   uint32_t mypid = Process::GetCurrentPID();
 
   {
@@ -139,15 +161,17 @@ void RenderDoc::TargetControlClientThread(uint32_t version, Network::Socket *cli
   const int progresstime = 100;    // update capture progress every 100ms
   int curtime = 0;
 
-  std::vector<CaptureData> captures;
-  std::vector<rdcpair<uint32_t, uint32_t> > children;
-  std::map<RDCDriver, bool> drivers;
+  RenderDoc::Inst().ValidateCaptures();
+
+  rdcarray<CaptureData> captures;
+  rdcarray<rdcpair<uint32_t, uint32_t> > children;
+  std::map<RDCDriver, RDCDriverStatus> drivers;
   float prevCaptureProgress = captureProgress;
   uint32_t prevWindows = 0;
 
   while(client)
   {
-    if(RenderDoc::Inst().m_ControlClientThreadShutdown || (client && !client->Connected()))
+    if(RenderDoc::Inst().m_ControlClientThreadShutdown || !client->Connected())
     {
       SAFE_DELETE(client);
       break;
@@ -156,10 +180,10 @@ void RenderDoc::TargetControlClientThread(uint32_t version, Network::Socket *cli
     Threading::Sleep(ticktime);
     curtime += ticktime;
 
-    std::map<RDCDriver, bool> curdrivers = RenderDoc::Inst().GetActiveDrivers();
+    std::map<RDCDriver, RDCDriverStatus> curdrivers = RenderDoc::Inst().GetActiveDrivers();
 
-    std::vector<CaptureData> caps = RenderDoc::Inst().GetCaptures();
-    std::vector<rdcpair<uint32_t, uint32_t> > childprocs = RenderDoc::Inst().GetChildProcesses();
+    rdcarray<CaptureData> caps = RenderDoc::Inst().GetCaptures();
+    rdcarray<rdcpair<uint32_t, uint32_t> > childprocs = RenderDoc::Inst().GetChildProcesses();
 
     uint32_t curWindows = RenderDoc::Inst().GetCapturableWindowCount();
 
@@ -167,7 +191,7 @@ void RenderDoc::TargetControlClientThread(uint32_t version, Network::Socket *cli
     {
       // find the first difference, either a new key or a key with a different value, and send it.
       RDCDriver driver = RDCDriver::Unknown;
-      bool presenting = false;
+      RDCDriverStatus status;
 
       // search for new drivers
       for(auto it = curdrivers.begin(); it != curdrivers.end(); it++)
@@ -175,7 +199,7 @@ void RenderDoc::TargetControlClientThread(uint32_t version, Network::Socket *cli
         if(drivers.find(it->first) == drivers.end() || drivers[it->first] != it->second)
         {
           driver = it->first;
-          presenting = it->second;
+          status = it->second;
           break;
         }
       }
@@ -183,17 +207,18 @@ void RenderDoc::TargetControlClientThread(uint32_t version, Network::Socket *cli
       RDCASSERTNOTEQUAL(driver, RDCDriver::Unknown);
 
       if(driver != RDCDriver::Unknown)
-        drivers[driver] = presenting;
-
-      bool supported =
-          RenderDoc::Inst().HasRemoteDriver(driver) || RenderDoc::Inst().HasReplayDriver(driver);
+        drivers[driver] = status;
 
       WRITE_DATA_SCOPE();
       {
         SCOPED_SERIALISE_CHUNK(ePacket_APIUse);
         SERIALISE_ELEMENT(driver);
-        SERIALISE_ELEMENT(presenting);
-        SERIALISE_ELEMENT(supported);
+        SERIALISE_ELEMENT(status.presenting);
+        SERIALISE_ELEMENT(status.supported);
+        if(version >= 8)
+        {
+          SERIALISE_ELEMENT(status.supportMessage);
+        }
       }
     }
     else if(caps.size() != captures.size())
@@ -202,12 +227,12 @@ void RenderDoc::TargetControlClientThread(uint32_t version, Network::Socket *cli
 
       captures.push_back(caps[idx]);
 
-      std::string path = FileIO::GetFullPathname(captures.back().path);
+      rdcstr path = FileIO::GetFullPathname(captures.back().path);
 
       bytebuf buf;
 
       ICaptureFile *file = RENDERDOC_OpenCaptureFile();
-      if(file->OpenFile(captures.back().path.c_str(), "rdc", NULL) == ReplayStatus::Succeeded)
+      if(file->OpenFile(captures.back().path, "rdc", NULL).OK())
       {
         buf = file->GetThumbnail(FileType::JPG, 0).data;
       }
@@ -221,9 +246,22 @@ void RenderDoc::TargetControlClientThread(uint32_t version, Network::Socket *cli
         SERIALISE_ELEMENT(path);
         SERIALISE_ELEMENT(buf);
         if(version >= 3)
+        {
           SERIALISE_ELEMENT(captures.back().driver);
+        }
         if(version >= 5)
+        {
           SERIALISE_ELEMENT(captures.back().frameNumber);
+        }
+        if(version >= 6)
+        {
+          uint64_t byteSize = FileIO::GetFileSize(captures.back().path);
+          SERIALISE_ELEMENT(byteSize);
+        }
+        if(version >= 9)
+        {
+          SERIALISE_ELEMENT(captures.back().title);
+        }
       }
     }
     else if(childprocs.size() != children.size())
@@ -267,6 +305,27 @@ void RenderDoc::TargetControlClientThread(uint32_t version, Network::Socket *cli
       {
         SCOPED_SERIALISE_CHUNK(ePacket_CapturableWindowCount);
         SERIALISE_ELEMENT(curWindows);
+      }
+    }
+    else if(version >= 7)
+    {
+      bool requestShow = false;
+
+      {
+        SCOPED_LOCK(RenderDoc::Inst().m_SingleClientLock);
+        if(RenderDoc::Inst().m_RequestControllerShow)
+        {
+          requestShow = RenderDoc::Inst().m_RequestControllerShow;
+          RenderDoc::Inst().m_RequestControllerShow = false;
+        }
+      }
+
+      if(requestShow)
+      {
+        WRITE_DATA_SCOPE();
+        {
+          SCOPED_SERIALISE_CHUNK(ePacket_RequestShow);
+        }
       }
     }
 
@@ -337,9 +396,9 @@ void RenderDoc::TargetControlClientThread(uint32_t version, Network::Socket *cli
           SCOPED_SERIALISE_CHUNK(ePacket_CopyCapture);
           SERIALISE_ELEMENT(id);
 
-          std::string filename = caps[id].path;
+          rdcstr filename = caps[id].path;
 
-          StreamReader fileStream(FileIO::fopen(filename.c_str(), "rb"));
+          StreamReader fileStream(FileIO::fopen(filename, FileIO::ReadBinary));
           ser.SerialiseStream(filename, fileStream);
 
           if(fileStream.IsErrored() || ser.IsErrored())
@@ -373,6 +432,8 @@ void RenderDoc::TargetControlClientThread(uint32_t version, Network::Socket *cli
 
 void RenderDoc::TargetControlServerThread(Network::Socket *sock)
 {
+  Threading::SetCurrentThreadName("TargetControlServerThread");
+
   Threading::KeepModuleAlive();
 
   RenderDoc::Inst().m_SingleClientName = "";
@@ -401,14 +462,16 @@ void RenderDoc::TargetControlServerThread(Network::Socket *sock)
       continue;
     }
 
-    std::string existingClient;
-    std::string newClient;
+    rdcstr existingClient;
+    rdcstr newClient;
     uint32_t version;
     bool kick = false;
 
     // receive handshake from client and get its name
     {
       ReadSerialiser ser(new StreamReader(client, Ownership::Nothing), Ownership::Stream);
+
+      ser.SetStreamingMode(true);
 
       PacketType type = ser.ReadChunk<PacketType>();
 
@@ -423,6 +486,8 @@ void RenderDoc::TargetControlServerThread(Network::Socket *sock)
       SERIALISE_ELEMENT(kick);
 
       ser.EndChunk();
+
+      strip_nonbasic(newClient);
 
       if(newClient.empty() || !IsProtocolVersionSupported(version))
       {
@@ -470,7 +535,7 @@ void RenderDoc::TargetControlServerThread(Network::Socket *sock)
 
       ser.SetStreamingMode(true);
 
-      std::string target = RenderDoc::Inst().GetCurrentTarget();
+      rdcstr target = RenderDoc::Inst().GetCurrentTarget();
       {
         SCOPED_SERIALISE_CHUNK(ePacket_Busy);
         SERIALISE_ELEMENT(TargetControlProtocolVersion);
@@ -496,12 +561,12 @@ void RenderDoc::TargetControlServerThread(Network::Socket *sock)
 struct TargetControl : public ITargetControl
 {
 public:
-  TargetControl(Network::Socket *sock, std::string clientName, bool forceConnection)
+  TargetControl(Network::Socket *sock, rdcstr clientName, bool forceConnection)
       : m_Socket(sock),
         reader(new StreamReader(sock, Ownership::Nothing), Ownership::Stream),
         writer(new StreamWriter(sock, Ownership::Nothing), Ownership::Stream)
   {
-    std::vector<byte> payload;
+    bytebuf payload;
 
     writer.SetStreamingMode(true);
     reader.SetStreamingMode(true);
@@ -545,12 +610,23 @@ public:
 
     m_Version = 0;
 
+    if(type == ePacket_Handshake)
     {
       READ_DATA_SCOPE();
       SERIALISE_ELEMENT(m_Version);
       SERIALISE_ELEMENT(m_Target);
       SERIALISE_ELEMENT(m_PID);
     }
+    else if(type == ePacket_Busy)
+    {
+      READ_DATA_SCOPE();
+      SERIALISE_ELEMENT(m_Version);
+      SERIALISE_ELEMENT(m_Target);
+      SERIALISE_ELEMENT(m_BusyClient);
+    }
+
+    strip_nonbasic(m_Target);
+    strip_nonbasic(m_BusyClient);
 
     reader.EndChunk();
 
@@ -579,10 +655,10 @@ public:
     delete this;
   }
 
-  const char *GetTarget() { return m_Target.c_str(); }
-  const char *GetAPI() { return m_API.c_str(); }
+  rdcstr GetTarget() { return m_Target; }
+  rdcstr GetAPI() { return m_API; }
   uint32_t GetPID() { return m_PID; }
-  const char *GetBusyClient() { return m_BusyClient.c_str(); }
+  rdcstr GetBusyClient() { return m_BusyClient; }
   void TriggerCapture(uint32_t numFrames)
   {
     WRITE_DATA_SCOPE();
@@ -606,7 +682,7 @@ public:
       SAFE_DELETE(m_Socket);
   }
 
-  void CopyCapture(uint32_t remoteID, const char *localpath)
+  void CopyCapture(uint32_t remoteID, const rdcstr &localpath)
   {
     WRITE_DATA_SCOPE();
     SCOPED_SERIALISE_CHUNK(ePacket_CopyCapture);
@@ -685,17 +761,6 @@ public:
       reader.EndChunk();
       return msg;
     }
-    else if(type == ePacket_Busy)
-    {
-      READ_DATA_SCOPE();
-      SERIALISE_ELEMENT(msg.busy.clientName).Named("Client Name"_lit);
-
-      SAFE_DELETE(m_Socket);
-
-      RDCLOG("Got busy signal: '%s", msg.busy.clientName.c_str());
-      msg.type = TargetControlMessageType::Busy;
-      return msg;
-    }
     else if(type == ePacket_NewChild)
     {
       msg.type = TargetControlMessageType::NewChild;
@@ -734,7 +799,9 @@ public:
         SERIALISE_ELEMENT(msg.newCapture.path).Named("path"_lit);
         SERIALISE_ELEMENT(thumbnail);
         if(m_Version >= 3)
+        {
           SERIALISE_ELEMENT(driver);
+        }
         if(m_Version >= 5)
         {
           SERIALISE_ELEMENT(msg.newCapture.frameNumber);
@@ -743,16 +810,32 @@ public:
         {
           msg.newCapture.frameNumber = msg.newCapture.captureId + 1;
         }
+        if(m_Version >= 6)
+        {
+          SERIALISE_ELEMENT(msg.newCapture.byteSize).Named("byteSize"_lit);
+        }
+        else
+        {
+          msg.newCapture.byteSize = 0;
+        }
+        if(m_Version >= 9)
+        {
+          SERIALISE_ELEMENT(msg.newCapture.title).Named("title"_lit);
+        }
+        else
+        {
+          msg.newCapture.title.clear();
+        }
       }
 
       if(driver != RDCDriver::Unknown)
         msg.newCapture.api = ToStr(driver);
 
-      msg.newCapture.local = FileIO::exists(msg.newCapture.path.c_str());
+      msg.newCapture.local = FileIO::exists(msg.newCapture.path);
 
-      RDCLOG("Got a new capture: %d (frame %u) (time %llu) %d byte thumbnail",
-             msg.newCapture.captureId, msg.newCapture.frameNumber, msg.newCapture.timestamp,
-             thumbnail.count());
+      RDCLOG("Got a new capture: %d (frame %u) (%u bytes) (time %llu) %d byte thumbnail",
+             msg.newCapture.captureId, msg.newCapture.frameNumber, msg.newCapture.byteSize,
+             msg.newCapture.timestamp, thumbnail.count());
 
       int w = 0;
       int h = 0;
@@ -784,22 +867,33 @@ public:
       RDCDriver driver = RDCDriver::Unknown;
       bool presenting = false;
       bool supported = false;
+      rdcstr supportMessage;
 
       READ_DATA_SCOPE();
       SERIALISE_ELEMENT(driver);
       SERIALISE_ELEMENT(presenting);
       SERIALISE_ELEMENT(supported);
+      if(m_Version >= 8)
+      {
+        SERIALISE_ELEMENT(supportMessage);
+      }
 
       msg.apiUse.name = ToStr(driver);
       msg.apiUse.presenting = presenting;
       msg.apiUse.supported = supported;
+      msg.apiUse.supportMessage = supportMessage;
 
       if(presenting)
         m_API = ToStr(driver);
 
       RDCLOG("Used API: %s (%s & %s)", msg.apiUse.name.c_str(),
-             presenting ? "Presenting" : "Not presenting",
-             supported ? "supported" : "not supported");
+             presenting ? "Presenting" : "Not presenting", supported ? "supported" : "not supported");
+
+      if(!supportMessage.empty())
+      {
+        strip_nonbasic(supportMessage);
+        RDCLOG("Support: %s", supportMessage.c_str());
+      }
 
       reader.EndChunk();
       return msg;
@@ -813,9 +907,10 @@ public:
 
       msg.newCapture.path = m_CaptureCopies[msg.newCapture.captureId];
 
-      StreamWriter streamWriter(FileIO::fopen(msg.newCapture.path.c_str(), "wb"), Ownership::Stream);
+      StreamWriter streamWriter(FileIO::fopen(msg.newCapture.path, FileIO::WriteBinary),
+                                Ownership::Stream);
 
-      ser.SerialiseStream(msg.newCapture.path.c_str(), streamWriter, progress);
+      ser.SerialiseStream(msg.newCapture.path, streamWriter, progress);
 
       if(reader.IsErrored())
       {
@@ -840,6 +935,12 @@ public:
       reader.EndChunk();
       return msg;
     }
+    else if(type == ePacket_RequestShow)
+    {
+      msg.type = TargetControlMessageType::RequestShow;
+      reader.EndChunk();
+      return msg;
+    }
     else
     {
       RDCERR("Unexpected packed received: %d", type);
@@ -854,31 +955,47 @@ private:
   Network::Socket *m_Socket;
   WriteSerialiser writer;
   ReadSerialiser reader;
-  std::string m_Target, m_API, m_BusyClient;
+  rdcstr m_Target, m_API, m_BusyClient;
   uint32_t m_Version, m_PID;
 
-  std::map<uint32_t, std::string> m_CaptureCopies;
+  std::map<uint32_t, rdcstr> m_CaptureCopies;
 };
 
 extern "C" RENDERDOC_API ITargetControl *RENDERDOC_CC RENDERDOC_CreateTargetControl(
-    const char *host, uint32_t ident, const char *clientName, bool forceConnection)
+    const rdcstr &URL, uint32_t ident, const rdcstr &clientName, bool forceConnection)
 {
-  std::string s = "localhost";
-  if(host != NULL && host[0] != '\0')
-    s = host;
+  rdcstr host = "localhost";
+  if(!URL.empty())
+    host = URL;
 
-  bool android = false;
+  rdcstr deviceID = host;
+  uint16_t port = ident & 0xffff;
 
-  if(host != NULL && Android::IsHostADB(host))
+  IDeviceProtocolHandler *protocol = RenderDoc::Inst().GetDeviceProtocol(deviceID);
+
+  if(protocol)
   {
-    android = true;
-    s = "127.0.0.1";
+    deviceID = protocol->GetDeviceID(deviceID);
+    host = protocol->RemapHostname(deviceID);
+    if(host.empty())
+      return NULL;
 
-    // we don't need the index or device ID here, because the port is already the right one
-    // forwarded to the right device.
+    port = protocol->RemapPort(deviceID, port);
+  }
+  else
+  {
+    int32_t idx = deviceID.indexOf(':');
+    if(idx > 0)
+    {
+      host = deviceID.substr(0, idx);
+      port = atoi(deviceID.substr(idx + 1).c_str()) & 0xffff;
+    }
   }
 
-  Network::Socket *sock = Network::CreateClientSocket(s.c_str(), ident & 0xffff, 750);
+  if(port == 0)
+    return NULL;
+
+  Network::Socket *sock = Network::CreateClientSocket(host, port, 750);
 
   if(sock == NULL)
     return NULL;

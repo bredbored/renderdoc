@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -24,9 +24,10 @@
 
 #include "gl_test.h"
 
-TEST(GL_VAO_0, OpenGLGraphicsTest)
+RD_TEST(GL_VAO_0, OpenGLGraphicsTest)
 {
-  static constexpr const char *Description = "Uses VAO 0 (i.e. never binds a VAO)";
+  static constexpr const char *Description =
+      "Uses VAO 0 (i.e. never binds a VAO) as well as testing client memory pointer behaviour.";
 
   std::string common = R"EOSHADER(
 
@@ -49,9 +50,11 @@ layout(location = 2) in vec2 UV;
 
 out v2f vertOut;
 
+uniform vec4 instance_xform;
+
 void main()
 {
-	vertOut.pos = vec4(Position.xyz, 1);
+	vertOut.pos = vec4(Position.x + float(gl_InstanceID % 4), Position.y + float(gl_InstanceID / 4), Position.z, 1) * vec4(instance_xform.xy, 1, 1);
 	gl_Position = vertOut.pos;
 	vertOut.col = Color;
 	vertOut.uv = vec4(UV.xy, 0, 1);
@@ -82,6 +85,16 @@ void main()
 
     uint32_t idxs[3] = {0, 1, 2};
 
+    for(int i = 0; i < 100; i++)
+    {
+      GraphicsWindow *win2 = MakeWindow(32, 32, "extra");
+      void *ctx2 = MakeContext(win2, mainContext);
+      ActivateContext(win2, ctx2);
+      ActivateContext(mainWindow, mainContext);
+      DestroyContext(ctx2);
+      delete win2;
+    }
+
     GLuint vb = MakeBuffer();
     glBindBuffer(GL_ARRAY_BUFFER, vb);
     glBufferStorage(GL_ARRAY_BUFFER, sizeof(DefaultTri), DefaultTri, 0);
@@ -102,12 +115,27 @@ void main()
 
     GLuint program = MakeProgram(common + vertex, common + pixel);
 
+    GLint loc = glGetUniformLocation(program, "instance_xform");
+
+    glEnable(GL_SCISSOR_TEST);
+
     while(Running())
     {
-      float col[] = {0.4f, 0.5f, 0.6f, 1.0f};
+      glScissor(0, 0, GLsizei(screenWidth), GLsizei(screenHeight));
+
+      float col[] = {0.2f, 0.2f, 0.2f, 1.0f};
       glClearBufferfv(GL_COLOR, 0, col);
 
+      // try to delete VAO 0. Should do nothing
+      GLuint zero = 0;
+      glDeleteVertexArrays(1, &zero);
+
+      // same with FBO 0
+      glDeleteFramebuffers(1, &zero);
+
       glUseProgram(program);
+
+      glUniform4f(loc, 1.0f, 1.0f, 0.0f, 0.0f);
 
       // use both buffers
       glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ib);
@@ -142,6 +170,24 @@ void main()
 
       glViewport((screenWidth * 3) / 4, 0, GLsizei(screenWidth) / 4, GLsizei(screenHeight));
       glDrawElements(GL_TRIANGLES, 3, GL_UNSIGNED_INT, idxs);
+
+      // draw with instance data that requires more data than a non-instanced stream would need
+      glViewport(0, 0, GLsizei(screenWidth) / 2, GLsizei(screenHeight) / 2);
+      glScissor(0, 0, GLsizei(screenWidth) / 2, GLsizei(screenHeight) / 2);
+      glClearBufferfv(GL_COLOR, 0, col);
+
+      Vec4f instcols[20] = {};
+      for(size_t i = 4; i < ARRAY_COUNT(instcols); i++)
+        instcols[i].z = 0.5f * (i - 3);
+
+      glUniform4f(loc, 0.25f, 0.25f, 0.0f, 0.0f);
+
+      glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, sizeof(Vec4f), instcols);
+      glVertexAttribDivisor(1, 1);
+
+      glDrawElementsInstancedBaseInstance(GL_TRIANGLES, 3, GL_UNSIGNED_INT, idxs, 16, 4);
+
+      glVertexAttribDivisor(1, 0);
 
       Present();
     }

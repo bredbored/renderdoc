@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2018-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -28,11 +28,25 @@
 #include "d3d11_context.h"
 #include "d3d11_debug.h"
 #include "d3d11_device.h"
+#include "d3d11_replay.h"
 #include "d3d11_resources.h"
 
 #include "data/hlsl/hlsl_cbuffers.h"
 
-void D3D11Replay::RenderMesh(uint32_t eventId, const std::vector<MeshFormat> &secondaryDraws,
+static uint32_t VisModeToMeshDisplayFormat(const MeshDisplay &cfg)
+{
+  switch(cfg.visualisationMode)
+  {
+    default: return (uint32_t)cfg.visualisationMode;
+    case Visualisation::Secondary:
+      return cfg.second.showAlpha ? MESHDISPLAY_SECONDARY_ALPHA : MESHDISPLAY_SECONDARY;
+    case Visualisation::Meshlet:
+      RDCERR("D3D11 does not support meshlet rendering");
+      return MESHDISPLAY_SOLID;
+  }
+}
+
+void D3D11Replay::RenderMesh(uint32_t eventId, const rdcarray<MeshFormat> &secondaryDraws,
                              const MeshDisplay &cfg)
 {
   if(cfg.position.vertexResourceId == ResourceId() || cfg.position.numIndices == 0)
@@ -49,10 +63,20 @@ void D3D11Replay::RenderMesh(uint32_t eventId, const std::vector<MeshFormat> &se
   Matrix4f projMat = Matrix4f::Perspective(90.0f, 0.1f, 100000.0f, m_OutputWidth / m_OutputHeight);
 
   Matrix4f camMat = cfg.cam ? ((Camera *)cfg.cam)->GetMatrix() : Matrix4f::Identity();
+
+  Matrix4f axisMapMat = Matrix4f(cfg.axisMapping);
+
   Matrix4f guessProjInv;
 
-  vertexData.ModelViewProj = projMat.Mul(camMat);
+  vertexData.ModelViewProj = projMat.Mul(camMat.Mul(axisMapMat));
   vertexData.SpriteSize = Vec2f();
+  vertexData.homogenousInput = cfg.position.unproject;
+  vertexData.vtxExploderSNorm = cfg.vtxExploderSliderSNorm;
+  vertexData.exploderCentre =
+      Vec3f((cfg.minBounds.x + cfg.maxBounds.x) * 0.5f, (cfg.minBounds.y + cfg.maxBounds.y) * 0.5f,
+            (cfg.minBounds.z + cfg.maxBounds.z) * 0.5f);
+  vertexData.exploderScale =
+      (cfg.visualisationMode == Visualisation::Explode) ? cfg.exploderScale : 0.0f;
 
   Vec4f col(0.0f, 0.0f, 0.0f, 1.0f);
   ID3D11Buffer *psCBuf = GetDebugManager()->MakeCBuffer(&col, sizeof(col));
@@ -139,6 +163,11 @@ void D3D11Replay::RenderMesh(uint32_t eventId, const std::vector<MeshFormat> &se
       if(cfg.ortho)
       {
         guessProj = Matrix4f::Orthographic(cfg.position.nearPlane, cfg.position.farPlane);
+      }
+
+      if(cfg.position.flipY)
+      {
+        guessProj[5] *= -1.0f;
       }
 
       guessProjInv = guessProj.Inverse();
@@ -250,21 +279,21 @@ void D3D11Replay::RenderMesh(uint32_t eventId, const std::vector<MeshFormat> &se
       m_pImmediateContext->IASetIndexBuffer(NULL, DXGI_FORMAT_UNKNOWN, NULL);
 
     // draw solid shaded mode
-    if(cfg.solidShadeMode != SolidShade::NoSolid && cfg.position.topology < Topology::PatchList_1CPs)
+    if(cfg.visualisationMode != Visualisation::NoSolid &&
+       cfg.position.topology < Topology::PatchList_1CPs)
     {
       m_pImmediateContext->RSSetState(m_General.RasterState);
 
       m_pImmediateContext->IASetPrimitiveTopology(topo);
 
-      pixelData.MeshDisplayFormat = (int)cfg.solidShadeMode;
-      if(cfg.solidShadeMode == SolidShade::Secondary && cfg.second.showAlpha)
-        pixelData.MeshDisplayFormat = MESHDISPLAY_SECONDARY_ALPHA;
+      pixelData.MeshDisplayFormat = VisModeToMeshDisplayFormat(cfg);
 
       pixelData.MeshColour = Vec3f(0.8f, 0.8f, 0.0f);
       GetDebugManager()->FillCBuffer(psCBuf, &pixelData, sizeof(pixelData));
       m_pImmediateContext->PSSetConstantBuffers(0, 1, &psCBuf);
 
-      if(cfg.solidShadeMode == SolidShade::Lit)
+      if(cfg.visualisationMode == Visualisation::Lit ||
+         cfg.visualisationMode == Visualisation::Explode)
       {
         MeshGeometryCBuffer geomData;
 
@@ -282,12 +311,13 @@ void D3D11Replay::RenderMesh(uint32_t eventId, const std::vector<MeshFormat> &se
       else
         m_pImmediateContext->Draw(cfg.position.numIndices, 0);
 
-      if(cfg.solidShadeMode == SolidShade::Lit)
+      if(cfg.visualisationMode == Visualisation::Lit ||
+         cfg.visualisationMode == Visualisation::Explode)
         m_pImmediateContext->GSSetShader(NULL, NULL, 0);
     }
 
     // draw wireframe mode
-    if(cfg.solidShadeMode == SolidShade::NoSolid || cfg.wireframeDraw ||
+    if(cfg.visualisationMode == Visualisation::NoSolid || cfg.wireframeDraw ||
        cfg.position.topology >= Topology::PatchList_1CPs)
     {
       m_pImmediateContext->RSSetState(m_MeshRender.WireframeRasterState);
@@ -314,9 +344,13 @@ void D3D11Replay::RenderMesh(uint32_t eventId, const std::vector<MeshFormat> &se
 
   m_pImmediateContext->RSSetState(m_MeshRender.WireframeRasterState);
 
+  vertexData.homogenousInput = 0U;
+
   // set up state for drawing helpers
   {
-    vertexData.ModelViewProj = projMat.Mul(camMat);
+    vertexData.ModelViewProj = projMat.Mul(camMat.Mul(axisMapMat));
+    vertexData.vtxExploderSNorm = 0.0f;
+    vertexData.exploderScale = 0.0f;
     GetDebugManager()->FillCBuffer(vsCBuf, &vertexData, sizeof(vertexData));
 
     m_pImmediateContext->RSSetState(m_MeshRender.SolidRasterState);
@@ -356,6 +390,8 @@ void D3D11Replay::RenderMesh(uint32_t eventId, const std::vector<MeshFormat> &se
 
   if(cfg.highlightVert != ~0U)
   {
+    vertexData.homogenousInput = cfg.position.unproject;
+
     m_HighlightCache.CacheHighlightingData(eventId, cfg);
 
     D3D11_PRIMITIVE_TOPOLOGY meshtopo = topo;
@@ -367,20 +403,19 @@ void D3D11Replay::RenderMesh(uint32_t eventId, const std::vector<MeshFormat> &se
     FloatVector activeVertex;
 
     // primitive this vert is a part of (red prim, optional)
-    std::vector<FloatVector> activePrim;
+    rdcarray<FloatVector> activePrim;
 
     // for patch lists, to show other verts in patch (green dots, optional)
     // for non-patch lists, we use the activePrim and adjacentPrimVertices
     // to show what other verts are related
-    std::vector<FloatVector> inactiveVertices;
+    rdcarray<FloatVector> inactiveVertices;
 
     // adjacency (line or tri, strips or lists) (green prims, optional)
     // will be N*M long, N adjacent prims of M verts each. M = primSize below
-    std::vector<FloatVector> adjacentPrimVertices;
+    rdcarray<FloatVector> adjacentPrimVertices;
 
-    D3D11_PRIMITIVE_TOPOLOGY primTopo =
-        D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;    // tri or line list
-    uint32_t primSize = 3;                        // number of verts per primitive
+    D3D11_PRIMITIVE_TOPOLOGY primTopo = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;    // tri or line list
+    uint32_t primSize = 3;    // number of verts per primitive
 
     if(meshtopo == D3D11_PRIMITIVE_TOPOLOGY_LINELIST ||
        meshtopo == D3D11_PRIMITIVE_TOPOLOGY_LINELIST_ADJ ||
@@ -403,7 +438,7 @@ void D3D11Replay::RenderMesh(uint32_t eventId, const std::vector<MeshFormat> &se
       if(cfg.position.unproject)
         vertexData.ModelViewProj = projMat.Mul(camMat.Mul(guessProjInv));
       else
-        vertexData.ModelViewProj = projMat.Mul(camMat);
+        vertexData.ModelViewProj = projMat.Mul(camMat.Mul(axisMapMat));
 
       m_pImmediateContext->IASetInputLayout(m_MeshRender.GenericLayout);
 
@@ -413,8 +448,8 @@ void D3D11Replay::RenderMesh(uint32_t eventId, const std::vector<MeshFormat> &se
       HRESULT hr = S_OK;
       UINT strides[] = {sizeof(Vec4f)};
       UINT offsets[] = {0};
-      m_pImmediateContext->IASetVertexBuffers(0, 1, &m_MeshRender.TriHighlightHelper,
-                                              (UINT *)&strides, (UINT *)&offsets);
+      m_pImmediateContext->IASetVertexBuffers(0, 1, &m_MeshRender.TriHighlightHelper, strides,
+                                              offsets);
 
       ////////////////////////////////////////////////////////////////
       // render primitives
@@ -478,7 +513,10 @@ void D3D11Replay::RenderMesh(uint32_t eventId, const std::vector<MeshFormat> &se
       m_pImmediateContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
 
       FloatVector vertSprite[4] = {
-          activeVertex, activeVertex, activeVertex, activeVertex,
+          activeVertex,
+          activeVertex,
+          activeVertex,
+          activeVertex,
       };
 
       hr = m_pImmediateContext->Map(m_MeshRender.TriHighlightHelper, 0, D3D11_MAP_WRITE_DISCARD, 0,
@@ -523,6 +561,8 @@ void D3D11Replay::RenderMesh(uint32_t eventId, const std::vector<MeshFormat> &se
       m_pImmediateContext->VSSetShader(m_MeshRender.MeshVS, NULL, 0);
   }
 
+  vertexData.homogenousInput = 0U;
+
   // bounding box
   if(cfg.showBBox)
   {
@@ -531,7 +571,7 @@ void D3D11Replay::RenderMesh(uint32_t eventId, const std::vector<MeshFormat> &se
     D3D11_MAPPED_SUBRESOURCE mapped;
 
     vertexData.SpriteSize = Vec2f();
-    vertexData.ModelViewProj = projMat.Mul(camMat);
+    vertexData.ModelViewProj = projMat.Mul(camMat.Mul(axisMapMat));
     GetDebugManager()->FillCBuffer(vsCBuf, &vertexData, sizeof(vertexData));
 
     HRESULT hr = m_pImmediateContext->Map(m_MeshRender.TriHighlightHelper, 0,
@@ -567,8 +607,7 @@ void D3D11Replay::RenderMesh(uint32_t eventId, const std::vector<MeshFormat> &se
     // we want this to clip
     m_pImmediateContext->OMSetDepthStencilState(m_MeshRender.LessEqualDepthState, 0);
 
-    m_pImmediateContext->IASetVertexBuffers(0, 1, &m_MeshRender.TriHighlightHelper,
-                                            (UINT *)&strides, (UINT *)&offsets);
+    m_pImmediateContext->IASetVertexBuffers(0, 1, &m_MeshRender.TriHighlightHelper, strides, offsets);
     m_pImmediateContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_LINELIST);
     m_pImmediateContext->IASetInputLayout(m_MeshRender.GenericLayout);
 
@@ -590,8 +629,7 @@ void D3D11Replay::RenderMesh(uint32_t eventId, const std::vector<MeshFormat> &se
     vertexData.ModelViewProj = projMat.Mul(camMat.Mul(guessProjInv));
     GetDebugManager()->FillCBuffer(vsCBuf, &vertexData, sizeof(vertexData));
 
-    m_pImmediateContext->IASetVertexBuffers(0, 1, &m_MeshRender.FrustumHelper, (UINT *)&strides,
-                                            (UINT *)&offsets);
+    m_pImmediateContext->IASetVertexBuffers(0, 1, &m_MeshRender.FrustumHelper, strides, offsets);
     m_pImmediateContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_LINELIST);
     m_pImmediateContext->IASetInputLayout(m_MeshRender.GenericLayout);
 

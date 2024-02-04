@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2017-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -24,7 +24,7 @@
 
 #include "lz4io.h"
 
-static const uint64_t lz4BlockSize = 64 * 1024;
+static const uint64_t lz4BlockSize = 1024 * 1024;
 
 LZ4Compressor::LZ4Compressor(StreamWriter *write, Ownership own) : Compressor(write, own)
 {
@@ -34,7 +34,7 @@ LZ4Compressor::LZ4Compressor(StreamWriter *write, Ownership own) : Compressor(wr
 
   m_PageOffset = 0;
 
-  LZ4_resetStream(&m_LZ4Comp);
+  m_LZ4Comp = LZ4_createStream();
 }
 
 LZ4Compressor::~LZ4Compressor()
@@ -42,6 +42,7 @@ LZ4Compressor::~LZ4Compressor()
   FreeAlignedBuffer(m_Page[0]);
   FreeAlignedBuffer(m_Page[1]);
   FreeAlignedBuffer(m_CompressBuffer);
+  LZ4_freeStream(m_LZ4Comp);
 }
 
 bool LZ4Compressor::Write(const void *data, uint64_t numBytes)
@@ -56,7 +57,7 @@ bool LZ4Compressor::Write(const void *data, uint64_t numBytes)
   // The basic plan is:
   // Write into page N incrementally until it is completely full. When full, flush it out to lz4 and
   // swap pages.
-  // This keeps lz4 happy with 64kb of history each time it compresses.
+  // This keeps lz4 happy with 1 block of history each time it compresses.
   // If we are writing some data the crosses the boundary between pages, we write the part that will
   // fit on one page, flush & swap, write the rest into the next page.
 
@@ -111,7 +112,7 @@ bool LZ4Compressor::Write(const void *data, uint64_t numBytes)
 bool LZ4Compressor::Finish()
 {
   // This function just writes the current page and closes lz4. Since we assume all blocks are
-  // precisely 64kb in size
+  // uniform in size
   // only the last one can be smaller, so we only write a partial page when finishing.
   // Calling Write() after Finish() is illegal
   return FlushPage0();
@@ -125,23 +126,27 @@ bool LZ4Compressor::FlushPage0()
 
   // m_PageOffset is the amount written, usually equal to lz4BlockSize except the last block.
   int32_t compSize =
-      LZ4_compress_fast_continue(&m_LZ4Comp, (const char *)m_Page[0], (char *)m_CompressBuffer,
-                                 (int)m_PageOffset, (int)LZ4_COMPRESSBOUND(lz4BlockSize), 1);
+      LZ4_compress_fast_continue(m_LZ4Comp, (const char *)m_Page[0], (char *)m_CompressBuffer,
+                                 (int)m_PageOffset, (int)LZ4_COMPRESSBOUND(lz4BlockSize), 20);
 
   if(compSize < 0)
   {
-    RDCERR("Error compressing: %i", compSize);
     FreeAlignedBuffer(m_Page[0]);
     FreeAlignedBuffer(m_Page[1]);
     FreeAlignedBuffer(m_CompressBuffer);
     m_Page[0] = m_Page[1] = m_CompressBuffer = NULL;
+    SET_ERROR_RESULT(m_Error, ResultCode::CompressionFailed, "LZ4 compression failed: %i", compSize);
     return false;
   }
 
   bool success = true;
 
   success &= m_Write->Write(compSize);
+  if(!success)
+    m_Error = m_Write->GetError();
   success &= m_Write->Write(m_CompressBuffer, compSize);
+  if(!success)
+    m_Error = m_Write->GetError();
 
   // swap pages
   std::swap(m_Page[0], m_Page[1]);
@@ -161,7 +166,9 @@ LZ4Decompressor::LZ4Decompressor(StreamReader *read, Ownership own) : Decompress
   m_PageOffset = 0;
   m_PageLength = 0;
 
-  LZ4_setStreamDecode(&m_LZ4Decomp, NULL, 0);
+  m_LZ4Decomp = LZ4_createStreamDecode();
+
+  LZ4_setStreamDecode(m_LZ4Decomp, NULL, 0);
 }
 
 LZ4Decompressor::~LZ4Decompressor()
@@ -169,6 +176,8 @@ LZ4Decompressor::~LZ4Decompressor()
   FreeAlignedBuffer(m_Page[0]);
   FreeAlignedBuffer(m_Page[1]);
   FreeAlignedBuffer(m_CompressBuffer);
+
+  LZ4_freeStreamDecode(m_LZ4Decomp);
 }
 
 bool LZ4Decompressor::Recompress(Compressor *comp)
@@ -179,7 +188,12 @@ bool LZ4Decompressor::Recompress(Compressor *comp)
   {
     success &= FillPage0();
     if(success)
+    {
       success &= comp->Write(m_Page[0], m_PageLength);
+
+      if(!success)
+        m_Error = comp->GetError();
+    }
   }
   success &= comp->Finish();
 
@@ -258,35 +272,48 @@ bool LZ4Decompressor::FillPage0()
   success &= m_Read->Read(compSize);
   if(!success || compSize < 0 || compSize > (int)LZ4_COMPRESSBOUND(lz4BlockSize))
   {
-    RDCERR("Error reading size: %i", compSize);
     FreeAlignedBuffer(m_Page[0]);
     FreeAlignedBuffer(m_Page[1]);
     FreeAlignedBuffer(m_CompressBuffer);
     m_Page[0] = m_Page[1] = m_CompressBuffer = NULL;
+
+    if(success)
+    {
+      m_Error = m_Read->GetError();
+    }
+    else
+    {
+      SET_ERROR_RESULT(m_Error, ResultCode::CompressionFailed,
+                       "LZ4 decompression encountered invalid compressed block size: %i", compSize);
+    }
     return false;
   }
+
   success &= m_Read->Read(m_CompressBuffer, compSize);
 
   if(!success)
   {
-    RDCERR("Error reading block: %i", compSize);
     FreeAlignedBuffer(m_Page[0]);
     FreeAlignedBuffer(m_Page[1]);
     FreeAlignedBuffer(m_CompressBuffer);
     m_Page[0] = m_Page[1] = m_CompressBuffer = NULL;
+    m_Error = m_Read->GetError();
     return false;
   }
 
-  int32_t decompSize = LZ4_decompress_safe_continue(&m_LZ4Decomp, (const char *)m_CompressBuffer,
+  int32_t decompSize = LZ4_decompress_safe_continue(m_LZ4Decomp, (const char *)m_CompressBuffer,
                                                     (char *)m_Page[0], compSize, lz4BlockSize);
 
   if(decompSize < 0)
   {
-    RDCERR("Error decompressing: %i", decompSize);
     FreeAlignedBuffer(m_Page[0]);
     FreeAlignedBuffer(m_Page[1]);
     FreeAlignedBuffer(m_CompressBuffer);
     m_Page[0] = m_Page[1] = m_CompressBuffer = NULL;
+
+    SET_ERROR_RESULT(m_Error, ResultCode::CompressionFailed,
+                     "LZ4 decompression failed on block: %i", decompSize);
+
     return false;
   }
 

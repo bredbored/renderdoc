@@ -29,7 +29,7 @@ def printVar(v, indent = ''):
 def sampleCode(controller):
 	print("Available disassembly formats:")
 
-	targets = controller.GetDisassemblyTargets()
+	targets = controller.GetDisassemblyTargets(True)
 
 	for disasm in targets:
 		print("  - " + disasm)
@@ -50,7 +50,7 @@ def sampleCode(controller):
 	print("Pixel shader:")
 	print(controller.DisassembleShader(pipe, ps, target))
 
-	cbufferVars = controller.GetCBufferVariableContents(ps.resourceId, entry, 0, cb.resourceId, 0)
+	cbufferVars = controller.GetCBufferVariableContents(pipe, ps.resourceId, rd.ShaderStage.Pixel, entry, 0, cb.resourceId, 0, 0)
 
 	for v in cbufferVars:
 		printVar(v)
@@ -60,31 +60,39 @@ def loadCapture(filename):
 	cap = rd.OpenCaptureFile()
 
 	# Open a particular file - see also OpenBuffer to load from memory
-	status = cap.OpenFile(filename, '', None)
+	result = cap.OpenFile(filename, '', None)
 
 	# Make sure the file opened successfully
-	if status != rd.ReplayStatus.Succeeded:
-		raise RuntimeError("Couldn't open file: " + str(status))
+	if result != rd.ResultCode.Succeeded:
+		raise RuntimeError("Couldn't open file: " + str(result))
 
 	# Make sure we can replay
 	if not cap.LocalReplaySupport():
 		raise RuntimeError("Capture cannot be replayed")
 
 	# Initialise the replay
-	status,controller = cap.OpenCapture(None)
+	result,controller = cap.OpenCapture(rd.ReplayOptions(), None)
 
-	if status != rd.ReplayStatus.Succeeded:
-		raise RuntimeError("Couldn't initialise replay: " + str(status))
+	if result != rd.ResultCode.Succeeded:
+		raise RuntimeError("Couldn't initialise replay: " + str(result))
 
 	return (cap, controller)
 
 if 'pyrenderdoc' in globals():
 	pyrenderdoc.Replay().BlockInvoke(sampleCode)
 else:
-	cap,controller = loadCapture('test.rdc')
+	rd.InitialiseReplay(rd.GlobalEnvironment(), [])
+
+	if len(sys.argv) <= 1:
+		print('Usage: python3 {} filename.rdc'.format(sys.argv[0]))
+		sys.exit(0)
+
+	cap,controller = loadCapture(sys.argv[1])
 
 	sampleCode(controller)
 
 	controller.Shutdown()
 	cap.Shutdown()
+
+	rd.ShutdownReplay()
 

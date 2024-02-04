@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2020-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -22,7 +22,9 @@
  * THE SOFTWARE.
  ******************************************************************************/
 
-#if defined(OPENGL_CORE)
+#if defined(GLES)
+#extension GL_OES_sample_variables : require
+#elif defined(OPENGL_CORE)
 #extension GL_ARB_sample_shading : require
 #endif
 
@@ -66,7 +68,7 @@ uniform ivec4 mscopy;
 void main()
 {
   ivec3 srcCoord =
-      ivec3(int(gl_FragCoord.x), int(gl_FragCoord.y), currentSlice *numMultiSamples + gl_SampleID);
+      ivec3(int(gl_FragCoord.x), int(gl_FragCoord.y), currentSlice * numMultiSamples + gl_SampleID);
 
   if(currentStencil < 256u)
   {

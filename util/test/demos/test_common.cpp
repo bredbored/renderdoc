@@ -1,26 +1,26 @@
 /******************************************************************************
-* The MIT License (MIT)
-*
-* Copyright (c) 2016-2019 Baldur Karlsson
-*
-* Permission is hereby granted, free of charge, to any person obtaining a copy
-* of this software and associated documentation files (the "Software"), to deal
-* in the Software without restriction, including without limitation the rights
-* to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-* copies of the Software, and to permit persons to whom the Software is
-* furnished to do so, subject to the following conditions:
-*
-* The above copyright notice and this permission notice shall be included in
-* all copies or substantial portions of the Software.
-*
-* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-* AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-* OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-* THE SOFTWARE.
-******************************************************************************/
+ * The MIT License (MIT)
+ *
+ * Copyright (c) 2019-2023 Baldur Karlsson
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ ******************************************************************************/
 
 #include "test_common.h"
 #include <stdarg.h>
@@ -28,9 +28,9 @@
 #include <algorithm>
 
 const DefaultA2V DefaultTri[3] = {
-    {Vec3f(-0.5f, -0.5f, 0.0f), Vec4f(1.0f, 0.0f, 0.0f, 1.0f), Vec2f(0.0f, 0.0f)},
+    {Vec3f(-0.5f, -0.5f, 0.0f), Vec4f(0.0f, 1.0f, 0.0f, 1.0f), Vec2f(0.0f, 0.0f)},
     {Vec3f(0.0f, 0.5f, 0.0f), Vec4f(0.0f, 1.0f, 0.0f, 1.0f), Vec2f(0.0f, 1.0f)},
-    {Vec3f(0.5f, -0.5f, 0.0f), Vec4f(0.0f, 0.0f, 1.0f, 1.0f), Vec2f(1.0f, 0.0f)},
+    {Vec3f(0.5f, -0.5f, 0.0f), Vec4f(0.0f, 1.0f, 0.0f, 1.0f), Vec2f(1.0f, 0.0f)},
 };
 
 /* XPM */
@@ -100,6 +100,29 @@ char tocupper(char c)
   return (char)toupper(c);
 }
 
+uint16_t MakeHalf(float f)
+{
+  bool sign = f < 0.0f;
+  f = sign ? -f : f;
+
+  if(f < 1e-15f)
+    return 0;
+
+  int exp;
+  f = frexpf(f, &exp);
+
+  uint32_t mantissa;
+  memcpy(&mantissa, &f, sizeof(mantissa));
+  mantissa = (mantissa & 0x007fffff) >> 13;
+
+  uint16_t ret = mantissa & 0x3ff;
+  ret |= ((exp + 14) << 10);
+  if(sign)
+    ret |= 0x8000;
+
+  return ret;
+}
+
 std::string strlower(const std::string &str)
 {
   std::string newstr(str);
@@ -129,6 +152,11 @@ std::string trim(const std::string &str)
 }
 
 static char printBuf[4096] = {};
+static FILE *logFile = NULL;
+
+#if defined(ANDROID)
+#include <android/log.h>
+#endif
 
 void DebugPrint(const char *fmt, ...)
 {
@@ -142,8 +170,18 @@ void DebugPrint(const char *fmt, ...)
   fputs(printBuf, stdout);
   fflush(stdout);
 
+  if(logFile)
+  {
+    fputs(printBuf, logFile);
+    fflush(logFile);
+  }
+
 #if defined(WIN32)
   OutputDebugStringA(printBuf);
+#endif
+
+#if defined(ANDROID)
+  __android_log_print(ANDROID_LOG_INFO, "rd_demos", "%s", printBuf);
 #endif
 }
 
@@ -177,17 +215,26 @@ void LoadXPM(const char **XPM, Texture &tex)
   }
 }
 
-#include "3rdparty/shaderc/shaderc.h"
-
 #ifndef HAVE_SHADERC
 #define HAVE_SHADERC 0
 #endif
 
-// this define toggles on/off using the linked shaderc. This can be useful if e.g. on windows the
-// shaderc in VULKAN_SDK is broken.
+// this define toggles on/off using the linked shaderc. This can be useful for quick testing without
+// having to remove the built shaderc files
 #define USE_LINKED_SHADERC (1 && HAVE_SHADERC)
 
+#if !USE_LINKED_SHADERC && defined(ANDROID)
+#error "can't execute shaderc on android"
+#endif
+
+#if USE_LINKED_SHADERC
+#include <shaderc/shaderc.h>
+#else
+typedef void *shaderc_compiler_t;
+#endif
+
 static shaderc_compiler_t shaderc = NULL;
+static std::string externalCompiler;
 
 bool InternalSpvCompiler()
 {
@@ -206,26 +253,43 @@ bool SpvCompilationSupported()
   if(shaderc)
     return true;
 
-  FILE *pipe = popen("glslc" EXECUTABLE_SUFFIX " --help 2>&1", "r");
+  for(std::string compiler : {"glslc", "glslangValidator"})
+  {
+    FILE *pipe = popen((compiler + EXECUTABLE_SUFFIX " --version 2>&1").c_str(), "r");
 
-  if(!pipe)
-    return false;
+    if(!pipe)
+      continue;
 
-  msleep(500);
+    msleep(500);
 
-  int code = pclose(pipe);
+    int code = pclose(pipe);
 
-  return WEXITSTATUS(code) == 0;
+    if(WEXITSTATUS(code) == 0)
+    {
+      externalCompiler = compiler;
+      return true;
+    }
+  }
+
+  return false;
 }
 
 std::vector<uint32_t> CompileShaderToSpv(const std::string &source_text, SPIRVTarget target,
-                                         ShaderLang lang, ShaderStage stage, const char *entry_point)
+                                         ShaderLang lang, ShaderStage stage, const char *entry_point,
+                                         const std::map<std::string, std::string> &macros)
 {
   std::vector<uint32_t> ret;
 
   if(shaderc)
   {
 #if USE_LINKED_SHADERC
+    static bool logged = false;
+
+    if(!logged)
+    {
+      logged = true;
+      TEST_LOG("Compiling using built-in shaderc");
+    }
     shaderc_compile_options_t opts = shaderc_compile_options_initialize();
 
     if(lang == ShaderLang::glsl)
@@ -250,9 +314,24 @@ std::vector<uint32_t> CompileShaderToSpv(const std::string &source_text, SPIRVTa
 
     if(target == SPIRVTarget::opengl)
       shaderc_compile_options_set_target_env(opts, shaderc_target_env_opengl, 0);
+    else if(target == SPIRVTarget::vulkan11)
+      shaderc_compile_options_set_target_env(opts, shaderc_target_env_vulkan,
+                                             shaderc_env_version_vulkan_1_1);
+    else if(target == SPIRVTarget::vulkan12)
+      shaderc_compile_options_set_target_env(opts, shaderc_target_env_vulkan,
+                                             shaderc_env_version_vulkan_1_2);
 
-    shaderc_compilation_result_t res = shaderc_compile_into_spv(
-        shaderc, source_text.c_str(), source_text.size(), shader_kind, "inshader", entry_point, opts);
+    for(auto it : macros)
+      shaderc_compile_options_add_macro_definition(opts, it.first.c_str(), it.first.length(),
+                                                   it.second.c_str(), it.second.length());
+
+    shaderc_compilation_result_t res;
+
+    if(lang == ShaderLang::spvasm)
+      res = shaderc_assemble_into_spv(shaderc, source_text.c_str(), source_text.size(), opts);
+    else
+      res = shaderc_compile_into_spv(shaderc, source_text.c_str(), source_text.size(), shader_kind,
+                                     "inshader", entry_point, opts);
 
     shaderc_compilation_status status = shaderc_result_get_compilation_status(res);
 
@@ -283,37 +362,105 @@ std::vector<uint32_t> CompileShaderToSpv(const std::string &source_text, SPIRVTa
 #endif
   }
 
-  std::string command_line = "glslc" EXECUTABLE_SUFFIX " -g -O0";
+  std::string command_line;
 
-  command_line += " -fentry-point=";
-  command_line += entry_point;
+  std::string path = GetExecutableName();
+  path.erase(path.find_last_of("/\\"));
+  path += "/tmp";
 
-  if(lang == ShaderLang::glsl)
-    command_line += " -x glsl";
-  else if(lang == ShaderLang::hlsl)
-    command_line += " -x hlsl";
+  MakeDir(path.c_str());
 
-  switch(stage)
+  std::string infile = path + "/input";
+  std::string outfile = path + "/output";
+
+  if(externalCompiler == "glslc")
   {
-    case ShaderStage::vert: command_line += " -fshader-stage=vert"; break;
-    case ShaderStage::frag: command_line += " -fshader-stage=frag"; break;
-    case ShaderStage::tesscontrol: command_line += " -fshader-stage=tesscontrol"; break;
-    case ShaderStage::tesseval: command_line += " -fshader-stage=tesseval"; break;
-    case ShaderStage::geom: command_line += " -fshader-stage=geom"; break;
-    case ShaderStage::comp: command_line += " -fshader-stage=comp"; break;
+    command_line = "glslc" EXECUTABLE_SUFFIX " -g -O0";
+    command_line += " -fentry-point=";
+    command_line += entry_point;
+
+    if(lang == ShaderLang::glsl)
+      command_line += " -x glsl";
+    else if(lang == ShaderLang::hlsl)
+      command_line += " -x hlsl";
+
+    for(auto it : macros)
+      command_line += " -D" + it.first + "=" + it.second;
+
+    // can't compile SPIR-V assembly if we specify a shader stage
+    if(lang != ShaderLang::spvasm)
+    {
+      switch(stage)
+      {
+        case ShaderStage::vert: command_line += " -fshader-stage=vert"; break;
+        case ShaderStage::frag: command_line += " -fshader-stage=frag"; break;
+        case ShaderStage::tesscontrol: command_line += " -fshader-stage=tesscontrol"; break;
+        case ShaderStage::tesseval: command_line += " -fshader-stage=tesseval"; break;
+        case ShaderStage::geom: command_line += " -fshader-stage=geom"; break;
+        case ShaderStage::comp: command_line += " -fshader-stage=comp"; break;
+      }
+    }
+    else
+    {
+      infile += ".spvasm";
+    }
+
+    if(target == SPIRVTarget::opengl)
+      command_line += " --target-env=opengl";
+    else if(target == SPIRVTarget::vulkan11)
+      command_line += " --target-env=vulkan1.1";
+    else if(target == SPIRVTarget::vulkan12)
+      command_line += " --target-env=vulkan1.2";
+
+    command_line += " -o ";
+    command_line += outfile;
+    command_line += " ";
+    command_line += infile;
+  }
+  else if(externalCompiler == "glslangValidator")
+  {
+    command_line = "glslangValidator" EXECUTABLE_SUFFIX " -g ";
+    command_line += " --entry-point ";
+    command_line += entry_point;
+
+    if(lang == ShaderLang::hlsl)
+      command_line += " -D";
+
+    if(lang == ShaderLang::spvasm)
+    {
+      TEST_ERROR("Can't compile SPIR-V assembly with glslangValidator");
+      return ret;
+    }
+
+    for(auto it : macros)
+      command_line += " -D" + it.first + "=" + it.second;
+
+    switch(stage)
+    {
+      case ShaderStage::vert: command_line += " -S vert"; break;
+      case ShaderStage::frag: command_line += " -S frag"; break;
+      case ShaderStage::tesscontrol: command_line += " -S tesscontrol"; break;
+      case ShaderStage::tesseval: command_line += " -S tesseval"; break;
+      case ShaderStage::geom: command_line += " -S geom"; break;
+      case ShaderStage::comp: command_line += " -S comp"; break;
+    }
+
+    if(target == SPIRVTarget::opengl)
+      command_line += " -G --target-env opengl";
+    else if(target == SPIRVTarget::vulkan11)
+      command_line += " -V --target-env vulkan1.1";
+    else if(target == SPIRVTarget::vulkan12)
+      command_line += " -V --target-env vulkan1.2";
+    else if(target == SPIRVTarget::vulkan)
+      command_line += " -V --target-env vulkan1.0";
+
+    command_line += " -o ";
+    command_line += outfile;
+    command_line += " ";
+    command_line += infile;
   }
 
-  char infile[MAX_PATH] = {};
-  char outfile[MAX_PATH] = {};
-  get_tmpnam(infile);
-  get_tmpnam(outfile);
-
-  command_line += " -o ";
-  command_line += outfile;
-  command_line += " ";
-  command_line += infile;
-
-  FILE *f = fopen(infile, "wb");
+  FILE *f = fopen(infile.c_str(), "wb");
   if(f)
   {
     fwrite(source_text.c_str(), 1, source_text.size(), f);
@@ -324,7 +471,7 @@ std::vector<uint32_t> CompileShaderToSpv(const std::string &source_text, SPIRVTa
 
   if(!pipe)
   {
-    TEST_ERROR("Couldn't run shaderc to compile shaders.");
+    TEST_ERROR("Couldn't run %s to compile shaders.", externalCompiler.c_str());
     return ret;
   }
 
@@ -334,11 +481,11 @@ std::vector<uint32_t> CompileShaderToSpv(const std::string &source_text, SPIRVTa
 
   if(code != 0)
   {
-    TEST_ERROR("Invoking shaderc failed: %s.", command_line.c_str());
+    TEST_ERROR("Invoking %s failed: %s.", externalCompiler.c_str(), command_line.c_str());
     return ret;
   }
 
-  f = fopen(outfile, "rb");
+  f = fopen(outfile.c_str(), "rb");
   if(f)
   {
     fseek(f, 0, SEEK_END);
@@ -348,8 +495,8 @@ std::vector<uint32_t> CompileShaderToSpv(const std::string &source_text, SPIRVTa
     fclose(f);
   }
 
-  unlink(infile);
-  unlink(outfile);
+  unlink(infile.c_str());
+  unlink(outfile.c_str());
 
   return ret;
 }
@@ -387,6 +534,11 @@ void GraphicsTest::Prepare(int argc, char **argv)
                         !strcmp(argv[i], "--max-frames")))
     {
       maxFrameCount = atoi(argv[i + 1]);
+    }
+
+    if(i + 1 < argc && !strcmp(argv[i], "--log"))
+    {
+      logFile = fopen(argv[i + 1], "w");
     }
 
     if(i + 1 < argc && (!strcmp(argv[i], "--width") || !strcmp(argv[i], "-w")))
@@ -429,10 +581,20 @@ bool GraphicsTest::Init()
   HMODULE mod = GetModuleHandleA("renderdoc.dll");
   if(mod)
     RENDERDOC_GetAPI = (pRENDERDOC_GetAPI)GetProcAddress(mod, "RENDERDOC_GetAPI");
-#else
+#elif defined(ANDROID)
+  void *mod = dlopen("libVkLayer_GLES_RenderDoc.so", RTLD_NOW | RTLD_NOLOAD);
+  if(mod)
+    RENDERDOC_GetAPI = (pRENDERDOC_GetAPI)dlsym(mod, "RENDERDOC_GetAPI");
+#elif defined(__linux__)
   void *mod = dlopen("librenderdoc.so", RTLD_NOW | RTLD_NOLOAD);
   if(mod)
     RENDERDOC_GetAPI = (pRENDERDOC_GetAPI)dlsym(mod, "RENDERDOC_GetAPI");
+#elif defined(__APPLE__)
+  void *mod = dlopen("librenderdoc.dylib", RTLD_NOW | RTLD_NOLOAD);
+  if(mod)
+    RENDERDOC_GetAPI = (pRENDERDOC_GetAPI)dlsym(mod, "RENDERDOC_GetAPI");
+#else
+#error UNKNOWN PLATFORM
 #endif
 
   if(RENDERDOC_GetAPI)

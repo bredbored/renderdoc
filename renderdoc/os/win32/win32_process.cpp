@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  * Copyright (c) 2014 Crytek
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -29,36 +29,25 @@
 #include <Psapi.h>
 #include <tchar.h>
 #include <tlhelp32.h>
-#include <string>
+#include "common/formatting.h"
 #include "core/core.h"
 #include "os/os_specific.h"
 #include "strings/string_utils.h"
 
-// add wstring strlower overload since we don't want to always be converting to/from wchars.
-static std::wstring strlower(std::wstring in)
-{
-  std::wstring ret;
-  ret.resize(in.size());
-  for(size_t i = 0; i < ret.size(); i++)
-    ret[i] = towlower(in[i]);
-  return ret;
-}
+#include <string>
 
-static std::vector<EnvironmentModification> &GetEnvModifications()
+static rdcarray<EnvironmentModification> &GetEnvModifications()
 {
-  static std::vector<EnvironmentModification> envCallbacks;
+  static rdcarray<EnvironmentModification> envCallbacks;
   return envCallbacks;
 }
 
 struct InsensitiveComparison
 {
-  bool operator()(const std::wstring &a, const std::wstring &b) const
-  {
-    return strlower(a) < strlower(b);
-  }
+  bool operator()(const rdcstr &a, const rdcstr &b) const { return strlower(a) < strlower(b); }
 };
 
-typedef std::map<std::wstring, std::string, InsensitiveComparison> EnvMap;
+typedef std::map<rdcstr, rdcstr, InsensitiveComparison> EnvMap;
 
 static EnvMap EnvStringToEnvMap(const wchar_t *envstring)
 {
@@ -70,41 +59,34 @@ static EnvMap EnvStringToEnvMap(const wchar_t *envstring)
   {
     const wchar_t *equals = wcschr(e, L'=');
 
-    std::wstring name;
-    std::wstring value;
+    rdcstr name = StringFormat::Wide2UTF8(rdcwstr(e, equals - e));
+    rdcstr value = StringFormat::Wide2UTF8(equals + 1);
 
-    name.assign(e, equals);
-    value = equals + 1;
+    ret[name] = value;
 
-    ret[name] = StringFormat::Wide2UTF8(value);
-
-    e += name.size();     // jump to =
-    e++;                  // advance past it
-    e += value.size();    // jump to \0
-    e++;                  // advance past it
+    // jump to \0 and past it
+    e += wcslen(e) + 1;
   }
 
   return ret;
 }
 
-void Process::RegisterEnvironmentModification(EnvironmentModification modif)
+void Process::RegisterEnvironmentModification(const EnvironmentModification &modif)
 {
   GetEnvModifications().push_back(modif);
 }
 
 static void ApplyEnvModifications(EnvMap &envValues,
-                                  const std::vector<EnvironmentModification> &modifications,
+                                  const rdcarray<EnvironmentModification> &modifications,
                                   bool setToSystem)
 {
   for(size_t i = 0; i < modifications.size(); i++)
   {
     const EnvironmentModification &m = modifications[i];
 
-    std::wstring name = StringFormat::UTF82Wide(m.name.c_str());
+    rdcstr value;
 
-    std::string value;
-
-    auto it = envValues.find(name);
+    auto it = envValues.find(m.name);
     if(it != envValues.end())
       value = it->second;
 
@@ -127,7 +109,7 @@ static void ApplyEnvModifications(EnvMap &envValues,
       {
         if(!value.empty())
         {
-          std::string prep = m.value;
+          rdcstr prep = m.value;
           if(m.sep == EnvSep::Platform || m.sep == EnvSep::SemiColon)
             prep += ";";
           else if(m.sep == EnvSep::Colon)
@@ -142,10 +124,11 @@ static void ApplyEnvModifications(EnvMap &envValues,
       }
     }
 
-    envValues[name] = value;
+    envValues[m.name] = value;
 
     if(setToSystem)
-      SetEnvironmentVariableW(name.c_str(), StringFormat::UTF82Wide(value).c_str());
+      SetEnvironmentVariableW(StringFormat::UTF82Wide(m.name).c_str(),
+                              StringFormat::UTF82Wide(value).c_str());
   }
 }
 
@@ -160,7 +143,7 @@ void Process::ApplyEnvironmentModification()
   LPWCH envStrings = GetEnvironmentStringsW();
   EnvMap envValues = EnvStringToEnvMap(envStrings);
   FreeEnvironmentStringsW(envStrings);
-  std::vector<EnvironmentModification> &modifications = GetEnvModifications();
+  rdcarray<EnvironmentModification> &modifications = GetEnvModifications();
 
   ApplyEnvModifications(envValues, modifications, true);
 
@@ -168,19 +151,18 @@ void Process::ApplyEnvironmentModification()
   modifications.clear();
 }
 
-const char *Process::GetEnvVariable(const char *name)
+rdcstr Process::GetEnvVariable(const rdcstr &name)
 {
-  DWORD ret = GetEnvironmentVariableA(name, NULL, 0);
-  if(ret == 0 && GetLastError() == ERROR_ENVVAR_NOT_FOUND)
-    return NULL;
+  DWORD len = GetEnvironmentVariableA(name.c_str(), NULL, 0);
+  if(len == 0 && GetLastError() == ERROR_ENVVAR_NOT_FOUND)
+    return rdcstr();
 
-  static char buf[1024] = {};
-  if(ret >= 1024)
-    RDCERR("Static buffer insufficiently sized");
+  rdcstr ret;
+  ret.resize(len + 1);
 
-  RDCEraseEl(buf);
-  GetEnvironmentVariableA(name, buf, RDCMIN((DWORD)1023U, ret));
-  return buf;
+  GetEnvironmentVariableA(name.c_str(), ret.data(), len);
+  ret.trim();
+  return ret;
 }
 
 uint64_t Process::GetMemoryUsage()
@@ -228,6 +210,11 @@ extern "C" __declspec(dllexport) void __cdecl INTERNAL_SetCaptureFile(const char
     RenderDoc::Inst().SetCaptureFileTemplate(capfile);
 }
 
+extern "C" __declspec(dllexport) void __cdecl INTERNAL_SetDebugLogFile(const char *logfile)
+{
+  RENDERDOC_SetDebugLogFile(logfile ? logfile : rdcstr());
+}
+
 static EnvironmentModification tempEnvMod;
 
 extern "C" __declspec(dllexport) void __cdecl INTERNAL_EnvModName(const char *name)
@@ -262,7 +249,7 @@ extern "C" __declspec(dllexport) void __cdecl INTERNAL_ApplyEnvMods(void *ignore
   Process::ApplyEnvironmentModification();
 }
 
-void InjectDLL(HANDLE hProcess, std::wstring libName)
+void InjectDLL(HANDLE hProcess, rdcwstr libName)
 {
   wchar_t dllPath[MAX_PATH + 1] = {0};
   wcscpy_s(dllPath, libName.c_str());
@@ -283,8 +270,8 @@ void InjectDLL(HANDLE hProcess, std::wstring libName)
     if(success)
     {
       HANDLE hThread = CreateRemoteThread(
-          hProcess, NULL, 0, (LPTHREAD_START_ROUTINE)GetProcAddress(kernel32, "LoadLibraryW"),
-          remoteMem, 0, NULL);
+          hProcess, NULL, 1024 * 1024U,
+          (LPTHREAD_START_ROUTINE)GetProcAddress(kernel32, "LoadLibraryW"), remoteMem, 0, NULL);
       if(hThread)
       {
         WaitForSingleObject(hThread, INFINITE);
@@ -309,11 +296,11 @@ void InjectDLL(HANDLE hProcess, std::wstring libName)
   }
 }
 
-uintptr_t FindRemoteDLL(DWORD pid, std::wstring libName)
+uintptr_t FindRemoteDLL(DWORD pid, rdcstr libName)
 {
   HANDLE hModuleSnap = INVALID_HANDLE_VALUE;
 
-  libName = strlower(libName);
+  rdcwstr wlibName = StringFormat::UTF82Wide(strlower(libName));
 
   // up to 10 retries
   for(int i = 0; i < 10; i++)
@@ -375,7 +362,7 @@ uintptr_t FindRemoteDLL(DWORD pid, std::wstring libName)
 
     numModules++;
 
-    if(wcsstr(modnameLower, libName.c_str()) == modnameLower)
+    if(wcsstr(modnameLower, wlibName.c_str()) == modnameLower)
     {
       ret = (uintptr_t)me32.modBaseAddr;
     }
@@ -399,7 +386,7 @@ uintptr_t FindRemoteDLL(DWORD pid, std::wstring libName)
     }
     else
     {
-      RDCERR("Couldn't find module '%ls' among %d modules", libName.c_str(), numModules);
+      RDCERR("Couldn't find module '%s' among %d modules", libName.c_str(), numModules);
     }
 
     if(h)
@@ -422,7 +409,7 @@ void InjectFunctionCall(HANDLE hProcess, uintptr_t renderdoc_remote, const char 
 
   RDCDEBUG("Injecting call to %s", funcName);
 
-  HMODULE renderdoc_local = GetModuleHandleA(STRINGIZE(RDOC_DLL_FILE) ".dll");
+  HMODULE renderdoc_local = GetModuleHandleA(STRINGIZE(RDOC_BASE_NAME) ".dll");
 
   uintptr_t func_local = (uintptr_t)GetProcAddress(renderdoc_local, funcName);
 
@@ -445,7 +432,8 @@ void InjectFunctionCall(HANDLE hProcess, uintptr_t renderdoc_remote, const char 
   VirtualFreeEx(hProcess, remoteMem, 0, MEM_RELEASE);
 }
 
-static PROCESS_INFORMATION RunProcess(const char *app, const char *workingDir, const char *cmdLine,
+static PROCESS_INFORMATION RunProcess(const rdcstr &app, const rdcstr &workingDir,
+                                      const rdcstr &cmdLine,
                                       const rdcarray<EnvironmentModification> &env, bool internal,
                                       HANDLE *phChildStdOutput_Rd, HANDLE *phChildStdError_Rd)
 {
@@ -459,28 +447,30 @@ static PROCESS_INFORMATION RunProcess(const char *app, const char *workingDir, c
   RDCEraseEl(pSec);
   RDCEraseEl(tSec);
 
+  si.cb = sizeof(si);
+
   pSec.nLength = sizeof(pSec);
   tSec.nLength = sizeof(tSec);
 
-  std::wstring workdir = L"";
+  rdcwstr workdir = L"";
 
-  if(workingDir != NULL && workingDir[0] != 0)
-    workdir = StringFormat::UTF82Wide(std::string(workingDir));
+  if(!workingDir.empty())
+    workdir = StringFormat::UTF82Wide(workingDir);
   else
-    workdir = StringFormat::UTF82Wide(get_dirname(std::string(app)));
+    workdir = StringFormat::UTF82Wide(get_dirname(app));
 
   wchar_t *paramsAlloc = NULL;
 
-  std::wstring wapp = StringFormat::UTF82Wide(std::string(app));
+  rdcwstr wapp = StringFormat::UTF82Wide(app);
 
   // CreateProcessW can modify the params, need space.
   size_t len = wapp.length() + 10;
 
-  std::wstring wcmd = L"";
+  rdcwstr wcmd = L"";
 
-  if(cmdLine != NULL && cmdLine[0] != 0)
+  if(!cmdLine.empty())
   {
-    wcmd = StringFormat::UTF82Wide(std::string(cmdLine));
+    wcmd = StringFormat::UTF82Wide(cmdLine);
     len += wcmd.length();
   }
 
@@ -492,11 +482,13 @@ static PROCESS_INFORMATION RunProcess(const char *app, const char *workingDir, c
   wcscat_s(paramsAlloc, len, wapp.c_str());
   wcscat_s(paramsAlloc, len, L"\"");
 
-  if(cmdLine != NULL && cmdLine[0] != 0)
+  if(!cmdLine.empty())
   {
     wcscat_s(paramsAlloc, len, L" ");
     wcscat_s(paramsAlloc, len, wcmd.c_str());
   }
+
+  bool inheritHandles = false;
 
   HANDLE hChildStdOutput_Wr = 0, hChildStdError_Wr = 0;
   if(phChildStdOutput_Rd)
@@ -521,6 +513,9 @@ static PROCESS_INFORMATION RunProcess(const char *app, const char *workingDir, c
     si.dwFlags |= STARTF_USESTDHANDLES;
     si.hStdOutput = hChildStdOutput_Wr;
     si.hStdError = hChildStdError_Wr;
+
+    // Need to inherit handles in CreateProcess for ReadFile to read stdout
+    inheritHandles = true;
   }
 
   // if it's a utility launch, hide the command prompt window from showing
@@ -528,7 +523,7 @@ static PROCESS_INFORMATION RunProcess(const char *app, const char *workingDir, c
     si.dwFlags |= STARTF_USESHOWWINDOW;
 
   if(!internal)
-    RDCLOG("Running process %s", app);
+    RDCLOG("Running process %s", app.c_str());
 
   // turn environment string to a UTF-8 map
   std::wstring envString;
@@ -539,24 +534,22 @@ static PROCESS_INFORMATION RunProcess(const char *app, const char *workingDir, c
     EnvMap envValues = EnvStringToEnvMap(envStrings);
     FreeEnvironmentStringsW(envStrings);
 
-    std::vector<EnvironmentModification> envMods;
-    envMods.insert(envMods.begin(), env.begin(), env.end());
-    ApplyEnvModifications(envValues, envMods, false);
+    ApplyEnvModifications(envValues, env, false);
 
     for(auto it = envValues.begin(); it != envValues.end(); ++it)
     {
-      envString += it->first;
+      envString += StringFormat::UTF82Wide(it->first).c_str();
       envString += L"=";
-      envString += StringFormat::UTF82Wide(it->second);
+      envString += StringFormat::UTF82Wide(it->second).c_str();
       envString.push_back(0);
     }
   }
 
-  BOOL retValue = CreateProcessW(NULL, paramsAlloc, &pSec, &tSec,
-                                 true,    // Need to inherit handles for ReadFile to read stdout
-                                 CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT,
-                                 envString.empty() ? NULL : (void *)envString.data(),
-                                 workdir.c_str(), &si, &pi);
+  BOOL retValue = CreateProcessW(
+      NULL, paramsAlloc, &pSec, &tSec, inheritHandles, CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT,
+      envString.empty() ? NULL : (void *)envString.data(), workdir.c_str(), &si, &pi);
+
+  DWORD err = GetLastError();
 
   if(phChildStdOutput_Rd)
   {
@@ -569,7 +562,7 @@ static PROCESS_INFORMATION RunProcess(const char *app, const char *workingDir, c
   if(!retValue)
   {
     if(!internal)
-      RDCWARN("Process %s could not be loaded.", app);
+      RDCWARN("Process %s could not be loaded (error %d).", app.c_str(), err);
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
     RDCEraseEl(pi);
@@ -578,11 +571,12 @@ static PROCESS_INFORMATION RunProcess(const char *app, const char *workingDir, c
   return pi;
 }
 
-ExecuteResult Process::InjectIntoProcess(uint32_t pid, const rdcarray<EnvironmentModification> &env,
-                                         const char *capturefile, const CaptureOptions &opts,
-                                         bool waitForExit)
+rdcpair<RDResult, uint32_t> Process::InjectIntoProcess(uint32_t pid,
+                                                       const rdcarray<EnvironmentModification> &env,
+                                                       const rdcstr &capturefile,
+                                                       const CaptureOptions &opts, bool waitForExit)
 {
-  std::wstring wcapturefile = capturefile == NULL ? L"" : StringFormat::UTF82Wide(capturefile);
+  rdcwstr wcapturefile = StringFormat::UTF82Wide(capturefile);
 
   HANDLE hProcess =
       OpenProcess(PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION | PROCESS_VM_OPERATION |
@@ -616,8 +610,8 @@ ExecuteResult Process::InjectIntoProcess(uint32_t pid, const rdcarray<Environmen
   RDCLOG("Injecting renderdoc into process %lu", pid);
 
   wchar_t renderdocPath[MAX_PATH] = {0};
-  GetModuleFileNameW(GetModuleHandleA(STRINGIZE(RDOC_DLL_FILE) ".dll"), &renderdocPath[0],
-                     MAX_PATH - 1);
+  GetModuleFileNameW(GetModuleHandleA(STRINGIZE(RDOC_BASE_NAME) ".dll"), &renderdocPath[0],
+                                      MAX_PATH - 1);
 
   wchar_t renderdocPathLower[MAX_PATH] = {0};
   memcpy(renderdocPathLower, renderdocPath, MAX_PATH * sizeof(wchar_t));
@@ -638,9 +632,11 @@ ExecuteResult Process::InjectIntoProcess(uint32_t pid, const rdcarray<Environmen
   if(!success)
   {
     DWORD err = GetLastError();
-    RDCERR("Couldn't determine bitness of process, err: %08x", err);
+    RDResult result;
+    SET_ERROR_RESULT(result, ResultCode::IncompatibleProcess,
+                     "Couldn't determine bitness of process, err: %08x", err);
     CloseHandle(hProcess);
-    return {ReplayStatus::IncompatibleProcess, 0};
+    return {result, 0};
   }
 
   bool capalt = false;
@@ -658,8 +654,11 @@ ExecuteResult Process::InjectIntoProcess(uint32_t pid, const rdcarray<Environmen
   if(!success)
   {
     DWORD err = GetLastError();
-    RDCERR("Couldn't determine bitness of self, err: %08x", err);
-    return {ReplayStatus::InternalError, 0};
+    RDResult result;
+    SET_ERROR_RESULT(result, ResultCode::IncompatibleProcess,
+                     "Couldn't determine bitness of self, err: %08x", err);
+    CloseHandle(hProcess);
+    return {result, 0};
   }
 
   // we know we're 32-bit, so if the target process is not wow64
@@ -708,10 +707,13 @@ ExecuteResult Process::InjectIntoProcess(uint32_t pid, const rdcarray<Environmen
     if(!capalt)
     {
       RDCDEBUG("Running from %ls", renderdocPathLower);
-      RDCERR("Can't capture x64 process with x86 renderdoc");
 
       CloseHandle(hProcess);
-      return {ReplayStatus::IncompatibleProcess, 0};
+      RDResult result;
+      SET_ERROR_RESULT(result, ResultCode::IncompatibleProcess,
+                       "Can't capture 64-bit program with 32-bit build of RenderDoc. Please run a "
+                       "64-bit build of RenderDoc");
+      return {result, 0};
     }
   }
 #else
@@ -829,16 +831,16 @@ ExecuteResult Process::InjectIntoProcess(uint32_t pid, const rdcarray<Environmen
     tSec.nLength = sizeof(tSec);
 
     // serialise to string with two chars per byte
-    std::string optstr = opts.EncodeAsString();
+    rdcstr optstr = opts.EncodeAsString();
 
     wchar_t *paramsAlloc = new wchar_t[2048];
 
-    std::string debugLogfile = RDCGETLOGFILE();
-    std::wstring wdebugLogfile = StringFormat::UTF82Wide(debugLogfile);
+    rdcstr debugLogfile = RDCGETLOGFILE();
+    rdcwstr wdebugLogfile = StringFormat::UTF82Wide(debugLogfile);
 
     _snwprintf_s(
         paramsAlloc, 2047, 2047,
-        L"\"%ls\" capaltbit --pid=%d --capfile=\"%ls\" --debuglog=\"%ls\" --capopts=\"%hs\"",
+        L"\"%ls\" capaltbit --pid=%u --capfile=\"%ls\" --debuglog=\"%ls\" --capopts=\"%hs\"",
         renderdocPath, pid, wcapturefile.c_str(), wdebugLogfile.c_str(), optstr.c_str());
 
     RDCDEBUG("params %ls", paramsAlloc);
@@ -855,8 +857,8 @@ ExecuteResult Process::InjectIntoProcess(uint32_t pid, const rdcarray<Environmen
 
       for(const EnvironmentModification &e : env)
       {
-        std::string name = trim(e.name.c_str());
-        std::string value = e.value.c_str();
+        rdcstr name = e.name.trimmed();
+        rdcstr value = e.value;
 
         if(name == "")
           break;
@@ -876,22 +878,29 @@ ExecuteResult Process::InjectIntoProcess(uint32_t pid, const rdcarray<Environmen
             case EnvSep::Platform: cmdWithEnv += L"-platform"; break;
             case EnvSep::SemiColon: cmdWithEnv += L"-semicolon"; break;
             case EnvSep::Colon: cmdWithEnv += L"-colon"; break;
+            case EnvSep::NoSep: break;
           }
         }
 
         cmdWithEnv += L" ";
 
         // escape the parameters
-        for(auto it = name.begin(); it != name.end(); ++it)
+        for(size_t it = 0; it < name.size(); it++)
         {
-          if(*it == '"')
-            it = name.insert(it, '\\') + 1;
+          if(name[it] == '"')
+          {
+            name.insert(it, '\\');
+            it++;
+          }
         }
 
-        for(auto it = value.begin(); it != value.end(); ++it)
+        for(size_t it = 0; it < value.size(); it++)
         {
-          if(*it == '"')
-            it = value.insert(it, '\\') + 1;
+          if(value[it] == '"')
+          {
+            value.insert(it, '\\');
+            it++;
+          }
         }
 
         if(name.back() == '\\')
@@ -900,8 +909,8 @@ ExecuteResult Process::InjectIntoProcess(uint32_t pid, const rdcarray<Environmen
         if(value.back() == '\\')
           value += "\\";
 
-        cmdWithEnv += L"\"" + StringFormat::UTF82Wide(name) + L"\" ";
-        cmdWithEnv += L"\"" + StringFormat::UTF82Wide(value) + L"\" ";
+        cmdWithEnv += L"\"" + std::wstring(StringFormat::UTF82Wide(name).c_str()) + L"\" ";
+        cmdWithEnv += L"\"" + std::wstring(StringFormat::UTF82Wide(value).c_str()) + L"\" ";
       }
 
       commandLine = (wchar_t *)cmdWithEnv.c_str();
@@ -914,10 +923,18 @@ ExecuteResult Process::InjectIntoProcess(uint32_t pid, const rdcarray<Environmen
 
     if(!retValue)
     {
-      RDCERR(
-          "Can't spawn alternate bitness renderdoccmd - have you built 32-bit and 64-bit?\n"
-          "You need to build the matching bitness for the programs you want to capture.");
-      return {ReplayStatus::InternalError, 0};
+      RDResult result;
+#if RENDERDOC_OFFICIAL_BUILD
+      SET_ERROR_RESULT(result, ResultCode::InternalError,
+                       "Can't run 32-bit renderdoccmd to capture 32-bit program.");
+#else
+      SET_ERROR_RESULT(
+          result, ResultCode::InternalError,
+          "Can't run 32-bit renderdoccmd to capture 32-bit program."
+          "If this is a locally built RenderDoc you must build both 32-bit and 64-bit versions.");
+#endif
+      CloseHandle(hProcess);
+      return {result, 0};
     }
 
     ResumeThread(pi.hThread);
@@ -934,49 +951,66 @@ ExecuteResult Process::InjectIntoProcess(uint32_t pid, const rdcarray<Environmen
     CloseHandle(hProcess);
 
     if(exitCode == 0)
-      return {ReplayStatus::UnknownError, 0};
-    if(exitCode < RenderDoc_FirstTargetControlPort)
-      return {(ReplayStatus)exitCode, 0};
+    {
+      RDResult result;
+      SET_ERROR_RESULT(result, ResultCode::UnknownError,
+                       "Encountered error while launching target 32-bit program.");
+      return {result, 0};
+    }
 
-    return {ReplayStatus::Succeeded, (uint32_t)exitCode};
+    if(exitCode < RenderDoc_FirstTargetControlPort)
+    {
+      ResultCode code = (ResultCode)exitCode;
+
+      RDResult result;
+      SET_ERROR_RESULT(result, code, "32-bit renderdoccmd returned '%s'", ToStr(code).c_str());
+      return {code, 0};
+    }
+
+    return {ResultCode::Succeeded, (uint32_t)exitCode};
   }
 
   InjectDLL(hProcess, renderdocPath);
 
-  uintptr_t loc = FindRemoteDLL(pid, CONCAT(L, STRINGIZE(RDOC_DLL_FILE)) L".dll");
+  const char *rdoc_dll = STRINGIZE(RDOC_BASE_NAME);
 
-  ExecuteResult result = {ReplayStatus::Succeeded, 0};
+  uintptr_t loc = FindRemoteDLL(pid, STRINGIZE(RDOC_BASE_NAME) ".dll");
+
+  rdcpair<RDResult, uint32_t> result = {ResultCode::Succeeded, 0};
 
   if(loc == 0)
   {
-    RDCERR("Can't locate " STRINGIZE(RDOC_DLL_FILE) ".dll in remote PID %d", pid);
-    result.status = ReplayStatus::InjectionFailed;
+    SET_ERROR_RESULT(
+        result.first, ResultCode::InjectionFailed,
+        "Failed to inject %s.dll into process. Check that the process did not crash or exit "
+        "early in initialisation, e.g. if the working directory is incorrectly set.",
+        rdoc_dll);
   }
   else
   {
     // safe to cast away the const as we know these functions don't modify the parameters
 
-    if(capturefile != NULL)
-      InjectFunctionCall(hProcess, loc, "INTERNAL_SetCaptureFile", (void *)capturefile,
-                         strlen(capturefile) + 1);
+    if(!capturefile.empty())
+      InjectFunctionCall(hProcess, loc, "INTERNAL_SetCaptureFile", (void *)capturefile.c_str(),
+                         capturefile.size() + 1);
 
-    std::string debugLogfile = RDCGETLOGFILE();
+    rdcstr debugLogfile = RDCGETLOGFILE();
 
-    InjectFunctionCall(hProcess, loc, "RENDERDOC_SetDebugLogFile", (void *)debugLogfile.c_str(),
+    InjectFunctionCall(hProcess, loc, "INTERNAL_SetDebugLogFile", (void *)debugLogfile.c_str(),
                        debugLogfile.size() + 1);
 
     InjectFunctionCall(hProcess, loc, "INTERNAL_SetCaptureOptions", (CaptureOptions *)&opts,
                        sizeof(CaptureOptions));
 
-    InjectFunctionCall(hProcess, loc, "INTERNAL_GetTargetControlIdent", &result.ident,
-                       sizeof(result.ident));
+    InjectFunctionCall(hProcess, loc, "INTERNAL_GetTargetControlIdent", &result.second,
+                       sizeof(result.second));
 
     if(!env.empty())
     {
       for(const EnvironmentModification &e : env)
       {
-        std::string name = trim(e.name.c_str());
-        std::string value = e.value.c_str();
+        rdcstr name = e.name.trimmed();
+        rdcstr value = e.value;
         EnvMod mod = e.mod;
         EnvSep sep = e.sep;
 
@@ -1005,24 +1039,38 @@ ExecuteResult Process::InjectIntoProcess(uint32_t pid, const rdcarray<Environmen
   return result;
 }
 
-uint32_t Process::LaunchProcess(const char *app, const char *workingDir, const char *cmdLine,
+uint32_t Process::LaunchProcess(const rdcstr &app, const rdcstr &workingDir, const rdcstr &cmdLine,
                                 bool internal, ProcessResult *result)
 {
   HANDLE hChildStdOutput_Rd = NULL, hChildStdError_Rd = NULL;
 
+  rdcstr appPath = app;
+  size_t len = appPath.length();
+  rdcstr ext;
+  if(len > 4)
+    ext = strlower(appPath.substr(len - 4));
+  if(ext != ".exe")
+    appPath += ".exe";
+
   PROCESS_INFORMATION pi =
-      RunProcess(app, workingDir, cmdLine, {}, internal, result ? &hChildStdOutput_Rd : NULL,
+      RunProcess(appPath, workingDir, cmdLine, {}, internal, result ? &hChildStdOutput_Rd : NULL,
                  result ? &hChildStdError_Rd : NULL);
 
   if(pi.dwProcessId == 0)
   {
     if(!internal)
-      RDCWARN("Couldn't launch process '%s'", app);
+      RDCWARN("Couldn't launch process '%s'", appPath.c_str());
+
+    if(hChildStdError_Rd != NULL)
+      CloseHandle(hChildStdError_Rd);
+    if(hChildStdOutput_Rd != NULL)
+      CloseHandle(hChildStdOutput_Rd);
+
     return 0;
   }
 
   if(!internal)
-    RDCLOG("Launched process '%s' with '%s'", app, cmdLine);
+    RDCLOG("Launched process '%s' with '%s'", appPath.c_str(), cmdLine.c_str());
 
   ResumeThread(pi.hThread);
 
@@ -1034,11 +1082,11 @@ uint32_t Process::LaunchProcess(const char *app, const char *workingDir, const c
     char chBuf[4096];
     DWORD dwOutputRead, dwErrorRead;
     BOOL success = FALSE;
-    std::string s;
+    rdcstr s;
     for(;;)
     {
       success = ReadFile(hChildStdOutput_Rd, chBuf, sizeof(chBuf), &dwOutputRead, NULL);
-      s = std::string(chBuf, dwOutputRead);
+      s = rdcstr(chBuf, dwOutputRead);
       result->strStdout += s;
 
       if(!success && !dwOutputRead)
@@ -1048,7 +1096,7 @@ uint32_t Process::LaunchProcess(const char *app, const char *workingDir, const c
     for(;;)
     {
       success = ReadFile(hChildStdError_Rd, chBuf, sizeof(chBuf), &dwErrorRead, NULL);
-      s = std::string(chBuf, dwErrorRead);
+      s = rdcstr(chBuf, dwErrorRead);
       result->strStderror += s;
 
       if(!success && !dwErrorRead)
@@ -1068,43 +1116,49 @@ uint32_t Process::LaunchProcess(const char *app, const char *workingDir, const c
   return pi.dwProcessId;
 }
 
-uint32_t Process::LaunchScript(const char *script, const char *workingDir, const char *argList,
-                               bool internal, ProcessResult *result)
+uint32_t Process::LaunchScript(const rdcstr &script, const rdcstr &workingDir,
+                               const rdcstr &argList, bool internal, ProcessResult *result)
 {
   // Change parameters to invoke command interpreter
-  std::string args = "/C " + std::string(script) + " " + std::string(argList);
+  rdcstr args = "/C " + script + " " + argList;
 
-  return LaunchProcess("cmd.exe", workingDir, args.c_str(), internal, result);
+  return LaunchProcess("cmd.exe", workingDir, args, internal, result);
 }
 
-ExecuteResult Process::LaunchAndInjectIntoProcess(const char *app, const char *workingDir,
-                                                  const char *cmdLine,
-                                                  const rdcarray<EnvironmentModification> &env,
-                                                  const char *capturefile,
-                                                  const CaptureOptions &opts, bool waitForExit)
+rdcpair<RDResult, uint32_t> Process::LaunchAndInjectIntoProcess(
+    const rdcstr &app, const rdcstr &workingDir, const rdcstr &cmdLine,
+    const rdcarray<EnvironmentModification> &env, const rdcstr &capturefile,
+    const CaptureOptions &opts, bool waitForExit)
 {
   void *func =
-      GetProcAddress(GetModuleHandleA(STRINGIZE(RDOC_DLL_FILE) ".dll"), "INTERNAL_SetCaptureFile");
+      GetProcAddress(GetModuleHandleA(STRINGIZE(RDOC_BASE_NAME) ".dll"), "INTERNAL_SetCaptureFile");
 
   if(func == NULL)
   {
-    RDCERR("Can't find required export function in " STRINGIZE(
-        RDOC_DLL_FILE) ".dll - corrupted/missing file?");
-    return {ReplayStatus::InternalError, 0};
+    const char *rdoc_dll = STRINGIZE(RDOC_BASE_NAME);
+    RDResult result;
+    SET_ERROR_RESULT(result, ResultCode::InternalError,
+                     "Can't find required export function in %s.dll - corrupted/missing file?",
+                     rdoc_dll);
+    return {result, 0};
   }
 
   PROCESS_INFORMATION pi = RunProcess(app, workingDir, cmdLine, env, false, NULL, NULL);
 
   if(pi.dwProcessId == 0)
-    return {ReplayStatus::InjectionFailed, 0};
+  {
+    RDResult result;
+    SET_ERROR_RESULT(result, ResultCode::InjectionFailed, "Failed to launch process");
+    return {result, 0};
+  }
 
-  ExecuteResult ret = InjectIntoProcess(pi.dwProcessId, {}, capturefile, opts, false);
+  rdcpair<RDResult, uint32_t> ret = InjectIntoProcess(pi.dwProcessId, {}, capturefile, opts, false);
 
   CloseHandle(pi.hProcess);
   ResumeThread(pi.hThread);
   ResumeThread(pi.hThread);
 
-  if(ret.ident == 0 || ret.status != ReplayStatus::Succeeded)
+  if(ret.second == 0 || ret.first != ResultCode::Succeeded)
   {
     CloseHandle(pi.hThread);
     return ret;
@@ -1136,15 +1190,15 @@ struct GlobalHookData
   {
     HANDLE pipe = NULL;
     DWORD appinitEnabled = 0;
-    std::wstring appinitDLLs;
+    rdcwstr appinitDLLs;
   } dataNative, dataWow32;
 
-  volatile int32_t finished = 0;
+  int32_t finished = 0;
   Threading::ThreadHandle pipeThread = 0;
 };
 
 // utility function to close the registry keys, print an error, and quit
-static bool HandleRegError(HKEY keyNative, HKEY keyWow32, LSTATUS ret, const char *msg)
+static RDResult HandleRegError(HKEY keyNative, HKEY keyWow32, LSTATUS ret, const char *msg)
 {
   if(keyNative)
     RegCloseKey(keyNative);
@@ -1152,8 +1206,11 @@ static bool HandleRegError(HKEY keyNative, HKEY keyWow32, LSTATUS ret, const cha
   if(keyWow32)
     RegCloseKey(keyWow32);
 
-  RDCERR("Error with AppInit registry keys - %s (%d)", msg, ret);
-  return false;
+  RDCLOG("Error with AppInit registry keys - %s (%d)", msg, ret);
+
+  RETURN_ERROR_RESULT(ResultCode::InjectionFailed,
+                      "Error updating registry to enable global hook.\n"
+                      "Check that RenderDoc is correctly running as administrator.");
 }
 
 #define REG_CHECK(msg)                                    \
@@ -1163,11 +1220,39 @@ static bool HandleRegError(HKEY keyNative, HKEY keyWow32, LSTATUS ret, const cha
   }
 
 // function to backup the previous settings for AppInit, then enable it and write our own paths.
-bool BackupAndChangeRegistry(GlobalHookData &hookdata, const std::wstring &shimpathWow32,
-                             const std::wstring &shimpathNative)
+RDResult BackupAndChangeRegistry(GlobalHookData &hookdata, const rdcstr &shimpathWow32,
+                                 const rdcstr &shimpathNative)
 {
   HKEY keyNative = NULL;
   HKEY keyWow32 = NULL;
+
+  // AppInit_DLLs requires short paths, but short paths can be disabled globally or on a per-volume
+  // level. If short paths are disabled we'll get the long path back, we *always* expect the path to
+  // get shorter because the shim filename is bigger than 8.3.
+
+  DWORD nativeShortSize = GetShortPathNameW(StringFormat::UTF82Wide(shimpathNative).c_str(), NULL,
+                                            (DWORD)shimpathNative.length());
+  if(nativeShortSize == (DWORD)shimpathNative.length() + 1)
+  {
+    RETURN_ERROR_RESULT(
+        ResultCode::FileIOFailed,
+        "RenderDoc is installed on a volume or system that has short paths disabled.\n"
+        "For the global hook, short paths must be enabled where RenderDoc is installed.");
+  }
+
+  if(!shimpathWow32.empty())
+  {
+    DWORD wow32ShortSize = GetShortPathNameW(StringFormat::UTF82Wide(shimpathWow32).c_str(), NULL,
+                                             (DWORD)shimpathWow32.length());
+
+    if(wow32ShortSize == (DWORD)shimpathWow32.length() + 1)
+    {
+      RETURN_ERROR_RESULT(
+          ResultCode::FileIOFailed,
+          "RenderDoc is installed on a volume or system that has short paths disabled.\n"
+          "For the global hook, short paths must be enabled where RenderDoc is installed.");
+    }
+  }
 
   // open the native key
   LSTATUS ret = RegCreateKeyExA(HKEY_LOCAL_MACHINE,
@@ -1198,9 +1283,9 @@ bool BackupAndChangeRegistry(GlobalHookData &hookdata, const std::wstring &shimp
   ret = RegGetValueW(keyNative, NULL, L"AppInit_DLLs", RRF_RT_ANY, NULL, NULL, &sz);
   if(ret == ERROR_MORE_DATA || ret == ERROR_SUCCESS)
   {
-    hookdata.dataNative.appinitDLLs.resize(sz / sizeof(wchar_t));
+    hookdata.dataNative.appinitDLLs = rdcwstr(sz / sizeof(wchar_t));
     ret = RegGetValueW(keyNative, NULL, L"AppInit_DLLs", RRF_RT_ANY, NULL,
-                       (void *)&hookdata.dataNative.appinitDLLs[0], &sz);
+                       hookdata.dataNative.appinitDLLs.data(), &sz);
   }
   REG_CHECK("Could not fetch AppInit_DLLs");
 
@@ -1208,12 +1293,12 @@ bool BackupAndChangeRegistry(GlobalHookData &hookdata, const std::wstring &shimp
   ret = RegSetValueExA(keyNative, "LoadAppInit_DLLs", 0, REG_DWORD, (const BYTE *)&one, sizeof(one));
   REG_CHECK("Could not set LoadAppInit_DLLs");
 
-  std::wstring shortpath;
-  shortpath = shimpathNative;
-  GetShortPathNameW(shimpathNative.c_str(), (wchar_t *)&shortpath[0], (DWORD)shortpath.size());
+  rdcwstr shortpath(shimpathNative.size());
+  GetShortPathNameW(StringFormat::UTF82Wide(shimpathNative).c_str(), shortpath.data(),
+                    (DWORD)shortpath.length());
 
   ret = RegSetValueExW(keyNative, L"AppInit_DLLs", 0, REG_SZ, (const BYTE *)shortpath.data(),
-                       DWORD(shortpath.size() * sizeof(wchar_t)));
+                       DWORD(shortpath.length() * sizeof(wchar_t)));
   REG_CHECK("Could not set AppInit_DLLs");
 
   // if we're doing Wow32, repeat the process for those keys
@@ -1228,20 +1313,21 @@ bool BackupAndChangeRegistry(GlobalHookData &hookdata, const std::wstring &shimp
     ret = RegGetValueW(keyWow32, NULL, L"AppInit_DLLs", RRF_RT_ANY, NULL, NULL, &sz);
     if(ret == ERROR_MORE_DATA || ret == ERROR_SUCCESS)
     {
-      hookdata.dataWow32.appinitDLLs.resize(sz / sizeof(wchar_t));
+      hookdata.dataWow32.appinitDLLs = rdcwstr(sz / sizeof(wchar_t));
       ret = RegGetValueW(keyWow32, NULL, L"AppInit_DLLs", RRF_RT_ANY, NULL,
-                         (void *)&hookdata.dataWow32.appinitDLLs[0], &sz);
+                         hookdata.dataWow32.appinitDLLs.data(), &sz);
     }
     REG_CHECK("Could not fetch AppInit_DLLs");
 
     ret = RegSetValueExA(keyWow32, "LoadAppInit_DLLs", 0, REG_DWORD, (const BYTE *)&one, sizeof(one));
     REG_CHECK("Could not set LoadAppInit_DLLs");
 
-    shortpath = shimpathWow32;
-    GetShortPathNameW(shimpathWow32.c_str(), &shortpath[0], (DWORD)shortpath.size());
+    shortpath = rdcwstr(shimpathWow32.size());
+    GetShortPathNameW(StringFormat::UTF82Wide(shimpathWow32).c_str(), shortpath.data(),
+                      (DWORD)shortpath.length());
 
     ret = RegSetValueExW(keyWow32, L"AppInit_DLLs", 0, REG_SZ, (const BYTE *)shortpath.data(),
-                         DWORD(shortpath.size() * sizeof(wchar_t)));
+                         DWORD(shortpath.length() * sizeof(wchar_t)));
     REG_CHECK("Could not set AppInit_DLLs");
   }
 
@@ -1297,7 +1383,7 @@ bool BackupAndChangeRegistry(GlobalHookData &hookdata, const std::wstring &shimp
     RDCERR("Backup registry data is:\n\n%ls\n\n", backup.c_str());
   }
 
-  return true;
+  return RDResult();
 }
 
 // switch error-handling to print-and-continue, as we can't really do anything about it at this
@@ -1334,8 +1420,8 @@ void RestoreRegistry(const GlobalHookData &hookdata)
   REG_CHECK("Could not set LoadAppInit_DLLs");
 
   ret = RegSetValueExW(keyNative, L"AppInit_DLLs", 0, REG_SZ,
-                       (const BYTE *)hookdata.dataNative.appinitDLLs.data(),
-                       DWORD(hookdata.dataNative.appinitDLLs.size() * sizeof(wchar_t)));
+                       (const BYTE *)hookdata.dataNative.appinitDLLs.c_str(),
+                       DWORD(hookdata.dataNative.appinitDLLs.length() * sizeof(wchar_t)));
   REG_CHECK("Could not set AppInit_DLLs");
 
   // if we opened it, restore the Wow32 values as well
@@ -1347,8 +1433,8 @@ void RestoreRegistry(const GlobalHookData &hookdata)
     REG_CHECK("Could not set LoadAppInit_DLLs");
 
     ret = RegSetValueExW(keyWow32, L"AppInit_DLLs", 0, REG_SZ,
-                         (const BYTE *)hookdata.dataWow32.appinitDLLs.data(),
-                         DWORD(hookdata.dataWow32.appinitDLLs.size() * sizeof(wchar_t)));
+                         (const BYTE *)hookdata.dataWow32.appinitDLLs.c_str(),
+                         DWORD(hookdata.dataWow32.appinitDLLs.length() * sizeof(wchar_t)));
     REG_CHECK("Could not set AppInit_DLLs");
   }
 }
@@ -1359,6 +1445,8 @@ static GlobalHookData *globalHook = NULL;
 // the global hook.
 static void GlobalHookThread()
 {
+  Threading::SetCurrentThreadName("GlobalHookThread");
+
   // keep looping doing an atomic compare-exchange to check that finished is still 0
   while(Atomic::CmpExch32(&globalHook->finished, 0, 0) == 0)
   {
@@ -1384,89 +1472,66 @@ static void GlobalHookThread()
   }
 }
 
-bool Process::StartGlobalHook(const char *pathmatch, const char *capturefile,
-                              const CaptureOptions &opts)
+RDResult Process::StartGlobalHook(const rdcstr &pathmatch, const rdcstr &capturefile,
+                                  const CaptureOptions &opts)
 {
-  if(pathmatch == NULL)
-    return false;
+  if(pathmatch.empty())
+  {
+    RETURN_ERROR_RESULT(ResultCode::InvalidParameter,
+                        "Invalid global hook parameter, empty path to match");
+  }
 
-  wchar_t renderdocPath[MAX_PATH] = {0};
-  GetModuleFileNameW(GetModuleHandleA(STRINGIZE(RDOC_DLL_FILE) ".dll"), &renderdocPath[0],
-                     MAX_PATH - 1);
+  rdcstr renderdocPath;
+  FileIO::GetLibraryFilename(renderdocPath);
 
-  wchar_t *slash = wcsrchr(renderdocPath, L'\\');
-
-  if(slash)
-    *slash = 0;
-  else
-    slash = renderdocPath + wcslen(renderdocPath);
+  renderdocPath = get_dirname(renderdocPath);
 
   // the native renderdoccmd.exe is always next to the dll. Wow32 will be somewhere else
-  std::wstring cmdpathNative = renderdocPath;
-  cmdpathNative += L"\\renderdoccmd.exe";
-  std::wstring cmdpathWow32;
+  rdcstr cmdpathNative = renderdocPath + "\\renderdoccmd.exe";
+  rdcstr cmdpathWow32;
 
-  std::wstring shimpathNative = renderdocPath;
-  std::wstring shimpathWow32;
+  rdcstr shimpathNative = renderdocPath;
+  rdcstr shimpathWow32;
 
 #if ENABLED(RDOC_X64)
 
   // native shim is just renderdocshim64.dll
-  *slash = 0;
-  wcscat_s(renderdocPath, L"\\renderdocshim64.dll");
-  shimpathNative = renderdocPath;
+  shimpathNative = renderdocPath + "\\renderdocshim64.dll";
 
   // if it looks like we're in the development environment, look for the alternate bitness in the
   // corresponding folder
-  const wchar_t *devLocation = wcsstr(renderdocPath, L"\\x64\\Development\\");
-  if(devLocation)
+  int devLocation = renderdocPath.find("\\x64\\Development");
+  if(devLocation >= 0)
   {
-    size_t idx = devLocation - renderdocPath;
+    renderdocPath.erase(devLocation, ~0U);
 
-    renderdocPath[idx] = 0;
-
-    shimpathWow32 = renderdocPath;
-    shimpathWow32 += L"\\Win32\\Development\\renderdocshim32.dll";
-
-    cmdpathWow32 = renderdocPath;
-    cmdpathWow32 += L"\\Win32\\Development\\renderdoccmd.exe";
+    shimpathWow32 = renderdocPath + "\\Win32\\Development\\renderdocshim32.dll";
+    cmdpathWow32 = renderdocPath + "\\Win32\\Development\\renderdoccmd.exe";
   }
-
-  if(!devLocation)
+  else
   {
-    devLocation = wcsstr(renderdocPath, L"\\x64\\Release\\");
+    devLocation = renderdocPath.find("\\x64\\Release");
 
-    if(devLocation)
+    if(devLocation >= 0)
     {
-      size_t idx = devLocation - renderdocPath;
+      renderdocPath.erase(devLocation, ~0U);
 
-      renderdocPath[idx] = 0;
-
-      shimpathWow32 = renderdocPath;
-      shimpathWow32 += L"\\Win32\\Release\\renderdocshim32.dll";
-
-      cmdpathWow32 = renderdocPath;
-      cmdpathWow32 += L"\\Win32\\Release\\renderdoccmd.exe";
+      shimpathWow32 = renderdocPath + "\\Win32\\Release\\renderdocshim32.dll";
+      cmdpathWow32 = renderdocPath + "\\Win32\\Release\\renderdoccmd.exe";
     }
   }
 
   // if we're not in the dev environment, assume it's under a x86\ subfolder
-  if(!devLocation)
+  if(devLocation < 0)
   {
-    *slash = 0;
-    shimpathWow32 = renderdocPath;
-    shimpathWow32 += L"\\x86\\renderdocshim32.dll";
-
-    cmdpathWow32 = renderdocPath;
-    cmdpathWow32 += L"\\x86\\renderdoccmd.exe";
+    shimpathWow32 = renderdocPath + "\\x86\\renderdocshim32.dll";
+    cmdpathWow32 = renderdocPath + "\\x86\\renderdoccmd.exe";
   }
 
 #else
 
   // nothing fancy to do here for 32-bit, just point the shim next to our dll.
-  *slash = 0;
-  wcscat_s(renderdocPath, L"\\renderdocshim32.dll");
-  shimpathNative = renderdocPath;
+  shimpathNative = renderdocPath + "\\renderdocshim32.dll";
 
 #endif
 
@@ -1474,9 +1539,9 @@ bool Process::StartGlobalHook(const char *pathmatch, const char *capturefile,
 
   // try to backup and change the registry settings to start loading our shim dlls. If that fails,
   // we bail out immediately
-  bool success = BackupAndChangeRegistry(hookdata, shimpathWow32, shimpathNative);
-  if(!success)
-    return false;
+  RDResult regStatus = BackupAndChangeRegistry(hookdata, shimpathWow32, shimpathNative);
+  if(regStatus != ResultCode::Succeeded)
+    return regStatus;
 
   PROCESS_INFORMATION pi = {0};
   STARTUPINFO si = {0};
@@ -1487,26 +1552,16 @@ bool Process::StartGlobalHook(const char *pathmatch, const char *capturefile,
 
   si.cb = sizeof(si);
 
-  std::wstring paramsAlloc;
-  paramsAlloc.resize(2048);
-
   // serialise to string with two chars per byte
-  std::string optstr = opts.EncodeAsString();
+  rdcstr optstr = opts.EncodeAsString();
+  rdcstr debugLogfile = RDCGETLOGFILE();
 
-  std::wstring wcapturefile =
-      capturefile == NULL ? L"" : StringFormat::UTF82Wide(std::string(capturefile));
-  std::wstring wpathmatch = StringFormat::UTF82Wide(std::string(pathmatch));
+  rdcstr params = StringFormat::Fmt(
+      "\"%s\" globalhook --match \"%s\" --capfile \"%s\" --debuglog \"%s\" --capopts \"%s\"",
+      cmdpathNative.c_str(), pathmatch.c_str(), capturefile.c_str(), debugLogfile.c_str(),
+      optstr.c_str());
 
-  std::string debugLogfile = RDCGETLOGFILE();
-  std::wstring wdebugLogfile = StringFormat::UTF82Wide(debugLogfile);
-
-  _snwprintf_s(&paramsAlloc[0], 2047, 2047,
-               L"\"%ls\" globalhook --match \"%ls\" --capfile \"%ls\" --debuglog \"%ls\" "
-               L"--capopts \"%hs\"",
-               cmdpathNative.c_str(), wpathmatch.c_str(), wcapturefile.c_str(),
-               wdebugLogfile.c_str(), optstr.c_str());
-
-  paramsAlloc[2047] = 0;
+  rdcwstr paramsAlloc = StringFormat::UTF82Wide(params);
 
   // we'll be setting stdin
   si.dwFlags = STARTF_USESHOWWINDOW | STARTF_USESTDHANDLES;
@@ -1516,6 +1571,8 @@ bool Process::StartGlobalHook(const char *pathmatch, const char *capturefile,
 
   // this is the end of the pipe that the child will inherit and use as stdin
   HANDLE childEnd = NULL;
+
+  DWORD err;
 
   // create a pipe with the writing end for us, and the reading end as the child process's stdin
   {
@@ -1529,9 +1586,10 @@ bool Process::StartGlobalHook(const char *pathmatch, const char *capturefile,
 
     if(!res)
     {
-      RDCERR("Could not create 32-bit stdin pipe");
+      err = GetLastError();
       RestoreRegistry(hookdata);
-      return false;
+      RETURN_ERROR_RESULT(ResultCode::InternalError, "Could not create 32-bit stdin pipe (err %u)",
+                          err);
     }
 
     // we don't want the child process to inherit our end
@@ -1539,9 +1597,10 @@ bool Process::StartGlobalHook(const char *pathmatch, const char *capturefile,
 
     if(!res)
     {
-      RDCERR("Could not make 32-bit stdin pipe inheritable");
+      err = GetLastError();
       RestoreRegistry(hookdata);
-      return false;
+      RETURN_ERROR_RESULT(ResultCode::InternalError,
+                          "Could not make 32-bit stdin pipe inheritable (err %u)", err);
     }
 
     si.hStdInput = childEnd;
@@ -1551,15 +1610,17 @@ bool Process::StartGlobalHook(const char *pathmatch, const char *capturefile,
   BOOL retValue = CreateProcessW(NULL, &paramsAlloc[0], &pSec, &tSec, true, CREATE_NEW_CONSOLE,
                                  NULL, NULL, &si, &pi);
 
+  err = GetLastError();
+
   // we don't need this end anymore, the child has it
   CloseHandle(childEnd);
 
   if(retValue == FALSE)
   {
-    RDCERR("Can't launch 64-bit renderdoccmd from '%ls'", cmdpathNative.c_str());
     CloseHandle(hookdata.dataNative.pipe);
     RestoreRegistry(hookdata);
-    return false;
+    RETURN_ERROR_RESULT(ResultCode::InternalError, "Can't launch renderdoccmd from '%s' (err %u)",
+                        cmdpathNative.c_str(), err);
   }
 
   CloseHandle(pi.hThread);
@@ -1569,13 +1630,12 @@ bool Process::StartGlobalHook(const char *pathmatch, const char *capturefile,
 
 // repeat the process for the Wow32 renderdoccmd
 #if ENABLED(RDOC_X64)
-  _snwprintf_s(&paramsAlloc[0], 2047, 2047,
-               L"\"%ls\" globalhook --match \"%ls\" --capfile \"%ls\" --debuglog \"%ls\" "
-               L"--capopts \"%hs\"",
-               cmdpathWow32.c_str(), wpathmatch.c_str(), wcapturefile.c_str(),
-               wdebugLogfile.c_str(), optstr.c_str());
+  params = StringFormat::Fmt(
+      "\"%s\" globalhook --match \"%s\" --capfile \"%s\" --debuglog \"%s\" --capopts \"%s\"",
+      cmdpathWow32.c_str(), pathmatch.c_str(), capturefile.c_str(), debugLogfile.c_str(),
+      optstr.c_str());
 
-  paramsAlloc[2047] = 0;
+  paramsAlloc = StringFormat::UTF82Wide(params);
 
   {
     SECURITY_ATTRIBUTES pipeSec;
@@ -1588,18 +1648,20 @@ bool Process::StartGlobalHook(const char *pathmatch, const char *capturefile,
 
     if(!res)
     {
-      RDCERR("Could not create 64-bit stdin pipe");
+      err = GetLastError();
       RestoreRegistry(hookdata);
-      return false;
+      RETURN_ERROR_RESULT(ResultCode::InternalError, "Could not create 64-bit stdin pipe (err %u)",
+                          err);
     }
 
     res = SetHandleInformation(hookdata.dataWow32.pipe, HANDLE_FLAG_INHERIT, 0);
 
     if(!res)
     {
-      RDCERR("Could not make 64-bit stdin pipe inheritable");
+      err = GetLastError();
       RestoreRegistry(hookdata);
-      return false;
+      RETURN_ERROR_RESULT(ResultCode::InternalError,
+                          "Could not make 64-bit stdin pipe inheritable (err %u)", err);
     }
 
     si.hStdInput = childEnd;
@@ -1608,16 +1670,18 @@ bool Process::StartGlobalHook(const char *pathmatch, const char *capturefile,
   retValue = CreateProcessW(NULL, &paramsAlloc[0], &pSec, &tSec, true, CREATE_NEW_CONSOLE, NULL,
                             NULL, &si, &pi);
 
+  err = GetLastError();
+
   // we don't need this end anymore
   CloseHandle(childEnd);
 
   if(retValue == FALSE)
   {
-    RDCERR("Can't launch 32-bit renderdoccmd from '%ls'", cmdpathWow32.c_str());
     CloseHandle(hookdata.dataNative.pipe);
     CloseHandle(hookdata.dataWow32.pipe);
     RestoreRegistry(hookdata);
-    return false;
+    RETURN_ERROR_RESULT(ResultCode::InternalError, "Can't launch renderdoccmd from '%s' (err %u)",
+                        cmdpathWow32.c_str(), err);
   }
 
   CloseHandle(pi.hThread);
@@ -1630,7 +1694,7 @@ bool Process::StartGlobalHook(const char *pathmatch, const char *capturefile,
 
   globalHook->pipeThread = Threading::CreateThread(&GlobalHookThread);
 
-  return true;
+  return RDResult();
 }
 
 bool Process::IsGlobalHookActive()
@@ -1656,21 +1720,26 @@ void Process::StopGlobalHook()
   globalHook = NULL;
 }
 
-void *Process::LoadModule(const char *module)
+bool Process::IsModuleLoaded(const rdcstr &module)
 {
-  HMODULE mod = GetModuleHandleA(module);
+  return GetModuleHandleA(module.c_str()) != NULL;
+}
+
+void *Process::LoadModule(const rdcstr &module)
+{
+  HMODULE mod = GetModuleHandleA(module.c_str());
   if(mod != NULL)
     return mod;
 
-  return LoadLibraryA(module);
+  return LoadLibraryA(module.c_str());
 }
 
-void *Process::GetFunctionAddress(void *module, const char *function)
+void *Process::GetFunctionAddress(void *module, const rdcstr &function)
 {
   if(module == NULL)
     return NULL;
 
-  return (void *)GetProcAddress((HMODULE)module, function);
+  return (void *)GetProcAddress((HMODULE)module, function.c_str());
 }
 
 uint32_t Process::GetCurrentPID()

@@ -1,36 +1,37 @@
 /******************************************************************************
-* The MIT License (MIT)
-*
-* Copyright (c) 2019 Baldur Karlsson
-*
-* Permission is hereby granted, free of charge, to any person obtaining a copy
-* of this software and associated documentation files (the "Software"), to deal
-* in the Software without restriction, including without limitation the rights
-* to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-* copies of the Software, and to permit persons to whom the Software is
-* furnished to do so, subject to the following conditions:
-*
-* The above copyright notice and this permission notice shall be included in
-* all copies or substantial portions of the Software.
-*
-* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-* AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-* OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-* THE SOFTWARE.
-******************************************************************************/
+ * The MIT License (MIT)
+ *
+ * Copyright (c) 2019-2023 Baldur Karlsson
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ ******************************************************************************/
 
-#include "intervals.h"
 #include "common/globalconfig.h"
 
 #if ENABLED(ENABLE_UNIT_TESTS)
 
-#include "3rdparty/catch/catch.hpp"
+#include "api/replay/rdcarray.h"
+#include "intervals.h"
+
+#include "catch/catch.hpp"
 
 #include <stdint.h>
-#include <vector>
 
 struct Interval
 {
@@ -39,7 +40,7 @@ struct Interval
   uint64_t end;
 };
 
-void check_intervals(Intervals<uint64_t> &value, const std::vector<Interval> &expected)
+void check_intervals(Intervals<uint64_t> &value, const rdcarray<Interval> &expected)
 {
   auto i = value.begin();
   auto j = expected.begin();
@@ -53,15 +54,14 @@ void check_intervals(Intervals<uint64_t> &value, const std::vector<Interval> &ex
   CHECK((j == expected.end()));
 }
 
-Intervals<uint64_t> make_intervals(const std::vector<Interval> &intervals)
+Intervals<uint64_t> make_intervals(const rdcarray<Interval> &intervals)
 {
   Intervals<uint64_t> res;
   for(auto i = intervals.begin(); i != intervals.end(); i++)
   {
     auto j = res.end();
     j--;
-    if(i->start > j->start())
-      j->split(i->start);
+    RDCASSERTMSG("make_intervals parameters must fully specify intervals", i->start == j->start());
     if(i->end < j->finish())
     {
       j->split(i->end);
@@ -283,15 +283,14 @@ TEST_CASE("Test Intervals type", "[intervals]")
     SECTION("update an empty interval at 0")
     {
       Intervals<uint64_t> test = make_intervals({{0, 0, 5}, {5, 1, 10}, {10, 0, UINT64_MAX}});
-      test.update(0, 0, 1, [](uint64_t x, uint64_t y) -> uint64_t { return x + y; });
+      test.update(0, 0, 1, [](uint64_t x, uint64_t y) -> uint64_t { return 99; });
       check_intervals(test, {{0, 0, 5}, {5, 1, 10}, {10, 0, UINT64_MAX}});
     };
 
     SECTION("update an empty interval at UINT64_MAX")
     {
       Intervals<uint64_t> test = make_intervals({{0, 0, 5}, {5, 1, 10}, {10, 0, UINT64_MAX}});
-      test.update(UINT64_MAX, UINT64_MAX, 1,
-                  [](uint64_t x, uint64_t y) -> uint64_t { return x + y; });
+      test.update(UINT64_MAX, UINT64_MAX, 1, [](uint64_t x, uint64_t y) -> uint64_t { return 99; });
       check_intervals(test, {{0, 0, 5}, {5, 1, 10}, {10, 0, UINT64_MAX}});
     };
   };

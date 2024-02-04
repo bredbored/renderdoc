@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2017-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -48,10 +48,11 @@ class LogItemModel : public QAbstractItemModel
 {
 public:
   LogItemModel(LogView *view) : QAbstractItemModel(view), m_Viewer(view) {}
-  void refresh()
+  void addRows(int numLines)
   {
-    emit beginResetModel();
-    emit endResetModel();
+    int count = rowCount();
+    emit beginInsertRows(QModelIndex(), count - numLines, count - 1);
+    emit endInsertRows();
   }
 
   QModelIndex index(int row, int column, const QModelIndex &parent = QModelIndex()) const override
@@ -120,7 +121,7 @@ public:
             case Column_Message:
             {
               QVariant desc = msg.Message;
-              RichResourceTextInitialise(desc);
+              RichResourceTextInitialise(desc, &m_Viewer->m_Ctx);
               return desc;
             }
             default: break;
@@ -157,17 +158,25 @@ public:
   void refresh()
   {
     emit beginResetModel();
-
-    int numRows = sourceModel()->rowCount();
-
     m_VisibleRows.clear();
-    m_VisibleRows.reserve(numRows);
-
-    for(int i = 0; i < numRows; i++)
+    for(int i = 0; i < sourceModel()->rowCount(); i++)
       if(isVisibleRow(i))
         m_VisibleRows.push_back(i);
-
     emit endResetModel();
+  }
+
+  void addRows(int addedRows)
+  {
+    int numRows = sourceModel()->rowCount();
+    emit beginInsertRows(QModelIndex(), numRows - addedRows, numRows - 1);
+
+    m_VisibleRows.reserve(m_VisibleRows.count() + addedRows);
+
+    for(int i = 0; i < addedRows; i++)
+      if(isVisibleRow(numRows - addedRows + i))
+        m_VisibleRows.push_back(numRows - addedRows + i);
+
+    emit endInsertRows();
   }
 
   virtual QModelIndex mapFromSource(const QModelIndex &sourceIndex) const override
@@ -188,7 +197,7 @@ public:
     if(proxyIndex.row() >= 0 && proxyIndex.row() < m_VisibleRows.count())
       row = m_VisibleRows[proxyIndex.row()];
 
-    return sourceModel()->index(row, proxyIndex.column(), proxyIndex.parent());
+    return sourceModel()->index(row, proxyIndex.column());
   }
 
   virtual int rowCount(const QModelIndex &parent = QModelIndex()) const override
@@ -218,6 +227,12 @@ public:
       return sourceModel()->headerData(m_VisibleRows[section], orientation, role);
     }
     return QVariant();
+  }
+  void itemChanged(const QModelIndex &idx, const QVector<int> &roles)
+  {
+    QModelIndex topLeft = index(idx.row(), 0);
+    QModelIndex bottomRight = index(idx.row(), columnCount() - 1);
+    emit dataChanged(topLeft, bottomRight, roles);
   }
 
 protected:
@@ -268,7 +283,14 @@ LogView::LogView(ICaptureContext &ctx, QWidget *parent)
   m_FilterModel->setSourceModel(m_ItemModel);
   ui->messages->setModel(m_FilterModel);
 
-  ui->messages->setFont(QFontDatabase::systemFont(QFontDatabase::FixedFont));
+  ui->messages->viewport()->installEventFilter(this);
+
+  m_delegate = new RichTextViewDelegate(ui->messages);
+  ui->messages->setItemDelegate(m_delegate);
+
+  ui->messages->setMouseTracking(true);
+
+  ui->messages->setFont(Formatter::FixedFont());
 
   m_TypeModel = new QStandardItemModel(0, 1, this);
 
@@ -276,11 +298,6 @@ LogView::LogView(ICaptureContext &ctx, QWidget *parent)
 
   for(LogType type : values<LogType>())
   {
-    // don't bother allowing fatal filtering. The UI is no longer running when one of these is
-    // logged
-    if(type == LogType::Fatal)
-      continue;
-
     logTypeStrings.push_back(ToQStr(type));
 
     QStandardItem *item = new QStandardItem(ToQStr(type));
@@ -297,12 +314,10 @@ LogView::LogView(ICaptureContext &ctx, QWidget *parent)
 
   ui->pidFilter->setModel(m_PIDModel);
 
-  {
-    RDHeaderView *header = new RDHeaderView(Qt::Horizontal, this);
-    ui->messages->setHeader(header);
+  ui->messages->header()->setSectionResizeMode(QHeaderView::Fixed);
 
-    header->setColumnStretchHints({-1, -1, -1, -1, -1, 1});
-  }
+  for(int c = 0; c < m_ItemModel->columnCount(); c++)
+    ui->messages->resizeColumnToContents(c);
 
   messages_refresh();
 
@@ -322,7 +337,6 @@ LogView::~LogView()
   m_Ctx.BuiltinWindowClosed(this);
 
   m_Messages.clear();
-  m_ItemModel->refresh();
 
   delete ui;
 }
@@ -354,7 +368,7 @@ void LogView::on_save_clicked()
   }
 
   rdcstr contents;
-  RENDERDOC_GetLogFileContents(contents);
+  RENDERDOC_GetLogFileContents(0, contents);
 
   f->write(QByteArray(contents.c_str(), contents.count()));
 
@@ -433,6 +447,28 @@ void LogView::typeFilter_changed(QStandardItem *item)
   ui->typeFilter->setCurrentIndex(0);
 }
 
+bool LogView::eventFilter(QObject *watched, QEvent *event)
+{
+  if(watched == ui->messages->viewport() && event->type() == QEvent::MouseMove)
+  {
+    bool ret = QObject::eventFilter(watched, event);
+
+    if(m_delegate->linkHover((QMouseEvent *)event, font(), ui->messages->currentHoverIndex()))
+    {
+      m_FilterModel->itemChanged(ui->messages->currentHoverIndex(), {Qt::DecorationRole});
+      ui->messages->setCursor(QCursor(Qt::PointingHandCursor));
+    }
+    else
+    {
+      ui->messages->unsetCursor();
+    }
+
+    return ret;
+  }
+
+  return QObject::eventFilter(watched, event);
+}
+
 void LogView::pidFilter_changed(QStandardItem *item)
 {
   uint32_t PID = item->text().toUInt();
@@ -450,14 +486,14 @@ void LogView::pidFilter_changed(QStandardItem *item)
 void LogView::messages_refresh()
 {
   rdcstr contents;
-  RENDERDOC_GetLogFileContents(contents);
+  RENDERDOC_GetLogFileContents(prevOffset, contents);
 
-  if(prevOffset == contents.size())
+  if(contents.empty())
     return;
 
   // look at all new lines since the last one we saw
-  QStringList lines = QString(contents.substr(prevOffset)).split(QRegularExpression(lit("[\r\n]")));
-  prevOffset = contents.size();
+  QStringList lines = QString(contents).split(QRegularExpression(lit("[\r\n]")));
+  prevOffset += contents.size();
 
   QString r =
       lit("^"                                                // start of the line
@@ -469,6 +505,8 @@ void LogView::messages_refresh()
           "(.*)");
 
   QRegularExpression logRegex(r);
+
+  int prevCount = m_Messages.count();
 
   for(const QString &line : lines)
   {
@@ -508,8 +546,22 @@ void LogView::messages_refresh()
 
   if(!lines.isEmpty())
   {
-    m_ItemModel->refresh();
-    m_FilterModel->refresh();
+    m_ItemModel->addRows(m_Messages.count() - prevCount);
+    m_FilterModel->addRows(m_Messages.count() - prevCount);
+  }
+
+  // go through each new message and size up columns to fit
+  for(int i = prevCount; i < m_Messages.count(); i++)
+  {
+    for(int c = 0; c < ui->messages->model()->columnCount(); c++)
+    {
+      QSize s = ui->messages->sizeHintForIndex(ui->messages->model()->index(i, c));
+
+      int w = ui->messages->header()->sectionSize(c);
+
+      if(s.width() > w)
+        ui->messages->header()->resizeSection(c, s.width());
+    }
   }
 
   if(ui->followNew->isChecked())

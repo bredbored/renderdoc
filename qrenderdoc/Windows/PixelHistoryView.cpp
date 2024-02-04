@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2017-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -27,7 +27,8 @@
 #include <math.h>
 #include <QAction>
 #include <QMenu>
-#include "3rdparty/toolwindowmanager/ToolWindowManager.h"
+#include "Code/Resources.h"
+#include "toolwindowmanager/ToolWindowManager.h"
 #include "ui_PixelHistoryView.h"
 
 struct EventTag
@@ -42,8 +43,8 @@ class PixelHistoryItemModel : public QAbstractItemModel
 {
 public:
   PixelHistoryItemModel(ICaptureContext &ctx, ResourceId tex, const TextureDisplay &display,
-                        QObject *parent)
-      : QAbstractItemModel(parent), m_Ctx(ctx)
+                        const QPalette &palette, QObject *parent)
+      : QAbstractItemModel(parent), m_Ctx(ctx), m_Palette(palette)
   {
     m_Tex = m_Ctx.GetTexture(tex);
     m_Display = display;
@@ -51,7 +52,7 @@ public:
     CompType compType = m_Tex->format.compType;
 
     if(compType == CompType::Typeless)
-      compType = display.typeHint;
+      compType = display.typeCast;
 
     m_IsUint = (compType == CompType::UInt);
     m_IsSint = (compType == CompType::SInt);
@@ -133,9 +134,9 @@ public:
     if(isEvent(parent))
     {
       const QList<PixelModification> &mods = getMods(parent);
-      const DrawcallDescription *draw = m_Ctx.GetDrawcall(mods.front().eventId);
+      const ActionDescription *action = m_Ctx.GetAction(mods.front().eventId);
 
-      if(draw && draw->flags & DrawFlags::Clear)
+      if(action && action->flags & (ActionFlags::Clear | ActionFlags::PassBoundary))
         return 0;
 
       return mods.count();
@@ -187,38 +188,39 @@ public:
 
       if(role == Qt::DisplayRole)
       {
+        QString uavName = IsD3D(m_Ctx.APIProps().pipelineType) ? lit("UAV") : lit("Storage");
         // main text
         if(col == 0)
         {
           if(isEvent(index))
           {
             const QList<PixelModification> &mods = getMods(index);
-            const DrawcallDescription *drawcall = m_Ctx.GetDrawcall(mods.front().eventId);
-            if(!drawcall)
+            const ActionDescription *action = m_Ctx.GetAction(mods.front().eventId);
+            if(!action)
               return QVariant();
 
             QString ret;
-            QList<const DrawcallDescription *> drawstack;
-            const DrawcallDescription *parent = drawcall->parent;
+            QList<const ActionDescription *> actionstack;
+            const ActionDescription *parent = action->parent;
             while(parent)
             {
-              drawstack.push_back(parent);
+              actionstack.push_back(parent);
               parent = parent->parent;
             }
 
-            if(!drawstack.isEmpty())
+            if(!actionstack.isEmpty())
             {
-              ret += lit("> ") + drawstack.back()->name;
+              ret += lit("> ") + actionstack.back()->customName;
 
-              if(drawstack.count() > 3)
+              if(actionstack.count() > 3)
                 ret += lit(" ...");
 
               ret += lit("\n");
 
-              if(drawstack.count() > 2)
-                ret += lit("> ") + drawstack[1]->name + lit("\n");
-              if(drawstack.count() > 1)
-                ret += lit("> ") + drawstack[0]->name + lit("\n");
+              if(actionstack.count() > 2)
+                ret += lit("> ") + actionstack[1]->customName + lit("\n");
+              if(actionstack.count() > 1)
+                ret += lit("> ") + actionstack[0]->customName + lit("\n");
 
               ret += lit("\n");
             }
@@ -228,12 +230,12 @@ public:
 
             if(mods.front().directShaderWrite)
             {
-              ret += tr("EID %1\n%2\nBound as UAV or copy - potential modification")
+              ret += tr("EID %1\n%2\nBound as %3 or copy - potential modification")
                          .arg(mods.front().eventId)
-                         .arg(drawcall->name);
+                         .arg(m_Ctx.GetEventBrowser()->GetEventName(action->eventId))
+                         .arg(uavName);
 
-              if(memcmp(mods[0].preMod.col.uintValue, mods[0].postMod.col.uintValue,
-                        sizeof(uint32_t) * 4) == 0)
+              if(mods[0].preMod.col.uintValue == mods[0].postMod.col.uintValue)
               {
                 ret += tr("\nNo change in tex value");
                 uavnowrite = true;
@@ -249,7 +251,7 @@ public:
 
               ret += tr("EID %1\n%2%3\n%4 Fragments touching pixel\n")
                          .arg(mods.front().eventId)
-                         .arg(drawcall->name)
+                         .arg(m_Ctx.GetEventBrowser()->GetEventName(action->eventId))
                          .arg(failure)
                          .arg(mods.count());
             }
@@ -262,7 +264,7 @@ public:
 
             if(mod.directShaderWrite)
             {
-              QString ret = tr("Potential UAV/Copy write");
+              QString ret = tr("Potential %1/Copy write").arg(uavName);
 
               if(mod.preMod.col.uintValue[0] == mod.postMod.col.uintValue[0] &&
                  mod.preMod.col.uintValue[1] == mod.postMod.col.uintValue[1] &&
@@ -278,7 +280,10 @@ public:
             {
               QString ret = tr("Primitive %1\n").arg(mod.primitiveID);
 
-              if(mod.shaderDiscarded)
+              if(mod.primitiveID == ~0U)
+                ret = tr("Unknown primitive\n");
+
+              if(!mod.Passed())
                 ret += failureString(mod);
 
               return ret;
@@ -320,9 +325,16 @@ public:
         if(col == 2)
         {
           if(isEvent(index))
+          {
             return backgroundBrush(getMods(index).first().preMod);
+          }
           else
-            return backgroundBrush(getMod(index).preMod);
+          {
+            const PixelModification &mod = getMod(index);
+            if(mod.directShaderWrite)
+              return backgroundBrush(mod.preMod);
+            return backgroundBrush(mod.shaderOut);
+          }
         }
         else if(col == 4)
         {
@@ -346,8 +358,7 @@ public:
             passed |= m.Passed();
 
           if(mods[0].directShaderWrite &&
-             memcmp(mods[0].preMod.col.uintValue, mods[0].postMod.col.uintValue,
-                    sizeof(uint32_t) * 4) == 0)
+             mods[0].preMod.col.uintValue == mods[0].postMod.col.uintValue)
             return QBrush(QColor::fromRgb(235, 235, 235));
 
           return passed ? QBrush(QColor::fromRgb(235, 255, 235))
@@ -355,8 +366,25 @@ public:
         }
         else
         {
-          if(getMod(index).shaderDiscarded)
+          if(!getMod(index).Passed())
             return QBrush(QColor::fromRgb(255, 235, 235));
+        }
+      }
+
+      // Since we change the background color for some cells, also change the foreground color to
+      // ensure contrast with all UI themes
+      if(role == Qt::ForegroundRole && (col == 0 || col == 1 || col == 3))
+      {
+        QColor textColor =
+            contrastingColor(QColor::fromRgb(235, 235, 235), m_Palette.color(QPalette::Text));
+        if(isEvent(index))
+        {
+          return QBrush(textColor);
+        }
+        else
+        {
+          if(!getMod(index).Passed())
+            return QBrush(textColor);
         }
       }
 
@@ -396,6 +424,8 @@ private:
   bool m_Loading = true;
   QVector<QList<PixelModification>> m_History;
   QVector<PixelModification> m_ModList;
+
+  const QPalette &m_Palette;
 
   // mask for top bit of quintptr
   static const quintptr eventTagMask = 1ULL << (Q_PROCESSOR_WORDSIZE * 8 - 1);
@@ -447,6 +477,9 @@ private:
 
   QBrush backgroundBrush(const ModificationValue &val) const
   {
+    if(!val.IsValid())
+      return QBrush();
+
     float rangesize = (m_Display.rangeMax - m_Display.rangeMin);
 
     float r = val.col.floatValue[0];
@@ -476,18 +509,17 @@ private:
     if(m_IsDepth)
       r = g = b = qBound(0.0f, (val.depth - m_Display.rangeMin) / rangesize, 1.0f);
 
-    {
-      r = (float)powf(r, 1.0f / 2.2f);
-      g = (float)powf(g, 1.0f / 2.2f);
-      b = (float)powf(b, 1.0f / 2.2f);
-    }
-
-    return QBrush(QColor::fromRgb((int)(255.0f * r), (int)(255.0f * g), (int)(255.0f * b)));
+    // Round to nearest value in [0,255]
+    return QBrush(QColor::fromRgb((int)(255.0f * r + 0.5f), (int)(255.0f * g + 0.5f),
+                                  (int)(255.0f * b + 0.5f)));
   }
 
   QString modString(const ModificationValue &val, int forceComps = 0) const
   {
     QString s;
+
+    if(!val.IsValid())
+      return tr("Unavailable");
 
     int numComps = (int)(m_Tex->format.compCount);
 
@@ -542,6 +574,8 @@ private:
       s += tr("\nBackface culled");
     if(mod.depthClipped)
       s += tr("\nDepth Clipped");
+    if(mod.depthBoundsFailed)
+      s += tr("\nDepth bounds test failed");
     if(mod.scissorClipped)
       s += tr("\nScissor Clipped");
     if(mod.shaderDiscarded)
@@ -600,7 +634,7 @@ PixelHistoryView::PixelHistoryView(ICaptureContext &ctx, ResourceId id, QPoint p
 
   ui->eventsHidden->setVisible(false);
 
-  m_Model = new PixelHistoryItemModel(ctx, id, display, this);
+  m_Model = new PixelHistoryItemModel(ctx, id, display, palette(), this);
   ui->events->setModel(m_Model);
 
   ui->events->hideBranches();
@@ -623,8 +657,10 @@ void PixelHistoryView::updateWindowTitle()
 
   TextureDescription *tex = m_Ctx.GetTexture(m_ID);
   if(tex->msSamp > 1)
-    title += tr(" @ Sample %1").arg(m_Display.sampleIdx);
+    title += tr(" @ Sample %1").arg(m_Display.subresource.sample);
 
+  if(tex->arraysize > 0)
+    title += tr(" @ Slice %1").arg(m_Display.subresource.slice);
   setWindowTitle(title);
 }
 
@@ -684,14 +720,37 @@ void PixelHistoryView::startDebug(EventTag tag)
 {
   m_Ctx.SetEventID({this}, tag.eventId, tag.eventId);
 
+  const ShaderReflection *shaderDetails =
+      m_Ctx.CurPipelineState().GetShaderReflection(ShaderStage::Pixel);
+
+  if(!m_Ctx.APIProps().shaderDebugging)
+  {
+    RDDialog::critical(this, tr("Can't debug pixel"),
+                       tr("This API does not support shader debugging"));
+    return;
+  }
+  else if(!shaderDetails)
+  {
+    RDDialog::critical(this, tr("Can't debug pixel"),
+                       tr("No pixel shader bound at event %1").arg(tag.eventId));
+    return;
+  }
+  else if(!shaderDetails->debugInfo.debuggable)
+  {
+    RDDialog::critical(
+        this, tr("Can't debug pixel"),
+        tr("This shader doesn't support debugging: %1").arg(shaderDetails->debugInfo.debugStatus));
+    return;
+  }
+
   bool done = false;
   ShaderDebugTrace *trace = NULL;
 
   m_Ctx.Replay().AsyncInvoke([this, &trace, &done, tag](IReplayController *r) {
-    trace = r->DebugPixel((uint32_t)m_Pixel.x(), (uint32_t)m_Pixel.y(), m_Display.sampleIdx,
-                          tag.primitive);
+    trace = r->DebugPixel((uint32_t)m_Pixel.x(), (uint32_t)m_Pixel.y(),
+                          m_Display.subresource.sample, tag.primitive);
 
-    if(trace->states.isEmpty())
+    if(trace->debugger == NULL)
     {
       r->FreeTrace(trace);
       trace = NULL;
@@ -716,8 +775,6 @@ void PixelHistoryView::startDebug(EventTag tag)
     return;
   }
 
-  const ShaderReflection *shaderDetails =
-      m_Ctx.CurPipelineState().GetShaderReflection(ShaderStage::Pixel);
   const ShaderBindpointMapping &bindMapping =
       m_Ctx.CurPipelineState().GetBindpointMapping(ShaderStage::Pixel);
   ResourceId pipeline = m_Ctx.CurPipelineState().GetGraphicsPipelineObject();
@@ -735,11 +792,12 @@ void PixelHistoryView::jumpToPrimitive(EventTag tag)
 
   IBufferViewer *viewer = m_Ctx.GetMeshPreview();
 
-  const DrawcallDescription *draw = m_Ctx.CurDrawcall();
+  const ActionDescription *action = m_Ctx.CurAction();
 
-  if(draw)
+  if(action)
   {
-    uint32_t vertIdx = RENDERDOC_VertexOffset(draw->topology, tag.primitive);
+    uint32_t vertIdx =
+        RENDERDOC_VertexOffset(m_Ctx.CurPipelineState().GetPrimitiveTopology(), tag.primitive);
 
     if(vertIdx != ~0U)
       viewer->ScrollToRow(vertIdx);
@@ -778,6 +836,8 @@ void PixelHistoryView::on_events_customContextMenuRequested(const QPoint &pos)
 
   QAction jumpAction(tr("&Go to primitive %1 at Event %2").arg(tag.primitive).arg(tag.eventId), this);
 
+  jumpAction.setIcon(Icons::find());
+
   QString debugText;
 
   if(tag.primitive == ~0U)
@@ -790,15 +850,25 @@ void PixelHistoryView::on_events_customContextMenuRequested(const QPoint &pos)
     debugText = tr("&Debug Pixel (%1, %2) primitive %3 at Event %4")
                     .arg(m_Pixel.x())
                     .arg(m_Pixel.y())
-                    .arg(tag.eventId)
-                    .arg(tag.primitive);
+                    .arg(tag.primitive)
+                    .arg(tag.eventId);
 
     contextMenu.addAction(&jumpAction);
   }
 
   QAction debugAction(debugText, this);
 
+  debugAction.setIcon(Icons::wrench());
+
   contextMenu.addAction(&debugAction);
+
+  if(!m_Ctx.APIProps().shaderDebugging)
+  {
+    debugAction.setToolTip(tr("This API does not support shader debugging"));
+    debugAction.setEnabled(false);
+  }
+
+  // can't check if the shader supports debugging here because we don't have its details.
 
   QObject::connect(&jumpAction, &QAction::triggered, [this, tag]() { jumpToPrimitive(tag); });
   QObject::connect(&debugAction, &QAction::triggered, [this, tag]() { startDebug(tag); });

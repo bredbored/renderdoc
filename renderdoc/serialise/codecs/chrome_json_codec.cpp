@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2017-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -23,18 +23,21 @@
  ******************************************************************************/
 
 #include <utility>
+#include "api/replay/structured_data.h"
 #include "common/common.h"
+#include "common/formatting.h"
 #include "serialise/rdcfile.h"
 
-ReplayStatus exportChrome(const char *filename, const RDCFile &rdc, const SDFile &structData,
-                          RENDERDOC_ProgressCallback progress)
+RDResult exportChrome(const rdcstr &filename, const RDCFile &rdc, const SDFile &structData,
+                      RENDERDOC_ProgressCallback progress)
 {
-  FILE *f = FileIO::fopen(filename, "w");
+  FILE *f = FileIO::fopen(filename, FileIO::WriteText);
 
   if(!f)
-    return ReplayStatus::FileIOFailed;
+    RETURN_ERROR_RESULT(ResultCode::FileIOFailed, "Failed to open '%s' for write: %s",
+                        filename.c_str(), FileIO::ErrorString().c_str());
 
-  std::string str;
+  rdcstr str;
 
   // add header, customise this as needed.
   str = R"({
@@ -89,13 +92,14 @@ ReplayStatus exportChrome(const char *filename, const RDCFile &rdc, const SDFile
 
   FileIO::fclose(f);
 
-  return ReplayStatus::Succeeded;
+  return ResultCode::Succeeded;
 }
 
 static ConversionRegistration XMLConversionRegistration(
     &exportChrome,
     {
-        "chrome.json", "Chrome profiler JSON",
+        "chrome.json",
+        "Chrome profiler JSON",
         R"(Exports the chunk threadID, timestamp and duration data to a JSON format that can be loaded
 by chrome's profiler at chrome://tracing)",
         false,

@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2014-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -25,7 +25,6 @@
 #include "string_utils.h"
 #include <ctype.h>
 #include <stdint.h>
-#include <wctype.h>
 #include <algorithm>
 #include "common/globalconfig.h"
 #include "os/os_specific.h"
@@ -49,93 +48,74 @@ uint32_t strhash(const char *str, uint32_t seed)
   return hash;
 }
 
-// since tolower is int -> int, this warns below. make a char -> char alternative
-char toclower(char c)
+rdcstr strlower(const rdcstr &str)
 {
-  return (char)tolower(c);
-}
-
-char tocupper(char c)
-{
-  return (char)toupper(c);
-}
-
-std::string strlower(const std::string &str)
-{
-  std::string newstr(str);
-  std::transform(newstr.begin(), newstr.end(), newstr.begin(), toclower);
+  rdcstr newstr(str);
+  for(size_t i = 0; i < newstr.size(); i++)
+    newstr[i] = (char)tolower(newstr[i]);
   return newstr;
 }
 
-std::string strupper(const std::string &str)
+rdcstr strupper(const rdcstr &str)
 {
-  std::string newstr(str);
-  std::transform(newstr.begin(), newstr.end(), newstr.begin(), tocupper);
+  rdcstr newstr(str);
+  for(size_t i = 0; i < newstr.size(); i++)
+    newstr[i] = (char)toupper(newstr[i]);
   return newstr;
 }
 
-std::string trim(const std::string &str)
+static bool ispathsep(char c)
 {
-  const char *whitespace = "\t \n\r";
-  size_t start = str.find_first_not_of(whitespace);
-  size_t end = str.find_last_not_of(whitespace);
-
-  // no non-whitespace characters, return the empty string
-  if(start == std::string::npos)
-    return "";
-
-  // searching from the start found something, so searching from the end must have too.
-  return str.substr(start, end - start + 1);
+  return c == '\\' || c == '/';
 }
 
-bool endswith(const std::string &value, const std::string &ending)
+static int get_lastpathsep(const rdcstr &path)
 {
-  if(ending.length() > value.length())
-    return false;
+  if(path.empty())
+    return -1;
 
-  return (0 == value.compare(value.length() - ending.length(), ending.length(), ending));
+  size_t offs = path.size() - 1;
+
+  while(offs > 0 && !ispathsep(path[offs]))
+    offs--;
+
+  if(offs == 0 && !ispathsep(path[0]))
+    return -1;
+
+  return (int)offs;
 }
 
-std::string get_basename(const std::string &path)
+rdcstr get_basename(const rdcstr &path)
 {
-  std::string base = path;
+  rdcstr base = path;
 
-  if(base.length() == 0)
+  while(!base.empty() && ispathsep(base.back()))
+    base.pop_back();
+
+  if(base.empty())
     return base;
 
-  if(base[base.length() - 1] == '/' || base[base.length() - 1] == '\\')
-    base.erase(base.size() - 1);
+  int offset = get_lastpathsep(base);
 
-  char pathSep[] = {'\\', '/', 0};
-
-  size_t offset = base.find_last_of(pathSep);
-
-  if(offset == std::string::npos)
+  if(offset == -1)
     return base;
 
   return base.substr(offset + 1);
 }
 
-std::wstring get_basename(const std::wstring &path)
+rdcstr get_dirname(const rdcstr &path)
 {
-  return StringFormat::UTF82Wide(get_basename(StringFormat::Wide2UTF8(path)));
-}
+  rdcstr base = path;
 
-std::string get_dirname(const std::string &path)
-{
-  std::string base = path;
+  while(!base.empty() && ispathsep(base.back()))
+    base.pop_back();
 
-  if(base.length() == 0)
-    return base;
+  if(base.empty())
+    return ".";
 
-  if(base[base.length() - 1] == '/' || base[base.length() - 1] == '\\')
-    base.erase(base.size() - 1);
+  int offset = get_lastpathsep(base);
 
-  char pathSep[3] = {'\\', '/', 0};
-
-  size_t offset = base.find_last_of(pathSep);
-
-  if(offset == std::string::npos)
+  if(offset == -1)
   {
     base.resize(1);
     base[0] = '.';
@@ -145,12 +125,35 @@ std::string get_dirname(const std::string &path)
   return base.substr(0, offset);
 }
 
-std::wstring get_dirname(const std::wstring &path)
+rdcstr strip_extension(const rdcstr &path)
 {
-  return StringFormat::UTF82Wide(get_dirname(StringFormat::Wide2UTF8(path)));
+  if(path.empty())
+    return path;
+
+  size_t offs = path.size() - 1;
+
+  while(offs > 0 && path[offs] != '.')
+    offs--;
+
+  if(offs == 0 && path[offs] != '.')
+    return path;
+
+  return path.substr(0, offs);
 }
 
-void split(const std::string &in, std::vector<std::string> &out, const char sep)
+void strip_nonbasic(rdcstr &str)
+{
+  for(char &c : str)
+  {
+    if((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.' ||
+       c == ' ')
+      continue;
+
+    c = '_';
+  }
+}
+
+void split(const rdcstr &in, rdcarray<rdcstr> &out, const char sep)
 {
   if(in.empty())
     return;
@@ -158,20 +161,21 @@ void split(const std::string &in, std::vector<std::string> &out, const char sep)
   {
     size_t numSeps = 0;
 
-    size_t offset = in.find(sep);
-    while(offset != std::string::npos)
+    int offset = in.find(sep);
+    while(offset >= 0)
     {
       numSeps++;
       offset = in.find(sep, offset + 1);
     }
 
     out.reserve(numSeps + 1);
+    out.clear();
   }
 
-  size_t begin = 0;
-  size_t end = in.find(sep);
+  int32_t begin = 0;
+  int32_t end = in.find(sep);
 
-  while(end != std::string::npos)
+  while(end >= 0)
   {
     out.push_back(in.substr(begin, end - begin));
 
@@ -179,13 +183,13 @@ void split(const std::string &in, std::vector<std::string> &out, const char sep)
     end = in.find(sep, begin);
   }
 
-  if(begin < in.size() || (begin == in.size() && in.back() == sep))
+  if(begin < in.count() || (begin == in.count() && in.back() == sep))
     out.push_back(in.substr(begin));
 }
 
-void merge(const std::vector<std::string> &in, std::string &out, const char sep)
+void merge(const rdcarray<rdcstr> &in, rdcstr &out, const char sep)
 {
-  out = std::string();
+  out = rdcstr();
   for(size_t i = 0; i < in.size(); i++)
   {
     out += in[i];
@@ -194,20 +198,8 @@ void merge(const std::vector<std::string> &in, std::string &out, const char sep)
   }
 }
 
-std::string removeFromEnd(const std::string &value, const std::string &ending)
-{
-  size_t pos = value.rfind(ending);
-
-  // Create new string from beginning to pattern
-  if(std::string::npos != pos)
-    return value.substr(0, pos);
-
-  // If pattern not found, just return original string
-  return value;
-}
-
 #if ENABLED(ENABLE_UNIT_TESTS)
-#include "3rdparty/catch/catch.hpp"
+#include "catch/catch.hpp"
 
 TEST_CASE("String hashing", "[string]")
 {
@@ -217,6 +209,24 @@ TEST_CASE("String hashing", "[string]")
     CHECK(strhash("blah") == strhash("blah"));
     CHECK(strhash("test of a long string for strhash") ==
           strhash("test of a long string for strhash"));
+  };
+
+  SECTION("hash of NULL or empty string returns the seed")
+  {
+    CHECK(strhash(NULL, 5) == 5);
+    CHECK(strhash(NULL, 50) == 50);
+    CHECK(strhash(NULL, 500) == 500);
+    CHECK(strhash(NULL, 5000) == 5000);
+
+    CHECK(strhash("", 5) == 5);
+    CHECK(strhash("", 50) == 50);
+    CHECK(strhash("", 500) == 500);
+    CHECK(strhash("", 5000) == 5000);
+
+    CHECK(strhash("0", 5) != 5);
+    CHECK(strhash("0", 50) != 50);
+    CHECK(strhash("0", 500) != 500);
+    CHECK(strhash("0", 5000) != 5000);
   };
 
   SECTION("Different inputs have different hashes")
@@ -257,9 +267,32 @@ TEST_CASE("String manipulation", "[string]")
     CHECK(strlower("FOOBAR") == "foobar");
   };
 
+  SECTION("get_lastpathsep")
+  {
+    CHECK(get_lastpathsep("") == -1);
+    CHECK(get_lastpathsep("foo") == -1);
+    CHECK(get_lastpathsep("foobar.blah") == -1);
+    CHECK(get_lastpathsep("/foo") == 0);
+    CHECK(get_lastpathsep("/foobar.blah") == 0);
+    CHECK(get_lastpathsep("foo/bar/blah/") == 12);
+    CHECK(get_lastpathsep("foo\\bar\\blah\\") == 12);
+    CHECK(get_lastpathsep("foo/bar/blah") == 7);
+    CHECK(get_lastpathsep("foo\\bar\\blah") == 7);
+    CHECK(get_lastpathsep("/foo/bar/blah/") == 13);
+    CHECK(get_lastpathsep("\\foo\\bar\\blah\\") == 13);
+    CHECK(get_lastpathsep("/foo/bar/blah") == 8);
+    CHECK(get_lastpathsep("\\foo\\bar\\blah") == 8);
+  };
+
   SECTION("basename")
   {
+    CHECK(get_basename("") == "");
+    CHECK(get_basename("/") == "");
+    CHECK(get_basename("/\\//\\") == "");
     CHECK(get_basename("foo") == "foo");
+    CHECK(get_basename("foo/") == "foo");
+    CHECK(get_basename("foo//") == "foo");
+    CHECK(get_basename("foo/\\//\\") == "foo");
     CHECK(get_basename("/foo") == "foo");
     CHECK(get_basename("/dir/foo") == "foo");
     CHECK(get_basename("/long/path/dir/foo") == "foo");
@@ -273,8 +306,17 @@ TEST_CASE("String manipulation", "[string]")
 
   SECTION("dirname")
   {
+    CHECK(get_dirname("") == ".");
+    CHECK(get_dirname("/") == ".");
+    CHECK(get_dirname("/\\//\\") == ".");
     CHECK(get_dirname("foo") == ".");
+    CHECK(get_dirname("foo/") == ".");
+    CHECK(get_dirname("foo//") == ".");
+    CHECK(get_dirname("foo/\\//\\") == ".");
     CHECK(get_dirname("/foo") == "");
+    CHECK(get_dirname("/foo/") == "");
+    CHECK(get_dirname("/foo//") == "");
+    CHECK(get_dirname("/foo/\\//\\") == "");
     CHECK(get_dirname("/dir/foo") == "/dir");
     CHECK(get_dirname("/long/path/dir/foo") == "/long/path/dir");
     CHECK(get_dirname("relative/long/path/dir/foo") == "relative/long/path/dir");
@@ -285,6 +327,18 @@ TEST_CASE("String manipulation", "[string]")
     CHECK(get_dirname("C:\\windows\\path/mixed/slashes\\foo") == "C:\\windows\\path/mixed/slashes");
   };
 
+  SECTION("strip_extension")
+  {
+    CHECK(strip_extension("foo.exe") == "foo");
+    CHECK(strip_extension("foo.exe.zip") == "foo.exe");
+    CHECK(strip_extension("foo..exe") == "foo.");
+    CHECK(strip_extension("foo") == "foo");
+    CHECK(strip_extension("") == "");
+    CHECK(strip_extension(".exe") == "");
+    CHECK(strip_extension(".config.txt") == ".config");
+    CHECK(strip_extension("bar/foo.exe") == "bar/foo");
+  };
+
   SECTION("strupper")
   {
     CHECK(strupper("foobar") == "FOOBAR");
@@ -292,31 +346,11 @@ TEST_CASE("String manipulation", "[string]")
     CHECK(strupper("FOOBAR") == "FOOBAR");
   };
 
-  SECTION("trim")
-  {
-    CHECK(trim("  foo bar  ") == "foo bar");
-    CHECK(trim("  Foo bar") == "Foo bar");
-    CHECK(trim("  Foo\nbar") == "Foo\nbar");
-    CHECK(trim("FOO BAR  ") == "FOO BAR");
-    CHECK(trim("FOO BAR  \t\n") == "FOO BAR");
-  };
-
-  SECTION("endswith / removeFromEnd")
-  {
-    CHECK(endswith("foobar", "bar"));
-    CHECK_FALSE(endswith("foobar", "foo"));
-    CHECK(endswith("foobar", ""));
-
-    CHECK(removeFromEnd("test/foobar", "") == "test/foobar");
-    CHECK(removeFromEnd("test/foobar", "foo") == "test/");
-    CHECK(removeFromEnd("test/foobar", "bar") == "test/foo");
-  };
-
   SECTION("split by comma")
   {
-    std::vector<std::string> vec;
+    rdcarray<rdcstr> vec;
 
-    split(std::string("foo,bar, blah,test"), vec, ',');
+    split(rdcstr("foo,bar, blah,test"), vec, ',');
 
     REQUIRE(vec.size() == 4);
     CHECK(vec[0] == "foo");
@@ -327,9 +361,9 @@ TEST_CASE("String manipulation", "[string]")
 
   SECTION("split by space")
   {
-    std::vector<std::string> vec;
+    rdcarray<rdcstr> vec;
 
-    split(std::string("this is a test string for   splitting!"), vec, ' ');
+    split(rdcstr("this is a test string for   splitting!"), vec, ' ');
 
     REQUIRE(vec.size() == 9);
     CHECK(vec[0] == "this");
@@ -341,13 +375,17 @@ TEST_CASE("String manipulation", "[string]")
     CHECK(vec[6] == "");
     CHECK(vec[7] == "");
     CHECK(vec[8] == "splitting!");
+
+    split(rdcstr("new test"), vec, ' ');
+
+    CHECK(vec.size() == 2);
   };
 
   SECTION("split with trailing separator")
   {
-    std::vector<std::string> vec;
+    rdcarray<rdcstr> vec;
 
-    split(std::string("foo,,bar, blah,,,test,"), vec, ',');
+    split(rdcstr("foo,,bar, blah,,,test,"), vec, ',');
 
     REQUIRE(vec.size() == 8);
     CHECK(vec[0] == "foo");
@@ -362,9 +400,9 @@ TEST_CASE("String manipulation", "[string]")
 
   SECTION("split with starting separator")
   {
-    std::vector<std::string> vec;
+    rdcarray<rdcstr> vec;
 
-    split(std::string(",foo,bar"), vec, ',');
+    split(rdcstr(",foo,bar"), vec, ',');
 
     REQUIRE(vec.size() == 3);
     CHECK(vec[0] == "");
@@ -374,8 +412,8 @@ TEST_CASE("String manipulation", "[string]")
 
   SECTION("merge")
   {
-    std::vector<std::string> vec;
-    std::string str;
+    rdcarray<rdcstr> vec;
+    rdcstr str;
 
     merge(vec, str, ' ');
     CHECK(str == "");
@@ -393,10 +431,10 @@ TEST_CASE("String manipulation", "[string]")
 
   SECTION("degenerate cases")
   {
-    std::vector<std::string> vec;
-    std::string str;
+    rdcarray<rdcstr> vec;
+    rdcstr str;
 
-    split(std::string(), vec, ',');
+    split(rdcstr(), vec, ',');
 
     REQUIRE(vec.empty());
 

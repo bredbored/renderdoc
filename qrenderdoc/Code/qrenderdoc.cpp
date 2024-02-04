@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2016-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -22,6 +22,7 @@
  * THE SOFTWARE.
  ******************************************************************************/
 
+#include <stdio.h>
 #include <QApplication>
 #include <QCommandLineParser>
 #include <QDir>
@@ -37,6 +38,108 @@
 #include "Windows/Dialogs/CrashDialog.h"
 #include "Windows/MainWindow.h"
 #include "version.h"
+
+#if QT_VERSION >= QT_VERSION_CHECK(5, 9, 0)
+
+#include <QOperatingSystemVersion>
+
+QString getOSVersion()
+{
+  QOperatingSystemVersion ver = QOperatingSystemVersion::current();
+
+  if(ver.type() == QOperatingSystemVersion::Windows && ver.majorVersion() >= 10)
+  {
+    int major = ver.majorVersion();
+    int build = ver.microVersion();
+    if(build >= 22000)
+      major = 11;
+
+    return QFormatStr("Windows %1 Build num %2").arg(major).arg(build);
+  }
+
+  return QSysInfo::prettyProductName();
+}
+
+#else
+
+QString getOSVersion()
+{
+  return QSysInfo::prettyProductName();
+}
+
+#endif
+
+#if ENABLE_UNIT_TESTS
+
+#define CATCH_CONFIG_RUNNER
+#define CATCH_CONFIG_NOSTDOUT
+
+#include "3rdparty/catch/catch.hpp"
+
+// since we force use of ToStr for everything and don't allow using catch's stringstream (so that
+// enums get forwarded to ToStr) we need to implement ToStr for one of Catch's structs.
+template <>
+rdcstr DoStringise(const Catch::SourceLineInfo &el)
+{
+  return QFormatStr("%1:%2").arg(QString::fromUtf8(el.file)).arg(el.line);
+}
+
+class LogOutputter : public std::stringbuf
+{
+  FILE *file;
+
+public:
+  LogOutputter(FILE *f) : file(f) {}
+  void finish()
+  {
+    std::string msg = this->str();
+    RENDERDOC_LogMessage(LogType::Comment, "EXTN", __FILE__, __LINE__, msg.c_str());
+    fputs(msg.c_str(), file);
+  }
+  virtual int sync() override
+  {
+    rdcstr str = this->str().c_str();
+    int idx = str.indexOf('\n');
+    if(idx >= 0)
+    {
+      rdcstr msg = str.substr(0, idx + 1);
+      RENDERDOC_LogMessage(LogType::Comment, "EXTN", __FILE__, __LINE__, msg);
+      fputs(msg.c_str(), file);
+      str = str.substr(idx + 1);
+      this->str("");
+      this->sputn(str.c_str(), str.size());
+    }
+    return 0;
+  }
+
+  // force a sync on every output
+  virtual std::streamsize xsputn(const char *s, std::streamsize n) override
+  {
+    std::streamsize ret = std::stringbuf::xsputn(s, n);
+    sync();
+    return ret;
+  }
+};
+
+std::ostream *catch_stream = NULL;
+
+namespace Catch
+{
+std::ostream &cout()
+{
+  return *catch_stream;
+}
+std::ostream &cerr()
+{
+  return *catch_stream;
+}
+std::ostream &clog()
+{
+  return *catch_stream;
+}
+}
+
+#endif
 
 #if defined(Q_OS_WIN32)
 extern "C" {
@@ -60,7 +163,7 @@ void sharedLogOutput(QtMsgType type, const QMessageLogContext &context, const QS
     case QtFatalMsg: logtype = LogType::Fatal; break;
   }
 
-  RENDERDOC_LogMessage(logtype, "QTRD", context.file, context.line, msg.toUtf8().data());
+  RENDERDOC_LogMessage(logtype, "QTRD", context.file ? context.file : rdcstr(), context.line, msg);
 }
 
 static QString tr(const char *string)
@@ -85,40 +188,129 @@ int main(int argc, char *argv[])
 
   qInstallMessageHandler(sharedLogOutput);
 
+  // there seems to be a persistent crash in QWidgetPrivate::subtractOpaqueSiblings where a widget
+  // has no parent but is not a window. Try to work around it by setting this env var, as it's only
+  // an optimisation
+  qputenv("QT_NO_SUBTRACTOPAQUESIBLINGS", lit("1").toUtf8());
+
   qInfo() << "QRenderDoc initialising.";
 
   if(IsRunningAsAdmin())
     qInfo() << "Running as administrator";
 
+#if defined(RENDERDOC_PLATFORM_LINUX) && !defined(RENDERDOC_WINDOWING_WAYLAND)
+  bool envChanged = false;
+  {
+    const char *qpa_plat = getenv("QT_QPA_PLATFORM");
+    // if not set or empty, force non-wayland to help go through backwards compatibility path on wayland.
+    char env_set[] = "QT_QPA_PLATFORM=xcb\0";
+    if(!qpa_plat || qpa_plat[0] == 0)
+    {
+      putenv(env_set);
+      envChanged = true;
+    }
+  }
+#endif
+
   QGuiApplication::setAttribute(Qt::AA_EnableHighDpiScaling);
   QGuiApplication::setAttribute(Qt::AA_UseHighDpiPixmaps);
+
+#if(QT_VERSION >= QT_VERSION_CHECK(5, 14, 0))
+  QGuiApplication::setHighDpiScaleFactorRoundingPolicy(
+      Qt::HighDpiScaleFactorRoundingPolicy::RoundPreferFloor);
+#endif
 
   QApplication::setApplicationVersion(lit(FULL_VERSION_STRING));
 
 // shortcut here so we can run this with a non-GUI application
-#if !defined(RELEASE)
+#if ENABLE_UNIT_TESTS
   if(QString::fromUtf8(argv[1]) == lit("--unittest"))
   {
-    QCoreApplication application(argc, argv);
-    PythonContext::GlobalInit();
+    char **mod_argv = new char *[argc + 1];
+    char **alloc_argv = mod_argv;
+    for(int i = 0; i < argc; i++)
+      mod_argv[i] = argv[i];
+    mod_argv[argc] = 0;
 
-    bool errors = false;
+    // pop --unittest
+    argc--;
+    mod_argv++;
 
-    qInfo() << "Checking python binding consistency.";
+    FILE *test_logOut = NULL;
 
+    if(argc >= 2 && QString::fromUtf8(mod_argv[1]).left(4) == lit("log="))
     {
-      PythonContextHandle py;
-      errors = py.ctx().CheckInterfaces();
+      test_logOut = fopen(mod_argv[1] + 4, "w");
+
+      // pop
+      argc--;
+      mod_argv++;
     }
 
-    if(errors)
+    mod_argv[0] = argv[0];
+
+    if(test_logOut == NULL)
+      test_logOut = stdout;
+
+    LogOutputter logbuf(test_logOut);
+    std::ostream logstream(&logbuf);
+
+    int ret = 0;
+
+    // catch tests first
     {
-      qCritical() << "Found errors in python bindings. Please fix!";
-      return 1;
+      catch_stream = &logstream;
+
+      Catch::Session session;
+
+      session.configData().name = "QRenderDoc";
+      session.configData().shouldDebugBreak = Catch::isDebuggerActive();
+
+      ret = session.applyCommandLine(argc, mod_argv);
+
+      if(ret == 0)
+      {
+        int numFailed = session.run();
+
+        // Note that on unices only the lower 8 bits are usually used, clamping
+        // the return value to 255 prevents false negative when some multiple
+        // of 256 tests has failed
+        if(numFailed != 0)
+          ret = (numFailed < 0xff ? numFailed : 0xff);
+      }
     }
 
-    qInfo() << "Python bindings are consistent.";
-    return 0;
+    {
+      QCoreApplication application(argc, mod_argv);
+      PythonContext::GlobalInit();
+
+      logstream << "Checking python binding consistency.\n";
+
+      rdcstr errorLog;
+      bool errors = false;
+      {
+        PythonContextHandle py;
+        errors = py.ctx().CheckInterfaces(errorLog);
+      }
+
+      if(errors)
+      {
+        logstream << errorLog;
+        qCritical() << "Found errors in python bindings. Please fix!\n";
+        ret = 1;
+      }
+      else
+      {
+        logstream << "Python bindings are consistent.\n";
+      }
+    }
+
+    logbuf.finish();
+
+    delete[] alloc_argv;
+
+    fclose(test_logOut);
+    return ret;
   }
 #endif
 
@@ -147,6 +339,11 @@ int main(int argc, char *argv[])
                             lit("filename.py"));
   parser.addOption(python);
 
+  QCommandLineOption uiscript({lit("ui-python"), lit("ui-script"), lit("ui-py")},
+                              tr("Run a python script after opening the main UI."),
+                              lit("filename.py"));
+  parser.addOption(uiscript);
+
   // secret non-described options
   QCommandLineOption installLayer(lit("install_vulkan_layer"), QString(), lit("root_or_not"));
   hideOption(installLayer);
@@ -169,11 +366,7 @@ int main(int argc, char *argv[])
   bool parsedCommands = parser.parse(application.arguments());
 
   if(!parsedCommands)
-  {
-    QString error = parser.errorText();
-    printf("%s\n", error.toUtf8().data());
-    return 1;
-  }
+    qCritical() << parser.errorText();
 
   if(parser.isSet(helpOption))
   {
@@ -243,7 +436,7 @@ int main(int argc, char *argv[])
     else
     {
       // no port specified, find the first open port.
-      ident = RENDERDOC_EnumerateRemoteTargets(host.toLocal8Bit().data(), ident);
+      ident = RENDERDOC_EnumerateRemoteTargets(host, ident);
       ok = (ident != 0);
     }
 
@@ -266,6 +459,10 @@ int main(int argc, char *argv[])
   QString crashReportPath;
   if(parser.isSet(crashReport))
     crashReportPath = parser.value(crashReport);
+
+  QString uiscriptFile;
+  if(parser.isSet(uiscript))
+    uiscriptFile = parser.value(uiscript);
 
   QStringList pyscripts = parser.values(python);
 
@@ -298,7 +495,7 @@ int main(int argc, char *argv[])
         dir.mkpath(configPath);
     }
 
-    QString configFilename = configFilePath(lit("UI.config"));
+    QString configFilename = ConfigFilePath(lit("UI.config"));
 
     if(!config.Load(configFilename))
     {
@@ -312,10 +509,11 @@ int main(int argc, char *argv[])
     int replayHostIndex = -1;
     if(parser.isSet(replayhost))
     {
-      QString replayHost = parser.value(replayhost);
-      for(int i = 0; i < config.RemoteHosts.count(); i++)
+      rdcstr replayHost = parser.value(replayhost);
+      rdcarray<RemoteHost> hosts = config.GetRemoteHosts();
+      for(int i = 0; i < hosts.count(); i++)
       {
-        if(QString(config.RemoteHosts[i]->hostname) == replayHost)
+        if(hosts[i].Hostname() == replayHost)
         {
           replayHostIndex = i;
           break;
@@ -357,29 +555,55 @@ int main(int argc, char *argv[])
       GlobalEnvironment env;
 #if defined(RENDERDOC_PLATFORM_LINUX)
       env.xlibDisplay = QX11Info::display();
+      if(QGuiApplication::platformName() == lit("wayland"))
+      {
+        env.waylandDisplay = (wl_display *)AccessWaylandPlatformInterface("display", NULL);
+
+        QString warning =
+            tr("Running directly on Wayland is NOT SUPPORTED and is likely to crash, hang, or "
+               "fail to render.");
+
+        qInfo() << "------ !!!! WARNING !!!! ------";
+        qInfo() << warning;
+        qInfo() << "------ !!!! WARNING !!!! ------";
+
+        RDDialog::critical(NULL, tr("Wayland Qt platform not supported"), warning);
+      }
 #endif
       rdcarray<rdcstr> coreargs;
       if(!crashReportPath.isEmpty())
         coreargs.push_back("--crash");
       for(const QString &arg : remaining)
         coreargs.push_back(arg);
-      RENDERDOC_InitGlobalEnv(env, coreargs);
+
+      // don't enumerate GPUs when reporting a crash, in case enumerating GPUs *causes* the crash.
+      if(!crashReportPath.isEmpty())
+        env.enumerateGPUs = false;
+
+      RENDERDOC_InitialiseReplay(env, coreargs);
     }
+
+#if defined(RENDERDOC_PLATFORM_LINUX) && !defined(RENDERDOC_WINDOWING_WAYLAND)
+    if(envChanged)
+      unsetenv("QT_QPA_PLATFORM");
+#endif
 
     if(!crashReportPath.isEmpty())
     {
-      QFile f(crashReportPath);
+      QVariantMap json;
 
-      if(f.exists() && f.open(QIODevice::ReadOnly | QIODevice::Text))
       {
-        QVariantMap json = JSONToVariant(QString::fromUtf8(f.readAll()));
+        QFile f(crashReportPath);
 
-        if(json.contains(lit("report")))
-        {
-          CrashDialog dialog(config, json);
+        if(f.exists() && f.open(QIODevice::ReadOnly | QIODevice::Text))
+          json = JSONToVariant(QString::fromUtf8(f.readAll()));
+      }
 
-          RDDialog::show(&dialog);
-        }
+      if(json.contains(lit("report")))
+      {
+        CrashDialog dialog(config, json);
+
+        RDDialog::show(&dialog);
       }
     }
     else
@@ -393,7 +617,7 @@ int main(int argc, char *argv[])
         config.Save();
       }
 
-      CaptureContext ctx(filename, remoteHost, remoteIdent, temp, config);
+      CaptureContext ctx(config);
       if(replayHostIndex >= 0)
       {
         ctx.SetRemoteHost(replayHostIndex);
@@ -405,7 +629,7 @@ int main(int argc, char *argv[])
       ANALYTIC_SET(Metadata.DistributionVersion, lit(DISTRIBUTION_NAME));
 #endif
       ANALYTIC_SET(Metadata.Bitness, ((sizeof(void *) == sizeof(uint64_t)) ? 64 : 32));
-      ANALYTIC_SET(Metadata.OSVersion, QSysInfo::prettyProductName());
+      ANALYTIC_SET(Metadata.OSVersion, getOSVersion());
 
 #if RENDERDOC_STABLE_BUILD
       ANALYTIC_SET(Metadata.OfficialBuildRun, true);
@@ -415,6 +639,8 @@ int main(int argc, char *argv[])
 
       ANALYTIC_SET(Metadata.DaysUsed[QDateTime::currentDateTime().date().day()], true);
 
+      bool pythonExited = false;
+
       if(!pyscripts.isEmpty())
       {
         PythonContextHandle py;
@@ -423,22 +649,28 @@ int main(int argc, char *argv[])
 
         py.ctx().setGlobal("pyrenderdoc", (ICaptureContext *)&ctx);
 
-        QObject::connect(&py.ctx(), &PythonContext::exception,
-                         [](const QString &type, const QString &value, int, QList<QString> frames) {
+        QObject::connect(
+            &py.ctx(), &PythonContext::exception,
+            [&pythonExited](const QString &type, const QString &value, int, QList<QString> frames) {
+              if(type == lit("SystemExit"))
+              {
+                pythonExited = true;
+                return;
+              }
 
-                           QString exString;
+              QString exString;
 
-                           if(!frames.isEmpty())
-                           {
-                             exString += tr("Traceback (most recent call last):\n");
-                             for(const QString &f : frames)
-                               exString += QFormatStr("  %1\n").arg(f);
-                           }
+              if(!frames.isEmpty())
+              {
+                exString += tr("Traceback (most recent call last):\n");
+                for(const QString &f : frames)
+                  exString += QFormatStr("  %1\n").arg(f);
+              }
 
-                           exString += QFormatStr("%1: %2\n").arg(type).arg(value);
+              exString += QFormatStr("%1: %2\n").arg(type).arg(value);
 
-                           qCritical("%s", exString.toUtf8().data());
-                         });
+              qCritical("%s", exString.toUtf8().data());
+            });
 
         QObject::connect(&py.ctx(), &PythonContext::textOutput,
                          [](bool isStdError, const QString &output) {
@@ -460,20 +692,28 @@ int main(int argc, char *argv[])
           {
             qWarning() << "Invalid python script" << f;
           }
+
+          if(pythonExited)
+            break;
         }
       }
 
-      while(ctx.isRunning())
+      if(!pythonExited)
       {
-        application.processEvents(QEventLoop::WaitForMoreEvents);
-        QCoreApplication::sendPostedEvents();
-        QCoreApplication::sendPostedEvents(NULL, QEvent::DeferredDelete);
+        ctx.Begin(filename, remoteHost, remoteIdent, temp, uiscriptFile);
+
+        while(ctx.isRunning())
+        {
+          application.processEvents(QEventLoop::WaitForMoreEvents);
+          QCoreApplication::sendPostedEvents();
+          QCoreApplication::sendPostedEvents(NULL, QEvent::DeferredDelete);
+        }
       }
 
       config.Save();
     }
 
-    RENDERDOC_AndroidShutdown();
+    RENDERDOC_ShutdownReplay();
 
     PythonContext::GlobalShutdown();
 

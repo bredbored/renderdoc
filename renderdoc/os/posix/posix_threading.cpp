@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2016-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -24,6 +24,7 @@
 
 #include <time.h>
 #include <unistd.h>
+#include "common/common.h"
 #include "os/os_specific.h"
 
 void CacheDebuggerPresent();
@@ -40,32 +41,32 @@ time_t Timing::GetUTCTime()
 
 namespace Atomic
 {
-int32_t Inc32(volatile int32_t *i)
+int32_t Inc32(int32_t *i)
 {
   return __sync_add_and_fetch(i, int32_t(1));
 }
 
-int32_t Dec32(volatile int32_t *i)
+int32_t Dec32(int32_t *i)
 {
   return __sync_add_and_fetch(i, int32_t(-1));
 }
 
-int64_t Inc64(volatile int64_t *i)
+int64_t Inc64(int64_t *i)
 {
   return __sync_add_and_fetch(i, int64_t(1));
 }
 
-int64_t Dec64(volatile int64_t *i)
+int64_t Dec64(int64_t *i)
 {
   return __sync_add_and_fetch(i, int64_t(-1));
 }
 
-int64_t ExchAdd64(volatile int64_t *i, int64_t a)
+int64_t ExchAdd64(int64_t *i, int64_t a)
 {
   return __sync_add_and_fetch(i, int64_t(a));
 }
 
-int32_t CmpExch32(volatile int32_t *dest, int32_t oldVal, int32_t newVal)
+int32_t CmpExch32(int32_t *dest, int32_t oldVal, int32_t newVal)
 {
   return __sync_val_compare_and_swap(dest, oldVal, newVal);
 }
@@ -181,11 +182,11 @@ int64_t nextTLSSlot = 0;
 
 struct TLSData
 {
-  std::vector<void *> data;
+  rdcarray<void *> data;
 };
 
 static CriticalSection *m_TLSListLock = NULL;
-static std::vector<TLSData *> *m_TLSList = NULL;
+static rdcarray<TLSData *> *m_TLSList = NULL;
 
 void Init()
 {
@@ -194,7 +195,7 @@ void Init()
     RDCFATAL("Can't allocate OS TLS slot");
 
   m_TLSListLock = new CriticalSection();
-  m_TLSList = new std::vector<TLSData *>();
+  m_TLSList = new rdcarray<TLSData *>();
 
   CacheDebuggerPresent();
 }
@@ -250,7 +251,7 @@ void SetTLSValue(uint64_t slot, void *value)
     }
 
     if(slot - 1 >= slots->data.size())
-    slots->data.resize((size_t)slot);
+      slots->data.resize((size_t)slot);
   }
 
   slots->data[(size_t)slot - 1] = value;

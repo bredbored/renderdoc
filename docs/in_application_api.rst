@@ -1,7 +1,7 @@
 In-application API
 ==================
 
-Reference for RenderDoc in-application API version 1.1.2. This API is not necessary to use RenderDoc by default, but if you would like more control or custom triggering of captures this API can provide the mechanism to do so.
+Reference for RenderDoc in-application API version 1.6.0. This API is not necessary to use RenderDoc by default, but if you would like more control or custom triggering of captures this API can provide the mechanism to do so.
 
 Make sure to use a matching API header for your build - if you use a newer header, the API version may not be available. All RenderDoc builds supporting this API ship the header in their root directory.
 
@@ -9,13 +9,9 @@ This page describes the RenderDoc API exposed to applications being captured, bo
 
 To begin using the API you need to fetch the ``RENDERDOC_GetAPI`` function. You should do this dynamically, it is not recommended to actually link against RenderDoc's DLL as it's intended to be injected or loaded at runtime. The header does not declare ``RENDERDOC_GetAPI``, it declares a function pointer typedef ``pRENDERDOC_GetAPI`` that you can use.
 
-There are two common ways to integrate RenderDoc. The recommended way is to passively check if the module is loaded, and use the API. This lets you continue to use RenderDoc entirely as normal, launching your program through the UI, but you can access additional functionality to e.g. trigger captures at custom times.
+The recommended way to access the RenderDoc API is to passively check if the module is loaded, and use the API if it is. This lets you continue to use RenderDoc entirely as normal, launching your program through the UI, but you can access additional functionality to e.g. trigger captures at custom times. When your program is launched independently it will see that the RenderDoc module is not present and safely fall back.
 
 To do this you'll use your platforms dynamic library functions to see if the library is open already - e.g. ``GetModuleHandle`` on Windows, or ``dlopen`` with the ``RTLD_NOW | RTLD_NOLOAD`` flags if available on \*nix systems. On most platforms you can just search for the module name - ``renderdoc.dll`` on Windows, or ``librenderdoc.so`` on Linux, or ``libVkLayer_GLES_RenderDoc.so`` on Android should be sufficient here, so you don't need to know the path to where RenderDoc is running from. This will vary by platform however so consult your platform's OS documentation. Then you can use ``GetProcAddress`` or ``dlsym`` to fetch the ``RENDERDOC_GetAPI`` function using the typedef above.
-
-On Windows only you can have a closer integration, where your code will explicitly load RenderDoc's library at runtime. This needs more care taken as it is much more complex. You will need to locate the RenderDoc module yourself, and load it as soon as possible after startup of your program. Due to the nature of RenderDoc's API hooking, the earlier you can load it the better in general. Once you've loaded it you can fetch the  ``RENDERDOC_GetAPI`` entry point as above, and use the API as normal.
-
-This is not supported on Linux or Android due to the differing methods of hooking and only Windows supporting injection at runtime.
 
 .. cpp:function:: int RENDERDOC_GetAPI(RENDERDOC_Version version, void **outAPIPointers)
 
@@ -116,9 +112,9 @@ This is not supported on Linux or Android due to the differing methods of hookin
 
     specifies whether each API call should save a callstack. Default is off.
 
-.. cpp:enumerator:: RENDERDOC_CaptureOption::eRENDERDOC_Option_CaptureCallstacksOnlyDraws
+.. cpp:enumerator:: RENDERDOC_CaptureOption::eRENDERDOC_Option_CaptureCallstacksOnlyActions
 
-    specifies whether - if ``CaptureCallstacks`` is enabled - callstacks are only saved on drawcalls. Default is off.
+    specifies whether - if ``CaptureCallstacks`` is enabled - callstacks are only saved on actions. Default is off.
 
 .. cpp:enumerator:: RENDERDOC_CaptureOption::eRENDERDOC_Option_DelayForDebugger
 
@@ -287,9 +283,17 @@ This is not supported on Linux or Android due to the differing methods of hookin
     :param uint32_t And: is a 32-bit value the mask is binary-AND'd with before processing ``Or``.
     :param uint32_t Or: is a 32-bit value the mask is binary-OR'd with after processing ``And``.
 
-.. cpp:function:: void Shutdown()
+.. cpp:function:: void RemoveHooks()
 
-    This function will attempt to shut down and remove RenderDoc and its hooks from the target process. It must be called as early as possible in the process, and will have undefined results if any graphics API functions have been called.
+    This function will attempt to remove RenderDoc and its hooks from the target process. It must be called as early as possible in the process, and will have undefined results if any graphics API functions have been called.
+
+.. note::
+
+    This process is only possible on Windows, and even then it is not well defined so may not be possible in all circumstances. This function is provided at your own risk.
+
+.. note::
+
+    This function was renamed, in earlier versions of the API it was declared as ``Shutdown``. This rename is backwards compatible as the function signature did not change.
 
 .. cpp:function:: void UnloadCrashHandler()
 
@@ -360,6 +364,18 @@ The path follows the template set in :cpp:func:`SetCaptureFilePathTemplate` so i
     :param const char* cmdline: is an optional UTF-8 null-terminated string to be appended to the command line, e.g. a capture filename. If this parameter is NULL, the command line will be unmodified.
     :return: If the UI was successfully launched, this function will return the PID of the new process. Otherwise it will return ``0``.
 
+.. cpp:function:: uint32_t ShowReplayUI()
+
+    This function requests that the currently connected replay UI raise its window to the top. This is only possible if an instance of the replay UI is currently connected, otherwise this function does nothing. This can be used in conjunction with IsTargetControlConnected and LaunchReplayUI to intelligently handle showing the UI after making a capture.
+
+    Given OS differences it is not guaranteed that the UI will be successfully raised even if the request is passed on. On some OSs it may only be highlighted or otherwise indicated to the user.
+
+    :return: If the request to be shown was passed onto the UI successfully this function will return ``1``. If there is no UI connected currently or some other error occurred it will return ``0``.
+
+.. note::
+
+    Added in API version 1.5.0
+
 .. cpp:function:: void SetActiveWindow(RENDERDOC_DevicePointer device, RENDERDOC_WindowHandle wndHandle)
 
     This function will explicitly set which window is considered active. The active window is the one that will be captured when the keybind to trigger a capture is pressed.
@@ -373,10 +389,11 @@ The path follows the template set in :cpp:func:`SetCaptureFilePathTemplate` so i
 
     * For D3D11 it must be the ``ID3D11Device`` device object.
     * For D3D12 it must be the ``ID3D12Device`` device object.
-    * For OpenGL it must be the ``HGLRC`` or ``GLXContext`` context object.
+    * For OpenGL it must be the ``HGLRC``, ``GLXContext``, or ``EGLContext`` context object.
+    * For OpenGLES it must be the ``EGLContext`` context object.
     * For Vulkan it must be the dispatch table pointer within the ``VkInstance``. This is a pointer-sized value at the location pointed to by the ``VkInstance``. NOTE - this is not the actual ``VkInstance`` pointer itself. You can use the RENDERDOC_DEVICEPOINTER_FROM_VKINSTANCE helper macro defined in the renderdoc header to obtain this pointer from any VkInstance.
 
-    ``RENDERDOC_WindowHandle`` is a typedef to ``void *``. It is the platform specific ``HWND``, ``xcb_window_t``, or Xlib ``Window``.
+    ``RENDERDOC_WindowHandle`` is a typedef to ``void *``. It is the platform specific Windows ``HWND``, Xcb ``xcb_window_t``, Xlib ``Window`` / ``Drawable``, Wayland ``wl_surface*``, or Android ``ANativeWindow*``.
 
 .. cpp:function:: void StartFrameCapture(RENDERDOC_DevicePointer device, RENDERDOC_WindowHandle wndHandle)
 
@@ -416,7 +433,7 @@ The path follows the template set in :cpp:func:`SetCaptureFilePathTemplate` so i
     ``RENDERDOC_DevicePointer`` and ``RENDERDOC_WindowHandle`` are described above in :cpp:func:`SetActiveWindow`.
     ``device`` and ``wndHandle`` can either or both be set to ``NULL`` to wildcard match against active device/window combinations. This wildcard matching can be used if the handle is difficult to obtain where frame captures are triggered.
 
-    Wildcard matching of `device` and `wndHandle` is described above in :cpp:func:`BeginFrameCapture`.
+    Wildcard matching of `device` and `wndHandle` is described above in :cpp:func:`StartFrameCapture`.
 
     There will be undefined results if there is not an active frame capture for the device/window combination.
 
@@ -434,9 +451,26 @@ The path follows the template set in :cpp:func:`SetCaptureFilePathTemplate` so i
     ``RENDERDOC_DevicePointer`` and ``RENDERDOC_WindowHandle`` are described above in :cpp:func:`SetActiveWindow`.
     ``device`` and ``wndHandle`` can either or both be set to ``NULL`` to wildcard match against active device/window combinations. This wildcard matching can be used if the handle is difficult to obtain where frame captures are triggered.
 
-    Wildcard matching of `device` and `wndHandle` is described above in :cpp:func:`BeginFrameCapture`.
+    Wildcard matching of `device` and `wndHandle` is described above in :cpp:func:`StartFrameCapture`.
 
     There will be undefined results if there is not an active frame capture for the device/window combination.
+
+.. note::
+
+    Added in API version 1.4.0
+
+.. cpp:function:: void SetCaptureTitle(const char *title)
+
+    This function sets a given title for the currently in-progress capture, which will be displayed in the UI. This can be used either with a user-defined capture using a manual start and end, or an automatic capture triggered by :cpp:func:`TriggerCapture` or a keypress.
+
+    If multiple captures are ongoing at once, the title will be applied to the first capture to end only. Any subsequent captures will not get any title unless the function is called again.
+
+    This function can only be called while a capture is in-progress, after :cpp:func:`StartFrameCapture` and before :cpp:func:`EndFrameCapture`. If it is called elsewhere it will have no effect. If it is called multiple times within a capture, only the last title will have any effect.
+
+
+.. note::
+
+    Added in API version 1.6.0
 
 .. cpp:function:: void TriggerMultiFrameCapture(uint32_t numFrames)
 
@@ -446,9 +480,18 @@ The path follows the template set in :cpp:func:`SetCaptureFilePathTemplate` so i
 
     :param uint32_t numFrames: the number of frames to capture, as an unsigned integer.
 
+.. note::
+
+    Added in API version 1.1.0
+
 .. cpp:function:: void SetCaptureFileComments(const char *filePath, const char *comments)
 
     This function adds an arbitrary comments field to an existing capture on disk, which will then be displayed in the UI to anyone opening the capture.
 
     :param const char* filePath: specifies the path to the capture file to set comments in, as UTF-8 null-terminated string. If this path is ``NULL`` or an empty string, the most recent capture file that has been created will be used.
     :param const char* comments: specifies the comments to set in the capture file, as UTF-8 null-terminated string.
+    
+.. note::
+
+    Added in API version 1.2.0
+

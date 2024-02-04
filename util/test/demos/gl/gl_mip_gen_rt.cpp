@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -24,7 +24,7 @@
 
 #include "gl_test.h"
 
-TEST(GL_Mip_Gen_RT, OpenGLGraphicsTest)
+RD_TEST(GL_Mip_Gen_RT, OpenGLGraphicsTest)
 {
   static constexpr const char *Description =
       "Tests rendering from one mip to another to do a downsample chain";
@@ -109,7 +109,7 @@ void main()
 
     while(Running())
     {
-      float col[] = {0.4f, 0.5f, 0.6f, 1.0f};
+      float col[] = {0.2f, 0.2f, 0.2f, 1.0f};
       glBindFramebuffer(GL_FRAMEBUFFER, 0);
       glClearBufferfv(GL_COLOR, 0, col);
 

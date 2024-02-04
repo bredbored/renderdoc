@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -24,7 +24,7 @@
 
 #include "gl_test.h"
 
-TEST(GL_Vertex_Attr_Zoo, OpenGLGraphicsTest)
+RD_TEST(GL_Vertex_Attr_Zoo, OpenGLGraphicsTest)
 {
   static constexpr const char *Description =
       "Draws a triangle but using different kinds of vertex attributes, including doubles, arrays, "
@@ -91,6 +91,17 @@ layout(location = 0, index = 0) out vec4 Color;
 void main()
 {
   Color = vec4(0, 1.0f, 0, 1);
+
+  // ensure all values are used
+  Color.g += abs(InSNorm.x);
+  Color.g += InUNorm.x;
+  Color.g += float(InUInt.x);
+  Color.g += float(InDouble.x);
+  Color.g += float(InArray[0].x);
+  Color.g += float(InArray[1].x);
+  Color.g += float(InArray[2].x);
+  Color.g += float(InMatrix[0][0]);
+  Color.g += float(InMatrix[1][1]);
 
   // check values came through correctly
 
@@ -233,7 +244,7 @@ void main()
 
     while(Running())
     {
-      float col[] = {0.4f, 0.5f, 0.6f, 1.0f};
+      float col[] = {0.2f, 0.2f, 0.2f, 1.0f};
       glClearBufferfv(GL_COLOR, 0, col);
 
       glBindVertexArray(vao);

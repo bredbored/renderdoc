@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2016-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -68,7 +68,9 @@ EnvironmentEditor::EnvironmentEditor(QWidget *parent)
   QObject::connect(ui->appendValue, &QRadioButton::toggled, separatorLambda);
 
   ui->separator->addItems({
-      ToQStr(EnvSep::Platform), ToQStr(EnvSep::SemiColon), ToQStr(EnvSep::Colon),
+      ToQStr(EnvSep::Platform),
+      ToQStr(EnvSep::SemiColon),
+      ToQStr(EnvSep::Colon),
       ToQStr(EnvSep::NoSep),
   });
 
@@ -88,7 +90,7 @@ EnvironmentEditor::EnvironmentEditor(QWidget *parent)
 
   ui->variables->sortByColumn(0, Qt::DescendingOrder);
 
-  ui->variables->setFont(QFontDatabase::systemFont(QFontDatabase::FixedFont));
+  ui->variables->setFont(Formatter::FixedFont());
 }
 
 EnvironmentEditor::~EnvironmentEditor()
@@ -130,7 +132,7 @@ void EnvironmentEditor::on_variables_currentItemChanged(RDTreeWidgetItem *curren
 
   EnvironmentModification mod = current->tag().value<EnvironmentModification>();
 
-  if(!mod.value.empty())
+  if(!mod.name.empty())
   {
     ui->name->setText(mod.name);
     ui->value->setText(mod.value);

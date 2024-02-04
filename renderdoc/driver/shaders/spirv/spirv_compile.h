@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -24,10 +24,12 @@
 
 #pragma once
 
-#include <string>
-#include <vector>
+#include "api/replay/rdcarray.h"
+#include "api/replay/rdcstr.h"
 
-enum class SPIRVShaderStage
+namespace rdcspv
+{
+enum class ShaderStage
 {
   Vertex,
   TessControl,
@@ -35,10 +37,13 @@ enum class SPIRVShaderStage
   Geometry,
   Fragment,
   Compute,
+  // gap of 6 for RT shaders
+  Task = Compute + 7,
+  Mesh,
   Invalid,
 };
 
-enum class SPIRVSourceLanguage
+enum class InputLanguage
 {
   Unknown,
   OpenGLGLSL,
@@ -46,18 +51,22 @@ enum class SPIRVSourceLanguage
   VulkanHLSL,
 };
 
-struct SPIRVCompilationSettings
+struct CompilationSettings
 {
-  SPIRVCompilationSettings(SPIRVSourceLanguage l, SPIRVShaderStage s) : stage(s), lang(l) {}
-  SPIRVCompilationSettings() = default;
+  CompilationSettings(InputLanguage l, ShaderStage s) : stage(s), lang(l) {}
+  CompilationSettings() = default;
 
-  SPIRVShaderStage stage = SPIRVShaderStage::Invalid;
-  SPIRVSourceLanguage lang = SPIRVSourceLanguage::Unknown;
-  std::string entryPoint;
+  ShaderStage stage = ShaderStage::Invalid;
+  InputLanguage lang = InputLanguage::Unknown;
+  bool debugInfo = false;
+  bool gles = false;
+  rdcstr entryPoint;
 };
 
-void InitSPIRVCompiler();
-void ShutdownSPIRVCompiler();
+void Init();
+void Shutdown();
 
-std::string CompileSPIRV(const SPIRVCompilationSettings &settings,
-                         const std::vector<std::string> &sources, std::vector<uint32_t> &spirv);
+rdcstr Compile(const CompilationSettings &settings, const rdcarray<rdcstr> &sources,
+               rdcarray<uint32_t> &spirv);
+
+};    // namespace rdcspv

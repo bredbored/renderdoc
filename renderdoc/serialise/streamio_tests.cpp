@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2017-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -27,7 +27,7 @@
 
 #if ENABLED(ENABLE_UNIT_TESTS)
 
-#include "3rdparty/catch/catch.hpp"
+#include "catch/catch.hpp"
 
 TEST_CASE("Test basic stream I/O operations", "[streamio]")
 {
@@ -92,6 +92,69 @@ TEST_CASE("Test basic stream I/O operations", "[streamio]")
   CHECK(test == 0);
 
   CHECK(reader.IsErrored());
+};
+
+TEST_CASE("Test stream I/O with invalid/broken outputs", "[streamio]")
+{
+  SECTION("NULL file writer")
+  {
+    StreamWriter writer((FILE *)NULL, Ownership::Stream);
+
+    CHECK(writer.IsErrored());
+
+    uint32_t test = 5;
+    writer.Write(test);
+
+    CHECK(writer.IsErrored());
+  };
+
+  SECTION("NULL socket writer")
+  {
+    StreamWriter writer((Network::Socket *)NULL, Ownership::Stream);
+
+    CHECK(writer.IsErrored());
+
+    uint32_t test = 5;
+    writer.Write(test);
+
+    CHECK(writer.IsErrored());
+  };
+
+  SECTION("NULL file reader")
+  {
+    StreamReader reader((FILE *)NULL, 0, Ownership::Stream);
+
+    CHECK(reader.IsErrored());
+
+    uint32_t test = 5;
+    reader.Read(test);
+
+    CHECK(reader.IsErrored());
+  };
+
+  SECTION("NULL file reader")
+  {
+    StreamReader reader((FILE *)NULL);
+
+    CHECK(reader.IsErrored());
+
+    uint32_t test = 5;
+    reader.Read(test);
+
+    CHECK(reader.IsErrored());
+  };
+
+  SECTION("NULL socket reader")
+  {
+    StreamReader reader((Network::Socket *)NULL, Ownership::Stream);
+
+    CHECK(reader.IsErrored());
+
+    uint32_t test = 5;
+    reader.Read(test);
+
+    CHECK(reader.IsErrored());
+  };
 };
 
 TEST_CASE("Test stream I/O operations over the network", "[streamio][network]")
@@ -170,12 +233,11 @@ TEST_CASE("Test stream I/O operations over the network", "[streamio][network]")
 
     // we have to do the send/receive on threads since it is blocking
 
-    std::vector<uint64_t> receivedValues;
-    std::vector<uint64_t> list = {1,  1,  2,   3,   5,   8,   13,  21,  34,
-                                  55, 89, 144, 233, 377, 610, 987, 1597};
+    rdcarray<uint64_t> receivedValues;
+    rdcarray<uint64_t> list = {1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 377, 610, 987, 1597};
 
     // Tracks the lifetime of each thread.
-    volatile int32_t threadA = 0, threadB = 0;
+    int32_t threadA = 0, threadB = 0;
 
     Threading::ThreadHandle recvThread =
         Threading::CreateThread([&threadA, &reader, &receivedValues]() {
@@ -228,7 +290,6 @@ TEST_CASE("Test stream I/O operations over the network", "[streamio][network]")
     uint64_t vals[10] = {1, 6, 0, 5, 3, 8, 7, 9, 2, 4};
 
     sendThread = Threading::CreateThread([&threadA, sender, &writer, &vals]() {
-
       PerformanceTimer timer;
 
       for(int32_t i = 0; i < 128; i++)
@@ -249,15 +310,15 @@ TEST_CASE("Test stream I/O operations over the network", "[streamio][network]")
     });
 
     recvThread = Threading::CreateThread([&threadB, &reader, &receivedValues]() {
-      uint64_t vals[10];
+      uint64_t tmp[10];
 
-      reader.Read(vals);
+      reader.Read(tmp);
 
       // keep reading indefinitely until we hit an error (i.e. socket disconnected)
       while(!reader.IsErrored())
       {
-        receivedValues.insert(receivedValues.end(), vals, vals + ARRAY_COUNT(vals));
-        reader.Read(vals);
+        receivedValues.append(tmp, ARRAY_COUNT(tmp));
+        reader.Read(tmp);
       }
 
       Atomic::Inc32(&threadB);

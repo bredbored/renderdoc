@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2016-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -35,14 +35,15 @@ class WrappedID3D12GraphicsCommandList;
 
 // The inheritance is awful for these. See WrappedID3D12DebugDevice for why there are multiple
 // parent classes
-struct WrappedID3D12DebugCommandList : public ID3D12DebugCommandList2, public ID3D12DebugCommandList1
+struct WrappedID3D12DebugCommandList : public ID3D12DebugCommandList3, public ID3D12DebugCommandList1
 {
-  WrappedID3D12GraphicsCommandList *m_pList;
-  ID3D12DebugCommandList *m_pReal;
-  ID3D12DebugCommandList1 *m_pReal1;
-  ID3D12DebugCommandList2 *m_pReal2;
+  WrappedID3D12GraphicsCommandList *m_pList = NULL;
+  ID3D12DebugCommandList *m_pReal = NULL;
+  ID3D12DebugCommandList1 *m_pReal1 = NULL;
+  ID3D12DebugCommandList2 *m_pReal2 = NULL;
+  ID3D12DebugCommandList3 *m_pReal3 = NULL;
 
-  WrappedID3D12DebugCommandList() : m_pList(NULL), m_pReal(NULL) {}
+  WrappedID3D12DebugCommandList() {}
   //////////////////////////////
   // implement IUnknown
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppvObject)
@@ -50,6 +51,24 @@ struct WrappedID3D12DebugCommandList : public ID3D12DebugCommandList2, public ID
     if(riid == __uuidof(ID3D12DebugCommandList))
     {
       *ppvObject = (ID3D12DebugCommandList *)this;
+      AddRef();
+      return S_OK;
+    }
+    else if(riid == __uuidof(ID3D12DebugCommandList1))
+    {
+      *ppvObject = (ID3D12DebugCommandList1 *)this;
+      AddRef();
+      return S_OK;
+    }
+    else if(riid == __uuidof(ID3D12DebugCommandList2))
+    {
+      *ppvObject = (ID3D12DebugCommandList2 *)this;
+      AddRef();
+      return S_OK;
+    }
+    else if(riid == __uuidof(ID3D12DebugCommandList3))
+    {
+      *ppvObject = (ID3D12DebugCommandList3 *)this;
       AddRef();
       return S_OK;
     }
@@ -67,14 +86,14 @@ struct WrappedID3D12DebugCommandList : public ID3D12DebugCommandList2, public ID
                                                      UINT State)
   {
     if(m_pReal)
-      m_pReal->AssertResourceState(pResource, Subresource, State);
+      return m_pReal->AssertResourceState(Unwrap(pResource), Subresource, State);
     return TRUE;
   }
 
   virtual HRESULT STDMETHODCALLTYPE SetFeatureMask(D3D12_DEBUG_FEATURE Mask)
   {
     if(m_pReal)
-      m_pReal->SetFeatureMask(Mask);
+      return m_pReal->SetFeatureMask(Mask);
     return S_OK;
   }
 
@@ -89,8 +108,7 @@ struct WrappedID3D12DebugCommandList : public ID3D12DebugCommandList2, public ID
   // implement ID3D12DebugCommandList1 / ID3D12DebugCommandList2
 
   virtual HRESULT STDMETHODCALLTYPE SetDebugParameter(D3D12_DEBUG_COMMAND_LIST_PARAMETER_TYPE Type,
-                                                      _In_reads_bytes_(DataSize) const void *pData,
-                                                      UINT DataSize)
+                                                      const void *pData, UINT DataSize)
   {
     if(m_pReal1)
       return m_pReal1->SetDebugParameter(Type, pData, DataSize);
@@ -100,8 +118,7 @@ struct WrappedID3D12DebugCommandList : public ID3D12DebugCommandList2, public ID
   }
 
   virtual HRESULT STDMETHODCALLTYPE GetDebugParameter(D3D12_DEBUG_COMMAND_LIST_PARAMETER_TYPE Type,
-                                                      _Out_writes_bytes_(DataSize) void *pData,
-                                                      UINT DataSize)
+                                                      void *pData, UINT DataSize)
   {
     if(m_pReal1)
       return m_pReal1->GetDebugParameter(Type, pData, DataSize);
@@ -109,9 +126,26 @@ struct WrappedID3D12DebugCommandList : public ID3D12DebugCommandList2, public ID
       return m_pReal2->GetDebugParameter(Type, pData, DataSize);
     return S_OK;
   }
+
+  //////////////////////////////
+  // implement ID3D12DebugCommandList3
+
+  virtual void STDMETHODCALLTYPE AssertResourceAccess(ID3D12Resource *pResource, UINT Subresource,
+                                                      D3D12_BARRIER_ACCESS Access)
+  {
+    if(m_pReal3)
+      m_pReal3->AssertResourceAccess(Unwrap(pResource), Subresource, Access);
+  }
+
+  virtual void STDMETHODCALLTYPE AssertTextureLayout(ID3D12Resource *pResource, UINT Subresource,
+                                                     D3D12_BARRIER_LAYOUT Layout)
+  {
+    if(m_pReal3)
+      m_pReal3->AssertTextureLayout(Unwrap(pResource), Subresource, Layout);
+  }
 };
 
-class WrappedID3D12GraphicsCommandList : public ID3D12GraphicsCommandList4
+class WrappedID3D12GraphicsCommandList : public ID3D12GraphicsCommandListX
 {
 private:
   ID3D12GraphicsCommandList *m_pList = NULL;
@@ -119,6 +153,11 @@ private:
   ID3D12GraphicsCommandList2 *m_pList2 = NULL;
   ID3D12GraphicsCommandList3 *m_pList3 = NULL;
   ID3D12GraphicsCommandList4 *m_pList4 = NULL;
+  ID3D12GraphicsCommandList5 *m_pList5 = NULL;
+  ID3D12GraphicsCommandList6 *m_pList6 = NULL;
+  ID3D12GraphicsCommandList7 *m_pList7 = NULL;
+  ID3D12GraphicsCommandList8 *m_pList8 = NULL;
+  ID3D12GraphicsCommandList9 *m_pList9 = NULL;
 
   RefCounter12<ID3D12GraphicsCommandList> m_RefCounter;
 
@@ -148,12 +187,12 @@ private:
     D3D12_COMMAND_LIST_TYPE type;
   } m_Init;
 
-  static std::string GetChunkName(uint32_t idx);
+  bool m_FakeCreationReset = false;
+
+  static rdcstr GetChunkName(uint32_t idx);
   D3D12ResourceManager *GetResourceManager() { return m_pDevice->GetResourceManager(); }
 public:
-  static const int AllocPoolCount = 8192;
-  static const int AllocMaxByteSize = 2 * 1024 * 1024;
-  ALLOCATE_WITH_WRAPPED_POOL(WrappedID3D12GraphicsCommandList, AllocPoolCount, AllocMaxByteSize);
+  ALLOCATE_WITH_WRAPPED_POOL(WrappedID3D12GraphicsCommandList);
 
   WrappedID3D12GraphicsCommandList(ID3D12GraphicsCommandList *real, WrappedID3D12Device *device,
                                    CaptureState &state);
@@ -165,15 +204,25 @@ public:
   ID3D12GraphicsCommandList2 *GetReal2() { return m_pList2; }
   ID3D12GraphicsCommandList3 *GetReal3() { return m_pList3; }
   ID3D12GraphicsCommandList4 *GetReal4() { return m_pList4; }
+  ID3D12GraphicsCommandList5 *GetReal5() { return m_pList5; }
+  ID3D12GraphicsCommandList6 *GetReal6() { return m_pList6; }
+  ID3D12GraphicsCommandList7 *GetReal7() { return m_pList7; }
+  ID3D12GraphicsCommandList8 *GetReal8() { return m_pList8; }
+  ID3D12GraphicsCommandList9 *GetReal9() { return m_pList9; }
   WrappedID3D12Device *GetWrappedDevice() { return m_pDevice; }
   D3D12ResourceRecord *GetResourceRecord() { return m_ListRecord; }
   D3D12ResourceRecord *GetCreationRecord() { return m_CreationRecord; }
-  ID3D12GraphicsCommandList *GetCrackedList();
-  ID3D12GraphicsCommandList1 *GetCrackedList1();
-  ID3D12GraphicsCommandList2 *GetCrackedList2();
-  ID3D12GraphicsCommandList3 *GetCrackedList3();
-  ID3D12GraphicsCommandList4 *GetCrackedList4();
-  ID3D12GraphicsCommandList4 *GetWrappedCrackedList();
+
+  void FinaliseExecuteIndirectEvents(BakedCmdListInfo &info, BakedCmdListInfo::ExecuteData &exec);
+  void SaveExecuteIndirectParameters(ID3D12GraphicsCommandListX *list,
+                                     ID3D12CommandSignature *pCommandSignature, UINT MaxCommandCount,
+                                     ID3D12Resource *pArgumentBuffer, UINT64 ArgumentBufferOffset,
+                                     ID3D12Resource *pCountBuffer, UINT64 CountBufferOffset);
+  void ResetAndRecordExecuteIndirectStates(ID3D12GraphicsCommandListX *list, uint32_t baseEventID,
+                                           uint32_t execCount,
+                                           ID3D12CommandSignature *pCommandSignature,
+                                           ID3D12Resource *pArgumentBuffer,
+                                           UINT64 ArgumentBufferOffset, uint32_t argumentsReplayed);
 
   void SetAMDMarkerInterface(IAmdExtD3DCommandListMarker *marker) { m_AMDMarkers = marker; }
   void SetCommandData(D3D12CommandData *cmd) { m_Cmd = cmd; }
@@ -183,6 +232,8 @@ public:
     m_Init.nodeMask = nodeMask;
     m_Init.type = type;
   }
+  HRESULT ResetInternal(ID3D12CommandAllocator *pAllocator, ID3D12PipelineState *pInitialState,
+                        bool fakeCreationReset);
 
   bool ValidateRootGPUVA(D3D12_GPU_VIRTUAL_ADDRESS buffer);
 
@@ -214,8 +265,8 @@ public:
     }
     else if(guid == WKPDID_D3DDebugObjectNameW)
     {
-      std::wstring wName((const wchar_t *)pData, DataSize / 2);
-      std::string sName = StringFormat::Wide2UTF8(wName);
+      rdcwstr wName((const wchar_t *)pData, DataSize / 2);
+      rdcstr sName = StringFormat::Wide2UTF8(wName);
       m_pDevice->SetName(this, sName.c_str());
     }
 
@@ -229,7 +280,7 @@ public:
 
   HRESULT STDMETHODCALLTYPE SetName(LPCWSTR Name)
   {
-    std::string utf8 = StringFormat::Wide2UTF8(Name);
+    rdcstr utf8 = StringFormat::Wide2UTF8(Name);
     m_pDevice->SetName(this, utf8.c_str());
 
     return m_pList->SetName(Name);
@@ -426,11 +477,6 @@ public:
 
   IMPLEMENT_FUNCTION_SERIALISED(virtual void STDMETHODCALLTYPE, EndEvent, );
 
-  void ReserveExecuteIndirect(ID3D12GraphicsCommandList *list,
-                              WrappedID3D12CommandSignature *comSig, UINT maxCount);
-  void PatchExecuteIndirect(BakedCmdListInfo &info, uint32_t executeIndex);
-  void ReplayExecuteIndirect(ID3D12GraphicsCommandList *list);
-
   IMPLEMENT_FUNCTION_SERIALISED(virtual void STDMETHODCALLTYPE, ExecuteIndirect,
                                 ID3D12CommandSignature *pCommandSignature, UINT MaxCommandCount,
                                 ID3D12Resource *pArgumentBuffer, UINT64 ArgumentBufferOffset,
@@ -526,6 +572,40 @@ public:
 
   IMPLEMENT_FUNCTION_SERIALISED(virtual void STDMETHODCALLTYPE, DispatchRays,
                                 _In_ const D3D12_DISPATCH_RAYS_DESC *pDesc);
+
+  //////////////////////////////
+  // implement ID3D12GraphicsCommandList5
+  IMPLEMENT_FUNCTION_SERIALISED(virtual void STDMETHODCALLTYPE, RSSetShadingRate,
+                                D3D12_SHADING_RATE baseShadingRate,
+                                const D3D12_SHADING_RATE_COMBINER *combiners);
+
+  IMPLEMENT_FUNCTION_SERIALISED(virtual void STDMETHODCALLTYPE, RSSetShadingRateImage,
+                                ID3D12Resource *shadingRateImage);
+
+  //////////////////////////////
+  // implement ID3D12GraphicsCommandList6
+  IMPLEMENT_FUNCTION_SERIALISED(virtual void STDMETHODCALLTYPE, DispatchMesh,
+                                _In_ UINT ThreadGroupCountX, _In_ UINT ThreadGroupCountY,
+                                _In_ UINT ThreadGroupCountZ);
+
+  //////////////////////////////
+  // implement ID3D12GraphicsCommandList7
+  IMPLEMENT_FUNCTION_SERIALISED(virtual void STDMETHODCALLTYPE, Barrier, UINT32 NumBarrierGroups,
+                                _In_reads_(NumBarrierGroups)
+                                    const D3D12_BARRIER_GROUP *pBarrierGroups);
+
+  //////////////////////////////
+  // implement ID3D12GraphicsCommandList8
+  IMPLEMENT_FUNCTION_SERIALISED(virtual void STDMETHODCALLTYPE, OMSetFrontAndBackStencilRef,
+                                _In_ UINT FrontStencilRef, _In_ UINT BackStencilRef);
+
+  //////////////////////////////
+  // implement ID3D12GraphicsCommandList9
+  IMPLEMENT_FUNCTION_SERIALISED(virtual void STDMETHODCALLTYPE, RSSetDepthBias, _In_ FLOAT DepthBias,
+                                _In_ FLOAT DepthBiasClamp, _In_ FLOAT SlopeScaledDepthBias);
+
+  IMPLEMENT_FUNCTION_SERIALISED(virtual void STDMETHODCALLTYPE, IASetIndexBufferStripCutValue,
+                                _In_ D3D12_INDEX_BUFFER_STRIP_CUT_VALUE IBStripCutValue);
 };
 
 template <>
@@ -551,18 +631,43 @@ template <>
 ResourceId GetResID(ID3D12GraphicsCommandList3 *obj);
 template <>
 ResourceId GetResID(ID3D12GraphicsCommandList4 *obj);
+template <>
+ResourceId GetResID(ID3D12GraphicsCommandList5 *obj);
+template <>
+ResourceId GetResID(ID3D12GraphicsCommandList6 *obj);
+template <>
+ResourceId GetResID(ID3D12GraphicsCommandList7 *obj);
+template <>
+ResourceId GetResID(ID3D12GraphicsCommandList8 *obj);
+template <>
+ResourceId GetResID(ID3D12GraphicsCommandList9 *obj);
 
 ID3D12GraphicsCommandList *Unwrap(ID3D12GraphicsCommandList1 *obj);
 ID3D12GraphicsCommandList *Unwrap(ID3D12GraphicsCommandList2 *obj);
 ID3D12GraphicsCommandList *Unwrap(ID3D12GraphicsCommandList3 *obj);
 ID3D12GraphicsCommandList *Unwrap(ID3D12GraphicsCommandList4 *obj);
+ID3D12GraphicsCommandList *Unwrap(ID3D12GraphicsCommandList5 *obj);
+ID3D12GraphicsCommandList *Unwrap(ID3D12GraphicsCommandList6 *obj);
+ID3D12GraphicsCommandList *Unwrap(ID3D12GraphicsCommandList7 *obj);
+ID3D12GraphicsCommandList *Unwrap(ID3D12GraphicsCommandList8 *obj);
+ID3D12GraphicsCommandList *Unwrap(ID3D12GraphicsCommandList9 *obj);
 
 ID3D12GraphicsCommandList1 *Unwrap1(ID3D12GraphicsCommandList1 *obj);
 ID3D12GraphicsCommandList2 *Unwrap2(ID3D12GraphicsCommandList2 *obj);
 ID3D12GraphicsCommandList3 *Unwrap3(ID3D12GraphicsCommandList3 *obj);
 ID3D12GraphicsCommandList4 *Unwrap4(ID3D12GraphicsCommandList4 *obj);
+ID3D12GraphicsCommandList5 *Unwrap5(ID3D12GraphicsCommandList5 *obj);
+ID3D12GraphicsCommandList6 *Unwrap6(ID3D12GraphicsCommandList6 *obj);
+ID3D12GraphicsCommandList7 *Unwrap7(ID3D12GraphicsCommandList7 *obj);
+ID3D12GraphicsCommandList8 *Unwrap8(ID3D12GraphicsCommandList8 *obj);
+ID3D12GraphicsCommandList9 *Unwrap9(ID3D12GraphicsCommandList9 *obj);
 
 WrappedID3D12GraphicsCommandList *GetWrapped(ID3D12GraphicsCommandList1 *obj);
 WrappedID3D12GraphicsCommandList *GetWrapped(ID3D12GraphicsCommandList2 *obj);
 WrappedID3D12GraphicsCommandList *GetWrapped(ID3D12GraphicsCommandList3 *obj);
 WrappedID3D12GraphicsCommandList *GetWrapped(ID3D12GraphicsCommandList4 *obj);
+WrappedID3D12GraphicsCommandList *GetWrapped(ID3D12GraphicsCommandList5 *obj);
+WrappedID3D12GraphicsCommandList *GetWrapped(ID3D12GraphicsCommandList6 *obj);
+WrappedID3D12GraphicsCommandList *GetWrapped(ID3D12GraphicsCommandList7 *obj);
+WrappedID3D12GraphicsCommandList *GetWrapped(ID3D12GraphicsCommandList8 *obj);
+WrappedID3D12GraphicsCommandList *GetWrapped(ID3D12GraphicsCommandList9 *obj);

@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2016-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -22,6 +22,7 @@
  * THE SOFTWARE.
  ******************************************************************************/
 
+#include "common/common.h"
 #include "os/os_specific.h"
 
 class AndroidCallstack : public Callstack::Stackwalk
@@ -68,6 +69,8 @@ Stackwalk *Create()
 
 bool GetLoadedModules(byte *buf, size_t &size)
 {
+  size = 0;
+
   if(buf)
     memcpy(buf, "ANRDCALL", 8);
 
@@ -76,7 +79,8 @@ bool GetLoadedModules(byte *buf, size_t &size)
   return true;
 }
 
-StackResolver *MakeResolver(byte *moduleDB, size_t DBSize, RENDERDOC_ProgressCallback progress)
+StackResolver *MakeResolver(bool interactive, byte *moduleDB, size_t DBSize,
+                            RENDERDOC_ProgressCallback progress)
 {
   RDCERR("Callstack resolving not supported on Android.");
   return NULL;

@@ -6,22 +6,19 @@ class VK_CBuffer_Zoo(rdtest.TestCase):
     demos_test_name = 'VK_CBuffer_Zoo'
 
     def check_capture(self):
-        draw = self.find_draw("Draw")
+        action = self.find_action("Draw")
 
-        self.check(draw is not None)
+        self.check(action is not None)
 
-        self.controller.SetFrameEvent(draw.eventId, False)
+        self.controller.SetFrameEvent(action.eventId, False)
 
-        # Make an output so we can pick pixels
-        out: rd.ReplayOutput = self.controller.CreateOutput(rd.CreateHeadlessWindowingData(100, 100), rd.ReplayOutputType.Texture)
-
-        self.check(out is not None)
+        props: rd.APIProperties = self.controller.GetAPIProperties()
 
         pipe: rd.PipeState = self.controller.GetPipelineState()
 
         stage = rd.ShaderStage.Pixel
 
-        # Verify that the GLSL draw is first
+        # Verify that the GLSL action is first
         disasm = self.controller.DisassembleShader(pipe.GetGraphicsPipelineObject(), pipe.GetShaderReflection(stage),
                                                    '')
 
@@ -30,10 +27,121 @@ class VK_CBuffer_Zoo(rdtest.TestCase):
         cbuf: rd.BoundCBuffer = pipe.GetConstantBuffer(stage, 0, 0)
 
         var_check = rdtest.ConstantBufferChecker(
-            self.controller.GetCBufferVariableContents(pipe.GetShader(stage),
+            self.controller.GetCBufferVariableContents(pipe.GetGraphicsPipelineObject(),
+                                                       pipe.GetShader(stage), stage,
                                                        pipe.GetShaderEntryPoint(stage), 0,
-                                                       cbuf.resourceId, cbuf.byteOffset))
+                                                       cbuf.resourceId, cbuf.byteOffset, cbuf.byteSize))
 
+        self.check_glsl_cbuffer(var_check)
+
+        rdtest.log.success("GLSL CBuffer variables are as expected")
+
+        cbuf: rd.BoundCBuffer = pipe.GetConstantBuffer(stage, 1, 0)
+
+        inline_check = rdtest.ConstantBufferChecker(
+            self.controller.GetCBufferVariableContents(pipe.GetGraphicsPipelineObject(),
+                                                       pipe.GetShader(stage), stage,
+                                                       pipe.GetShaderEntryPoint(stage), 1,
+                                                       cbuf.resourceId, cbuf.byteOffset, cbuf.byteSize))
+
+        self.check_inline_cbuffer(inline_check)
+
+        rdtest.log.success("GLSL Inline uniform variables are as expected")
+
+        self.check_pixel_value(pipe.GetOutputTargets()[0].resourceId, 0.5, 0.5, [536.1, 537.0, 538.0, 539.0])
+
+        rdtest.log.success("GLSL picked value is as expected")
+
+        # Check the specialization constants
+        cbuf: rd.BoundCBuffer = pipe.GetConstantBuffer(stage, 2, 0)
+
+        var_check = rdtest.ConstantBufferChecker(
+            self.controller.GetCBufferVariableContents(pipe.GetGraphicsPipelineObject(),
+                                                       pipe.GetShader(stage), stage,
+                                                       pipe.GetShaderEntryPoint(stage), 2,
+                                                       cbuf.resourceId, cbuf.byteOffset, cbuf.byteSize))
+
+        # int A;
+        # Default value 10, untouched
+        var_check.check('A').type(rd.VarType.SInt).rows(1).cols(1).value([10])
+
+        # float B;
+        # Value 20 from spec constants
+        var_check.check('B').type(rd.VarType.Float).rows(1).cols(1).value([20.0])
+
+        # bool C;
+        # Value True from spec constants
+        var_check.check('C').type(rd.VarType.Bool).rows(1).cols(1).value([1])
+
+        var_check.done()
+
+        rdtest.log.success("Specialization constants are as expected")
+
+        # Move to the HLSL action
+        action = action.next
+
+        self.check(action is not None)
+
+        self.controller.SetFrameEvent(action.eventId, False)
+
+        pipe: rd.PipeState = self.controller.GetPipelineState()
+
+        # Verify that this is the HLSL action
+        disasm = self.controller.DisassembleShader(pipe.GetGraphicsPipelineObject(), pipe.GetShaderReflection(stage),
+                                                   '')
+
+        self.check('HLSL' in disasm)
+
+        cbuf: rd.BoundCBuffer = pipe.GetConstantBuffer(stage, 0, 0)
+
+        var_check = rdtest.ConstantBufferChecker(
+            self.controller.GetCBufferVariableContents(pipe.GetGraphicsPipelineObject(),
+                                                       pipe.GetShader(stage), stage,
+                                                       pipe.GetShaderEntryPoint(stage), 0,
+                                                       cbuf.resourceId, cbuf.byteOffset, cbuf.byteSize))
+
+        self.check_hlsl_cbuffer(var_check)
+
+        rdtest.log.success("HLSL CBuffer variables are as expected")
+
+        cbuf: rd.BoundCBuffer = pipe.GetConstantBuffer(stage, 1, 0)
+
+        inline_check = rdtest.ConstantBufferChecker(
+            self.controller.GetCBufferVariableContents(pipe.GetGraphicsPipelineObject(),
+                                                       pipe.GetShader(stage), stage,
+                                                       pipe.GetShaderEntryPoint(stage), 1,
+                                                       cbuf.resourceId, cbuf.byteOffset, cbuf.byteSize))
+
+        self.check_inline_cbuffer(inline_check)
+
+        rdtest.log.success("HLSL Inline uniform variables are as expected")
+
+        self.check_pixel_value(pipe.GetOutputTargets()[0].resourceId, 0.5, 0.5, [536.1, 537.0, 538.0, 539.0])
+
+        rdtest.log.success("HLSL picked value is as expected")
+
+    def check_inline_cbuffer(self, inline_check):
+        # float4 zero;
+        inline_check.check('inline_zero').rows(1).cols(4).value([0.0, 0.0, 0.0, 0.0])
+
+        # float4 a;
+        inline_check.check('inline_a').rows(1).cols(4).value([10.0, 20.0, 30.0, 40.0])
+
+        # float2 b;
+        inline_check.check('inline_b').rows(1).cols(2).value([50.0, 60.0])
+
+        # float2 c;
+        inline_check.check('inline_c').rows(1).cols(2).value([70.0, 80.0])
+
+        # float3_1 d;
+        inline_check.check('inline_d').rows(0).cols(0).structSize(2).members({
+            'a': lambda y: y.rows(1).cols(3).value([90.0, 100.0, 110.0]),
+            'b': lambda y: y.rows(1).cols(1).value([120.0]),
+        })
+
+        inline_check.done()
+
+    def check_glsl_cbuffer(self, var_check):
         # For more detailed reference for the below checks, see the commented definition of the cbuffer
         # in the shader source code in the demo itself
 
@@ -296,73 +404,82 @@ class VK_CBuffer_Zoo(rdtest.TestCase):
                                                                  433.0, 437.0]),
         })
 
-        # vec4 test;
-        var_check.check('test').rows(1).cols(4).value([440.0, 441.0, 442.0, 443.0])
+        # struct nested_with_padding
+        # {
+        #   float a; // vec3 padding
+        #   vec4 b;
+        #   float c; // vec3 padding
+        #   vec3 d[4]; // float padding after each one
+        # };
+        # nested_with_padding ak[2];
+        var_check.check('ak').rows(0).cols(0).arraySize(2).members({
+            # ak[0]
+            0: lambda s: s.rows(0).cols(0).structSize(4).members({
+                'a': lambda y: y.rows(1).cols(1).value([440.0]),
+                'b': lambda y: y.rows(1).cols(4).value([444.0, 445.0, 446.0, 447.0]),
+                'c': lambda y: y.rows(1).cols(1).value([448.0]),
+                'd': lambda x: x.rows(0).cols(0).arraySize(4).members({
+                    0: lambda z: z.rows(1).cols(3).value([452.0, 453.0, 454.0]),
+                    1: lambda z: z.rows(1).cols(3).value([456.0, 457.0, 458.0]),
+                    2: lambda z: z.rows(1).cols(3).value([460.0, 461.0, 462.0]),
+                    3: lambda z: z.rows(1).cols(3).value([464.0, 465.0, 466.0]),
+                }),
+            }),
+            # ak[1]
+            1: lambda s: s.rows(0).cols(0).structSize(4).members({
+                'a': lambda y: y.rows(1).cols(1).value([468.0]),
+                'b': lambda y: y.rows(1).cols(4).value([472.0, 473.0, 474.0, 475.0]),
+                'c': lambda y: y.rows(1).cols(1).value([476.0]),
+                'd': lambda x: x.rows(0).cols(0).arraySize(4).members({
+                    0: lambda z: z.rows(1).cols(3).value([480.0, 481.0, 482.0]),
+                    1: lambda z: z.rows(1).cols(3).value([484.0, 485.0, 486.0]),
+                    2: lambda z: z.rows(1).cols(3).value([488.0, 489.0, 490.0]),
+                    3: lambda z: z.rows(1).cols(3).value([492.0, 493.0, 494.0]),
+                }),
+            }),
+        })
+
+        # vec4 dummy12;
+        var_check.check('dummy12')
+
+        # float al;
+        var_check.check('al').rows(1).cols(1).value([500.0])
+
+        # struct float2_struct
+        # {
+        #   float x, y;
+        # };
+        # float2_struct am;
+        var_check.check('am').rows(0).cols(0).members({
+            'x': lambda y: y.rows(1).cols(1).value([504.0]),
+            'y': lambda y: y.rows(1).cols(1).value([505.0]),
+        })
+
+        # float an;
+        var_check.check('an').rows(1).cols(1).value([508.0])
+
+        # float4 dummy13[2];
+        var_check.check('dummy13')
+
+        # misaligned_struct ao[2];
+        var_check.check('ao').rows(0).cols(0).arraySize(2).members({
+            # ao[0]
+            0: lambda s: s.rows(0).cols(0).structSize(2).members({
+                'a': lambda y: y.rows(1).cols(4).value([520.0, 521.0, 522.0, 523.0]),
+                'b': lambda y: y.rows(1).cols(2).value([524.0, 525.0]),
+            }),
+            1: lambda s: s.rows(0).cols(0).structSize(2).members({
+                'a': lambda y: y.rows(1).cols(4).value([528.0, 529.0, 530.0, 531.0]),
+                'b': lambda y: y.rows(1).cols(2).value([532.0, 533.0]),
+            }),
+        })
+
+        # float4 test;
+        var_check.check('test').rows(1).cols(4).value([536.0, 537.0, 538.0, 539.0])
 
         var_check.done()
 
-        rdtest.log.success("GLSL CBuffer variables are as expected")
-
-        tex = rd.TextureDisplay()
-        tex.resourceId = pipe.GetOutputTargets()[0].resourceId
-        out.SetTextureDisplay(tex)
-
-        texdetails = self.get_texture(tex.resourceId)
-
-        picked: rd.PixelValue = out.PickPixel(tex.resourceId, False,
-                                              int(texdetails.width / 2), int(texdetails.height / 2), 0, 0, 0)
-
-        if not rdtest.value_compare(picked.floatValue, [440.1, 441.0, 442.0, 443.0]):
-            raise rdtest.TestFailureException("Picked value {} doesn't match expectation".format(picked.floatValue))
-
-        rdtest.log.success("GLSL picked value is as expected")
-
-        # Check the specialization constants
-        cbuf: rd.BoundCBuffer = pipe.GetConstantBuffer(stage, 1, 0)
-
-        var_check = rdtest.ConstantBufferChecker(
-            self.controller.GetCBufferVariableContents(pipe.GetShader(stage),
-                                                       pipe.GetShaderEntryPoint(stage), 1,
-                                                       cbuf.resourceId, cbuf.byteOffset))
-
-        # int A;
-        # Default value 10, untouched
-        var_check.check('A').type(rd.VarType.SInt).rows(1).cols(1).value([10])
-
-        # float B;
-        # Value 20 from spec constants
-        var_check.check('B').type(rd.VarType.Float).rows(1).cols(1).value([20.0])
-
-        # bool C;
-        # Value True from spec constants
-        var_check.check('C').type(rd.VarType.UInt).rows(1).cols(1).value([1])
-
-        var_check.done()
-
-        rdtest.log.success("Specialization constants are as expected")
-
-        # Move to the HLSL draw
-        draw = draw.next
-
-        self.check(draw is not None)
-
-        self.controller.SetFrameEvent(draw.eventId, False)
-
-        pipe: rd.PipeState = self.controller.GetPipelineState()
-
-        # Verify that this is the HLSL draw
-        disasm = self.controller.DisassembleShader(pipe.GetGraphicsPipelineObject(), pipe.GetShaderReflection(stage),
-                                                   '')
-
-        self.check('HLSL' in disasm)
-
-        cbuf: rd.BoundCBuffer = pipe.GetConstantBuffer(stage, 0, 0)
-
-        var_check = rdtest.ConstantBufferChecker(
-            self.controller.GetCBufferVariableContents(pipe.GetShader(stage),
-                                                       pipe.GetShaderEntryPoint(stage), 0,
-                                                       cbuf.resourceId, cbuf.byteOffset))
-
+    def check_hlsl_cbuffer(self, var_check):
         # For more detailed reference for the below checks, see the commented definition of the cbuffer
         # in the shader source code in the demo itself
 
@@ -646,19 +763,78 @@ class VK_CBuffer_Zoo(rdtest.TestCase):
                                                               436.0, 437.0]),
         })
 
+        # struct nested_with_padding
+        # {
+        #   float a; // float3 padding
+        #   float4 b;
+        #   float c; // float3 padding
+        #   float3 d[4]; // float padding after each one
+        # };
+        # nested_with_padding ak[2];
+        var_check.check('ak').rows(0).cols(0).arraySize(2).members({
+            # ak[0]
+            0: lambda s: s.rows(0).cols(0).structSize(4).members({
+                'a': lambda y: y.rows(1).cols(1).value([440.0]),
+                'b': lambda y: y.rows(1).cols(4).value([444.0, 445.0, 446.0, 447.0]),
+                'c': lambda y: y.rows(1).cols(1).value([448.0]),
+                'd': lambda x: x.rows(0).cols(0).arraySize(4).members({
+                    0: lambda z: z.rows(1).cols(3).value([452.0, 453.0, 454.0]),
+                    1: lambda z: z.rows(1).cols(3).value([456.0, 457.0, 458.0]),
+                    2: lambda z: z.rows(1).cols(3).value([460.0, 461.0, 462.0]),
+                    3: lambda z: z.rows(1).cols(3).value([464.0, 465.0, 466.0]),
+                }),
+            }),
+            # ak[1]
+            1: lambda s: s.rows(0).cols(0).structSize(4).members({
+                'a': lambda y: y.rows(1).cols(1).value([468.0]),
+                'b': lambda y: y.rows(1).cols(4).value([472.0, 473.0, 474.0, 475.0]),
+                'c': lambda y: y.rows(1).cols(1).value([476.0]),
+                'd': lambda x: x.rows(0).cols(0).arraySize(4).members({
+                    0: lambda z: z.rows(1).cols(3).value([480.0, 481.0, 482.0]),
+                    1: lambda z: z.rows(1).cols(3).value([484.0, 485.0, 486.0]),
+                    2: lambda z: z.rows(1).cols(3).value([488.0, 489.0, 490.0]),
+                    3: lambda z: z.rows(1).cols(3).value([492.0, 493.0, 494.0]),
+                }),
+            }),
+        })
+
+        # float4 dummy14;
+        var_check.check('dummy14')
+
+        # float al;
+        var_check.check('al').rows(1).cols(1).value([500.0])
+
+        # struct float2_struct
+        # {
+        #   float x, y;
+        # };
+        # float2_struct am;
+        var_check.check('am').rows(0).cols(0).members({
+            'x': lambda y: y.rows(1).cols(1).value([504.0]),
+            'y': lambda y: y.rows(1).cols(1).value([505.0]),
+        })
+
+        # float an;
+        var_check.check('an').rows(1).cols(1).value([508.0])
+
+        # float4 dummy15[2];
+        var_check.check('dummy15')
+
+        # misaligned_struct ao[2];
+        var_check.check('ao').rows(0).cols(0).arraySize(2).members({
+            # ao[0]
+            0: lambda s: s.rows(0).cols(0).structSize(2).members({
+                'a': lambda y: y.rows(1).cols(4).value([520.0, 521.0, 522.0, 523.0]),
+                'b': lambda y: y.rows(1).cols(2).value([524.0, 525.0]),
+            }),
+            1: lambda s: s.rows(0).cols(0).structSize(2).members({
+                'a': lambda y: y.rows(1).cols(4).value([528.0, 529.0, 530.0, 531.0]),
+                'b': lambda y: y.rows(1).cols(2).value([532.0, 533.0]),
+            }),
+        })
+
         # float4 test;
-        var_check.check('test').rows(1).cols(4).value([440.0, 441.0, 442.0, 443.0])
+        var_check.check('test').rows(1).cols(4).value([536.0, 537.0, 538.0, 539.0])
 
         var_check.done()
 
-        rdtest.log.success("HLSL CBuffer variables are as expected")
-
-        picked: rd.PixelValue = out.PickPixel(tex.resourceId, False,
-                                              int(texdetails.width / 2), int(texdetails.height / 2), 0, 0, 0)
-
-        if not rdtest.value_compare(picked.floatValue, [440.1, 441.0, 442.0, 443.0]):
-            raise rdtest.TestFailureException("Picked value {} doesn't match expectation".format(picked.floatValue))
-
-        rdtest.log.success("HLSL picked value is as expected")
-
-        out.Shutdown()

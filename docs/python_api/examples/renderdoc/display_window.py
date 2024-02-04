@@ -12,28 +12,34 @@ def loadCapture(filename):
 	cap = rd.OpenCaptureFile()
 
 	# Open a particular file - see also OpenBuffer to load from memory
-	status = cap.OpenFile(filename, '', None)
+	result = cap.OpenFile(filename, '', None)
 
 	# Make sure the file opened successfully
-	if status != rd.ReplayStatus.Succeeded:
-		raise RuntimeError("Couldn't open file: " + str(status))
+	if result != rd.ResultCode.Succeeded:
+		raise RuntimeError("Couldn't open file: " + str(result))
 
 	# Make sure we can replay
 	if not cap.LocalReplaySupport():
 		raise RuntimeError("Capture cannot be replayed")
 
 	# Initialise the replay
-	status,controller = cap.OpenCapture(None)
+	result,controller = cap.OpenCapture(rd.ReplayOptions(), None)
 
-	if status != rd.ReplayStatus.Succeeded:
-		raise RuntimeError("Couldn't initialise replay: " + str(status))
+	if result != rd.ResultCode.Succeeded:
+		raise RuntimeError("Couldn't initialise replay: " + str(result))
 
 	return cap,controller
 
 if 'pyrenderdoc' in globals():
 	raise RuntimeError("This sample should not be run within the RenderDoc UI")
 else:
-	cap,controller = loadCapture('test.rdc')
+	if len(sys.argv) <= 1:
+		print('Usage: python3 {} filename.rdc'.format(sys.argv[0]))
+		sys.exit(0)
+
+	rd.InitialiseReplay(rd.GlobalEnvironment(), [])
+
+	cap,controller = loadCapture(sys.argv[1])
 
 # Use tkinter to create windows
 import tkinter
@@ -62,8 +68,8 @@ out = controller.CreateOutput(windata, rd.ReplayOutputType.Texture)
 # Fetch the list of textures
 textures = controller.GetTextures()
 
-# Fetch the list of drawcalls
-draws = controller.GetDrawcalls()
+# Fetch the list of actions
+actions = controller.GetRootActions()
 
 # Function to look up the texture descriptor for a given resourceId
 def getTexture(texid):
@@ -79,39 +85,51 @@ def paint():
 	out.Display()
 	window.after(33, paint)
 
-# Start on the first drawcall
-curdraw = 0
+# Start on the first action
+curact = actions[0]
 
-# The advance function will be called every 150ms, to move to the next draw
+loopcount = 0
+
+# The advance function will be called every 50ms, to move to the next action
 def advance():
-	global out, window, curdraw
+	global out, window, curact, actions, loopcount
 
-	# Move to the current drawcall
-	controller.SetFrameEvent(draws[curdraw].eventId, False)
+	# Move to the current action
+	controller.SetFrameEvent(curact.eventId, False)
 
 	# Initialise a default TextureDisplay object
 	disp = rd.TextureDisplay()
 
 	# Set the first colour output as the texture to display
-	disp.resourceId = draws[curdraw].outputs[0]
+	disp.resourceId = curact.outputs[0]
 
-	# Get the details of this texture
-	texDetails = getTexture(disp.resourceId)
+	if disp.resourceId != rd.ResourceId.Null():
+		# Get the details of this texture
+		texDetails = getTexture(disp.resourceId)
 
-	# Calculate the scale required in width and height
-	widthScale = window.winfo_width() / texDetails.width
-	heightScale = window.winfo_height() / texDetails.height
+		# Calculate the scale required in width and height
+		widthScale = window.winfo_width() / texDetails.width
+		heightScale = window.winfo_height() / texDetails.height
 
-	# Use the lower scale to fit the texture on the window
-	disp.scale = min(widthScale, heightScale)
+		# Use the lower scale to fit the texture on the window
+		disp.scale = min(widthScale, heightScale)
 
-	# Update the texture display
-	out.SetTextureDisplay(disp)
+		# Update the texture display
+		out.SetTextureDisplay(disp)
 
-	# Set the next drawcall
-	curdraw = (curdraw + 1) % len(draws)
+	# Set the next action
+	curact = curact.next
 
-	window.after(150, advance)
+	# If we have no next action, start again from the first
+	if curact is None:
+		loopcount = loopcount + 1
+		curact = actions[0]
+
+	# after 3 loops, quit
+	if loopcount == 3:
+		window.quit()
+	else:
+		window.after(50, advance)
 
 # Start the callbacks
 advance()
@@ -123,3 +141,6 @@ window.mainloop()
 controller.Shutdown()
 
 cap.Shutdown()
+
+if 'pyrenderdoc' not in globals():
+	rd.ShutdownReplay()

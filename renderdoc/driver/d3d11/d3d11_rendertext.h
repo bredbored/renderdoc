@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2018-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -24,6 +24,7 @@
 
 #pragma once
 
+#include "common/common.h"
 #include "driver/dx/official/d3d11_4.h"
 
 class WrappedID3D11Device;
@@ -44,7 +45,7 @@ public:
   int GetHeight() { return RDCMAX(1, m_height); }
   void SetOutputWindow(HWND w);
 
-  void RenderText(float x, float y, const char *textfmt, ...);
+  void RenderText(float x, float y, const rdcstr &text);
 
 private:
   int m_width = 1, m_height = 1;
@@ -53,7 +54,7 @@ private:
   WrappedID3D11Device *m_pDevice = NULL;
   WrappedID3D11DeviceContext *m_pImmediateContext = NULL;
 
-  void RenderTextInternal(float x, float y, const char *text);
+  void RenderTextInternal(float x, float y, const rdcstr &text);
 
   static const int FONT_TEX_WIDTH = 256;
   static const int FONT_TEX_HEIGHT = 128;

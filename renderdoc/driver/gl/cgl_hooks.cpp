@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2018-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -38,7 +38,7 @@ public:
   WrappedOpenGL driver;
   std::set<CGLContextObj> contexts;
 
-  volatile int32_t suppressed = 0;
+  int32_t suppressed = 0;
 } cglhook;
 
 CGLError GL_EXPORT_NAME(CGLCreateContext)(CGLPixelFormatObj pix, CGLContextObj share,
@@ -118,12 +118,13 @@ CGLError GL_EXPORT_NAME(CGLSetCurrentContext)(CGLContextObj ctx)
     {
       cglhook.contexts.insert(ctx);
 
-      FetchEnabledExtensions();
-
-      // see gl_emulated.cpp
-      GL.EmulateUnsupportedFunctions();
-      GL.EmulateRequiredExtensions();
-      GL.DriverForEmulation(&cglhook.driver);
+      if(FetchEnabledExtensions())
+      {
+        // see gl_emulated.cpp
+        GL.EmulateUnsupportedFunctions();
+        GL.EmulateRequiredExtensions();
+        GL.DriverForEmulation(&cglhook.driver);
+      }
     }
 
     CGRect rect = {};
@@ -146,14 +147,14 @@ CGLError GL_EXPORT_NAME(CGLSetCurrentContext)(CGLContextObj ctx)
       CGL.CGSGetSurfaceBounds(conn, window, surface, &rect);
     }
 
-    cglhook.driver.ActivateContext(data);
-
     if(data.ctx)
     {
       GLInitParams &params = cglhook.driver.GetInitParams(data);
       params.width = (uint32_t)rect.size.width;
       params.height = (uint32_t)rect.size.height;
     }
+
+    cglhook.driver.ActivateContext(data);
   }
 
   return ret;
@@ -178,7 +179,9 @@ CGLError GL_EXPORT_NAME(CGLFlushDrawable)(CGLContextObj ctx)
 
     CGL.CGLGetSurface(ctx, &conn, &window, &surface);
 
-    cglhook.driver.SwapBuffers((void *)(uintptr_t)window);
+    gl_CurChunk = GLChunk::CGLFlushDrawable;
+
+    cglhook.driver.SwapBuffers(WindowingSystem::MacOS, (void *)(uintptr_t)window);
   }
 
   CGLError ret;
@@ -197,6 +200,9 @@ DECL_HOOK_EXPORT(CGLCreateContext);
 DECL_HOOK_EXPORT(CGLSetCurrentContext);
 DECL_HOOK_EXPORT(CGLFlushDrawable);
 
+extern void RegisterAppleGLSymbols();
+extern void AppleRegisterRealSymbol(const char *functionName, void *address);
+
 static void CGLHooked(void *handle)
 {
   RDCDEBUG("CGL library hooked");
@@ -205,6 +211,7 @@ static void CGLHooked(void *handle)
   // pointers
   cglhook.handle = handle;
 
+  RegisterAppleGLSymbols();
   // enable hooks immediately, we'll suppress them when calling into CGL
   EnableGLHooks();
 
@@ -227,8 +234,9 @@ void CGLHook::RegisterHooks()
   LibraryHooks::RegisterLibraryHook("libGL.dylib", NULL);
 
 // register CGL hooks
-#define CGL_REGISTER(func)            \
-  LibraryHooks::RegisterFunctionHook( \
+#define CGL_REGISTER(func)                                   \
+  AppleRegisterRealSymbol(STRINGIZE(func), (void *)&::func); \
+  LibraryHooks::RegisterFunctionHook(                        \
       "OpenGL", FunctionHook(STRINGIZE(func), (void **)&CGL.func, (void *)&GL_EXPORT_NAME(func)));
   CGL_HOOKED_SYMBOLS(CGL_REGISTER)
 #undef CGL_REGISTER

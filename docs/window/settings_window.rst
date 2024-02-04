@@ -22,6 +22,22 @@ This allows you to choose what theme to use in RenderDoc. By default when first 
 
 ---------------
 
+  | :guilabel:`Global font scale` Default: ``100%``
+
+This option will apply a global font scale to all fonts in the UI. This will only apply to text elements, and other UI elements will take their scale from the system's DPI scaling configuration.
+
+Changing this option will need the UI to be restarted before it fully takes effect on all UI elements.
+
+---------------
+
+  | :guilabel:`Prefer monospaced fonts in UI` Default: ``Disabled``
+
+This option will use a monospaced font for every place in the UI where any data or output is displayed.
+
+Changing this option will need the UI to be restarted before it fully takes effect on all UI elements.
+
+---------------
+
   | :guilabel:`Minimum decimal places on float values` Default: ``2``
 
 Defines the smallest number of decimal places to display on a float, padding with 0s.
@@ -86,6 +102,14 @@ Examples:
 
 ---------------
 
+  | :guilabel:`Offset or size fields format mode` Default: ``Auto``
+
+Any fields which are displayed in the UI that represent byte offsets or sizes can be configured to display as either decimal, hexadecimal, or automatic.
+
+In the default automatic mode the fields will be shown as decimal for small values up to a given threshold, and as hexadecimal for larger values. With this option they can be instead forced to always display as one or the other.
+
+---------------
+
   | :guilabel:`Directory for temporary capture files` Default: ``%TEMP%``
 
 This allows you to choose where on disk temporary capture files are stored between when the capture is made, and when it is either discarded or saved to a permanent location on disk.
@@ -110,19 +134,19 @@ This option **can be dangerous** which is why you have to deliberately enable it
 
 ---------------
 
+  | :guilabel:`Enable process injection (restart required)` Default: ``Disabled``
+
+On windows only RenderDoc is able to inject into running processes. By default this is disabled since it is almost never the right thing to do and can easily break, so you are strongly recommended to instead launch your program from RenderDoc's launch process panel.
+
+Injecting into processes can be unreliable and should only be used as a last resort when no other methods succeed, it should not be used as a primary method of launching applications.
+
+---------------
+
   | :guilabel:`Allow periodic anonymous update checks` Default: ``Enabled``
 
 Every couple of days RenderDoc will send a single web request to a secure server to see if a new version is available and let you know about it. The only information transmitted is the version of RenderDoc that is running.
 
 If you would prefer RenderDoc does not ever contact an external server, disable this checkbox. If you do this it's recommended that you manually check for updates as new versions will be made available regularly with bugfixes.
-
----------------
-
-  | :guilabel:`Prefer monospaced fonts in UI` Default: ``Disabled``
-
-This option will use a monospaced font for every place in the UI where any data or output is displayed.
-
-Changing this option will need the UI to be restarted before it takes effect.
 
 ---------------
 
@@ -155,7 +179,7 @@ Core options
 
 Here you can choose which locations to search in, and in which order, when looking up a relative path for unstripped debug info.
 
-For more information you can consult :ref:`the FAQ entry about providing unstripped shader debug information <unstripped-shader-info>`.
+For more information you can consult :doc:`../how/how_shader_debug_info`.
 
   | :guilabel:`Enable Radeon GPU Profiler integration` Default: ``Off``
 
@@ -168,6 +192,13 @@ For more information you can see :doc:`../how/how_rgp_profile`.
 Here you can choose where ``RadeonGPUProfiler`` executable is, for use with the RGP integration.
 
 For more information you can see :doc:`../how/how_rgp_profile`.
+
+Replay options
+--------------
+
+In this panel you can configure the default options used for replaying captures.
+
+The specific options are documented along with the explanation of how replay options affect the capture in :doc:`../how/how_control_replay`.
 
 Texture Viewer options
 ----------------------
@@ -187,6 +218,12 @@ Settings including which channels are displayed (red, green, blue, alpha or dept
   | :guilabel:`Y-flipping state saved per-texture` Default: ``Disabled``
 
 If the above setting is enabled, then also store the y-flip per texture. By default this is treated as a global toggle for all textures. With this setting enabled the flip will default to off for all textures, and then be saved per-texture.
+
+  | :guilabel:`Custom shader directories` Default: ``Empty``
+
+Here you can choose additional locations to search for custom visualisation shaders, and in which order in case of duplicates.
+
+For more information see :doc:`../how/how_custom_visualisation`.
 
 Shader Viewer options
 ---------------------
@@ -212,6 +249,8 @@ Other custom tools can be configured, but for those the command line arguments m
 * ``{entry_point}`` will be replaced by the entry point name, only when compiling a shader.
 * ``{glsl_stage4}`` will be replaced by the glsl stage short-hand, one of: vert, tesc, tese, geom, frag, or comp.
 * ``{hlsl_stage2}`` will be replaced by the hlsl stage short-hand, one of: vs, hs, ds, gs, ps, or cs.
+* ``{spirv_ver}`` will be replaced by the SPIR-V version in use, e.g. spirv1.2 or spirv1.6.
+* ``{vulkan_ver}`` will be replaced by the Vulkan-identified SPIR-V version in use, e.g. vulkan1.0 or vulkan1.3. This value may be lossy, and will pick the next *lowest* version that compiles with a given SPIR-V version. E.g. SPIR-V 1.2 was not used by a vulkan version, so will be rounded down to vulkan1.0.
 
 You must also select the input and output format of the tool, such as HLSL input and SPIR-V output. This will be used to match the tool against a given need at runtime with different types of shaders.
 
@@ -222,7 +261,7 @@ Event Browser options
 
   | :guilabel:`Time unit used for event browser timings` Default: ``Microseconds``
 
-This option allows you to select the unit that will be shown in the duration column in the event browser when you time individual drawcalls.
+This option allows you to select the unit that will be shown in the duration column in the event browser when you time individual actions.
 
 Seconds through to nanoseconds are supported.
 
@@ -230,29 +269,9 @@ Seconds through to nanoseconds are supported.
 
   | :guilabel:`Add fake markers if none present` Default: ``Enable``
 
-If a capture is found to contain no markers whatsoever, RenderDoc will generate some default markers based on grouping drawcalls by the different output targets that they are drawing to. Roughly forming 'passes' of different types.
+If a capture is found to contain no markers whatsoever, RenderDoc will generate some default markers based on grouping actions by the different output targets that they are drawing to. Roughly forming 'passes' of different types.
 
-You can disable this option here if you want to view a pure list of drawcalls with no annotations.
-
-This option only applies itself the next time you load a capture.
-
-
----------------
-
-  | :guilabel:`Hide empty marker sections` Default: ``Disabled``
-
-Marker sections that contain no API calls or drawcalls will be completely removed. This also applies to the Timeline Bar.
-
-This option only applies itself the next time you load a capture.
-
-
----------------
-
-  | :guilabel:`Hide marker sections with only non-draw API calls` Default: ``Disabled``
-
-Marker sections that contain only miscellaneous non-draw API calls like queries or state setting will be completely removed. This also applies to the Timeline Bar.
-
-This can be useful if you have markers around occlusion queries or where you have a minor state change, and you don't want them cluttering up the capture.
+You can disable this option here if you want to view a pure list of actions with no annotations.
 
 This option only applies itself the next time you load a capture.
 
@@ -290,7 +309,7 @@ Android options
 
   | :guilabel:`Android SDK root path` Default: ``Empty``
 
-RenderDoc requires some android tools from the android SDK to be able to function. In most cases it's able to locate the tools automatically without any configuration needed, but if not this option allows you to manually locate the JDK root.
+RenderDoc requires some android tools from the android SDK to be able to function. In most cases it's able to locate the tools automatically without any configuration needed, but if not this option allows you to manually locate the SDK root.
 
 By default it will try to auto-locate those tools by looking in different environment variables like ``ANDROID_HOME`` and ``ANDROID_SDK``, or else searching the default executable path. If it fails completely it will try to use the tools bundled with RenderDoc's installation.
 

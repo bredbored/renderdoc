@@ -1,4 +1,7 @@
 
+%feature("python:tp_str") ResultDetails "result_str";
+%feature("python:tp_repr") ResultDetails "result_str";
+
 // add some useful builtin functions for ResourceId
 %feature("python:tp_str") ResourceId "resid_str";
 %feature("python:tp_repr") ResourceId "resid_str";
@@ -19,7 +22,7 @@ PyObject *__lt__(PyObject *other)
   {
     int res = SWIG_ConvertPtr(other, &resptr, SWIGTYPE_p_ResourceId, 0);
     if (!SWIG_IsOK(res)) {
-      SWIG_exception_fail(SWIG_ArgError(res), "incorrect comparison type");
+      goto fail;
     }
 
     id = (ResourceId *)resptr;
@@ -35,6 +38,22 @@ fail:
 } // %extend ResourceId
 
 %wrapper %{
+static PyObject *result_str(PyObject *resid)
+{
+  void *resptr = NULL;
+  ResultDetails *result = NULL;
+  int res = SWIG_ConvertPtr(resid, &resptr, SWIGTYPE_p_ResultDetails, 0);
+  if (!SWIG_IsOK(res)) {
+    SWIG_exception_fail(SWIG_ArgError(res), "in method 'ResultDetails.str', ResultDetails is not correct type");
+  }
+
+  result = (ResultDetails *)resptr;
+
+  return PyUnicode_FromFormat("<Result: '%s'>", result->Message().c_str());
+fail:
+  return NULL;
+}
+
 static PyObject *resid_str(PyObject *resid)
 {
   void *resptr = NULL;
@@ -48,7 +67,7 @@ static PyObject *resid_str(PyObject *resid)
   id = (unsigned long long *)resptr;
   static_assert(sizeof(unsigned long long) == sizeof(ResourceId), "Wrong size");
 
-  return PyUnicode_FromFormat("<ResourceId %llu>", *id);
+  return PyUnicode_FromFormat("ResourceId::%llu", *id);
 fail:
   return NULL;
 }
@@ -110,7 +129,7 @@ PyObject *__eq__(PyObject *other)
   {
     int res = SWIG_ConvertPtr(other, &resptr, SWIGTYPE_p_##Class, 0);
     if (!SWIG_IsOK(res)) {
-      SWIG_exception_fail(SWIG_ArgError(res), "incorrect comparison type");
+      goto fail;
     }
 
     id = (Class *)resptr;
@@ -133,7 +152,7 @@ PyObject *__ne__(PyObject *other)
   {
     int res = SWIG_ConvertPtr(other, &resptr, SWIGTYPE_p_##Class, 0);
     if (!SWIG_IsOK(res)) {
-      SWIG_exception_fail(SWIG_ArgError(res), "incorrect comparison type");
+      goto fail;
     }
 
     id = (Class *)resptr;
@@ -150,7 +169,7 @@ fail:
 
 %enddef // %define DEFINE_SAFE_COMPARISONS
 
-DEFINE_SAFE_EQUALITY(DrawcallDescription)
+DEFINE_SAFE_EQUALITY(ActionDescription)
 DEFINE_SAFE_EQUALITY(CounterResult)
 DEFINE_SAFE_EQUALITY(APIEvent)
 DEFINE_SAFE_EQUALITY(Bindpoint)
@@ -172,8 +191,8 @@ DEFINE_SAFE_EQUALITY(ShaderResource)
 DEFINE_SAFE_EQUALITY(ShaderSampler)
 DEFINE_SAFE_EQUALITY(ShaderSourceFile)
 DEFINE_SAFE_EQUALITY(ShaderVariable)
-DEFINE_SAFE_EQUALITY(RegisterRange)
-DEFINE_SAFE_EQUALITY(LocalVariableMapping)
+DEFINE_SAFE_EQUALITY(DebugVariableReference)
+DEFINE_SAFE_EQUALITY(SourceVariableMapping)
 DEFINE_SAFE_EQUALITY(SigParameter)
 DEFINE_SAFE_EQUALITY(TextureDescription)
 DEFINE_SAFE_EQUALITY(ShaderEntryPoint)

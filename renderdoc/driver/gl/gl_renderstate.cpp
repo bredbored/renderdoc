@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  * Copyright (c) 2014 Crytek
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -25,6 +25,7 @@
 
 #include "gl_renderstate.h"
 #include "gl_driver.h"
+#include "gl_replay.h"
 
 struct EnableDisableCap
 {
@@ -484,12 +485,23 @@ void GLRenderState::MarkReferenced(WrappedOpenGL *driver, bool initial) const
   manager->MarkResourceFrameReferenced(Program, initial ? eFrameRef_None : eFrameRef_Read);
   manager->MarkResourceFrameReferenced(Pipeline, initial ? eFrameRef_None : eFrameRef_Read);
 
-  // the pipeline correctly has program parents, but we must also mark the programs as frame
-  // referenced so that their
-  // initial contents will be serialised.
-  GLResourceRecord *record = manager->GetResourceRecord(Pipeline);
-  if(record)
-    record->MarkParentsReferenced(manager, initial ? eFrameRef_None : eFrameRef_Read);
+  if(Pipeline.name)
+  {
+    // mark all the sub programs referenced
+    GLenum programBinds[] = {
+        eGL_VERTEX_SHADER,       eGL_FRAGMENT_SHADER,        eGL_GEOMETRY_SHADER,
+        eGL_TESS_CONTROL_SHADER, eGL_TESS_EVALUATION_SHADER, eGL_COMPUTE_SHADER,
+    };
+
+    for(GLenum progbind : programBinds)
+    {
+      GLuint prog = 0;
+      GL.glGetProgramPipelineiv(Pipeline.name, progbind, (GLint *)&prog);
+      if(prog)
+        manager->MarkResourceFrameReferenced(ProgramRes(driver->GetCtx(), prog),
+                                             initial ? eFrameRef_None : eFrameRef_Read);
+    }
+  }
 
   for(size_t i = 0; i < ARRAY_COUNT(BufferBindings); i++)
     manager->MarkResourceFrameReferenced(BufferBindings[i],
@@ -520,20 +532,24 @@ void GLRenderState::MarkReferenced(WrappedOpenGL *driver, bool initial) const
   MarkDirty(driver);
 }
 
-void GLRenderState::MarkDirty(WrappedOpenGL *driver) const
+void GLRenderState::MarkDirty(WrappedOpenGL *driver)
 {
   GLResourceManager *manager = driver->GetResourceManager();
 
   ContextPair &ctx = driver->GetCtx();
+  const WrappedOpenGL::ContextData &ctxData = driver->GetCtxData();
 
-  GLint maxCount = 0;
   GLuint name = 0;
 
-  if(HasExt[ARB_transform_feedback2])
+  // we can skip this if no transform feedback object is bound
+  if(HasExt[ARB_transform_feedback2] && ctxData.m_FeedbackRecord)
   {
-    GL.glGetIntegerv(eGL_MAX_TRANSFORM_FEEDBACK_SEPARATE_ATTRIBS, &maxCount);
+    // cache this count, we don't expect it to change between contexts if the extension is available
+    static GLint xfbCount = 0;
+    if(xfbCount == 0)
+      GL.glGetIntegerv(eGL_MAX_TRANSFORM_FEEDBACK_SEPARATE_ATTRIBS, &xfbCount);
 
-    for(GLint i = 0; i < maxCount; i++)
+    for(GLint i = 0; i < xfbCount; i++)
     {
       name = 0;
       GL.glGetIntegeri_v(eGL_TRANSFORM_FEEDBACK_BUFFER_BINDING, i, (GLint *)&name);
@@ -545,9 +561,13 @@ void GLRenderState::MarkDirty(WrappedOpenGL *driver) const
 
   if(HasExt[ARB_shader_image_load_store])
   {
-    GL.glGetIntegerv(eGL_MAX_IMAGE_UNITS, &maxCount);
+    static GLint imgCount = 0;
+    if(imgCount == 0)
+      GL.glGetIntegerv(eGL_MAX_IMAGE_UNITS, &imgCount);
 
-    for(GLint i = 0; i < maxCount; i++)
+    // small optimisation, store the high water mark of which image unit is used and only iterate up
+    // to there
+    for(GLint i = 0; i < RDCMIN(imgCount, ctxData.m_MaxImgBind); i++)
     {
       name = 0;
       GL.glGetIntegeri_v(eGL_IMAGE_BINDING_NAME, i, (GLint *)&name);
@@ -559,9 +579,11 @@ void GLRenderState::MarkDirty(WrappedOpenGL *driver) const
 
   if(HasExt[ARB_shader_atomic_counters])
   {
-    GL.glGetIntegerv(eGL_MAX_ATOMIC_COUNTER_BUFFER_BINDINGS, &maxCount);
+    static GLint atomicCount = 0;
+    if(atomicCount == 0)
+      GL.glGetIntegerv(eGL_MAX_ATOMIC_COUNTER_BUFFER_BINDINGS, &atomicCount);
 
-    for(GLint i = 0; i < maxCount; i++)
+    for(GLint i = 0; i < RDCMIN(atomicCount, ctxData.m_MaxAtomicBind); i++)
     {
       name = 0;
       GL.glGetIntegeri_v(eGL_ATOMIC_COUNTER_BUFFER_BINDING, i, (GLint *)&name);
@@ -573,9 +595,11 @@ void GLRenderState::MarkDirty(WrappedOpenGL *driver) const
 
   if(HasExt[ARB_shader_storage_buffer_object])
   {
-    GL.glGetIntegerv(eGL_MAX_SHADER_STORAGE_BUFFER_BINDINGS, &maxCount);
+    static GLint ssboCount = 0;
+    if(ssboCount == 0)
+      GL.glGetIntegerv(eGL_MAX_SHADER_STORAGE_BUFFER_BINDINGS, &ssboCount);
 
-    for(GLint i = 0; i < maxCount; i++)
+    for(GLint i = 0; i < RDCMIN(ssboCount, ctxData.m_MaxSSBOBind); i++)
     {
       name = 0;
       GL.glGetIntegeri_v(eGL_SHADER_STORAGE_BUFFER_BINDING, i, (GLint *)&name);
@@ -585,56 +609,9 @@ void GLRenderState::MarkDirty(WrappedOpenGL *driver) const
     }
   }
 
-  GL.glGetIntegerv(eGL_MAX_COLOR_ATTACHMENTS, &maxCount);
-
-  GL.glGetIntegerv(eGL_DRAW_FRAMEBUFFER_BINDING, (GLint *)&name);
-
-  if(name)
+  if(ctxData.m_DrawFramebufferRecord)
   {
-    GLenum type = eGL_TEXTURE;
-    for(GLint i = 0; i < maxCount; i++)
-    {
-      GL.glGetFramebufferAttachmentParameteriv(
-          eGL_DRAW_FRAMEBUFFER, GLenum(eGL_COLOR_ATTACHMENT0 + i),
-          eGL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, (GLint *)&name);
-      GL.glGetFramebufferAttachmentParameteriv(
-          eGL_DRAW_FRAMEBUFFER, GLenum(eGL_COLOR_ATTACHMENT0 + i),
-          eGL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, (GLint *)&type);
-
-      if(name)
-      {
-        if(type == eGL_RENDERBUFFER)
-          manager->MarkDirtyResource(RenderbufferRes(ctx, name));
-        else
-          manager->MarkDirtyWithWriteReference(TextureRes(ctx, name));
-      }
-    }
-
-    GL.glGetFramebufferAttachmentParameteriv(eGL_DRAW_FRAMEBUFFER, eGL_DEPTH_ATTACHMENT,
-                                             eGL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, (GLint *)&name);
-    GL.glGetFramebufferAttachmentParameteriv(eGL_DRAW_FRAMEBUFFER, eGL_DEPTH_ATTACHMENT,
-                                             eGL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, (GLint *)&type);
-
-    if(name)
-    {
-      if(type == eGL_RENDERBUFFER)
-        manager->MarkDirtyResource(RenderbufferRes(ctx, name));
-      else
-        manager->MarkDirtyWithWriteReference(TextureRes(ctx, name));
-    }
-
-    GL.glGetFramebufferAttachmentParameteriv(eGL_DRAW_FRAMEBUFFER, eGL_STENCIL_ATTACHMENT,
-                                             eGL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, (GLint *)&name);
-    GL.glGetFramebufferAttachmentParameteriv(eGL_DRAW_FRAMEBUFFER, eGL_STENCIL_ATTACHMENT,
-                                             eGL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, (GLint *)&type);
-
-    if(name)
-    {
-      if(type == eGL_RENDERBUFFER)
-        manager->MarkDirtyResource(RenderbufferRes(ctx, name));
-      else
-        manager->MarkDirtyWithWriteReference(TextureRes(ctx, name));
-    }
+    manager->MarkFBODirtyWithWriteReference(ctxData.m_DrawFramebufferRecord);
   }
 }
 
@@ -980,23 +957,36 @@ void GLRenderState::FetchState(WrappedOpenGL *driver)
     GLenum maxcount;
   } idxBufs[] = {
       {
-          AtomicCounter, ARRAY_COUNT(AtomicCounter), eGL_ATOMIC_COUNTER_BUFFER_BINDING,
-          eGL_ATOMIC_COUNTER_BUFFER_START, eGL_ATOMIC_COUNTER_BUFFER_SIZE,
+          AtomicCounter,
+          ARRAY_COUNT(AtomicCounter),
+          eGL_ATOMIC_COUNTER_BUFFER_BINDING,
+          eGL_ATOMIC_COUNTER_BUFFER_START,
+          eGL_ATOMIC_COUNTER_BUFFER_SIZE,
           eGL_MAX_ATOMIC_COUNTER_BUFFER_BINDINGS,
       },
       {
-          ShaderStorage, ARRAY_COUNT(ShaderStorage), eGL_SHADER_STORAGE_BUFFER_BINDING,
-          eGL_SHADER_STORAGE_BUFFER_START, eGL_SHADER_STORAGE_BUFFER_SIZE,
+          ShaderStorage,
+          ARRAY_COUNT(ShaderStorage),
+          eGL_SHADER_STORAGE_BUFFER_BINDING,
+          eGL_SHADER_STORAGE_BUFFER_START,
+          eGL_SHADER_STORAGE_BUFFER_SIZE,
           eGL_MAX_SHADER_STORAGE_BUFFER_BINDINGS,
       },
       {
-          TransformFeedback, ARRAY_COUNT(TransformFeedback), eGL_TRANSFORM_FEEDBACK_BUFFER_BINDING,
-          eGL_TRANSFORM_FEEDBACK_BUFFER_START, eGL_TRANSFORM_FEEDBACK_BUFFER_SIZE,
+          TransformFeedback,
+          ARRAY_COUNT(TransformFeedback),
+          eGL_TRANSFORM_FEEDBACK_BUFFER_BINDING,
+          eGL_TRANSFORM_FEEDBACK_BUFFER_START,
+          eGL_TRANSFORM_FEEDBACK_BUFFER_SIZE,
           eGL_MAX_TRANSFORM_FEEDBACK_SEPARATE_ATTRIBS,
       },
       {
-          UniformBinding, ARRAY_COUNT(UniformBinding), eGL_UNIFORM_BUFFER_BINDING,
-          eGL_UNIFORM_BUFFER_START, eGL_UNIFORM_BUFFER_SIZE, eGL_MAX_UNIFORM_BUFFER_BINDINGS,
+          UniformBinding,
+          ARRAY_COUNT(UniformBinding),
+          eGL_UNIFORM_BUFFER_BINDING,
+          eGL_UNIFORM_BUFFER_START,
+          eGL_UNIFORM_BUFFER_SIZE,
+          eGL_MAX_UNIFORM_BUFFER_BINDINGS,
       },
   };
 
@@ -1446,19 +1436,27 @@ void GLRenderState::ApplyState(WrappedOpenGL *driver)
     GLenum maxcount;
   } idxBufs[] = {
       {
-          AtomicCounter, ARRAY_COUNT(AtomicCounter), eGL_ATOMIC_COUNTER_BUFFER,
+          AtomicCounter,
+          ARRAY_COUNT(AtomicCounter),
+          eGL_ATOMIC_COUNTER_BUFFER,
           eGL_MAX_ATOMIC_COUNTER_BUFFER_BINDINGS,
       },
       {
-          ShaderStorage, ARRAY_COUNT(ShaderStorage), eGL_SHADER_STORAGE_BUFFER,
+          ShaderStorage,
+          ARRAY_COUNT(ShaderStorage),
+          eGL_SHADER_STORAGE_BUFFER,
           eGL_MAX_SHADER_STORAGE_BUFFER_BINDINGS,
       },
       {
-          TransformFeedback, ARRAY_COUNT(TransformFeedback), eGL_TRANSFORM_FEEDBACK_BUFFER,
+          TransformFeedback,
+          ARRAY_COUNT(TransformFeedback),
+          eGL_TRANSFORM_FEEDBACK_BUFFER,
           eGL_MAX_TRANSFORM_FEEDBACK_SEPARATE_ATTRIBS,
       },
       {
-          UniformBinding, ARRAY_COUNT(UniformBinding), eGL_UNIFORM_BUFFER,
+          UniformBinding,
+          ARRAY_COUNT(UniformBinding),
+          eGL_UNIFORM_BUFFER,
           eGL_MAX_UNIFORM_BUFFER_BINDINGS,
       },
   };
@@ -1695,7 +1693,8 @@ void GLRenderState::ApplyState(WrappedOpenGL *driver)
 
   if(HasExt[ARB_tessellation_shader])
   {
-    GL.glPatchParameteri(eGL_PATCH_VERTICES, PatchParams.numVerts);
+    if(PatchParams.numVerts > 0)
+      GL.glPatchParameteri(eGL_PATCH_VERTICES, PatchParams.numVerts);
     if(!IsGLES)
     {
       GL.glPatchParameterfv(eGL_PATCH_DEFAULT_INNER_LEVEL, PatchParams.defaultInnerLevel);

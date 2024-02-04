@@ -1,3 +1,4 @@
+// clang-format off
 /****************************************************************************
 **
 ** Copyright (C) 2015 The Qt Company Ltd.
@@ -124,6 +125,8 @@ bool FlowLayout::hasHeightForWidth() const
 
 int FlowLayout::heightForWidth(int width) const
 {
+    if(m_prevRect.isEmpty())
+        return minimumSize().height();
     int height = doLayout(QRect(0, 0, width, 0), true);
     return height;
 }
@@ -143,6 +146,8 @@ void FlowLayout::setGeometry(const QRect &rect)
 
 QSize FlowLayout::sizeHint() const
 {
+    if(m_prevRect.isEmpty())
+        return minimumSize();
     QSize size = geometry().size();
     size.setHeight(doLayout(geometry().adjusted(0, 0, -10, 0), true));
     return size;
@@ -156,6 +161,19 @@ QSize FlowLayout::minimumSize() const
         size = size.expandedTo(item->minimumSize());
 
     size += QSize(2*margin(), 2*margin());
+
+    if(!m_prevRect.isEmpty())
+    {
+        // we use the previous height as a hint for the minimum size otherwise we'll never request
+        // enough height for multiple rows
+        size.setHeight(qMax(size.height(), heightForWidth(m_prevRect.width())));
+
+        // we use the previous width as a minimum, otherwise if we have a long item which expands
+        // up to a large width in our minimum, other layouts might starve us of enough height
+        // because it will assume we are sized to the minimum.
+        size.setWidth(qMin(size.width(), m_prevRect.width()));
+    }
+
     return size;
 }
 

@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -22,12 +22,21 @@
  * THE SOFTWARE.
  ******************************************************************************/
 
+#include <algorithm>
 #include "../vk_core.h"
 #include "../vk_debug.h"
 #include "../vk_rendertext.h"
+#include "../vk_replay.h"
 #include "../vk_shader_cache.h"
 #include "api/replay/version.h"
+#include "core/settings.h"
 #include "strings/string_utils.h"
+
+RDOC_CONFIG(
+    bool, Vulkan_Debug_ReplaceAppInfo, true,
+    "By default we have no choice but to replace VkApplicationInfo to safely work on all drivers. "
+    "This behaviour can be disabled with this flag, which lets it through both during capture and "
+    "on replay.");
 
 // intercept and overwrite the application info if present. We must use the same appinfo on
 // capture and replay, and the safer default is not to replay as if we were the original app but
@@ -42,6 +51,15 @@ static VkApplicationInfo renderdocAppInfo = {
     VK_MAKE_VERSION(RENDERDOC_VERSION_MAJOR, RENDERDOC_VERSION_MINOR, 0),
     VK_API_VERSION_1_0,
 };
+
+static bool equivalent(const VkQueueFamilyProperties &a, const VkQueueFamilyProperties &b)
+{
+  return a.timestampValidBits == b.timestampValidBits &&
+         a.minImageTransferGranularity.width == b.minImageTransferGranularity.width &&
+         a.minImageTransferGranularity.height == b.minImageTransferGranularity.height &&
+         a.minImageTransferGranularity.depth == b.minImageTransferGranularity.depth &&
+         a.queueFlags == b.queueFlags;
+}
 
 // we store the index in the loader table, since it won't be dereferenced and other parts of the
 // code expect to copy it into a wrapped object
@@ -91,98 +109,123 @@ void InitInstanceTable(VkInstance inst, PFN_vkGetInstanceProcAddr gpa);
 // and
 // instance are destroyed. We only clean up after our own objects.
 
-static void StripUnwantedLayers(std::vector<std::string> &Layers)
+static void StripUnwantedLayers(rdcarray<rdcstr> &Layers)
 {
-  for(auto it = Layers.begin(); it != Layers.end();)
-  {
+  Layers.removeIf([](const rdcstr &layer) {
     // don't try and create our own layer on replay!
-    if(*it == RENDERDOC_VULKAN_LAYER_NAME)
+    if(layer == RENDERDOC_VULKAN_LAYER_NAME)
     {
-      it = Layers.erase(it);
-      continue;
+      return true;
     }
 
     // don't enable tracing or dumping layers just in case they
     // came along with the application
-    if(*it == "VK_LAYER_LUNARG_api_dump" || *it == "VK_LAYER_LUNARG_vktrace")
+    if(layer == "VK_LAYER_LUNARG_api_dump" || layer == "VK_LAYER_LUNARG_vktrace")
     {
-      it = Layers.erase(it);
-      continue;
+      return true;
     }
 
     // also remove the framerate monitor layer as it's buggy and doesn't do anything
     // in our case
-    if(*it == "VK_LAYER_LUNARG_monitor")
+    if(layer == "VK_LAYER_LUNARG_monitor")
     {
-      it = Layers.erase(it);
-      continue;
+      return true;
     }
 
     // remove the optimus layer just in case it was explicitly enabled.
-    if(*it == "VK_LAYER_NV_optimus")
+    if(layer == "VK_LAYER_NV_optimus")
     {
-      it = Layers.erase(it);
-      continue;
+      return true;
     }
 
     // filter out validation layers
-    if(*it == "VK_LAYER_LUNARG_standard_validation" || *it == "VK_LAYER_KHRONOS_validation" ||
-       *it == "VK_LAYER_LUNARG_core_validation" || *it == "VK_LAYER_LUNARG_device_limits" ||
-       *it == "VK_LAYER_LUNARG_image" || *it == "VK_LAYER_LUNARG_object_tracker" ||
-       *it == "VK_LAYER_LUNARG_parameter_validation" || *it == "VK_LAYER_LUNARG_swapchain" ||
-       *it == "VK_LAYER_GOOGLE_threading" || *it == "VK_LAYER_GOOGLE_unique_objects" ||
-       *it == "VK_LAYER_LUNARG_assistant_layer")
+    if(layer == "VK_LAYER_LUNARG_standard_validation" || layer == "VK_LAYER_KHRONOS_validation" ||
+       layer == "VK_LAYER_LUNARG_core_validation" || layer == "VK_LAYER_LUNARG_device_limits" ||
+       layer == "VK_LAYER_LUNARG_image" || layer == "VK_LAYER_LUNARG_object_tracker" ||
+       layer == "VK_LAYER_LUNARG_parameter_validation" || layer == "VK_LAYER_LUNARG_swapchain" ||
+       layer == "VK_LAYER_GOOGLE_threading" || layer == "VK_LAYER_GOOGLE_unique_objects" ||
+       layer == "VK_LAYER_LUNARG_assistant_layer")
     {
-      it = Layers.erase(it);
-      continue;
+      return true;
     }
 
-    ++it;
-  }
+    return false;
+  });
 }
 
-static void StripUnwantedExtensions(std::vector<std::string> &Extensions)
+static void StripUnwantedExtensions(rdcarray<rdcstr> &Extensions)
 {
   // strip out any WSI/direct display extensions. We'll add the ones we want for creating windows
   // on the current platforms below, and we don't replay any of the WSI functionality
   // directly so these extensions aren't needed
-  for(auto it = Extensions.begin(); it != Extensions.end();)
-  {
+  Extensions.removeIf([](const rdcstr &ext) {
     // remove surface extensions
-    if(*it == "VK_KHR_xlib_surface" || *it == "VK_KHR_xcb_surface" ||
-       *it == "VK_KHR_wayland_surface" || *it == "VK_KHR_mir_surface" ||
-       *it == "VK_MVK_macos_surface" || *it == "VK_KHR_android_surface" ||
-       *it == "VK_KHR_win32_surface" || *it == "VK_GGP_stream_descriptor_surface")
+    if(ext == "VK_KHR_xlib_surface" || ext == "VK_KHR_xcb_surface" ||
+       ext == "VK_KHR_wayland_surface" || ext == "VK_KHR_mir_surface" ||
+       ext == "VK_MVK_macos_surface" || ext == "VK_KHR_android_surface" ||
+       ext == "VK_KHR_win32_surface" || ext == "VK_GGP_stream_descriptor_surface" ||
+       ext == "VK_GGP_frame_token")
     {
-      it = Extensions.erase(it);
-      continue;
+      return true;
     }
 
     // remove direct display extensions
-    if(*it == "VK_KHR_display" || *it == "VK_EXT_direct_mode_display" ||
-       *it == "VK_EXT_acquire_xlib_display" || *it == "VK_EXT_display_surface_counter")
+    if(ext == "VK_KHR_display" || ext == "VK_EXT_direct_mode_display" ||
+       ext == "VK_EXT_acquire_xlib_display" || ext == "VK_EXT_display_surface_counter" ||
+       ext == "VK_EXT_acquire_drm_display")
     {
-      it = Extensions.erase(it);
-      continue;
+      return true;
     }
 
-    ++it;
-  }
+    // remove platform-specific external extensions, as we don't replay external objects. We leave
+    // the base extensions since they're widely supported and we don't strip all uses of e.g.
+    // feature structs.
+    if(ext == "VK_KHR_external_fence_fd" || ext == "VK_KHR_external_fence_win32" ||
+       ext == "VK_KHR_external_memory_fd" || ext == "VK_KHR_external_memory_win32" ||
+       ext == "VK_KHR_external_semaphore_fd" || ext == "VK_KHR_external_semaphore_win32" ||
+       ext == "VK_KHR_win32_keyed_mutex")
+    {
+      return true;
+    }
+
+    // remove WSI-only extensions
+    if(ext == "VK_GOOGLE_display_timing" || ext == "VK_KHR_display_swapchain" ||
+       ext == "VK_EXT_display_control" || ext == "VK_KHR_present_id" ||
+       ext == "VK_KHR_present_wait" || ext == "VK_EXT_surface_maintenance1" ||
+       ext == "VK_EXT_swapchain_maintenance1")
+      return true;
+
+    // remove fullscreen exclusive extension
+    if(ext == "VK_EXT_full_screen_exclusive")
+      return true;
+
+    // this is debug only, nothing to capture, so nothing to replay
+    if(ext == "VK_EXT_tooling_info" || ext == "VK_EXT_private_data" ||
+       ext == "VK_EXT_validation_features" || ext == "VK_EXT_validation_cache" ||
+       ext == "VK_EXT_validation_flags")
+      return true;
+
+    // these are debug only and will be added (if supported) as optional
+    if(ext == "VK_EXT_debug_utils" || ext == "VK_EXT_debug_marker")
+      return true;
+
+    return false;
+  });
 }
 
-ReplayStatus WrappedVulkan::Initialise(VkInitParams &params, uint64_t sectionVersion)
+RDResult WrappedVulkan::Initialise(VkInitParams &params, uint64_t sectionVersion,
+                                   const ReplayOptions &opts)
 {
   m_InitParams = params;
   m_SectionVersion = sectionVersion;
+  m_ReplayOptions = opts;
+
+  m_ResourceManager->SetOptimisationLevel(m_ReplayOptions.optimisation);
 
   StripUnwantedLayers(params.Layers);
   StripUnwantedExtensions(params.Extensions);
 
-#if ENABLED(FORCE_VALIDATION_LAYERS) && DISABLED(RDOC_ANDROID)
-  params.Layers.push_back("VK_LAYER_LUNARG_standard_validation");
-#endif
-
-  std::set<std::string> supportedLayers;
+  std::set<rdcstr> supportedLayers;
 
   {
     uint32_t count = 0;
@@ -197,20 +240,41 @@ ReplayStatus WrappedVulkan::Initialise(VkInitParams &params, uint64_t sectionVer
     SAFE_DELETE_ARRAY(props);
   }
 
-  // complain about any missing layers, but remove them from the list and continue
-  for(auto it = params.Layers.begin(); it != params.Layers.end();)
+  if(m_ReplayOptions.apiValidation)
   {
-    if(supportedLayers.find(*it) == supportedLayers.end())
-    {
-      RDCERR("Capture used layer '%s' which is not available, continuing without it", it->c_str());
-      it = params.Layers.erase(it);
-      continue;
-    }
+    const char KhronosValidation[] = "VK_LAYER_KHRONOS_validation";
+    const char LunarGValidation[] = "VK_LAYER_LUNARG_standard_validation";
 
-    ++it;
+    if(supportedLayers.find(KhronosValidation) != supportedLayers.end())
+    {
+      RDCLOG("Enabling %s layer for API validation", KhronosValidation);
+      params.Layers.push_back(KhronosValidation);
+      m_LayersEnabled[VkCheckLayer_unique_objects] = true;
+    }
+    else if(supportedLayers.find(LunarGValidation) != supportedLayers.end())
+    {
+      RDCLOG("Enabling %s layer for API validation", LunarGValidation);
+      params.Layers.push_back(LunarGValidation);
+      m_LayersEnabled[VkCheckLayer_unique_objects] = true;
+    }
+    else
+    {
+      RDCLOG("API validation layers are not available, check you have the Vulkan SDK installed");
+    }
   }
 
-  std::set<std::string> supportedExtensions;
+  // complain about any missing layers, but remove them from the list and continue
+  params.Layers.removeIf([&supportedLayers](const rdcstr &layer) {
+    if(supportedLayers.find(layer) == supportedLayers.end())
+    {
+      RDCERR("Capture used layer '%s' which is not available, continuing without it", layer.c_str());
+      return true;
+    }
+
+    return false;
+  });
+
+  std::set<rdcstr> supportedExtensions;
 
   for(size_t i = 0; i <= params.Layers.size(); i++)
   {
@@ -228,6 +292,23 @@ ReplayStatus WrappedVulkan::Initialise(VkInitParams &params, uint64_t sectionVer
     SAFE_DELETE_ARRAY(props);
   }
 
+  if(!m_Replay->IsRemoteProxy())
+  {
+    size_t i = 0;
+    for(const rdcstr &ext : supportedExtensions)
+    {
+      RDCLOG("Inst Ext %u: %s", i, ext.c_str());
+      i++;
+    }
+
+    i = 0;
+    for(const rdcstr &layer : supportedLayers)
+    {
+      RDCLOG("Inst Layer %u: %s", i, layer.c_str());
+      i++;
+    }
+  }
+
   AddRequiredExtensions(true, params.Extensions, supportedExtensions);
 
   // after 1.0, VK_KHR_get_physical_device_properties2 is promoted to core, but enable it if it's
@@ -237,8 +318,7 @@ ReplayStatus WrappedVulkan::Initialise(VkInitParams &params, uint64_t sectionVer
     if(supportedExtensions.find(VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME) !=
        supportedExtensions.end())
     {
-      if(std::find(params.Extensions.begin(), params.Extensions.end(),
-                   VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME) == params.Extensions.end())
+      if(!params.Extensions.contains(VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME))
         params.Extensions.push_back(VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME);
     }
   }
@@ -252,8 +332,7 @@ ReplayStatus WrappedVulkan::Initialise(VkInitParams &params, uint64_t sectionVer
     }
     else
     {
-      if(std::find(params.Extensions.begin(), params.Extensions.end(),
-                   VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME) == params.Extensions.end())
+      if(!params.Extensions.contains(VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME))
         params.Extensions.push_back(VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME);
     }
   }
@@ -263,25 +342,70 @@ ReplayStatus WrappedVulkan::Initialise(VkInitParams &params, uint64_t sectionVer
   {
     if(supportedExtensions.find(params.Extensions[i]) == supportedExtensions.end())
     {
-      RDCERR("Capture requires extension '%s' which is not supported", params.Extensions[i].c_str());
-      return ReplayStatus::APIHardwareUnsupported;
+      RETURN_ERROR_RESULT(ResultCode::APIHardwareUnsupported,
+                          "Capture requires instance extension '%s' which is not supported\n",
+                          params.Extensions[i].c_str());
     }
   }
 
   // we always want debug extensions if it available, and not already enabled
   if(supportedExtensions.find(VK_EXT_DEBUG_UTILS_EXTENSION_NAME) != supportedExtensions.end() &&
-     std::find(params.Extensions.begin(), params.Extensions.end(),
-               VK_EXT_DEBUG_UTILS_EXTENSION_NAME) == params.Extensions.end())
+     !params.Extensions.contains(VK_EXT_DEBUG_UTILS_EXTENSION_NAME))
   {
-    RDCLOG("Enabling VK_EXT_debug_utils");
+    if(!m_Replay->IsRemoteProxy())
+      RDCLOG("Enabling VK_EXT_debug_utils");
     params.Extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
   }
   else if(supportedExtensions.find(VK_EXT_DEBUG_REPORT_EXTENSION_NAME) != supportedExtensions.end() &&
-          std::find(params.Extensions.begin(), params.Extensions.end(),
-                    VK_EXT_DEBUG_REPORT_EXTENSION_NAME) == params.Extensions.end())
+          !params.Extensions.contains(VK_EXT_DEBUG_REPORT_EXTENSION_NAME))
   {
-    RDCLOG("Enabling VK_EXT_debug_report");
+    if(!m_Replay->IsRemoteProxy())
+      RDCLOG("Enabling VK_EXT_debug_report");
     params.Extensions.push_back(VK_EXT_DEBUG_REPORT_EXTENSION_NAME);
+  }
+
+  VkValidationFeaturesEXT featuresEXT = {VK_STRUCTURE_TYPE_VALIDATION_FEATURES_EXT};
+  VkValidationFeatureDisableEXT disableFeatures[] = {VK_VALIDATION_FEATURE_DISABLE_SHADERS_EXT};
+  featuresEXT.disabledValidationFeatureCount = ARRAY_COUNT(disableFeatures);
+  featuresEXT.pDisabledValidationFeatures = disableFeatures;
+
+// enable this to get GPU-based validation, where available, whenever we enable API validation
+#if 0
+  if(m_ReplayOptions.apiValidation)
+  {
+    VkValidationFeatureEnableEXT enableFeatures[] = {
+        VK_VALIDATION_FEATURE_ENABLE_GPU_ASSISTED_EXT,
+        VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT};
+    featuresEXT.enabledValidationFeatureCount = ARRAY_COUNT(enableFeatures);
+    featuresEXT.pEnabledValidationFeatures = enableFeatures;
+  }
+#endif
+
+  VkValidationFlagsEXT flagsEXT = {VK_STRUCTURE_TYPE_VALIDATION_FLAGS_EXT};
+  VkValidationCheckEXT disableChecks[] = {VK_VALIDATION_CHECK_SHADERS_EXT};
+  flagsEXT.disabledValidationCheckCount = ARRAY_COUNT(disableChecks);
+  flagsEXT.pDisabledValidationChecks = disableChecks;
+
+  void *instNext = NULL;
+
+  if(supportedExtensions.find(VK_EXT_VALIDATION_FEATURES_EXTENSION_NAME) != supportedExtensions.end() &&
+     !params.Extensions.contains(VK_EXT_VALIDATION_FEATURES_EXTENSION_NAME))
+  {
+    if(!m_Replay->IsRemoteProxy())
+      RDCLOG("Enabling VK_EXT_validation_features");
+    params.Extensions.push_back(VK_EXT_VALIDATION_FEATURES_EXTENSION_NAME);
+
+    instNext = &featuresEXT;
+  }
+  else if(supportedExtensions.find(VK_EXT_VALIDATION_FLAGS_EXTENSION_NAME) !=
+              supportedExtensions.end() &&
+          !params.Extensions.contains(VK_EXT_VALIDATION_FLAGS_EXTENSION_NAME))
+  {
+    if(!m_Replay->IsRemoteProxy())
+      RDCLOG("Enabling VK_EXT_validation_flags");
+    params.Extensions.push_back(VK_EXT_VALIDATION_FLAGS_EXTENSION_NAME);
+
+    instNext = &flagsEXT;
   }
 
   const char **layerscstr = new const char *[params.Layers.size()];
@@ -294,7 +418,7 @@ ReplayStatus WrappedVulkan::Initialise(VkInitParams &params, uint64_t sectionVer
 
   VkInstanceCreateInfo instinfo = {
       VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
-      NULL,
+      instNext,
       0,
       &renderdocAppInfo,
       (uint32_t)params.Layers.size(),
@@ -306,46 +430,27 @@ ReplayStatus WrappedVulkan::Initialise(VkInitParams &params, uint64_t sectionVer
   if(params.APIVersion >= VK_API_VERSION_1_0)
     renderdocAppInfo.apiVersion = params.APIVersion;
 
+  m_EnabledExtensions.vulkanVersion = renderdocAppInfo.apiVersion;
+
+  if(!Vulkan_Debug_ReplaceAppInfo())
+  {
+    // if we're not replacing the app info, set renderdocAppInfo's parameters to the ones from the
+    // capture
+    renderdocAppInfo.pEngineName = params.EngineName.c_str();
+    renderdocAppInfo.engineVersion = params.EngineVersion;
+    renderdocAppInfo.pApplicationName = params.AppName.c_str();
+    renderdocAppInfo.applicationVersion = params.AppVersion;
+  }
+
   m_Instance = VK_NULL_HANDLE;
-
-  VkValidationFeaturesEXT featuresEXT = {VK_STRUCTURE_TYPE_VALIDATION_FEATURES_EXT};
-  VkValidationFeatureDisableEXT disableFeatures[] = {VK_VALIDATION_FEATURE_DISABLE_SHADERS_EXT};
-  featuresEXT.disabledValidationFeatureCount = ARRAY_COUNT(disableFeatures);
-  featuresEXT.pDisabledValidationFeatures = disableFeatures;
-
-  VkValidationFlagsEXT flagsEXT = {VK_STRUCTURE_TYPE_VALIDATION_FLAGS_EXT};
-  VkValidationCheckEXT disableChecks[] = {VK_VALIDATION_CHECK_SHADERS_EXT};
-  flagsEXT.disabledValidationCheckCount = ARRAY_COUNT(disableChecks);
-  flagsEXT.pDisabledValidationChecks = disableChecks;
-
-  if(supportedExtensions.find(VK_EXT_VALIDATION_FEATURES_EXTENSION_NAME) != supportedExtensions.end() &&
-     std::find(params.Extensions.begin(), params.Extensions.end(),
-               VK_EXT_VALIDATION_FEATURES_EXTENSION_NAME) == params.Extensions.end())
-  {
-    RDCLOG("Enabling VK_EXT_validation_features");
-    params.Extensions.push_back(VK_EXT_VALIDATION_FEATURES_EXTENSION_NAME);
-
-    instinfo.pNext = &featuresEXT;
-  }
-  else if(supportedExtensions.find(VK_EXT_VALIDATION_FLAGS_EXTENSION_NAME) !=
-              supportedExtensions.end() &&
-          std::find(params.Extensions.begin(), params.Extensions.end(),
-                    VK_EXT_VALIDATION_FLAGS_EXTENSION_NAME) == params.Extensions.end())
-  {
-    RDCLOG("Enabling VK_EXT_validation_flags");
-    params.Extensions.push_back(VK_EXT_VALIDATION_FLAGS_EXTENSION_NAME);
-
-    instinfo.pNext = &flagsEXT;
-  }
 
   VkResult ret = GetInstanceDispatchTable(NULL)->CreateInstance(&instinfo, NULL, &m_Instance);
 
 #undef CheckExt
-#define CheckExt(name, ver)                                       \
-  if(!strcmp(instinfo.ppEnabledExtensionNames[i], "VK_" #name) || \
-     (int)renderdocAppInfo.apiVersion >= ver)                     \
-  {                                                               \
-    m_EnabledExtensions.ext_##name = true;                        \
+#define CheckExt(name, ver)                                                                           \
+  if(!strcmp(instinfo.ppEnabledExtensionNames[i], "VK_" #name) || renderdocAppInfo.apiVersion >= ver) \
+  {                                                                                                   \
+    m_EnabledExtensions.ext_##name = true;                                                            \
   }
 
   for(uint32_t i = 0; i < instinfo.enabledExtensionCount; i++)
@@ -357,7 +462,10 @@ ReplayStatus WrappedVulkan::Initialise(VkInitParams &params, uint64_t sectionVer
   SAFE_DELETE_ARRAY(extscstr);
 
   if(ret != VK_SUCCESS)
-    return ReplayStatus::APIHardwareUnsupported;
+  {
+    RETURN_ERROR_RESULT(ResultCode::APIHardwareUnsupported, "Vulkan instance creation returned %s",
+                        ToStr(ret).c_str());
+  }
 
   RDCASSERTEQUAL(ret, VK_SUCCESS);
 
@@ -370,6 +478,10 @@ ReplayStatus WrappedVulkan::Initialise(VkInitParams &params, uint64_t sectionVer
 
     AddResource(params.InstanceID, ResourceType::Device, "Instance");
     GetReplay()->GetResourceDesc(params.InstanceID).initialisationChunks.clear();
+  }
+  else
+  {
+    GetResourceManager()->AddLiveResource(GetResID(m_Instance), m_Instance);
   }
 
   InitInstanceExtensionTables(m_Instance, &m_EnabledExtensions);
@@ -400,7 +512,7 @@ ReplayStatus WrappedVulkan::Initialise(VkInitParams &params, uint64_t sectionVer
   else if(ObjDisp(m_Instance)->CreateDebugReportCallbackEXT)
   {
     VkDebugReportCallbackCreateInfoEXT debugInfo = {};
-    debugInfo.sType = VK_STRUCTURE_TYPE_DEBUG_REPORT_CREATE_INFO_EXT;
+    debugInfo.sType = VK_STRUCTURE_TYPE_DEBUG_REPORT_CALLBACK_CREATE_INFO_EXT;
     debugInfo.pfnCallback = &DebugReportCallbackStatic;
     debugInfo.pUserData = this;
     debugInfo.flags = VK_DEBUG_REPORT_WARNING_BIT_EXT |
@@ -413,24 +525,31 @@ ReplayStatus WrappedVulkan::Initialise(VkInitParams &params, uint64_t sectionVer
   uint32_t count = 0;
 
   VkResult vkr = ObjDisp(m_Instance)->EnumeratePhysicalDevices(Unwrap(m_Instance), &count, NULL);
-  RDCASSERTEQUAL(vkr, VK_SUCCESS);
+  CheckVkResult(vkr);
 
   if(count == 0)
-    return ReplayStatus::APIHardwareUnsupported;
+  {
+    RETURN_ERROR_RESULT(ResultCode::APIHardwareUnsupported,
+                        "No physical devices exist in this vulkan instance");
+  }
 
   m_ReplayPhysicalDevices.resize(count);
   m_ReplayPhysicalDevicesUsed.resize(count);
   m_OriginalPhysicalDevices.resize(count);
-  m_MemIdxMaps.resize(count);
 
   vkr = ObjDisp(m_Instance)
             ->EnumeratePhysicalDevices(Unwrap(m_Instance), &count, &m_ReplayPhysicalDevices[0]);
-  RDCASSERTEQUAL(vkr, VK_SUCCESS);
+  CheckVkResult(vkr);
 
   for(uint32_t i = 0; i < count; i++)
     GetResourceManager()->WrapResource(m_Instance, m_ReplayPhysicalDevices[i]);
 
-  return ReplayStatus::Succeeded;
+#if ENABLED(RDOC_WIN32)
+  if(GetModuleHandleA("nvoglv64.dll"))
+    LoadLibraryA("nvoglv64.dll");
+#endif
+
+  return ResultCode::Succeeded;
 }
 
 VkResult WrappedVulkan::vkCreateInstance(const VkInstanceCreateInfo *pCreateInfo,
@@ -441,6 +560,10 @@ VkResult WrappedVulkan::vkCreateInstance(const VkInstanceCreateInfo *pCreateInfo
 
   // don't support any extensions for this createinfo
   RDCASSERT(pCreateInfo->pApplicationInfo == NULL || pCreateInfo->pApplicationInfo->pNext == NULL);
+
+  const bool internalInstance =
+      (pCreateInfo->pApplicationInfo && pCreateInfo->pApplicationInfo->pApplicationName &&
+       rdcstr(pCreateInfo->pApplicationInfo->pApplicationName) == "RenderDoc forced instance");
 
   VkLayerInstanceCreateInfo *layerCreateInfo = (VkLayerInstanceCreateInfo *)pCreateInfo->pNext;
 
@@ -467,6 +590,59 @@ VkResult WrappedVulkan::vkCreateInstance(const VkInstanceCreateInfo *pCreateInfo
   VkInstanceCreateInfo modifiedCreateInfo;
   modifiedCreateInfo = *pCreateInfo;
 
+  // Android is a bad platform with a bad loader that it custom wrote, and implicit layers get added
+  // to the create info's layer list even if they weren't specified, so it's impossible to tell if
+  // it's an application making a mistake or the platform messing up. Disable this protection on Android
+#if DISABLED(RDOC_ANDROID)
+  for(uint32_t i = 0; i < modifiedCreateInfo.enabledLayerCount; i++)
+  {
+    if(rdcstr(modifiedCreateInfo.ppEnabledLayerNames[i]) == RENDERDOC_VULKAN_LAYER_NAME)
+    {
+      // see if any debug report callbacks were passed in the pNext chain
+      VkDebugReportCallbackCreateInfoEXT *report =
+          (VkDebugReportCallbackCreateInfoEXT *)pCreateInfo->pNext;
+
+      rdcstr msg =
+          "RenderDoc's layer should NEVER be activated manually. Do not include it in "
+          "vkCreateInstance's instance layers.";
+
+      RDCERR("%s", msg.c_str());
+
+      while(report)
+      {
+        if(report->sType == VK_STRUCTURE_TYPE_DEBUG_REPORT_CALLBACK_CREATE_INFO_EXT)
+          report->pfnCallback(VK_DEBUG_REPORT_ERROR_BIT_EXT, VK_DEBUG_REPORT_OBJECT_TYPE_INSTANCE_EXT,
+                              0, 1, 1, "RDOC", msg.c_str(), report->pUserData);
+
+        report = (VkDebugReportCallbackCreateInfoEXT *)report->pNext;
+      }
+
+      // or debug utils callbacks
+      VkDebugUtilsMessengerCreateInfoEXT *messenger =
+          (VkDebugUtilsMessengerCreateInfoEXT *)pCreateInfo->pNext;
+
+      VkDebugUtilsMessengerCallbackDataEXT messengerData = {};
+
+      messengerData.messageIdNumber = 1;
+      messengerData.pMessageIdName = NULL;
+      messengerData.pMessage = msg.c_str();
+      messengerData.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CALLBACK_DATA_EXT;
+
+      while(messenger)
+      {
+        if(messenger->sType == VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT)
+          messenger->pfnUserCallback(VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT,
+                                     VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT, &messengerData,
+                                     messenger->pUserData);
+
+        messenger = (VkDebugUtilsMessengerCreateInfoEXT *)messenger->pNext;
+      }
+
+      return VK_ERROR_INITIALIZATION_FAILED;
+    }
+  }
+#endif
+
   for(uint32_t i = 0; i < modifiedCreateInfo.enabledExtensionCount; i++)
   {
     if(!IsSupportedExtension(modifiedCreateInfo.ppEnabledExtensionNames[i]))
@@ -481,13 +657,14 @@ VkResult WrappedVulkan::vkCreateInstance(const VkInstanceCreateInfo *pCreateInfo
       VkDebugReportCallbackCreateInfoEXT *report =
           (VkDebugReportCallbackCreateInfoEXT *)pCreateInfo->pNext;
 
+      rdcstr msg = StringFormat::Fmt("RenderDoc does not support requested instance extension: %s.",
+                                     modifiedCreateInfo.ppEnabledExtensionNames[i]);
+
       while(report)
       {
-        if(report && report->sType == VK_STRUCTURE_TYPE_DEBUG_REPORT_CALLBACK_CREATE_INFO_EXT)
-          report->pfnCallback(VK_DEBUG_REPORT_ERROR_BIT_EXT,
-                              VK_DEBUG_REPORT_OBJECT_TYPE_INSTANCE_EXT, 0, 1, 1, "RDOC",
-                              "RenderDoc does not support a requested instance extension.",
-                              report->pUserData);
+        if(report->sType == VK_STRUCTURE_TYPE_DEBUG_REPORT_CALLBACK_CREATE_INFO_EXT)
+          report->pfnCallback(VK_DEBUG_REPORT_ERROR_BIT_EXT, VK_DEBUG_REPORT_OBJECT_TYPE_INSTANCE_EXT,
+                              0, 1, 1, "RDOC", msg.c_str(), report->pUserData);
 
         report = (VkDebugReportCallbackCreateInfoEXT *)report->pNext;
       }
@@ -500,12 +677,12 @@ VkResult WrappedVulkan::vkCreateInstance(const VkInstanceCreateInfo *pCreateInfo
 
       messengerData.messageIdNumber = 1;
       messengerData.pMessageIdName = NULL;
-      messengerData.pMessage = "RenderDoc does not support a requested instance extension.";
+      messengerData.pMessage = msg.c_str();
       messengerData.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CALLBACK_DATA_EXT;
 
       while(messenger)
       {
-        if(messenger && messenger->sType == VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT)
+        if(messenger->sType == VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT)
           messenger->pfnUserCallback(VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT,
                                      VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT, &messengerData,
                                      messenger->pUserData);
@@ -517,69 +694,89 @@ VkResult WrappedVulkan::vkCreateInstance(const VkInstanceCreateInfo *pCreateInfo
     }
   }
 
-  const char **addedExts = new const char *[modifiedCreateInfo.enabledExtensionCount + 1];
+  const char **addedExts = NULL;
 
-  bool hasDebugReport = false, hasDebugUtils = false;
-
-  for(uint32_t i = 0; i < modifiedCreateInfo.enabledExtensionCount; i++)
+  if(!internalInstance)
   {
-    addedExts[i] = modifiedCreateInfo.ppEnabledExtensionNames[i];
-    if(!strcmp(addedExts[i], VK_EXT_DEBUG_REPORT_EXTENSION_NAME))
-      hasDebugReport = true;
-    if(!strcmp(addedExts[i], VK_EXT_DEBUG_UTILS_EXTENSION_NAME))
-      hasDebugUtils = true;
-  }
+    addedExts = new const char *[modifiedCreateInfo.enabledExtensionCount + 2];
 
-  std::vector<VkExtensionProperties> supportedExts;
-
-  // enumerate what instance extensions are available
-  void *module = LoadVulkanLibrary();
-  if(module)
-  {
-    PFN_vkEnumerateInstanceExtensionProperties enumInstExts =
-        (PFN_vkEnumerateInstanceExtensionProperties)Process::GetFunctionAddress(
-            module, "vkEnumerateInstanceExtensionProperties");
-
-    if(enumInstExts)
+    bool hasDebugReport = false, hasDebugUtils = false, hasGPDP2 = false;
+    for(uint32_t i = 0; i < modifiedCreateInfo.enabledExtensionCount; i++)
     {
-      uint32_t numSupportedExts = 0;
-      enumInstExts(NULL, &numSupportedExts, NULL);
-
-      supportedExts.resize(numSupportedExts);
-      enumInstExts(NULL, &numSupportedExts, &supportedExts[0]);
+      addedExts[i] = modifiedCreateInfo.ppEnabledExtensionNames[i];
+      if(!strcmp(addedExts[i], VK_EXT_DEBUG_REPORT_EXTENSION_NAME))
+        hasDebugReport = true;
+      if(!strcmp(addedExts[i], VK_EXT_DEBUG_UTILS_EXTENSION_NAME))
+        hasDebugUtils = true;
+      if(!strcmp(addedExts[i], VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME))
+        hasGPDP2 = true;
     }
-  }
 
-  if(supportedExts.empty())
-    RDCWARN(
-        "Couldn't load vkEnumerateInstanceExtensionProperties in vkCreateInstance to enumerate "
-        "instance extensions");
+    rdcarray<VkExtensionProperties> supportedExts;
 
-  // always enable debug report/utils, if it's available
-  if(!hasDebugUtils)
-  {
-    for(const VkExtensionProperties &ext : supportedExts)
+    // enumerate what instance extensions are available
+    void *module = LoadVulkanLibrary();
+    if(module)
     {
-      if(!strcmp(ext.extensionName, VK_EXT_DEBUG_UTILS_EXTENSION_NAME))
+      PFN_vkEnumerateInstanceExtensionProperties enumInstExts =
+          (PFN_vkEnumerateInstanceExtensionProperties)Process::GetFunctionAddress(
+              module, "vkEnumerateInstanceExtensionProperties");
+
+      if(enumInstExts)
       {
-        addedExts[modifiedCreateInfo.enabledExtensionCount++] = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
-        break;
+        uint32_t numSupportedExts = 0;
+        enumInstExts(NULL, &numSupportedExts, NULL);
+
+        supportedExts.resize(numSupportedExts);
+        enumInstExts(NULL, &numSupportedExts, &supportedExts[0]);
       }
     }
-  }
-  else if(!hasDebugReport)
-  {
-    for(const VkExtensionProperties &ext : supportedExts)
+
+    if(supportedExts.empty())
+      RDCWARN(
+          "Couldn't load vkEnumerateInstanceExtensionProperties in vkCreateInstance to enumerate "
+          "instance extensions");
+
+    // always enable GPDP2 if it's available
+    if(!hasGPDP2)
     {
-      if(!strcmp(ext.extensionName, VK_EXT_DEBUG_REPORT_EXTENSION_NAME))
+      for(const VkExtensionProperties &ext : supportedExts)
       {
-        addedExts[modifiedCreateInfo.enabledExtensionCount++] = VK_EXT_DEBUG_REPORT_EXTENSION_NAME;
-        break;
+        if(!strcmp(ext.extensionName, VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME))
+        {
+          addedExts[modifiedCreateInfo.enabledExtensionCount++] =
+              VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME;
+          break;
+        }
       }
     }
-  }
 
-  modifiedCreateInfo.ppEnabledExtensionNames = addedExts;
+    // always enable debug report/utils, if it's available
+    if(!hasDebugUtils)
+    {
+      for(const VkExtensionProperties &ext : supportedExts)
+      {
+        if(!strcmp(ext.extensionName, VK_EXT_DEBUG_UTILS_EXTENSION_NAME))
+        {
+          addedExts[modifiedCreateInfo.enabledExtensionCount++] = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
+          break;
+        }
+      }
+    }
+    else if(!hasDebugReport)
+    {
+      for(const VkExtensionProperties &ext : supportedExts)
+      {
+        if(!strcmp(ext.extensionName, VK_EXT_DEBUG_REPORT_EXTENSION_NAME))
+        {
+          addedExts[modifiedCreateInfo.enabledExtensionCount++] = VK_EXT_DEBUG_REPORT_EXTENSION_NAME;
+          break;
+        }
+      }
+    }
+
+    modifiedCreateInfo.ppEnabledExtensionNames = addedExts;
+  }
 
   bool brokenGetDeviceProcAddr = false;
 
@@ -593,12 +790,16 @@ VkResult WrappedVulkan::vkCreateInstance(const VkInstanceCreateInfo *pCreateInfo
     if(modifiedCreateInfo.pApplicationInfo->apiVersion >= VK_API_VERSION_1_0)
       renderdocAppInfo.apiVersion = modifiedCreateInfo.pApplicationInfo->apiVersion;
 
-    modifiedCreateInfo.pApplicationInfo = &renderdocAppInfo;
+    if(Vulkan_Debug_ReplaceAppInfo())
+    {
+      modifiedCreateInfo.pApplicationInfo = &renderdocAppInfo;
+    }
   }
 
   for(uint32_t i = 0; i < modifiedCreateInfo.enabledLayerCount; i++)
   {
     if(!strcmp(modifiedCreateInfo.ppEnabledLayerNames[i], "VK_LAYER_LUNARG_standard_validation") ||
+       !strcmp(modifiedCreateInfo.ppEnabledLayerNames[i], "VK_LAYER_KHRONOS_validation") ||
        !strcmp(modifiedCreateInfo.ppEnabledLayerNames[i], "VK_LAYER_GOOGLE_unique_objects"))
     {
       m_LayersEnabled[VkCheckLayer_unique_objects] = true;
@@ -630,19 +831,21 @@ VkResult WrappedVulkan::vkCreateInstance(const VkInstanceCreateInfo *pCreateInfo
 
   record->instDevInfo->vulkanVersion = VK_API_VERSION_1_0;
 
+  // whether or not we're using it, we updated the apiVersion in renderdocAppInfo
   if(renderdocAppInfo.apiVersion > VK_API_VERSION_1_0)
     record->instDevInfo->vulkanVersion = renderdocAppInfo.apiVersion;
 
-  std::set<std::string> availablePhysDeviceFunctions;
+  std::set<rdcstr> availablePhysDeviceFunctions;
 
   {
     uint32_t count = 0;
     ObjDisp(m_Instance)->EnumeratePhysicalDevices(Unwrap(m_Instance), &count, NULL);
 
-    std::vector<VkPhysicalDevice> physDevs(count);
+    rdcarray<VkPhysicalDevice> physDevs;
+    physDevs.resize(count);
     ObjDisp(m_Instance)->EnumeratePhysicalDevices(Unwrap(m_Instance), &count, physDevs.data());
 
-    std::vector<VkExtensionProperties> exts;
+    rdcarray<VkExtensionProperties> exts;
     for(VkPhysicalDevice p : physDevs)
     {
       ObjDisp(m_Instance)->EnumerateDeviceExtensionProperties(p, NULL, &count, NULL);
@@ -664,23 +867,36 @@ VkResult WrappedVulkan::vkCreateInstance(const VkInstanceCreateInfo *pCreateInfo
 // * it's a device extension and available on at least one physical device
 #undef CheckExt
 #define CheckExt(name, ver)                                                                \
-  if(!strcmp(modifiedCreateInfo.ppEnabledExtensionNames[i], "VK_" #name) ||                \
-     record->instDevInfo->vulkanVersion >= ver ||                                          \
+  if(record->instDevInfo->vulkanVersion >= ver ||                                          \
      availablePhysDeviceFunctions.find("VK_" #name) != availablePhysDeviceFunctions.end()) \
   {                                                                                        \
     record->instDevInfo->ext_##name = true;                                                \
   }
-
+  CheckInstanceExts();
+#undef CheckExt
+#define CheckExt(name, ver)                                               \
+  if(!strcmp(modifiedCreateInfo.ppEnabledExtensionNames[i], "VK_" #name)) \
+  {                                                                       \
+    record->instDevInfo->ext_##name = true;                               \
+  }
   for(uint32_t i = 0; i < modifiedCreateInfo.enabledExtensionCount; i++)
   {
     CheckInstanceExts();
   }
 
-  delete[] addedExts;
+  SAFE_DELETE_ARRAY(addedExts);
 
   InitInstanceExtensionTables(m_Instance, record->instDevInfo);
 
-  RenderDoc::Inst().AddDeviceFrameCapturer(LayerDisp(m_Instance), this);
+  // don't register a frame capturer for our internal instance on android
+  if(internalInstance)
+  {
+    RDCDEBUG("Not registering internal instance as frame capturer");
+  }
+  else
+  {
+    RenderDoc::Inst().AddDeviceFrameCapturer(LayerDisp(m_Instance), this);
+  }
 
   m_DbgReportCallback = VK_NULL_HANDLE;
   m_DbgUtilsCallback = VK_NULL_HANDLE;
@@ -708,7 +924,7 @@ VkResult WrappedVulkan::vkCreateInstance(const VkInstanceCreateInfo *pCreateInfo
   else if(ObjDisp(m_Instance)->CreateDebugReportCallbackEXT)
   {
     VkDebugReportCallbackCreateInfoEXT debugInfo = {};
-    debugInfo.sType = VK_STRUCTURE_TYPE_DEBUG_REPORT_CREATE_INFO_EXT;
+    debugInfo.sType = VK_STRUCTURE_TYPE_DEBUG_REPORT_CALLBACK_CREATE_INFO_EXT;
     debugInfo.pNext = NULL;
     debugInfo.pfnCallback = &DebugReportCallbackStatic;
     debugInfo.pUserData = this;
@@ -734,11 +950,12 @@ void WrappedVulkan::Shutdown()
   SubmitSemaphores();
   FlushQ();
 
-  // destroy any events we created for waiting on
-  for(size_t i = 0; i < m_PersistentEvents.size(); i++)
-    ObjDisp(GetDev())->DestroyEvent(Unwrap(GetDev()), m_PersistentEvents[i], NULL);
-
-  m_PersistentEvents.clear();
+  // idle the device as well so that external queues are idle.
+  if(m_Device)
+  {
+    VkResult vkr = ObjDisp(m_Device)->DeviceWaitIdle(Unwrap(m_Device));
+    CheckVkResult(vkr);
+  }
 
   // since we didn't create proper registered resources for our command buffers,
   // they won't be taken down properly with the pool. So we release them (just our
@@ -764,9 +981,25 @@ void WrappedVulkan::Shutdown()
 
   for(size_t i = 0; i < m_ExternalQueues.size(); i++)
   {
-    if(m_ExternalQueues[i].buffer != VK_NULL_HANDLE)
+    if(m_ExternalQueues[i].pool != VK_NULL_HANDLE)
     {
-      GetResourceManager()->ReleaseWrappedResource(m_ExternalQueues[i].buffer);
+      for(size_t x = 0; x < ARRAY_COUNT(m_ExternalQueues[i].ring); x++)
+      {
+        GetResourceManager()->ReleaseWrappedResource(m_ExternalQueues[i].ring[x].acquire);
+        GetResourceManager()->ReleaseWrappedResource(m_ExternalQueues[i].ring[x].release);
+
+        ObjDisp(m_Device)->DestroySemaphore(Unwrap(m_Device),
+                                            Unwrap(m_ExternalQueues[i].ring[x].fromext), NULL);
+        GetResourceManager()->ReleaseWrappedResource(m_ExternalQueues[i].ring[x].fromext);
+
+        ObjDisp(m_Device)->DestroySemaphore(Unwrap(m_Device),
+                                            Unwrap(m_ExternalQueues[i].ring[x].toext), NULL);
+        GetResourceManager()->ReleaseWrappedResource(m_ExternalQueues[i].ring[x].toext);
+
+        ObjDisp(m_Device)->DestroyFence(Unwrap(m_Device), Unwrap(m_ExternalQueues[i].ring[x].fence),
+                                        NULL);
+        GetResourceManager()->ReleaseWrappedResource(m_ExternalQueues[i].ring[x].fence);
+      }
 
       ObjDisp(m_Device)->DestroyCommandPool(Unwrap(m_Device), Unwrap(m_ExternalQueues[i].pool), NULL);
       GetResourceManager()->ReleaseWrappedResource(m_ExternalQueues[i].pool);
@@ -774,6 +1007,13 @@ void WrappedVulkan::Shutdown()
   }
 
   FreeAllMemory(MemoryScope::InitialContents);
+
+  if(m_MemoryFreeThread)
+  {
+    Threading::JoinThread(m_MemoryFreeThread);
+    Threading::CloseThread(m_MemoryFreeThread);
+    m_MemoryFreeThread = 0;
+  }
 
   // we do more in Shutdown than the equivalent vkDestroyInstance since on replay there's
   // no explicit vkDestroyDevice, we destroy the device here then the instance
@@ -783,7 +1023,7 @@ void WrappedVulkan::Shutdown()
   for(size_t i = 0; i < m_ReplayPhysicalDevices.size(); i++)
     GetResourceManager()->ReleaseWrappedResource(m_ReplayPhysicalDevices[i]);
 
-  m_Replay.DestroyResources();
+  m_Replay->DestroyResources();
 
   m_IndirectBuffer.Destroy();
 
@@ -834,6 +1074,9 @@ void WrappedVulkan::Shutdown()
 
 void WrappedVulkan::vkDestroyInstance(VkInstance instance, const VkAllocationCallbacks *pAllocator)
 {
+  if(instance == VK_NULL_HANDLE)
+    return;
+
   RDCASSERT(m_Instance == instance);
 
   if(ObjDisp(m_Instance)->DestroyDebugReportCallbackEXT && m_DbgReportCallback != VK_NULL_HANDLE)
@@ -860,9 +1103,10 @@ bool WrappedVulkan::Serialise_vkEnumeratePhysicalDevices(SerialiserType &ser, Vk
   SERIALISE_ELEMENT(instance);
   SERIALISE_ELEMENT_LOCAL(PhysicalDeviceIndex, *pPhysicalDeviceCount);
   SERIALISE_ELEMENT_LOCAL(PhysicalDevice, GetResID(*pPhysicalDevices))
-      .TypedAs("VkPhysicalDevice"_lit);
+      .TypedAs("VkPhysicalDevice"_lit)
+      .Important();
 
-  uint32_t memIdxMap[VK_MAX_MEMORY_TYPES] = {0};
+  uint32_t legacyUnused_memIdxMap[VK_MAX_MEMORY_TYPES] = {0};
   // not used at the moment but useful for reference and might be used
   // in the future
   VkPhysicalDeviceProperties physProps = {};
@@ -871,14 +1115,12 @@ bool WrappedVulkan::Serialise_vkEnumeratePhysicalDevices(SerialiserType &ser, Vk
   uint32_t queueCount = 0;
   VkQueueFamilyProperties queueProps[16] = {};
 
-  VkPhysicalDeviceDriverPropertiesKHR driverProps = {
-      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES_KHR,
+  VkPhysicalDeviceDriverProperties driverProps = {
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES,
   };
 
   if(ser.IsWriting())
   {
-    memcpy(memIdxMap, GetRecord(*pPhysicalDevices)->memIdxMap, sizeof(memIdxMap));
-
     ObjDisp(instance)->GetPhysicalDeviceProperties(Unwrap(*pPhysicalDevices), &physProps);
     ObjDisp(instance)->GetPhysicalDeviceMemoryProperties(Unwrap(*pPhysicalDevices), &memProps);
     ObjDisp(instance)->GetPhysicalDeviceFeatures(Unwrap(*pPhysicalDevices), &physFeatures);
@@ -895,35 +1137,10 @@ bool WrappedVulkan::Serialise_vkEnumeratePhysicalDevices(SerialiserType &ser, Vk
     ObjDisp(instance)->GetPhysicalDeviceQueueFamilyProperties(Unwrap(*pPhysicalDevices),
                                                               &queueCount, queueProps);
 
-    if(GetExtensions(GetRecord(instance)).ext_KHR_get_physical_device_properties2)
-    {
-      uint32_t count = 0;
-      ObjDisp(*pPhysicalDevices)
-          ->EnumerateDeviceExtensionProperties(Unwrap(*pPhysicalDevices), NULL, &count, NULL);
-
-      VkExtensionProperties *props = new VkExtensionProperties[count];
-      ObjDisp(*pPhysicalDevices)
-          ->EnumerateDeviceExtensionProperties(Unwrap(*pPhysicalDevices), NULL, &count, props);
-
-      for(uint32_t e = 0; e < count; e++)
-      {
-        if(!strcmp(props[e].extensionName, VK_KHR_DRIVER_PROPERTIES_EXTENSION_NAME))
-        {
-          VkPhysicalDeviceProperties2 physProps2 = {
-              VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
-          };
-
-          physProps2.pNext = &driverProps;
-          ObjDisp(instance)->GetPhysicalDeviceProperties2(Unwrap(*pPhysicalDevices), &physProps2);
-          break;
-        }
-      }
-
-      SAFE_DELETE_ARRAY(props);
-    }
+    GetPhysicalDeviceDriverProperties(ObjDisp(instance), Unwrap(*pPhysicalDevices), driverProps);
   }
 
-  SERIALISE_ELEMENT(memIdxMap);
+  SERIALISE_ELEMENT(legacyUnused_memIdxMap).Hidden();    // was never used
   SERIALISE_ELEMENT(physProps);
   SERIALISE_ELEMENT(memProps);
   SERIALISE_ELEMENT(physFeatures);
@@ -956,8 +1173,9 @@ bool WrappedVulkan::Serialise_vkEnumeratePhysicalDevices(SerialiserType &ser, Vk
         m_OriginalPhysicalDevices.resize(PhysicalDeviceIndex + 1);
 
       m_OriginalPhysicalDevices[PhysicalDeviceIndex].props = physProps;
+      m_OriginalPhysicalDevices[PhysicalDeviceIndex].driverProps = driverProps;
       m_OriginalPhysicalDevices[PhysicalDeviceIndex].memProps = memProps;
-      m_OriginalPhysicalDevices[PhysicalDeviceIndex].features = physFeatures;
+      m_OriginalPhysicalDevices[PhysicalDeviceIndex].availFeatures = physFeatures;
       m_OriginalPhysicalDevices[PhysicalDeviceIndex].queueCount = queueCount;
       memcpy(m_OriginalPhysicalDevices[PhysicalDeviceIndex].queueProps, queueProps,
              sizeof(queueProps));
@@ -967,54 +1185,39 @@ bool WrappedVulkan::Serialise_vkEnumeratePhysicalDevices(SerialiserType &ser, Vk
     // hopefully the most common case is when there's a precise match, and maybe the order changed.
     //
     // If more GPUs were present on replay than during capture, we map many-to-one which might have
-    // bad side-effects as e.g. we have to pick one memidxmap, but this is as good as we can do.
+    // bad side-effects, but this is as good as we can do.
 
     uint32_t bestIdx = 0;
     VkPhysicalDeviceProperties bestPhysProps = {};
-    VkPhysicalDeviceDriverPropertiesKHR bestDriverProps = {
-        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES_KHR,
+    VkPhysicalDeviceDriverProperties bestDriverProps = {
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES,
     };
 
+    rdcarray<VkPhysicalDeviceProperties> compPhysPropsArray;
+    rdcarray<VkPhysicalDeviceDriverProperties> compDriverPropsArray;
+
+    compPhysPropsArray.resize(m_ReplayPhysicalDevices.size());
+    compDriverPropsArray.resize(m_ReplayPhysicalDevices.size());
+
+    // first cache all the physical device data to compare against
     for(uint32_t i = 0; i < (uint32_t)m_ReplayPhysicalDevices.size(); i++)
     {
-      VkPhysicalDeviceProperties compPhysProps = {};
-      VkPhysicalDeviceDriverPropertiesKHR compDriverProps = {
-          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES_KHR,
-      };
+      VkPhysicalDeviceProperties &compPhysProps = compPhysPropsArray[i];
+      RDCEraseEl(compPhysProps);
+      VkPhysicalDeviceDriverProperties &compDriverProps = compDriverPropsArray[i];
+      RDCEraseEl(compDriverProps);
+      compDriverProps.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES;
 
       pd = m_ReplayPhysicalDevices[i];
 
       // find the best possible match for this physical device
       ObjDisp(pd)->GetPhysicalDeviceProperties(Unwrap(pd), &compPhysProps);
 
-      if(m_EnabledExtensions.ext_KHR_get_physical_device_properties2)
-      {
-        uint32_t count = 0;
-        ObjDisp(pd)->EnumerateDeviceExtensionProperties(Unwrap(pd), NULL, &count, NULL);
-
-        VkExtensionProperties *props = new VkExtensionProperties[count];
-        ObjDisp(pd)->EnumerateDeviceExtensionProperties(Unwrap(pd), NULL, &count, props);
-
-        for(uint32_t e = 0; e < count; e++)
-        {
-          if(!strcmp(props[e].extensionName, VK_KHR_DRIVER_PROPERTIES_EXTENSION_NAME))
-          {
-            VkPhysicalDeviceProperties2 physProps2 = {
-                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
-            };
-
-            physProps2.pNext = &compDriverProps;
-            ObjDisp(pd)->GetPhysicalDeviceProperties2(Unwrap(pd), &physProps2);
-            break;
-          }
-        }
-
-        SAFE_DELETE_ARRAY(props);
-      }
+      GetPhysicalDeviceDriverProperties(ObjDisp(pd), Unwrap(pd), compDriverProps);
 
       if(firstTime)
       {
-        VkDriverInfo runningVersion(compPhysProps);
+        VkDriverInfo runningVersion(compPhysProps, compDriverProps);
 
         RDCLOG("Replay has physical device %u available:", i);
         RDCLOG("   - %s (ver %u.%u patch 0x%x) - %04x:%04x", compPhysProps.deviceName,
@@ -1030,88 +1233,171 @@ bool WrappedVulkan::Serialise_vkEnumeratePhysicalDevices(SerialiserType &ser, Vk
               compDriverProps.conformanceVersion.subminor, compDriverProps.conformanceVersion.patch);
         }
       }
+    }
 
-      // the first is the best at the start
-      if(i == 0)
+    // if we're forcing use of a GPU, try to find that one
+    bool forced = false;
+    if(m_ReplayOptions.forceGPUVendor != GPUVendor::Unknown)
+    {
+      for(uint32_t i = 0; i < (uint32_t)m_ReplayPhysicalDevices.size(); i++)
       {
-        bestPhysProps = compPhysProps;
-        bestDriverProps = compDriverProps;
-        continue;
-      }
+        const VkPhysicalDeviceProperties &compPhysProps = compPhysPropsArray[i];
+        const VkPhysicalDeviceDriverProperties &compDriverProps = compDriverPropsArray[i];
 
-      // an exact vendorID match is a better match than not
-      if(compPhysProps.vendorID == physProps.vendorID && bestPhysProps.vendorID != physProps.vendorID)
-      {
-        bestIdx = i;
-        bestPhysProps = compPhysProps;
-        bestDriverProps = compDriverProps;
-        continue;
-      }
-      else if(compPhysProps.vendorID != physProps.vendorID)
-      {
-        continue;
-      }
+        VkDriverInfo bestInfo(bestPhysProps, bestDriverProps);
+        VkDriverInfo compInfo(compPhysProps, compDriverProps);
 
-      // ditto deviceID
-      if(compPhysProps.deviceID == physProps.deviceID && bestPhysProps.deviceID != physProps.deviceID)
-      {
-        bestIdx = i;
-        bestPhysProps = compPhysProps;
-        bestDriverProps = compDriverProps;
-        continue;
-      }
-      else if(compPhysProps.deviceID != physProps.deviceID)
-      {
-        continue;
-      }
+        // an exact vendorID match is a better match than not
+        if(compInfo.Vendor() == m_ReplayOptions.forceGPUVendor &&
+           bestInfo.Vendor() != m_ReplayOptions.forceGPUVendor)
+        {
+          bestIdx = i;
+          bestPhysProps = compPhysProps;
+          bestDriverProps = compDriverProps;
+          forced = true;
+          continue;
+        }
+        else if(compInfo.Vendor() != m_ReplayOptions.forceGPUVendor)
+        {
+          continue;
+        }
 
-      // driver matching. Only do this if both capture and replay gave us valid driver info to
-      // compare
-      if(compDriverProps.driverID && driverProps.driverID)
+        // ditto deviceID
+        if(compPhysProps.deviceID == m_ReplayOptions.forceGPUDeviceID &&
+           bestPhysProps.deviceID != m_ReplayOptions.forceGPUDeviceID)
+        {
+          bestIdx = i;
+          bestPhysProps = compPhysProps;
+          bestDriverProps = compDriverProps;
+          forced = true;
+          continue;
+        }
+        else if(compPhysProps.deviceID != m_ReplayOptions.forceGPUDeviceID)
+        {
+          continue;
+        }
+
+        // driver matching. Only do this if we have a driver name to look at
+        if(compDriverProps.driverID && !m_ReplayOptions.forceGPUDriverName.empty())
+        {
+          rdcstr compHumanDriverName = HumanDriverName(compDriverProps.driverID);
+          rdcstr bestHumanDriverName = HumanDriverName(bestDriverProps.driverID);
+
+          // check for a better driverID match
+          if(compHumanDriverName == m_ReplayOptions.forceGPUDriverName &&
+             bestHumanDriverName != m_ReplayOptions.forceGPUDriverName)
+          {
+            bestIdx = i;
+            bestPhysProps = compPhysProps;
+            bestDriverProps = compDriverProps;
+            forced = true;
+            continue;
+          }
+        }
+      }
+    }
+
+    if(forced)
+    {
+      RDCLOG("Forcing use of physical device");
+    }
+    else
+    {
+      bestIdx = 0;
+      RDCEraseEl(bestPhysProps);
+      RDCEraseEl(bestDriverProps);
+
+      for(uint32_t i = 0; i < (uint32_t)m_ReplayPhysicalDevices.size(); i++)
       {
-        // check for a better driverID match
-        if(compDriverProps.driverID == driverProps.driverID &&
-           bestDriverProps.driverID != driverProps.driverID)
+        const VkPhysicalDeviceProperties &compPhysProps = compPhysPropsArray[i];
+        const VkPhysicalDeviceDriverProperties &compDriverProps = compDriverPropsArray[i];
+
+        pd = m_ReplayPhysicalDevices[i];
+
+        // the first is the best at the start
+        if(i == 0)
+        {
+          bestPhysProps = compPhysProps;
+          bestDriverProps = compDriverProps;
+          continue;
+        }
+
+        // an exact vendorID match is a better match than not
+        if(compPhysProps.vendorID == physProps.vendorID &&
+           bestPhysProps.vendorID != physProps.vendorID)
         {
           bestIdx = i;
           bestPhysProps = compPhysProps;
           bestDriverProps = compDriverProps;
           continue;
         }
-        else if(compDriverProps.driverID != driverProps.driverID)
+        else if(compPhysProps.vendorID != physProps.vendorID)
         {
           continue;
         }
-      }
 
-      // if we have an exact driver version match, prefer that
-      if(compPhysProps.driverVersion == physProps.driverVersion &&
-         bestPhysProps.driverVersion != physProps.driverVersion)
-      {
-        bestIdx = i;
-        bestPhysProps = compPhysProps;
-        bestDriverProps = compDriverProps;
-        continue;
-      }
-      else if(compPhysProps.driverVersion != physProps.driverVersion)
-      {
-        continue;
-      }
+        // ditto deviceID
+        if(compPhysProps.deviceID == physProps.deviceID &&
+           bestPhysProps.deviceID != physProps.deviceID)
+        {
+          bestIdx = i;
+          bestPhysProps = compPhysProps;
+          bestDriverProps = compDriverProps;
+          continue;
+        }
+        else if(compPhysProps.deviceID != physProps.deviceID)
+        {
+          continue;
+        }
 
-      // if we have multiple identical devices, which isn't uncommon, favour the one
-      // that hasn't been assigned
-      if(m_ReplayPhysicalDevicesUsed[bestIdx] && !m_ReplayPhysicalDevicesUsed[i])
-      {
-        bestIdx = i;
-        bestPhysProps = compPhysProps;
-        continue;
-      }
+        // driver matching. Only do this if both capture and replay gave us valid driver info to
+        // compare
+        if(compDriverProps.driverID && driverProps.driverID)
+        {
+          // check for a better driverID match
+          if(compDriverProps.driverID == driverProps.driverID &&
+             bestDriverProps.driverID != driverProps.driverID)
+          {
+            bestIdx = i;
+            bestPhysProps = compPhysProps;
+            bestDriverProps = compDriverProps;
+            continue;
+          }
+          else if(compDriverProps.driverID != driverProps.driverID)
+          {
+            continue;
+          }
+        }
 
-      // this device isn't any better, ignore it
+        // if we have an exact driver version match, prefer that
+        if(compPhysProps.driverVersion == physProps.driverVersion &&
+           bestPhysProps.driverVersion != physProps.driverVersion)
+        {
+          bestIdx = i;
+          bestPhysProps = compPhysProps;
+          bestDriverProps = compDriverProps;
+          continue;
+        }
+        else if(compPhysProps.driverVersion != physProps.driverVersion)
+        {
+          continue;
+        }
+
+        // if we have multiple identical devices, which isn't uncommon, favour the one
+        // that hasn't been assigned
+        if(m_ReplayPhysicalDevicesUsed[bestIdx] && !m_ReplayPhysicalDevicesUsed[i])
+        {
+          bestIdx = i;
+          bestPhysProps = compPhysProps;
+          continue;
+        }
+
+        // this device isn't any better, ignore it
+      }
     }
 
     {
-      VkDriverInfo capturedVersion(physProps);
+      VkDriverInfo capturedVersion(physProps, driverProps);
 
       RDCLOG("Found capture physical device %u:", PhysicalDeviceIndex);
       RDCLOG("   - %s (ver %u.%u patch 0x%x) - %04x:%04x", physProps.deviceName,
@@ -1126,7 +1412,8 @@ bool WrappedVulkan::Serialise_vkEnumeratePhysicalDevices(SerialiserType &ser, Vk
                driverProps.conformanceVersion.patch);
       }
 
-      RDCLOG("Mapping during replay to best-match physical device %u", bestIdx);
+      RDCLOG("Mapping during replay to %s physical device %u", forced ? "forced" : "best-match",
+             bestIdx);
     }
 
     pd = m_ReplayPhysicalDevices[bestIdx];
@@ -1165,17 +1452,6 @@ bool WrappedVulkan::Serialise_vkEnumeratePhysicalDevices(SerialiserType &ser, Vk
           "Mapping multiple capture-time physical devices to a single replay-time physical device."
           "This means the HW has changed between capture and replay and may cause bugs.");
     }
-    else if(m_MemIdxMaps[bestIdx] == NULL)
-    {
-      // the first physical device 'wins' for the memory index map
-      uint32_t *storedMap = new uint32_t[32];
-      memcpy(storedMap, memIdxMap, sizeof(memIdxMap));
-
-      for(uint32_t i = 0; i < 32; i++)
-        storedMap[i] = i;
-
-      m_MemIdxMaps[bestIdx] = storedMap;
-    }
 
     m_ReplayPhysicalDevicesUsed[bestIdx] = true;
   }
@@ -1198,7 +1474,7 @@ VkResult WrappedVulkan::vkEnumeratePhysicalDevices(VkInstance instance,
 
   SERIALISE_TIME_CALL(
       vkr = ObjDisp(instance)->EnumeratePhysicalDevices(Unwrap(instance), &count, devices));
-  RDCASSERTEQUAL(vkr, VK_SUCCESS);
+  CheckVkResult(vkr);
 
   m_PhysicalDevices.resize(count);
 
@@ -1223,24 +1499,22 @@ VkResult WrappedVulkan::vkEnumeratePhysicalDevices(VkInstance instance,
         VkResourceRecord *record = GetResourceManager()->AddResourceRecord(devices[i]);
         RDCASSERT(record);
 
-        record->memProps = new VkPhysicalDeviceMemoryProperties();
-
-        ObjDisp(devices[i])->GetPhysicalDeviceMemoryProperties(Unwrap(devices[i]), record->memProps);
+        VkResourceRecord *instrecord = GetRecord(instance);
 
         VkPhysicalDeviceProperties physProps;
 
         ObjDisp(devices[i])->GetPhysicalDeviceProperties(Unwrap(devices[i]), &physProps);
 
-        VkDriverInfo capturedVersion(physProps);
+        VkPhysicalDeviceDriverProperties driverProps = {};
+        GetPhysicalDeviceDriverProperties(ObjDisp(devices[i]), Unwrap(devices[i]), driverProps);
+
+        VkDriverInfo capturedVersion(physProps, driverProps);
 
         RDCLOG("physical device %u: %s (ver %u.%u patch 0x%x) - %04x:%04x", i, physProps.deviceName,
                capturedVersion.Major(), capturedVersion.Minor(), capturedVersion.Patch(),
                physProps.vendorID, physProps.deviceID);
 
         m_PhysicalDevices[i] = devices[i];
-
-        // we remap memory indices to discourage coherent maps as much as possible
-        RemapMemoryIndices(record->memProps, &record->memIdxMap);
 
         {
           CACHE_THREAD_SERIALISER();
@@ -1251,9 +1525,10 @@ VkResult WrappedVulkan::vkEnumeratePhysicalDevices(VkInstance instance,
           record->AddChunk(scope.Get());
         }
 
-        VkResourceRecord *instrecord = GetRecord(instance);
-
         instrecord->AddParent(record);
+
+        // copy the instance's setup directly
+        record->instDevInfo = new InstanceDeviceInfo(*instrecord->instDevInfo);
 
         // treat physical devices as pool members of the instance (ie. freed when the instance dies)
         {
@@ -1265,14 +1540,122 @@ VkResult WrappedVulkan::vkEnumeratePhysicalDevices(VkInstance instance,
     }
   }
 
-  if(pPhysicalDeviceCount)
-    *pPhysicalDeviceCount = count;
+  VkResult result = VK_SUCCESS;
+
   if(pPhysicalDevices)
+  {
+    if(count > *pPhysicalDeviceCount)
+    {
+      count = *pPhysicalDeviceCount;
+      result = VK_INCOMPLETE;
+    }
     memcpy(pPhysicalDevices, devices, count * sizeof(VkPhysicalDevice));
+  }
+  *pPhysicalDeviceCount = count;
 
   SAFE_DELETE_ARRAY(devices);
 
-  return VK_SUCCESS;
+  return result;
+}
+
+bool WrappedVulkan::SelectGraphicsComputeQueue(const rdcarray<VkQueueFamilyProperties> &queueProps,
+                                               VkDeviceCreateInfo &createInfo,
+                                               uint32_t &queueFamilyIndex)
+{
+  // storage for if we need to change the requested queues
+  static rdcarray<VkDeviceQueueCreateInfo> modQueues;
+
+  bool found = false;
+
+  // we need graphics, and if there is a graphics queue there must be a graphics & compute queue.
+  const VkQueueFlags search = (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT);
+
+  // for queue priorities, if we need it
+  static const float one = 1.0f;
+
+  for(uint32_t i = 0; i < createInfo.queueCreateInfoCount; i++)
+  {
+    uint32_t idx = createInfo.pQueueCreateInfos[i].queueFamilyIndex;
+    RDCASSERT(idx < queueProps.size());
+
+    // this requested queue is one we can use too
+    if((queueProps[idx].queueFlags & search) == search &&
+       createInfo.pQueueCreateInfos[i].queueCount > 0)
+    {
+      queueFamilyIndex = idx;
+      found = true;
+      break;
+    }
+  }
+
+  // if we didn't find it, search for which queue family we should add a request for
+  if(!found)
+  {
+    RDCDEBUG("App didn't request a queue family we can use - adding our own");
+
+    for(uint32_t i = 0; i < queueProps.size(); i++)
+    {
+      if((queueProps[i].queueFlags & search) == search)
+      {
+        queueFamilyIndex = i;
+        found = true;
+        break;
+      }
+    }
+
+    if(!found)
+    {
+      SET_ERROR_RESULT(
+          m_FailedReplayResult, ResultCode::APIHardwareUnsupported,
+          "Can't add a queue with required properties for RenderDoc! Unsupported configuration");
+      return false;
+    }
+
+    // we found the queue family, add it
+    modQueues.resize(createInfo.queueCreateInfoCount + 1);
+    for(uint32_t i = 0; i < createInfo.queueCreateInfoCount; i++)
+      modQueues[i] = createInfo.pQueueCreateInfos[i];
+
+    modQueues[createInfo.queueCreateInfoCount].queueFamilyIndex = queueFamilyIndex;
+    modQueues[createInfo.queueCreateInfoCount].queueCount = 1;
+    modQueues[createInfo.queueCreateInfoCount].pQueuePriorities = &one;
+    modQueues[createInfo.queueCreateInfoCount].sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+    modQueues[createInfo.queueCreateInfoCount].pNext = NULL;
+    modQueues[createInfo.queueCreateInfoCount].flags = 0;
+
+    createInfo.pQueueCreateInfos = modQueues.data();
+    createInfo.queueCreateInfoCount++;
+  }
+
+  return true;
+}
+
+void WrappedVulkan::SendUserDebugMessage(const rdcstr &msg)
+{
+  VkDebugUtilsMessengerCallbackDataEXT messengerData = {};
+
+  messengerData.messageIdNumber = 1;
+  messengerData.pMessageIdName = NULL;
+  messengerData.pMessage = msg.c_str();
+  messengerData.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CALLBACK_DATA_EXT;
+
+  {
+    SCOPED_LOCK(m_CallbacksLock);
+
+    for(UserDebugReportCallbackData *cb : m_ReportCallbacks)
+    {
+      cb->createInfo.pfnCallback(VK_DEBUG_REPORT_ERROR_BIT_EXT,
+                                 VK_DEBUG_REPORT_OBJECT_TYPE_DEVICE_EXT, 0, 1, 1, "RDOC",
+                                 msg.c_str(), cb->createInfo.pUserData);
+    }
+
+    for(UserDebugUtilsCallbackData *cb : m_UtilsCallbacks)
+    {
+      cb->createInfo.pfnUserCallback(VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT,
+                                     VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT, &messengerData,
+                                     cb->createInfo.pUserData);
+    }
+  }
 }
 
 template <typename SerialiserType>
@@ -1281,8 +1664,8 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
                                              const VkAllocationCallbacks *pAllocator,
                                              VkDevice *pDevice)
 {
-  SERIALISE_ELEMENT(physicalDevice);
-  SERIALISE_ELEMENT_LOCAL(CreateInfo, *pCreateInfo);
+  SERIALISE_ELEMENT(physicalDevice).Important();
+  SERIALISE_ELEMENT_LOCAL(CreateInfo, *pCreateInfo).Important();
   SERIALISE_ELEMENT_OPT(pAllocator);
   SERIALISE_ELEMENT_LOCAL(Device, GetResID(*pDevice)).TypedAs("VkDevice"_lit);
 
@@ -1304,64 +1687,63 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
     uint32_t physicalDeviceIndex = GetPhysicalDeviceIndexFromHandle(Unwrap(physicalDevice));
     physicalDevice = m_PhysicalDevices[physicalDeviceIndex];
 
+    RDCLOG("Creating replay device from physical device %u", physicalDeviceIndex);
+
+    ObjDisp(physicalDevice)
+        ->GetPhysicalDeviceProperties(Unwrap(physicalDevice), &m_PhysicalDeviceData.props);
+
+    ObjDisp(physicalDevice)
+        ->GetPhysicalDeviceMemoryProperties(Unwrap(physicalDevice), &m_PhysicalDeviceData.memProps);
+
+    ObjDisp(physicalDevice)
+        ->GetPhysicalDeviceFeatures(Unwrap(physicalDevice), &m_PhysicalDeviceData.availFeatures);
+
+    GetPhysicalDeviceDriverProperties(ObjDisp(physicalDevice), Unwrap(physicalDevice),
+                                      m_PhysicalDeviceData.driverProps);
+
+    m_PhysicalDeviceData.driverInfo =
+        VkDriverInfo(m_PhysicalDeviceData.props, m_PhysicalDeviceData.driverProps, true);
+
+    rdcarray<VkDeviceQueueGlobalPriorityCreateInfoKHR *> queuePriorities;
+
+    for(uint32_t i = 0; i < CreateInfo.queueCreateInfoCount; i++)
+    {
+      VkDeviceQueueGlobalPriorityCreateInfoKHR *queuePrio =
+          (VkDeviceQueueGlobalPriorityCreateInfoKHR *)FindNextStruct(
+              &CreateInfo.pQueueCreateInfos[i],
+              VK_STRUCTURE_TYPE_DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO_KHR);
+
+      if(queuePrio)
+        queuePriorities.push_back(queuePrio);
+    }
+
+    const PhysicalDeviceData &origData = m_OriginalPhysicalDevices[physicalDeviceIndex];
+
+    m_OrigPhysicalDeviceData = origData;
+    m_OrigPhysicalDeviceData.driverInfo = VkDriverInfo(origData.props, origData.driverProps, false);
+
     // we must make any modifications locally, so the free of pointers
     // in the serialised VkDeviceCreateInfo don't double-free
     VkDeviceCreateInfo createInfo = CreateInfo;
 
-    std::vector<std::string> Extensions;
+    rdcarray<rdcstr> Extensions;
     for(uint32_t i = 0; i < createInfo.enabledExtensionCount; i++)
     {
-      // don't include the debug marker extension
-      if(!strcmp(createInfo.ppEnabledExtensionNames[i], VK_EXT_DEBUG_MARKER_EXTENSION_NAME))
-        continue;
-
-      // don't include the validation cache extension
-      if(!strcmp(createInfo.ppEnabledExtensionNames[i], VK_EXT_VALIDATION_CACHE_EXTENSION_NAME))
-        continue;
-
-      // don't include direct-display WSI extensions
-      if(!strcmp(createInfo.ppEnabledExtensionNames[i], VK_KHR_DISPLAY_SWAPCHAIN_EXTENSION_NAME) ||
-         !strcmp(createInfo.ppEnabledExtensionNames[i], VK_EXT_DISPLAY_CONTROL_EXTENSION_NAME))
-        continue;
-
       Extensions.push_back(createInfo.ppEnabledExtensionNames[i]);
     }
 
-    if(std::find(Extensions.begin(), Extensions.end(),
-                 VK_AMD_NEGATIVE_VIEWPORT_HEIGHT_EXTENSION_NAME) != Extensions.end())
-      m_ExtensionsEnabled[VkCheckExt_AMD_neg_viewport] = true;
+    StripUnwantedExtensions(Extensions);
 
-    if(std::find(Extensions.begin(), Extensions.end(), VK_KHR_MAINTENANCE1_EXTENSION_NAME) !=
-       Extensions.end())
-      m_ExtensionsEnabled[VkCheckExt_KHR_maintenance1] = true;
+    std::set<rdcstr> supportedExtensions;
 
-    if(std::find(Extensions.begin(), Extensions.end(),
-                 VK_EXT_CONSERVATIVE_RASTERIZATION_EXTENSION_NAME) != Extensions.end())
-      m_ExtensionsEnabled[VkCheckExt_EXT_conserv_rast] = true;
-
-    if(std::find(Extensions.begin(), Extensions.end(),
-                 VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME) != Extensions.end())
-      m_ExtensionsEnabled[VkCheckExt_EXT_vertex_divisor] = true;
-
-    std::vector<std::string> Layers;
-    for(uint32_t i = 0; i < createInfo.enabledLayerCount; i++)
-      Layers.push_back(createInfo.ppEnabledLayerNames[i]);
-
-    StripUnwantedLayers(Layers);
-
-    std::set<std::string> supportedExtensions;
-
-    for(size_t i = 0; i <= Layers.size(); i++)
     {
-      const char *pLayerName = (i == 0 ? NULL : Layers[i - 1].c_str());
-
       uint32_t count = 0;
       ObjDisp(physicalDevice)
-          ->EnumerateDeviceExtensionProperties(Unwrap(physicalDevice), pLayerName, &count, NULL);
+          ->EnumerateDeviceExtensionProperties(Unwrap(physicalDevice), NULL, &count, NULL);
 
       VkExtensionProperties *props = new VkExtensionProperties[count];
       ObjDisp(physicalDevice)
-          ->EnumerateDeviceExtensionProperties(Unwrap(physicalDevice), pLayerName, &count, props);
+          ->EnumerateDeviceExtensionProperties(Unwrap(physicalDevice), NULL, &count, props);
 
       for(uint32_t e = 0; e < count; e++)
         supportedExtensions.insert(props[e].extensionName);
@@ -1371,12 +1753,27 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
 
     AddRequiredExtensions(false, Extensions, supportedExtensions);
 
+    // Drop VK_KHR_driver_properties if it's not available, but add it if it is
+    bool driverPropsSupported = (supportedExtensions.find(VK_KHR_DRIVER_PROPERTIES_EXTENSION_NAME) !=
+                                 supportedExtensions.end());
+    if(driverPropsSupported)
+    {
+      if(!Extensions.contains(VK_KHR_DRIVER_PROPERTIES_EXTENSION_NAME))
+        Extensions.push_back(VK_KHR_DRIVER_PROPERTIES_EXTENSION_NAME);
+    }
+    else
+    {
+      Extensions.removeOne(VK_KHR_DRIVER_PROPERTIES_EXTENSION_NAME);
+    }
+
     for(size_t i = 0; i < Extensions.size(); i++)
     {
       if(supportedExtensions.find(Extensions[i]) == supportedExtensions.end())
       {
-        m_FailedReplayStatus = ReplayStatus::APIHardwareUnsupported;
-        RDCERR("Capture requires extension '%s' which is not supported", Extensions[i].c_str());
+        SET_ERROR_RESULT(m_FailedReplayResult, ResultCode::APIHardwareUnsupported,
+                         "Capture requires extension '%s' which is not supported\n"
+                         "\n%s",
+                         Extensions[i].c_str(), GetPhysDeviceCompatString(false, false).c_str());
         return false;
       }
     }
@@ -1427,6 +1824,26 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
       RDCLOG("Enabling VK_KHR_driver_properties");
     }
 
+    // enable VK_KHR_shader_non_semantic_info if it's available, to enable debug printf
+    if(supportedExtensions.find(VK_KHR_SHADER_NON_SEMANTIC_INFO_EXTENSION_NAME) !=
+       supportedExtensions.end())
+    {
+      Extensions.push_back(VK_KHR_SHADER_NON_SEMANTIC_INFO_EXTENSION_NAME);
+      RDCLOG("Enabling VK_KHR_shader_non_semantic_info");
+    }
+
+    bool pipeExec = false;
+
+    // enable VK_KHR_pipeline_executable_properties if it's available, to fetch disassembly and
+    // statistics
+    if(supportedExtensions.find(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME) !=
+       supportedExtensions.end())
+    {
+      pipeExec = true;
+      Extensions.push_back(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
+      RDCLOG("Enabling VK_KHR_pipeline_executable_properties");
+    }
+
     bool xfb = false;
 
     // enable VK_EXT_TRANSFORM_FEEDBACK_EXTENSION_NAME if it's available, to fetch mesh output in
@@ -1444,45 +1861,86 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
           "geometry/tessellation stages will not be available");
     }
 
-    if(supportedExtensions.find(VK_EXT_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME) !=
+    bool scalarBlock = false;
+
+    // enable VK_EXT_scalar_block_layout if it's available, to fetch mesh output in the mesh stage
+    if(supportedExtensions.find(VK_EXT_SCALAR_BLOCK_LAYOUT_EXTENSION_NAME) !=
        supportedExtensions.end())
+    {
+      scalarBlock = true;
+      Extensions.push_back(VK_EXT_SCALAR_BLOCK_LAYOUT_EXTENSION_NAME);
+      RDCLOG("Enabling VK_EXT_scalar_block_layout extension");
+    }
+    else
+    {
+      VkPhysicalDeviceMeshShaderFeaturesEXT *meshFeats =
+          (VkPhysicalDeviceMeshShaderFeaturesEXT *)FindNextStruct(
+              &createInfo, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT);
+
+      if(meshFeats && meshFeats->meshShader)
+        RDCWARN(
+            "VK_EXT_scalar_block_layout extension not available, mesh output from "
+            "mesh stage will not be available");
+    }
+
+    bool KHRbuffer = false, EXTbuffer = false;
+
+    if(supportedExtensions.find(VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME) !=
+       supportedExtensions.end())
+    {
+      Extensions.push_back(VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME);
+      RDCLOG("Enabling VK_KHR_buffer_device_address");
+
+      KHRbuffer = true;
+    }
+    else if(supportedExtensions.find(VK_EXT_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME) !=
+            supportedExtensions.end())
     {
       Extensions.push_back(VK_EXT_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME);
       RDCLOG("Enabling VK_EXT_buffer_device_address");
+
+      EXTbuffer = true;
     }
     else
     {
       RDCWARN(
-          "VK_EXT_buffer_device_address not available, feedback from "
+          "VK_[KHR|EXT]_buffer_device_address not available, feedback from "
           "bindless shader access will use less reliable fallback");
+    }
+
+    bool perfQuery = false;
+
+    if(supportedExtensions.find(VK_KHR_PERFORMANCE_QUERY_EXTENSION_NAME) != supportedExtensions.end())
+    {
+      perfQuery = true;
+      Extensions.push_back(VK_KHR_PERFORMANCE_QUERY_EXTENSION_NAME);
+      RDCLOG("Enabling VK_KHR_performance_query");
     }
 
     VkDevice device;
 
-    uint32_t qCount = 0;
-    ObjDisp(physicalDevice)->GetPhysicalDeviceQueueFamilyProperties(Unwrap(physicalDevice), &qCount, NULL);
+    rdcarray<VkQueueFamilyProperties> queueProps;
 
-    if(qCount > 16)
     {
-      RDCERR("Unexpected number of queue families: %u", qCount);
-      qCount = 16;
-    }
+      uint32_t qCount = 0;
+      ObjDisp(physicalDevice)
+          ->GetPhysicalDeviceQueueFamilyProperties(Unwrap(physicalDevice), &qCount, NULL);
 
-    VkQueueFamilyProperties props[16] = {};
-    ObjDisp(physicalDevice)
-        ->GetPhysicalDeviceQueueFamilyProperties(Unwrap(physicalDevice), &qCount, props);
+      queueProps.resize(qCount);
+      ObjDisp(physicalDevice)
+          ->GetPhysicalDeviceQueueFamilyProperties(Unwrap(physicalDevice), &qCount,
+                                                   queueProps.data());
+    }
 
     // to aid the search algorithm below, we apply implied transfer bit onto the queue properties.
-    for(uint32_t i = 0; i < qCount; i++)
+    for(VkQueueFamilyProperties &q : queueProps)
     {
-      if(props[i].queueFlags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT))
-        props[i].queueFlags |= VK_QUEUE_TRANSFER_BIT;
+      if(q.queueFlags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT))
+        q.queueFlags |= VK_QUEUE_TRANSFER_BIT;
     }
 
-    PhysicalDeviceData &origData = m_OriginalPhysicalDevices[physicalDeviceIndex];
-
     uint32_t origQCount = origData.queueCount;
-    VkQueueFamilyProperties *origprops = origData.queueProps;
+    const VkQueueFamilyProperties *origprops = origData.queueProps;
 
     // create queue remapping
     for(uint32_t origQIndex = 0; origQIndex < origQCount; origQIndex++)
@@ -1502,6 +1960,12 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
       // ensure the remapped queue family is at least as good as it was at capture time.
       uint32_t destFamily = 0;
 
+      if(origQIndex < queueProps.size() && equivalent(origprops[origQIndex], queueProps[origQIndex]))
+      {
+        destFamily = origQIndex;
+        RDCLOG(" (identity match)");
+      }
+      else
       {
         // we categorise the original queue as one of four types: universal
         // (graphics/compute/transfer), graphics/transfer only (rare), compute-only
@@ -1549,22 +2013,23 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
         {
           bool found = false;
 
-          for(uint32_t replayQIndex = 0; replayQIndex < qCount; replayQIndex++)
+          for(uint32_t replayQIndex = 0; replayQIndex < queueProps.size(); replayQIndex++)
           {
             // ignore queues that couldn't satisfy the required transfer granularity
             if(!CheckTransferGranularity(needGranularity,
-                                         props[replayQIndex].minImageTransferGranularity))
+                                         queueProps[replayQIndex].minImageTransferGranularity))
               continue;
 
             // ignore queues that don't have sparse binding, if we need that
-            if(needSparse && ((props[replayQIndex].queueFlags & VK_QUEUE_SPARSE_BINDING_BIT) == 0))
+            if(needSparse &&
+               ((queueProps[replayQIndex].queueFlags & VK_QUEUE_SPARSE_BINDING_BIT) == 0))
               continue;
 
             switch(search)
             {
               case SearchType::Failed: break;
               case SearchType::Universal:
-                if((props[replayQIndex].queueFlags & mask) ==
+                if((queueProps[replayQIndex].queueFlags & mask) ==
                    (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT))
                 {
                   destFamily = replayQIndex;
@@ -1572,7 +2037,7 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
                 }
                 break;
               case SearchType::GraphicsTransfer:
-                if((props[replayQIndex].queueFlags & mask) ==
+                if((queueProps[replayQIndex].queueFlags & mask) ==
                    (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_TRANSFER_BIT))
                 {
                   destFamily = replayQIndex;
@@ -1580,7 +2045,7 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
                 }
                 break;
               case SearchType::ComputeTransfer:
-                if((props[replayQIndex].queueFlags & mask) ==
+                if((queueProps[replayQIndex].queueFlags & mask) ==
                    (VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT))
                 {
                   destFamily = replayQIndex;
@@ -1588,9 +2053,9 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
                 }
                 break;
               case SearchType::GraphicsOrComputeTransfer:
-                if((props[replayQIndex].queueFlags & mask) ==
+                if((queueProps[replayQIndex].queueFlags & mask) ==
                        (VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT) ||
-                   (props[replayQIndex].queueFlags & mask) ==
+                   (queueProps[replayQIndex].queueFlags & mask) ==
                        (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_TRANSFER_BIT))
                 {
                   destFamily = replayQIndex;
@@ -1598,7 +2063,7 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
                 }
                 break;
               case SearchType::TransferOnly:
-                if((props[replayQIndex].queueFlags & mask) == VK_QUEUE_TRANSFER_BIT)
+                if((queueProps[replayQIndex].queueFlags & mask) == VK_QUEUE_TRANSFER_BIT)
                 {
                   destFamily = replayQIndex;
                   found = true;
@@ -1635,12 +2100,13 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
       }
 
       RDCLOG("Remapping to queue family %u:", destFamily);
-      RDCLOG("   - %u queues available with %s", props[destFamily].queueCount,
-             ToStr(VkQueueFlagBits(props[destFamily].queueFlags)).c_str());
-      RDCLOG("     %u timestamp bits (%u,%u,%u) granularity", props[destFamily].timestampValidBits,
-             props[destFamily].minImageTransferGranularity.width,
-             props[destFamily].minImageTransferGranularity.height,
-             props[destFamily].minImageTransferGranularity.depth);
+      RDCLOG("   - %u queues available with %s", queueProps[destFamily].queueCount,
+             ToStr(VkQueueFlagBits(queueProps[destFamily].queueFlags)).c_str());
+      RDCLOG("     %u timestamp bits (%u,%u,%u) granularity",
+             queueProps[destFamily].timestampValidBits,
+             queueProps[destFamily].minImageTransferGranularity.width,
+             queueProps[destFamily].minImageTransferGranularity.height,
+             queueProps[destFamily].minImageTransferGranularity.depth);
 
       // loop over the queues, wrapping around if necessary to provide enough queues. The idea being
       // an application is more likely to use early queues than later ones, so if there aren't
@@ -1648,7 +2114,7 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
       // indices
       for(uint32_t q = 0; q < origprops[origQIndex].queueCount; q++)
       {
-        m_QueueRemapping[origQIndex][q] = {destFamily, q % props[destFamily].queueCount};
+        m_QueueRemapping[origQIndex][q] = {destFamily, q % queueProps[destFamily].queueCount};
       }
     }
 
@@ -1663,7 +2129,7 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
       uint32_t queueFamily = queueCreate.queueFamilyIndex;
       queueFamily = m_QueueRemapping[queueFamily][0].family;
       queueCreate.queueFamilyIndex = queueFamily;
-      uint32_t queueCount = RDCMIN(queueCreate.queueCount, props[queueFamily].queueCount);
+      uint32_t queueCount = RDCMIN(queueCreate.queueCount, queueProps[queueFamily].queueCount);
 
       if(queueCount < queueCreate.queueCount)
         RDCWARN("Truncating queue family request from %u queues to %u queues",
@@ -1673,7 +2139,7 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
     }
 
     // remove any duplicates that have been created
-    std::vector<VkDeviceQueueCreateInfo> queueInfos;
+    rdcarray<VkDeviceQueueCreateInfo> queueInfos;
 
     for(uint32_t i = 0; i < createInfo.queueCreateInfoCount; i++)
     {
@@ -1714,64 +2180,35 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
     createInfo.queueCreateInfoCount = (uint32_t)queueInfos.size();
     createInfo.pQueueCreateInfos = queueInfos.data();
 
-    bool found = false;
     uint32_t qFamilyIdx = 0;
 
-    // we need graphics, and if there is a graphics queue there must be a graphics & compute queue.
-    VkQueueFlags search = (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT);
-
-    // for queue priorities, if we need it
-    float one = 1.0f;
-
-    for(uint32_t i = 0; i < createInfo.queueCreateInfoCount; i++)
+    if(!SelectGraphicsComputeQueue(queueProps, createInfo, qFamilyIdx))
     {
-      uint32_t idx = createInfo.pQueueCreateInfos[i].queueFamilyIndex;
-      RDCASSERT(idx < qCount);
-
-      // this requested queue is one we can use too
-      if((props[idx].queueFlags & search) == search && createInfo.pQueueCreateInfos[i].queueCount > 0)
-      {
-        qFamilyIdx = idx;
-        found = true;
-        break;
-      }
+      SET_ERROR_RESULT(
+          m_FailedReplayResult, ResultCode::APIHardwareUnsupported,
+          "Can't add a queue with required properties for RenderDoc! Unsupported configuration");
+      return false;
     }
 
-    // if we didn't find it, search for which queue family we should add a request for
-    if(!found)
+    // remove structs from extensions that we have stripped but may still be referenced here,
+    // to ensure we don't pass structs for disabled extensions.
+    bool private_data = false;
+    private_data |= RemoveNextStruct(&createInfo, VK_STRUCTURE_TYPE_DEVICE_PRIVATE_DATA_CREATE_INFO);
+    private_data |=
+        RemoveNextStruct(&createInfo, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRIVATE_DATA_FEATURES);
+    if(private_data)
     {
-      RDCDEBUG("App didn't request a queue family we can use - adding our own");
+      RDCLOG("Removed VK_EXT_private_data structs from vkCreateDevice pNext chain");
+    }
 
-      for(uint32_t i = 0; i < qCount; i++)
-      {
-        if((props[i].queueFlags & search) == search)
-        {
-          qFamilyIdx = i;
-          found = true;
-          break;
-        }
-      }
-
-      if(!found)
-      {
-        RDCERR(
-            "Can't add a queue with required properties for RenderDoc! Unsupported configuration");
-      }
-      else
-      {
-        // we found the queue family, add it
-        VkDeviceQueueCreateInfo newQueue;
-
-        newQueue.queueFamilyIndex = qFamilyIdx;
-        newQueue.queueCount = 1;
-        newQueue.pQueuePriorities = &one;
-
-        queueInfos.push_back(newQueue);
-
-        // reset these in case the vector resized
-        createInfo.queueCreateInfoCount = (uint32_t)queueInfos.size();
-        createInfo.pQueueCreateInfos = queueInfos.data();
-      }
+    bool present_id = false;
+    present_id |=
+        RemoveNextStruct(&createInfo, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR);
+    present_id |=
+        RemoveNextStruct(&createInfo, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR);
+    if(present_id)
+    {
+      RDCLOG("Removed VK_KHR_present_id/wait structs from vkCreateDevice pNext chain");
     }
 
     VkPhysicalDeviceFeatures enabledFeatures = {0};
@@ -1790,12 +2227,14 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
     VkPhysicalDeviceFeatures availFeatures = {0};
     ObjDisp(physicalDevice)->GetPhysicalDeviceFeatures(Unwrap(physicalDevice), &availFeatures);
 
-#define CHECK_PHYS_FEATURE(feature)                                                           \
-  if(enabledFeatures.feature && !availFeatures.feature)                                       \
-  {                                                                                           \
-    m_FailedReplayStatus = ReplayStatus::APIHardwareUnsupported;                              \
-    RDCERR("Capture requires physical device feature '" #feature "' which is not supported"); \
-    return false;                                                                             \
+#define CHECK_PHYS_FEATURE(feature)                                            \
+  if(enabledFeatures.feature && !availFeatures.feature)                        \
+  {                                                                            \
+    SET_ERROR_RESULT(m_FailedReplayResult, ResultCode::APIHardwareUnsupported, \
+                     "Capture requires physical device feature '" #feature     \
+                     "' which is not supported\n\n%s",                         \
+                     GetPhysDeviceCompatString(false, false).c_str());         \
+    return false;                                                              \
   }
 
     CHECK_PHYS_FEATURE(robustBufferAccess);
@@ -1865,22 +2304,135 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
 
 #define END_PHYS_EXT_CHECK() }
 
-#define CHECK_PHYS_EXT_FEATURE(feature)                          \
-  if(ext->feature && !avail.feature)                             \
-  {                                                              \
-    m_FailedReplayStatus = ReplayStatus::APIHardwareUnsupported; \
-    RDCERR("Capture requires physical device feature '" #feature \
-           "' in struct '%s' which is not supported",            \
-           structName);                                          \
-    return false;                                                \
+#define CHECK_PHYS_EXT_FEATURE(feature)                                            \
+  if(ext->feature && !avail.feature)                                               \
+  {                                                                                \
+    SET_ERROR_RESULT(m_FailedReplayResult, ResultCode::APIHardwareUnsupported,     \
+                     "Capture requires physical device feature '" #feature         \
+                     "' in struct '%s' which is not supported\n\n%s",              \
+                     structName, GetPhysDeviceCompatString(false, false).c_str()); \
+    return false;                                                                  \
   }
 
-    VkPhysicalDeviceDescriptorIndexingFeaturesEXT descIndexingFeatures = {};
+    VkPhysicalDeviceDescriptorIndexingFeatures descIndexingFeatures = {};
+    VkPhysicalDeviceVulkan12Features vulkan12Features = {};
+    VkPhysicalDeviceVulkan13Features vulkan13Features = {};
+    VkPhysicalDeviceSynchronization2Features sync2 = {};
 
     if(ObjDisp(physicalDevice)->GetPhysicalDeviceFeatures2)
     {
-      BEGIN_PHYS_EXT_CHECK(VkPhysicalDevice8BitStorageFeaturesKHR,
-                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES_KHR);
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceVulkan11Features,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES);
+      {
+        CHECK_PHYS_EXT_FEATURE(storageBuffer16BitAccess);
+        CHECK_PHYS_EXT_FEATURE(uniformAndStorageBuffer16BitAccess);
+        CHECK_PHYS_EXT_FEATURE(storagePushConstant16);
+        CHECK_PHYS_EXT_FEATURE(storageInputOutput16);
+        CHECK_PHYS_EXT_FEATURE(multiview);
+        CHECK_PHYS_EXT_FEATURE(multiviewGeometryShader);
+        CHECK_PHYS_EXT_FEATURE(multiviewTessellationShader);
+        CHECK_PHYS_EXT_FEATURE(variablePointersStorageBuffer);
+        CHECK_PHYS_EXT_FEATURE(variablePointers);
+        CHECK_PHYS_EXT_FEATURE(protectedMemory);
+        CHECK_PHYS_EXT_FEATURE(samplerYcbcrConversion);
+        CHECK_PHYS_EXT_FEATURE(shaderDrawParameters);
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceVulkan12Features,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES);
+      {
+        vulkan12Features = *ext;
+
+        CHECK_PHYS_EXT_FEATURE(samplerMirrorClampToEdge);
+        CHECK_PHYS_EXT_FEATURE(drawIndirectCount);
+        CHECK_PHYS_EXT_FEATURE(storageBuffer8BitAccess);
+        CHECK_PHYS_EXT_FEATURE(uniformAndStorageBuffer8BitAccess);
+        CHECK_PHYS_EXT_FEATURE(storagePushConstant8);
+        CHECK_PHYS_EXT_FEATURE(shaderBufferInt64Atomics);
+        CHECK_PHYS_EXT_FEATURE(shaderSharedInt64Atomics);
+        CHECK_PHYS_EXT_FEATURE(shaderFloat16);
+        CHECK_PHYS_EXT_FEATURE(shaderInt8);
+        CHECK_PHYS_EXT_FEATURE(descriptorIndexing);
+        CHECK_PHYS_EXT_FEATURE(shaderInputAttachmentArrayDynamicIndexing);
+        CHECK_PHYS_EXT_FEATURE(shaderUniformTexelBufferArrayDynamicIndexing);
+        CHECK_PHYS_EXT_FEATURE(shaderStorageTexelBufferArrayDynamicIndexing);
+        CHECK_PHYS_EXT_FEATURE(shaderUniformBufferArrayNonUniformIndexing);
+        CHECK_PHYS_EXT_FEATURE(shaderSampledImageArrayNonUniformIndexing);
+        CHECK_PHYS_EXT_FEATURE(shaderStorageBufferArrayNonUniformIndexing);
+        CHECK_PHYS_EXT_FEATURE(shaderStorageImageArrayNonUniformIndexing);
+        CHECK_PHYS_EXT_FEATURE(shaderInputAttachmentArrayNonUniformIndexing);
+        CHECK_PHYS_EXT_FEATURE(shaderUniformTexelBufferArrayNonUniformIndexing);
+        CHECK_PHYS_EXT_FEATURE(shaderStorageTexelBufferArrayNonUniformIndexing);
+        CHECK_PHYS_EXT_FEATURE(descriptorBindingUniformBufferUpdateAfterBind);
+        CHECK_PHYS_EXT_FEATURE(descriptorBindingSampledImageUpdateAfterBind);
+        CHECK_PHYS_EXT_FEATURE(descriptorBindingStorageImageUpdateAfterBind);
+        CHECK_PHYS_EXT_FEATURE(descriptorBindingStorageBufferUpdateAfterBind);
+        CHECK_PHYS_EXT_FEATURE(descriptorBindingUniformTexelBufferUpdateAfterBind);
+        CHECK_PHYS_EXT_FEATURE(descriptorBindingStorageTexelBufferUpdateAfterBind);
+        CHECK_PHYS_EXT_FEATURE(descriptorBindingUpdateUnusedWhilePending);
+        CHECK_PHYS_EXT_FEATURE(descriptorBindingPartiallyBound);
+        CHECK_PHYS_EXT_FEATURE(descriptorBindingVariableDescriptorCount);
+        CHECK_PHYS_EXT_FEATURE(runtimeDescriptorArray);
+        CHECK_PHYS_EXT_FEATURE(samplerFilterMinmax);
+        CHECK_PHYS_EXT_FEATURE(scalarBlockLayout);
+        CHECK_PHYS_EXT_FEATURE(imagelessFramebuffer);
+        CHECK_PHYS_EXT_FEATURE(uniformBufferStandardLayout);
+        CHECK_PHYS_EXT_FEATURE(shaderSubgroupExtendedTypes);
+        CHECK_PHYS_EXT_FEATURE(separateDepthStencilLayouts);
+        CHECK_PHYS_EXT_FEATURE(hostQueryReset);
+        CHECK_PHYS_EXT_FEATURE(timelineSemaphore);
+        CHECK_PHYS_EXT_FEATURE(bufferDeviceAddress);
+        CHECK_PHYS_EXT_FEATURE(bufferDeviceAddressCaptureReplay);
+        CHECK_PHYS_EXT_FEATURE(bufferDeviceAddressMultiDevice);
+        CHECK_PHYS_EXT_FEATURE(vulkanMemoryModel);
+        CHECK_PHYS_EXT_FEATURE(vulkanMemoryModelDeviceScope);
+        CHECK_PHYS_EXT_FEATURE(vulkanMemoryModelAvailabilityVisibilityChains);
+        CHECK_PHYS_EXT_FEATURE(shaderOutputViewportIndex);
+        CHECK_PHYS_EXT_FEATURE(shaderOutputLayer);
+        CHECK_PHYS_EXT_FEATURE(subgroupBroadcastDynamicId);
+
+        m_SeparateDepthStencil |= (ext->separateDepthStencilLayouts != VK_FALSE);
+
+        if(ext->bufferDeviceAddress && !avail.bufferDeviceAddressCaptureReplay)
+        {
+          SET_ERROR_RESULT(
+              m_FailedReplayResult, ResultCode::APIHardwareUnsupported,
+              "Capture requires bufferDeviceAddress support, which is available, but "
+              "bufferDeviceAddressCaptureReplay support is not available which is required to "
+              "replay\n"
+              "\n%s",
+              GetPhysDeviceCompatString(false, false).c_str());
+          return false;
+        }
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceVulkan13Features,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES);
+      {
+        vulkan13Features = *ext;
+
+        CHECK_PHYS_EXT_FEATURE(robustImageAccess);
+        CHECK_PHYS_EXT_FEATURE(inlineUniformBlock);
+        CHECK_PHYS_EXT_FEATURE(descriptorBindingInlineUniformBlockUpdateAfterBind);
+        CHECK_PHYS_EXT_FEATURE(pipelineCreationCacheControl);
+        CHECK_PHYS_EXT_FEATURE(privateData);
+        CHECK_PHYS_EXT_FEATURE(shaderDemoteToHelperInvocation);
+        CHECK_PHYS_EXT_FEATURE(shaderTerminateInvocation);
+        CHECK_PHYS_EXT_FEATURE(subgroupSizeControl);
+        CHECK_PHYS_EXT_FEATURE(computeFullSubgroups);
+        CHECK_PHYS_EXT_FEATURE(synchronization2);
+        CHECK_PHYS_EXT_FEATURE(textureCompressionASTC_HDR);
+        CHECK_PHYS_EXT_FEATURE(shaderZeroInitializeWorkgroupMemory);
+        CHECK_PHYS_EXT_FEATURE(dynamicRendering);
+        CHECK_PHYS_EXT_FEATURE(shaderIntegerDotProduct);
+        CHECK_PHYS_EXT_FEATURE(maintenance4);
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDevice8BitStorageFeatures,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES);
       {
         CHECK_PHYS_EXT_FEATURE(storageBuffer8BitAccess);
         CHECK_PHYS_EXT_FEATURE(uniformAndStorageBuffer8BitAccess);
@@ -1905,8 +2457,17 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
       }
       END_PHYS_EXT_CHECK();
 
-      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceFragmentShaderBarycentricFeaturesNV,
-                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_NV);
+      BEGIN_PHYS_EXT_CHECK(
+          VkPhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT,
+          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_FEATURES_EXT);
+      {
+        CHECK_PHYS_EXT_FEATURE(attachmentFeedbackLoopLayout);
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(
+          VkPhysicalDeviceFragmentShaderBarycentricFeaturesKHR,
+          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR);
       {
         CHECK_PHYS_EXT_FEATURE(fragmentShaderBarycentric);
       }
@@ -1930,6 +2491,21 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
       }
       END_PHYS_EXT_CHECK();
 
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceFragmentDensityMap2FeaturesEXT,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_DENSITY_MAP_2_FEATURES_EXT);
+      {
+        CHECK_PHYS_EXT_FEATURE(fragmentDensityMapDeferred);
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(
+          VkPhysicalDeviceFragmentDensityMapOffsetFeaturesQCOM,
+          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_DENSITY_MAP_OFFSET_FEATURES_QCOM);
+      {
+        CHECK_PHYS_EXT_FEATURE(fragmentDensityMapOffset);
+      }
+      END_PHYS_EXT_CHECK();
+
       BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceProtectedMemoryFeatures,
                            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROTECTED_MEMORY_FEATURES);
       {
@@ -1944,8 +2520,8 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
       }
       END_PHYS_EXT_CHECK();
 
-      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceShaderAtomicInt64FeaturesKHR,
-                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES_KHR);
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceShaderAtomicInt64Features,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES);
       {
         CHECK_PHYS_EXT_FEATURE(shaderBufferInt64Atomics);
         CHECK_PHYS_EXT_FEATURE(shaderSharedInt64Atomics);
@@ -1990,11 +2566,12 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
       }
       END_PHYS_EXT_CHECK();
 
-      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceVulkanMemoryModelFeaturesKHR,
-                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_MEMORY_MODEL_FEATURES_KHR);
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceVulkanMemoryModelFeatures,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_MEMORY_MODEL_FEATURES);
       {
         CHECK_PHYS_EXT_FEATURE(vulkanMemoryModel);
         CHECK_PHYS_EXT_FEATURE(vulkanMemoryModelDeviceScope);
+        CHECK_PHYS_EXT_FEATURE(vulkanMemoryModelAvailabilityVisibilityChains);
       }
       END_PHYS_EXT_CHECK();
 
@@ -2006,10 +2583,55 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
       }
       END_PHYS_EXT_CHECK();
 
-      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceHostQueryResetFeaturesEXT,
-                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES_EXT);
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceHostQueryResetFeatures,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES);
       {
         CHECK_PHYS_EXT_FEATURE(hostQueryReset);
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceDepthClipControlFeaturesEXT,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_CONTROL_FEATURES_EXT);
+      {
+        CHECK_PHYS_EXT_FEATURE(depthClipControl);
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(
+          VkPhysicalDevicePrimitiveTopologyListRestartFeaturesEXT,
+          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRIMITIVE_TOPOLOGY_LIST_RESTART_FEATURES_EXT);
+      {
+        CHECK_PHYS_EXT_FEATURE(primitiveTopologyListRestart);
+        CHECK_PHYS_EXT_FEATURE(primitiveTopologyPatchListRestart);
+
+        m_ListRestart = ext->primitiveTopologyListRestart != VK_FALSE;
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDevicePrimitivesGeneratedQueryFeaturesEXT,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRIMITIVES_GENERATED_QUERY_FEATURES_EXT);
+      {
+        CHECK_PHYS_EXT_FEATURE(primitivesGeneratedQuery);
+        CHECK_PHYS_EXT_FEATURE(primitivesGeneratedQueryWithRasterizerDiscard);
+        CHECK_PHYS_EXT_FEATURE(primitivesGeneratedQueryWithNonZeroStreams);
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(
+          VkPhysicalDeviceMultisampledRenderToSingleSampledFeaturesEXT,
+          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_FEATURES_EXT);
+      {
+        CHECK_PHYS_EXT_FEATURE(multisampledRenderToSingleSampled);
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(
+          VkPhysicalDeviceRasterizationOrderAttachmentAccessFeaturesEXT,
+          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_FEATURES_EXT);
+      {
+        CHECK_PHYS_EXT_FEATURE(rasterizationOrderColorAttachmentAccess);
+        CHECK_PHYS_EXT_FEATURE(rasterizationOrderDepthAttachmentAccess);
+        CHECK_PHYS_EXT_FEATURE(rasterizationOrderStencilAttachmentAccess);
       }
       END_PHYS_EXT_CHECK();
 
@@ -2036,18 +2658,41 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
 
         if(ext->bufferDeviceAddress && !avail.bufferDeviceAddressCaptureReplay)
         {
-          m_FailedReplayStatus = ReplayStatus::APIHardwareUnsupported;
-          RDCERR(
+          SET_ERROR_RESULT(
+              m_FailedReplayResult, ResultCode::APIHardwareUnsupported,
               "Capture requires bufferDeviceAddress support, which is available, but "
               "bufferDeviceAddressCaptureReplay support is not available which is required to "
-              "replay");
+              "replay\n"
+              "\n%s",
+              GetPhysDeviceCompatString(false, false).c_str());
           return false;
         }
       }
       END_PHYS_EXT_CHECK();
 
-      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceDescriptorIndexingFeaturesEXT,
-                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES_EXT);
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceBufferDeviceAddressFeatures,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES);
+      {
+        CHECK_PHYS_EXT_FEATURE(bufferDeviceAddress);
+        CHECK_PHYS_EXT_FEATURE(bufferDeviceAddressCaptureReplay);
+        CHECK_PHYS_EXT_FEATURE(bufferDeviceAddressMultiDevice);
+
+        if(ext->bufferDeviceAddress && !avail.bufferDeviceAddressCaptureReplay)
+        {
+          SET_ERROR_RESULT(
+              m_FailedReplayResult, ResultCode::APIHardwareUnsupported,
+              "Capture requires bufferDeviceAddress support, which is available, but "
+              "bufferDeviceAddressCaptureReplay support is not available which is required to "
+              "replay\n"
+              "\n%s",
+              GetPhysDeviceCompatString(false, false).c_str());
+          return false;
+        }
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceDescriptorIndexingFeatures,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES);
       {
         descIndexingFeatures = *ext;
 
@@ -2074,9 +2719,8 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
       }
       END_PHYS_EXT_CHECK();
 
-      BEGIN_PHYS_EXT_CHECK(
-          VkPhysicalDeviceUniformBufferStandardLayoutFeaturesKHR,
-          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFORM_BUFFER_STANDARD_LAYOUT_FEATURES_KHR);
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceUniformBufferStandardLayoutFeatures,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFORM_BUFFER_STANDARD_LAYOUT_FEATURES);
       {
         CHECK_PHYS_EXT_FEATURE(uniformBufferStandardLayout);
       }
@@ -2092,8 +2736,8 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
       END_PHYS_EXT_CHECK();
 
       BEGIN_PHYS_EXT_CHECK(
-          VkPhysicalDeviceShaderDemoteToHelperInvocationFeaturesEXT,
-          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DEMOTE_TO_HELPER_INVOCATION_FEATURES_EXT);
+          VkPhysicalDeviceShaderDemoteToHelperInvocationFeatures,
+          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DEMOTE_TO_HELPER_INVOCATION_FEATURES);
       {
         CHECK_PHYS_EXT_FEATURE(shaderDemoteToHelperInvocation);
       }
@@ -2105,6 +2749,531 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
         CHECK_PHYS_EXT_FEATURE(texelBufferAlignment);
       }
       END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceIndexTypeUint8FeaturesEXT,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INDEX_TYPE_UINT8_FEATURES_EXT);
+      {
+        CHECK_PHYS_EXT_FEATURE(indexTypeUint8);
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceImagelessFramebufferFeatures,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGELESS_FRAMEBUFFER_FEATURES);
+      {
+        CHECK_PHYS_EXT_FEATURE(imagelessFramebuffer);
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceSubgroupSizeControlFeatures,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES);
+      {
+        CHECK_PHYS_EXT_FEATURE(subgroupSizeControl);
+        CHECK_PHYS_EXT_FEATURE(computeFullSubgroups);
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(
+          VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR,
+          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR);
+      {
+        CHECK_PHYS_EXT_FEATURE(pipelineExecutableInfo);
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceLineRasterizationFeaturesEXT,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LINE_RASTERIZATION_FEATURES_EXT);
+      {
+        CHECK_PHYS_EXT_FEATURE(rectangularLines);
+        CHECK_PHYS_EXT_FEATURE(bresenhamLines);
+        CHECK_PHYS_EXT_FEATURE(smoothLines);
+        CHECK_PHYS_EXT_FEATURE(stippledRectangularLines);
+        CHECK_PHYS_EXT_FEATURE(stippledBresenhamLines);
+        CHECK_PHYS_EXT_FEATURE(stippledSmoothLines);
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceShaderSubgroupExtendedTypesFeatures,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SUBGROUP_EXTENDED_TYPES_FEATURES);
+      {
+        CHECK_PHYS_EXT_FEATURE(shaderSubgroupExtendedTypes);
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceCoherentMemoryFeaturesAMD,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COHERENT_MEMORY_FEATURES_AMD);
+      {
+        CHECK_PHYS_EXT_FEATURE(deviceCoherentMemory);
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceShaderClockFeaturesKHR,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CLOCK_FEATURES_KHR);
+      {
+        CHECK_PHYS_EXT_FEATURE(shaderSubgroupClock);
+        CHECK_PHYS_EXT_FEATURE(shaderDeviceClock);
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceMemoryPriorityFeaturesEXT,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PRIORITY_FEATURES_EXT);
+      {
+        CHECK_PHYS_EXT_FEATURE(memoryPriority);
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceScalarBlockLayoutFeatures,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SCALAR_BLOCK_LAYOUT_FEATURES);
+      {
+        CHECK_PHYS_EXT_FEATURE(scalarBlockLayout);
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceShaderFloat16Int8Features,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES);
+      {
+        CHECK_PHYS_EXT_FEATURE(shaderFloat16);
+        CHECK_PHYS_EXT_FEATURE(shaderInt8);
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceTimelineSemaphoreFeatures,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES);
+      {
+        CHECK_PHYS_EXT_FEATURE(timelineSemaphore);
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceSeparateDepthStencilLayoutsFeatures,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SEPARATE_DEPTH_STENCIL_LAYOUTS_FEATURES);
+      {
+        CHECK_PHYS_EXT_FEATURE(separateDepthStencilLayouts);
+
+        m_SeparateDepthStencil |= (ext->separateDepthStencilLayouts != VK_FALSE);
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDevicePerformanceQueryFeaturesKHR,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PERFORMANCE_QUERY_FEATURES_KHR);
+      {
+        CHECK_PHYS_EXT_FEATURE(performanceCounterQueryPools);
+        CHECK_PHYS_EXT_FEATURE(performanceCounterMultipleQueryPools);
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceInlineUniformBlockFeatures,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INLINE_UNIFORM_BLOCK_FEATURES);
+      {
+        CHECK_PHYS_EXT_FEATURE(inlineUniformBlock);
+        CHECK_PHYS_EXT_FEATURE(descriptorBindingInlineUniformBlockUpdateAfterBind);
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceCustomBorderColorFeaturesEXT,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT);
+      {
+        CHECK_PHYS_EXT_FEATURE(customBorderColors);
+        CHECK_PHYS_EXT_FEATURE(customBorderColorWithoutFormat);
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceRobustness2FeaturesEXT,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT);
+      {
+        CHECK_PHYS_EXT_FEATURE(robustBufferAccess2);
+        CHECK_PHYS_EXT_FEATURE(robustImageAccess2);
+        CHECK_PHYS_EXT_FEATURE(nullDescriptor);
+
+        m_NULLDescriptorsAllowed |= (ext->nullDescriptor != VK_FALSE);
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(
+          VkPhysicalDevicePipelineCreationCacheControlFeatures,
+          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_CREATION_CACHE_CONTROL_FEATURES);
+      {
+        CHECK_PHYS_EXT_FEATURE(pipelineCreationCacheControl);
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceComputeShaderDerivativesFeaturesNV,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMPUTE_SHADER_DERIVATIVES_FEATURES_NV);
+      {
+        CHECK_PHYS_EXT_FEATURE(computeDerivativeGroupQuads);
+        CHECK_PHYS_EXT_FEATURE(computeDerivativeGroupLinear);
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceExtendedDynamicStateFeaturesEXT,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT);
+      {
+        CHECK_PHYS_EXT_FEATURE(extendedDynamicState);
+
+        m_ExtendedDynState = (ext->extendedDynamicState != VK_FALSE);
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceShaderTerminateInvocationFeatures,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_TERMINATE_INVOCATION_FEATURES);
+      {
+        CHECK_PHYS_EXT_FEATURE(shaderTerminateInvocation);
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceImageRobustnessFeatures,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_ROBUSTNESS_FEATURES);
+      {
+        CHECK_PHYS_EXT_FEATURE(robustImageAccess);
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceShaderAtomicFloatFeaturesEXT,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT);
+      {
+        CHECK_PHYS_EXT_FEATURE(shaderBufferFloat32Atomics);
+        CHECK_PHYS_EXT_FEATURE(shaderBufferFloat32AtomicAdd);
+        CHECK_PHYS_EXT_FEATURE(shaderBufferFloat64Atomics);
+        CHECK_PHYS_EXT_FEATURE(shaderBufferFloat64AtomicAdd);
+        CHECK_PHYS_EXT_FEATURE(shaderSharedFloat32Atomics);
+        CHECK_PHYS_EXT_FEATURE(shaderSharedFloat32AtomicAdd);
+        CHECK_PHYS_EXT_FEATURE(shaderSharedFloat64Atomics);
+        CHECK_PHYS_EXT_FEATURE(shaderSharedFloat64AtomicAdd);
+        CHECK_PHYS_EXT_FEATURE(shaderImageFloat32Atomics);
+        CHECK_PHYS_EXT_FEATURE(shaderImageFloat32AtomicAdd);
+        CHECK_PHYS_EXT_FEATURE(sparseImageFloat32Atomics);
+        CHECK_PHYS_EXT_FEATURE(sparseImageFloat32AtomicAdd);
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceShaderImageAtomicInt64FeaturesEXT,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_IMAGE_ATOMIC_INT64_FEATURES_EXT);
+      {
+        CHECK_PHYS_EXT_FEATURE(shaderImageInt64Atomics);
+        CHECK_PHYS_EXT_FEATURE(sparseImageInt64Atomics);
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(
+          VkPhysicalDeviceZeroInitializeWorkgroupMemoryFeatures,
+          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ZERO_INITIALIZE_WORKGROUP_MEMORY_FEATURES);
+      {
+        CHECK_PHYS_EXT_FEATURE(shaderZeroInitializeWorkgroupMemory);
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(
+          VkPhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR,
+          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_FEATURES_KHR);
+      {
+        CHECK_PHYS_EXT_FEATURE(workgroupMemoryExplicitLayout);
+        CHECK_PHYS_EXT_FEATURE(workgroupMemoryExplicitLayoutScalarBlockLayout);
+        CHECK_PHYS_EXT_FEATURE(workgroupMemoryExplicitLayout8BitAccess);
+        CHECK_PHYS_EXT_FEATURE(workgroupMemoryExplicitLayout16BitAccess);
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceSynchronization2Features,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES);
+      {
+        sync2 = *ext;
+
+        CHECK_PHYS_EXT_FEATURE(synchronization2);
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceMaintenance4Features,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_4_FEATURES);
+      {
+        CHECK_PHYS_EXT_FEATURE(maintenance4);
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceShaderIntegerDotProductFeatures,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES);
+      {
+        CHECK_PHYS_EXT_FEATURE(shaderIntegerDotProduct);
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(
+          VkPhysicalDeviceShaderSubgroupUniformControlFlowFeaturesKHR,
+          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SUBGROUP_UNIFORM_CONTROL_FLOW_FEATURES_KHR);
+      {
+        CHECK_PHYS_EXT_FEATURE(shaderSubgroupUniformControlFlow);
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceShaderAtomicFloat2FeaturesEXT,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_2_FEATURES_EXT);
+      {
+        CHECK_PHYS_EXT_FEATURE(shaderBufferFloat16Atomics);
+        CHECK_PHYS_EXT_FEATURE(shaderBufferFloat16AtomicAdd);
+        CHECK_PHYS_EXT_FEATURE(shaderBufferFloat16AtomicMinMax);
+        CHECK_PHYS_EXT_FEATURE(shaderBufferFloat32AtomicMinMax);
+        CHECK_PHYS_EXT_FEATURE(shaderBufferFloat64AtomicMinMax);
+        CHECK_PHYS_EXT_FEATURE(shaderSharedFloat16Atomics);
+        CHECK_PHYS_EXT_FEATURE(shaderSharedFloat16AtomicAdd);
+        CHECK_PHYS_EXT_FEATURE(shaderSharedFloat16AtomicMinMax);
+        CHECK_PHYS_EXT_FEATURE(shaderSharedFloat32AtomicMinMax);
+        CHECK_PHYS_EXT_FEATURE(shaderSharedFloat64AtomicMinMax);
+        CHECK_PHYS_EXT_FEATURE(shaderImageFloat32AtomicMinMax);
+        CHECK_PHYS_EXT_FEATURE(sparseImageFloat32AtomicMinMax);
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceYcbcr2Plane444FormatsFeaturesEXT,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_YCBCR_2_PLANE_444_FORMATS_FEATURES_EXT);
+      {
+        CHECK_PHYS_EXT_FEATURE(ycbcr2plane444Formats);
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceRGBA10X6FormatsFeaturesEXT,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RGBA10X6_FORMATS_FEATURES_EXT);
+      {
+        CHECK_PHYS_EXT_FEATURE(formatRgba10x6WithoutYCbCrSampler);
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceGlobalPriorityQueryFeaturesKHR,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GLOBAL_PRIORITY_QUERY_FEATURES_KHR);
+      {
+        CHECK_PHYS_EXT_FEATURE(globalPriorityQuery);
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceColorWriteEnableFeaturesEXT,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COLOR_WRITE_ENABLE_FEATURES_EXT);
+      {
+        CHECK_PHYS_EXT_FEATURE(colorWriteEnable);
+
+        m_DynColorWrite = (ext->colorWriteEnable != VK_FALSE);
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceExtendedDynamicState2FeaturesEXT,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_2_FEATURES_EXT);
+      {
+        CHECK_PHYS_EXT_FEATURE(extendedDynamicState2);
+        CHECK_PHYS_EXT_FEATURE(extendedDynamicState2LogicOp);
+        CHECK_PHYS_EXT_FEATURE(extendedDynamicState2PatchControlPoints);
+
+        m_ExtendedDynState2 = (ext->extendedDynamicState2 != VK_FALSE);
+        m_ExtendedDynState2Logic = (ext->extendedDynamicState2LogicOp != VK_FALSE);
+        m_ExtendedDynState2CPs = (ext->extendedDynamicState2PatchControlPoints != VK_FALSE);
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceVertexInputDynamicStateFeaturesEXT,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_INPUT_DYNAMIC_STATE_FEATURES_EXT);
+      {
+        CHECK_PHYS_EXT_FEATURE(vertexInputDynamicState);
+
+        m_DynVertexInput = (ext->vertexInputDynamicState != VK_FALSE);
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT);
+      {
+        CHECK_PHYS_EXT_FEATURE(graphicsPipelineLibrary);
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceDynamicRenderingFeatures,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES);
+      {
+        CHECK_PHYS_EXT_FEATURE(dynamicRendering);
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDevice4444FormatsFeaturesEXT,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_4444_FORMATS_FEATURES_EXT);
+      {
+        CHECK_PHYS_EXT_FEATURE(formatA4R4G4B4);
+        CHECK_PHYS_EXT_FEATURE(formatA4B4G4R4);
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceTextureCompressionASTCHDRFeatures,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TEXTURE_COMPRESSION_ASTC_HDR_FEATURES);
+      {
+        CHECK_PHYS_EXT_FEATURE(textureCompressionASTC_HDR);
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceFragmentShadingRateFeaturesKHR,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR);
+      {
+        CHECK_PHYS_EXT_FEATURE(pipelineFragmentShadingRate);
+        CHECK_PHYS_EXT_FEATURE(primitiveFragmentShadingRate);
+        CHECK_PHYS_EXT_FEATURE(attachmentFragmentShadingRate);
+
+        m_FragmentShadingRate = (ext->pipelineFragmentShadingRate != VK_FALSE) ||
+                                (ext->primitiveFragmentShadingRate != VK_FALSE) ||
+                                (ext->attachmentFragmentShadingRate != VK_FALSE);
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceMutableDescriptorTypeFeaturesEXT,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MUTABLE_DESCRIPTOR_TYPE_FEATURES_EXT);
+      {
+        CHECK_PHYS_EXT_FEATURE(mutableDescriptorType);
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(
+          VkPhysicalDevicePageableDeviceLocalMemoryFeaturesEXT,
+          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PAGEABLE_DEVICE_LOCAL_MEMORY_FEATURES_EXT);
+      {
+        CHECK_PHYS_EXT_FEATURE(pageableDeviceLocalMemory);
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceSwapchainMaintenance1FeaturesEXT,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_EXT);
+      {
+        CHECK_PHYS_EXT_FEATURE(swapchainMaintenance1);
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceBorderColorSwizzleFeaturesEXT,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BORDER_COLOR_SWIZZLE_FEATURES_EXT);
+      {
+        CHECK_PHYS_EXT_FEATURE(borderColorSwizzle);
+        CHECK_PHYS_EXT_FEATURE(borderColorSwizzleFromImage);
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceNonSeamlessCubeMapFeaturesEXT,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_NON_SEAMLESS_CUBE_MAP_FEATURES_EXT);
+      {
+        CHECK_PHYS_EXT_FEATURE(nonSeamlessCubeMap);
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceDepthClampZeroOneFeaturesEXT,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLAMP_ZERO_ONE_FEATURES_EXT);
+      {
+        CHECK_PHYS_EXT_FEATURE(depthClampZeroOne);
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceImageViewMinLodFeaturesEXT,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_VIEW_MIN_LOD_FEATURES_EXT);
+      {
+        CHECK_PHYS_EXT_FEATURE(minLod);
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceProvokingVertexFeaturesEXT,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROVOKING_VERTEX_FEATURES_EXT);
+      {
+        CHECK_PHYS_EXT_FEATURE(provokingVertexLast);
+        CHECK_PHYS_EXT_FEATURE(transformFeedbackPreservesProvokingVertex);
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(
+          VkPhysicalDeviceAttachmentFeedbackLoopDynamicStateFeaturesEXT,
+          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_FEATURES_EXT);
+      {
+        CHECK_PHYS_EXT_FEATURE(attachmentFeedbackLoopDynamicState);
+        m_DynAttachmentLoop = ext->attachmentFeedbackLoopDynamicState != VK_FALSE;
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceImage2DViewOf3DFeaturesEXT,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_2D_VIEW_OF_3D_FEATURES_EXT);
+      {
+        CHECK_PHYS_EXT_FEATURE(image2DViewOf3D);
+        CHECK_PHYS_EXT_FEATURE(sampler2DViewOf3D);
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceExtendedDynamicState3FeaturesEXT,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT);
+      {
+        CHECK_PHYS_EXT_FEATURE(extendedDynamicState3TessellationDomainOrigin);
+        CHECK_PHYS_EXT_FEATURE(extendedDynamicState3DepthClampEnable);
+        CHECK_PHYS_EXT_FEATURE(extendedDynamicState3PolygonMode);
+        CHECK_PHYS_EXT_FEATURE(extendedDynamicState3RasterizationSamples);
+        CHECK_PHYS_EXT_FEATURE(extendedDynamicState3SampleMask);
+        CHECK_PHYS_EXT_FEATURE(extendedDynamicState3AlphaToCoverageEnable);
+        CHECK_PHYS_EXT_FEATURE(extendedDynamicState3AlphaToOneEnable);
+        CHECK_PHYS_EXT_FEATURE(extendedDynamicState3LogicOpEnable);
+        CHECK_PHYS_EXT_FEATURE(extendedDynamicState3ColorBlendEnable);
+        CHECK_PHYS_EXT_FEATURE(extendedDynamicState3ColorBlendEquation);
+        CHECK_PHYS_EXT_FEATURE(extendedDynamicState3ColorWriteMask);
+        CHECK_PHYS_EXT_FEATURE(extendedDynamicState3RasterizationStream);
+        CHECK_PHYS_EXT_FEATURE(extendedDynamicState3ConservativeRasterizationMode);
+        CHECK_PHYS_EXT_FEATURE(extendedDynamicState3ExtraPrimitiveOverestimationSize);
+        CHECK_PHYS_EXT_FEATURE(extendedDynamicState3DepthClipEnable);
+        CHECK_PHYS_EXT_FEATURE(extendedDynamicState3SampleLocationsEnable);
+        CHECK_PHYS_EXT_FEATURE(extendedDynamicState3ColorBlendAdvanced);
+        CHECK_PHYS_EXT_FEATURE(extendedDynamicState3ProvokingVertexMode);
+        CHECK_PHYS_EXT_FEATURE(extendedDynamicState3LineRasterizationMode);
+        CHECK_PHYS_EXT_FEATURE(extendedDynamicState3LineStippleEnable);
+        CHECK_PHYS_EXT_FEATURE(extendedDynamicState3DepthClipNegativeOneToOne);
+        CHECK_PHYS_EXT_FEATURE(extendedDynamicState3ViewportWScalingEnable);
+        CHECK_PHYS_EXT_FEATURE(extendedDynamicState3ViewportSwizzle);
+        CHECK_PHYS_EXT_FEATURE(extendedDynamicState3CoverageToColorEnable);
+        CHECK_PHYS_EXT_FEATURE(extendedDynamicState3CoverageToColorLocation);
+        CHECK_PHYS_EXT_FEATURE(extendedDynamicState3CoverageModulationMode);
+        CHECK_PHYS_EXT_FEATURE(extendedDynamicState3CoverageModulationTableEnable);
+        CHECK_PHYS_EXT_FEATURE(extendedDynamicState3CoverageModulationTable);
+        CHECK_PHYS_EXT_FEATURE(extendedDynamicState3CoverageReductionMode);
+        CHECK_PHYS_EXT_FEATURE(extendedDynamicState3RepresentativeFragmentTestEnable);
+        CHECK_PHYS_EXT_FEATURE(extendedDynamicState3ShadingRateImageEnable);
+
+        m_ExtendedDynState3TesselDomain =
+            (ext->extendedDynamicState3TessellationDomainOrigin != VK_FALSE);
+        m_ExtendedDynState3DepthClampEnable =
+            (ext->extendedDynamicState3DepthClampEnable != VK_FALSE);
+        m_ExtendedDynState3PolyMode = (ext->extendedDynamicState3PolygonMode != VK_FALSE);
+        m_ExtendedDynState3RastSamples = (ext->extendedDynamicState3RasterizationSamples != VK_FALSE);
+        m_ExtendedDynState3SampleMask = (ext->extendedDynamicState3SampleMask != VK_FALSE);
+        m_ExtendedDynState3AlphaToCover =
+            (ext->extendedDynamicState3AlphaToCoverageEnable != VK_FALSE);
+        m_ExtendedDynState3AlphaToOne = (ext->extendedDynamicState3AlphaToOneEnable != VK_FALSE);
+        m_ExtendedDynState3LogicEnable = (ext->extendedDynamicState3LogicOpEnable != VK_FALSE);
+        m_ExtendedDynState3CBEnable = (ext->extendedDynamicState3ColorBlendEnable != VK_FALSE);
+        m_ExtendedDynState3CBEquation = (ext->extendedDynamicState3ColorBlendEquation != VK_FALSE);
+        m_ExtendedDynState3WriteMask = (ext->extendedDynamicState3ColorWriteMask != VK_FALSE);
+        m_ExtendedDynState3RastStream = (ext->extendedDynamicState3RasterizationStream != VK_FALSE);
+        m_ExtendedDynState3ConservRast =
+            (ext->extendedDynamicState3ConservativeRasterizationMode != VK_FALSE);
+        m_ExtendedDynState3PrimOverest =
+            (ext->extendedDynamicState3ExtraPrimitiveOverestimationSize != VK_FALSE);
+        m_ExtendedDynState3DepthClip = (ext->extendedDynamicState3DepthClipEnable != VK_FALSE);
+        m_ExtendedDynState3SampleLoc = (ext->extendedDynamicState3SampleLocationsEnable != VK_FALSE);
+        m_ExtendedDynState3ProvokingVert =
+            (ext->extendedDynamicState3ProvokingVertexMode != VK_FALSE);
+        m_ExtendedDynState3LineRast = (ext->extendedDynamicState3LineRasterizationMode != VK_FALSE);
+        m_ExtendedDynState3LineStipple = (ext->extendedDynamicState3LineStippleEnable != VK_FALSE);
+        m_ExtendedDynState3DepthClipNeg =
+            (ext->extendedDynamicState3DepthClipNegativeOneToOne != VK_FALSE);
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceMeshShaderFeaturesEXT,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT);
+      {
+        CHECK_PHYS_EXT_FEATURE(taskShader);
+        CHECK_PHYS_EXT_FEATURE(meshShader);
+        CHECK_PHYS_EXT_FEATURE(multiviewMeshShader);
+        CHECK_PHYS_EXT_FEATURE(primitiveFragmentShadingRateMeshShader);
+        CHECK_PHYS_EXT_FEATURE(meshShaderQueries);
+
+        m_MeshShaders = ext->meshShader != VK_FALSE;
+        m_TaskShaders = ext->taskShader != VK_FALSE;
+        m_MeshQueries = avail.meshShaderQueries != VK_FALSE;
+
+        if(avail.meshShaderQueries)
+          ext->meshShaderQueries = true;
+        else
+          RDCWARN("meshShaderQueries = false, mesh shader performance counters unavailable");
+      }
+      END_PHYS_EXT_CHECK();
     }
 
     if(availFeatures.depthClamp)
@@ -2113,19 +3282,51 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
       RDCWARN(
           "depthClamp = false, overlays like highlight drawcall won't show depth-clipped pixels.");
 
+    // we have a fallback for this case, so no warning
     if(availFeatures.fillModeNonSolid)
       enabledFeatures.fillModeNonSolid = true;
 
-    // we have a fallback for this case, so no warning
+    // don't warn if this isn't available, we just won't report the counters
+    if(availFeatures.pipelineStatisticsQuery)
+      enabledFeatures.pipelineStatisticsQuery = true;
 
     if(availFeatures.geometryShader)
       enabledFeatures.geometryShader = true;
     else
       RDCWARN(
-          "geometryShader = false, lit mesh rendering will not be available if rendering on this "
-          "device.");
+          "geometryShader = false, pixel history primitive ID and triangle size overlay will not "
+          "be available, and local rendering on this device will not support lit mesh views.");
+
+    // enable these features for simplicity, since we use them when available in the shader
+    // debugging to simplify samples. If minlod isn't used then we omit it, and that's fine because
+    // the application's shaders wouldn't have been using minlod. We use gatherExtended for gather
+    // offsets, which means if it's not supported then we can't debug constant offsets properly
+    // (because we pass offsets as uniforms), but that's not a big deal.
+    if(availFeatures.shaderImageGatherExtended)
+      enabledFeatures.shaderImageGatherExtended = true;
+    if(availFeatures.shaderResourceMinLod)
+      enabledFeatures.shaderResourceMinLod = true;
+    if(availFeatures.imageCubeArray)
+      enabledFeatures.imageCubeArray = true;
 
     bool descIndexingAllowsRBA = true;
+
+    if(vulkan12Features.descriptorBindingUniformBufferUpdateAfterBind ||
+       vulkan12Features.descriptorBindingStorageBufferUpdateAfterBind ||
+       vulkan12Features.descriptorBindingUniformTexelBufferUpdateAfterBind ||
+       vulkan12Features.descriptorBindingStorageTexelBufferUpdateAfterBind)
+    {
+      // if any update after bind feature is enabled, check robustBufferAccessUpdateAfterBind
+      VkPhysicalDeviceVulkan12Properties vulkan12Props = {
+          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES,
+      };
+
+      VkPhysicalDeviceProperties2 availBase = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+      availBase.pNext = &vulkan12Props;
+      ObjDisp(physicalDevice)->GetPhysicalDeviceProperties2(Unwrap(physicalDevice), &availBase);
+
+      descIndexingAllowsRBA = vulkan12Props.robustBufferAccessUpdateAfterBind != VK_FALSE;
+    }
 
     if(descIndexingFeatures.descriptorBindingUniformBufferUpdateAfterBind ||
        descIndexingFeatures.descriptorBindingStorageBufferUpdateAfterBind ||
@@ -2133,8 +3334,8 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
        descIndexingFeatures.descriptorBindingStorageTexelBufferUpdateAfterBind)
     {
       // if any update after bind feature is enabled, check robustBufferAccessUpdateAfterBind
-      VkPhysicalDeviceDescriptorIndexingPropertiesEXT descIndexingProps = {
-          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_PROPERTIES_EXT,
+      VkPhysicalDeviceDescriptorIndexingProperties descIndexingProps = {
+          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_PROPERTIES,
       };
 
       VkPhysicalDeviceProperties2 availBase = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
@@ -2167,9 +3368,7 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
     if(availFeatures.shaderInt64)
       enabledFeatures.shaderInt64 = true;
     else
-      RDCWARN(
-          "shaderInt64 = false, feedback from bindless shader access will use less reliable "
-          "fallback.");
+      RDCWARN("shaderInt64 = false, feedback from shaders will use less reliable fallback.");
 
     if(availFeatures.shaderStorageImageWriteWithoutFormat)
       enabledFeatures.shaderStorageImageWriteWithoutFormat = true;
@@ -2182,13 +3381,27 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
       enabledFeatures.shaderStorageImageMultisample = true;
     else
       RDCWARN(
-          "shaderStorageImageMultisample = false, save/load from 2DMS textures will not be "
+          "shaderStorageImageMultisample = false, accurately replaying 2DMS textures will not be "
           "possible");
+
+    if(availFeatures.occlusionQueryPrecise)
+      enabledFeatures.occlusionQueryPrecise = true;
+    else
+      RDCWARN("occlusionQueryPrecise = false, samples passed counter will not be available");
 
     if(availFeatures.fragmentStoresAndAtomics)
       enabledFeatures.fragmentStoresAndAtomics = true;
     else
-      RDCWARN("fragmentStoresAndAtomics = false, quad overdraw overlay will not be available");
+      RDCWARN(
+          "fragmentStoresAndAtomics = false, quad overdraw overlay will not be available and "
+          "feedback from shaders will not be fetched for fragment stage");
+
+    if(availFeatures.vertexPipelineStoresAndAtomics)
+      enabledFeatures.vertexPipelineStoresAndAtomics = true;
+    else
+      RDCWARN(
+          "vertexPipelineStoresAndAtomics = false, feedback from shaders will not be fetched for "
+          "vertex stages");
 
     if(availFeatures.sampleRateShading)
       enabledFeatures.sampleRateShading = true;
@@ -2208,18 +3421,63 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
     VkResult vkr =
         ObjDisp(physicalDevice)
             ->EnumerateDeviceExtensionProperties(Unwrap(physicalDevice), NULL, &numExts, NULL);
-    RDCASSERTEQUAL(vkr, VK_SUCCESS);
+    CheckVkResult(vkr);
 
     VkExtensionProperties *exts = new VkExtensionProperties[numExts];
 
     vkr = ObjDisp(physicalDevice)
               ->EnumerateDeviceExtensionProperties(Unwrap(physicalDevice), NULL, &numExts, exts);
-    RDCASSERTEQUAL(vkr, VK_SUCCESS);
+    CheckVkResult(vkr);
 
     for(uint32_t i = 0; i < numExts; i++)
-      RDCLOG("Ext %u: %s (%u)", i, exts[i].extensionName, exts[i].specVersion);
+      RDCLOG("Dev Ext %u: %s (%u)", i, exts[i].extensionName, exts[i].specVersion);
 
     SAFE_DELETE_ARRAY(exts);
+
+    VkPhysicalDeviceProperties physProps;
+    ObjDisp(physicalDevice)->GetPhysicalDeviceProperties(Unwrap(physicalDevice), &physProps);
+
+    VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR pipeExecFeatures = {
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR,
+    };
+
+    if(pipeExec)
+    {
+      VkPhysicalDeviceFeatures2 availBase = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+      availBase.pNext = &pipeExecFeatures;
+      ObjDisp(physicalDevice)->GetPhysicalDeviceFeatures2(Unwrap(physicalDevice), &availBase);
+
+      if(pipeExecFeatures.pipelineExecutableInfo)
+      {
+        // see if there's an existing struct
+        VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR *existing =
+            (VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR *)FindNextStruct(
+                &createInfo,
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR);
+
+        if(existing)
+        {
+          // if so, make sure the feature is enabled
+          existing->pipelineExecutableInfo = VK_TRUE;
+        }
+        else
+        {
+          // otherwise, add our own, and push it onto the pNext array
+          pipeExecFeatures.pipelineExecutableInfo = VK_TRUE;
+
+          pipeExecFeatures.pNext = (void *)createInfo.pNext;
+          createInfo.pNext = &pipeExecFeatures;
+        }
+      }
+      else
+      {
+        RDCWARN(
+            "VK_KHR_pipeline_executable_properties is available, but the physical device feature "
+            "is not. Disabling");
+
+        Extensions.removeOne(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
+      }
+    }
 
     VkPhysicalDeviceTransformFeedbackFeaturesEXT xfbFeatures = {
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT,
@@ -2260,33 +3518,339 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
             "VK_EXT_transform_feedback is available, but the physical device feature is not. "
             "Disabling");
 
-        auto it = std::find(Extensions.begin(), Extensions.end(),
-                            VK_EXT_TRANSFORM_FEEDBACK_EXTENSION_NAME);
-        RDCASSERT(it != Extensions.end());
-        Extensions.erase(it);
+        Extensions.removeOne(VK_EXT_TRANSFORM_FEEDBACK_EXTENSION_NAME);
       }
     }
 
-    std::vector<const char *> layerArray(Layers.size());
-    for(size_t i = 0; i < Layers.size(); i++)
-      layerArray[i] = Layers[i].c_str();
+    VkPhysicalDevicePerformanceQueryFeaturesKHR perfFeatures = {
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PERFORMANCE_QUERY_FEATURES_KHR,
+    };
 
-    createInfo.enabledLayerCount = (uint32_t)layerArray.size();
-    createInfo.ppEnabledLayerNames = layerArray.data();
+    if(perfQuery)
+    {
+      VkPhysicalDeviceFeatures2 availBase = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+      m_PhysicalDeviceData.performanceQueryFeatures.sType =
+          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PERFORMANCE_QUERY_FEATURES_KHR;
+      availBase.pNext = &perfFeatures;
+      ObjDisp(physicalDevice)->GetPhysicalDeviceFeatures2(Unwrap(physicalDevice), &availBase);
 
-    std::vector<const char *> extArray(Extensions.size());
+      m_PhysicalDeviceData.performanceQueryFeatures = perfFeatures;
+
+      if(perfFeatures.performanceCounterQueryPools)
+      {
+        VkPhysicalDevicePerformanceQueryFeaturesKHR *existing =
+            (VkPhysicalDevicePerformanceQueryFeaturesKHR *)FindNextStruct(
+                &createInfo, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PERFORMANCE_QUERY_FEATURES_KHR);
+
+        if(existing)
+        {
+          existing->performanceCounterQueryPools = VK_TRUE;
+        }
+        else
+        {
+          perfFeatures.performanceCounterQueryPools = VK_TRUE;
+          perfFeatures.performanceCounterMultipleQueryPools = VK_FALSE;
+
+          perfFeatures.pNext = (void *)createInfo.pNext;
+          createInfo.pNext = &perfFeatures;
+        }
+      }
+      else
+      {
+        Extensions.removeOne(VK_KHR_PERFORMANCE_QUERY_EXTENSION_NAME);
+      }
+    }
+
+    VkPhysicalDeviceScalarBlockLayoutFeaturesEXT scalarBlockEXTFeatures = {
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SCALAR_BLOCK_LAYOUT_FEATURES_EXT,
+    };
+
+    if(RDCMIN(m_EnabledExtensions.vulkanVersion, physProps.apiVersion) >= VK_MAKE_VERSION(1, 2, 0))
+    {
+      VkPhysicalDeviceVulkan12Features avail12Features = {
+          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
+      };
+      VkPhysicalDeviceFeatures2 availBase = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+      availBase.pNext = &avail12Features;
+      ObjDisp(physicalDevice)->GetPhysicalDeviceFeatures2(Unwrap(physicalDevice), &availBase);
+
+      if(avail12Features.scalarBlockLayout)
+      {
+        VkPhysicalDeviceVulkan12Features *existing =
+            (VkPhysicalDeviceVulkan12Features *)FindNextStruct(
+                &createInfo, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES);
+
+        if(existing)
+        {
+          existing->scalarBlockLayout = VK_TRUE;
+        }
+        else
+        {
+          VkPhysicalDeviceScalarBlockLayoutFeaturesEXT *existingEXT =
+              (VkPhysicalDeviceScalarBlockLayoutFeaturesEXT *)FindNextStruct(
+                  &createInfo, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SCALAR_BLOCK_LAYOUT_FEATURES_EXT);
+
+          if(existingEXT)
+          {
+            existingEXT->scalarBlockLayout = VK_TRUE;
+          }
+          else
+          {
+            // don't add a new VkPhysicalDeviceVulkan12Features to the pNext chain because if we do
+            // we have to remove any components etc. Instead just add the individual
+            // VkPhysicalDeviceScalarBlockLayoutFeaturesEXT
+            scalarBlockEXTFeatures.scalarBlockLayout = VK_TRUE;
+
+            scalarBlockEXTFeatures.pNext = (void *)createInfo.pNext;
+            createInfo.pNext = &scalarBlockEXTFeatures;
+          }
+        }
+      }
+    }
+    else if(scalarBlock)
+    {
+      VkPhysicalDeviceScalarBlockLayoutFeaturesEXT scalarAvail = {
+          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SCALAR_BLOCK_LAYOUT_FEATURES_EXT,
+      };
+      VkPhysicalDeviceFeatures2 availBase = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+      availBase.pNext = &scalarAvail;
+      ObjDisp(physicalDevice)->GetPhysicalDeviceFeatures2(Unwrap(physicalDevice), &availBase);
+
+      if(scalarAvail.scalarBlockLayout)
+      {
+        // see if there's an existing struct
+        VkPhysicalDeviceScalarBlockLayoutFeaturesEXT *existing =
+            (VkPhysicalDeviceScalarBlockLayoutFeaturesEXT *)FindNextStruct(
+                &createInfo, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SCALAR_BLOCK_LAYOUT_FEATURES_EXT);
+
+        if(existing)
+        {
+          existing->scalarBlockLayout = VK_TRUE;
+        }
+        else
+        {
+          // otherwise, add our own, and push it onto the pNext array
+          scalarBlockEXTFeatures.scalarBlockLayout = VK_TRUE;
+
+          scalarBlockEXTFeatures.pNext = (void *)createInfo.pNext;
+          createInfo.pNext = &scalarBlockEXTFeatures;
+        }
+      }
+      else
+      {
+        RDCWARN(
+            "VK_EXT_scalar_block_layout is available, but the physical device feature "
+            "is not. Disabling");
+
+        Extensions.removeOne(VK_EXT_SCALAR_BLOCK_LAYOUT_EXTENSION_NAME);
+      }
+    }
+
+    VkPhysicalDeviceBufferDeviceAddressFeaturesEXT bufAddrEXTFeatures = {
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES_EXT,
+    };
+    VkPhysicalDeviceBufferDeviceAddressFeaturesKHR bufAddrKHRFeatures = {
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES_KHR,
+    };
+
+    if(RDCMIN(m_EnabledExtensions.vulkanVersion, physProps.apiVersion) >= VK_MAKE_VERSION(1, 3, 0))
+    {
+      // VK_EXT_extended_dynamic_state and VK_EXT_extended_dynamic_state2 were unconditionally
+      // promoted and considered implicitly enabled in vulkan 1.3
+      m_ExtendedDynState = true;
+      m_ExtendedDynState2 = true;
+      // logic and patch CPs were not
+    }
+
+    if(RDCMIN(m_EnabledExtensions.vulkanVersion, physProps.apiVersion) >= VK_MAKE_VERSION(1, 2, 0))
+    {
+      VkPhysicalDeviceVulkan12Features avail12Features = {
+          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
+      };
+      VkPhysicalDeviceFeatures2 availBase = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+      availBase.pNext = &avail12Features;
+      ObjDisp(physicalDevice)->GetPhysicalDeviceFeatures2(Unwrap(physicalDevice), &availBase);
+
+      if(avail12Features.bufferDeviceAddress)
+      {
+        VkPhysicalDeviceVulkan12Features *existing =
+            (VkPhysicalDeviceVulkan12Features *)FindNextStruct(
+                &createInfo, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES);
+
+        if(existing)
+        {
+          if(existing->bufferDeviceAddress)
+            existing->bufferDeviceAddressCaptureReplay = VK_TRUE;
+          existing->bufferDeviceAddress = VK_TRUE;
+        }
+        else
+        {
+          VkPhysicalDeviceBufferDeviceAddressFeaturesKHR *existingKHR =
+              (VkPhysicalDeviceBufferDeviceAddressFeaturesKHR *)FindNextStruct(
+                  &createInfo, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES_KHR);
+          VkPhysicalDeviceBufferDeviceAddressFeaturesEXT *existingEXT =
+              (VkPhysicalDeviceBufferDeviceAddressFeaturesEXT *)FindNextStruct(
+                  &createInfo, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES_EXT);
+
+          if(existingKHR)
+          {
+            if(existingKHR->bufferDeviceAddress)
+              existingKHR->bufferDeviceAddressCaptureReplay = VK_TRUE;
+            existingKHR->bufferDeviceAddress = VK_TRUE;
+          }
+          else if(existingEXT)
+          {
+            if(existingEXT->bufferDeviceAddress)
+              existingEXT->bufferDeviceAddressCaptureReplay = VK_TRUE;
+            existingEXT->bufferDeviceAddress = VK_TRUE;
+          }
+          else
+          {
+            // don't add a new VkPhysicalDeviceVulkan12Features to the pNext chain because if we do
+            // we have to remove any components etc. Instead just add the individual
+            // VkPhysicalDeviceBufferDeviceAddressFeaturesKHR
+            bufAddrKHRFeatures.bufferDeviceAddress = VK_TRUE;
+            bufAddrKHRFeatures.bufferDeviceAddressMultiDevice = VK_FALSE;
+
+            bufAddrKHRFeatures.pNext = (void *)createInfo.pNext;
+            createInfo.pNext = &bufAddrKHRFeatures;
+          }
+        }
+      }
+    }
+    else if(KHRbuffer)
+    {
+      VkPhysicalDeviceFeatures2 availBase = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+      availBase.pNext = &bufAddrKHRFeatures;
+      ObjDisp(physicalDevice)->GetPhysicalDeviceFeatures2(Unwrap(physicalDevice), &availBase);
+
+      if(bufAddrKHRFeatures.bufferDeviceAddress)
+      {
+        // see if there's an existing struct
+        VkPhysicalDeviceBufferDeviceAddressFeaturesKHR *existing =
+            (VkPhysicalDeviceBufferDeviceAddressFeaturesKHR *)FindNextStruct(
+                &createInfo, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES_KHR);
+
+        if(existing)
+        {
+          if(existing->bufferDeviceAddress)
+            existing->bufferDeviceAddressCaptureReplay = VK_TRUE;
+          // if so, make sure the feature is enabled
+          existing->bufferDeviceAddress = VK_TRUE;
+        }
+        else
+        {
+          // otherwise, add our own, and push it onto the pNext array
+          bufAddrKHRFeatures.bufferDeviceAddress = VK_TRUE;
+          bufAddrKHRFeatures.bufferDeviceAddressMultiDevice = VK_FALSE;
+
+          bufAddrKHRFeatures.pNext = (void *)createInfo.pNext;
+          createInfo.pNext = &bufAddrKHRFeatures;
+        }
+      }
+      else
+      {
+        RDCWARN(
+            "VK_KHR_buffer_device_address is available, but the physical device feature "
+            "is not. Disabling");
+
+        Extensions.removeOne(VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME);
+      }
+    }
+    else if(EXTbuffer)
+    {
+      VkPhysicalDeviceFeatures2 availBase = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+      availBase.pNext = &bufAddrEXTFeatures;
+      ObjDisp(physicalDevice)->GetPhysicalDeviceFeatures2(Unwrap(physicalDevice), &availBase);
+
+      if(bufAddrEXTFeatures.bufferDeviceAddress)
+      {
+        // see if there's an existing struct
+        VkPhysicalDeviceBufferDeviceAddressFeaturesEXT *existing =
+            (VkPhysicalDeviceBufferDeviceAddressFeaturesEXT *)FindNextStruct(
+                &createInfo, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES_EXT);
+
+        if(existing)
+        {
+          if(existing->bufferDeviceAddress)
+            existing->bufferDeviceAddressCaptureReplay = VK_TRUE;
+
+          // if so, make sure the feature is enabled
+          existing->bufferDeviceAddress = VK_TRUE;
+        }
+        else
+        {
+          // otherwise, add our own, and push it onto the pNext array
+          bufAddrEXTFeatures.bufferDeviceAddress = VK_TRUE;
+          bufAddrEXTFeatures.bufferDeviceAddressMultiDevice = VK_FALSE;
+
+          bufAddrEXTFeatures.pNext = (void *)createInfo.pNext;
+          createInfo.pNext = &bufAddrEXTFeatures;
+        }
+      }
+      else
+      {
+        RDCWARN(
+            "VK_EXT_buffer_device_address is available, but the physical device feature "
+            "is not. Disabling");
+
+        Extensions.removeOne(VK_EXT_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME);
+      }
+    }
+
+    rdcarray<const char *> layerArray;
+    layerArray.resize(m_InitParams.Layers.size());
+    for(size_t i = 0; i < m_InitParams.Layers.size(); i++)
+      layerArray[i] = m_InitParams.Layers[i].c_str();
+
+    createInfo.enabledLayerCount = 0;
+    createInfo.ppEnabledLayerNames = NULL;
+
+    rdcarray<const char *> extArray;
+    extArray.resize(Extensions.size());
     for(size_t i = 0; i < Extensions.size(); i++)
       extArray[i] = Extensions[i].c_str();
 
     createInfo.enabledExtensionCount = (uint32_t)extArray.size();
     createInfo.ppEnabledExtensionNames = extArray.data();
 
+    byte *tempMem = GetTempMemory(GetNextPatchSize(createInfo.pNext));
+
+    UnwrapNextChain(m_State, "VkDeviceCreateInfo", tempMem, (VkBaseInStructure *)&createInfo);
+
+    VkDeviceGroupDeviceCreateInfo *device_group_info =
+        (VkDeviceGroupDeviceCreateInfo *)FindNextStruct(
+            &createInfo, VK_STRUCTURE_TYPE_DEVICE_GROUP_DEVICE_CREATE_INFO);
+    // decode physical devices that are actually indices
+    if(device_group_info)
+    {
+      VkPhysicalDevice *physDevs = (VkPhysicalDevice *)device_group_info->pPhysicalDevices;
+      for(uint32_t i = 0; i < device_group_info->physicalDeviceCount; i++)
+        physDevs[i] = Unwrap(m_PhysicalDevices[GetPhysicalDeviceIndexFromHandle(physDevs[i])]);
+    }
+
     vkr = GetDeviceDispatchTable(NULL)->CreateDevice(Unwrap(physicalDevice), &createInfo, NULL,
                                                      &device);
 
+    if(vkr != VK_SUCCESS && !queuePriorities.empty())
+    {
+      RDCWARN("Failed to create logical device: %s. Reducing queue priorities", ToStr(vkr).c_str());
+
+      for(VkDeviceQueueGlobalPriorityCreateInfoKHR *q : queuePriorities)
+      {
+        // medium is considered the default if no priority is set otherwise
+        if(q->globalPriority > VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_EXT)
+          q->globalPriority = VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_EXT;
+      }
+
+      vkr = GetDeviceDispatchTable(NULL)->CreateDevice(Unwrap(physicalDevice), &createInfo, NULL,
+                                                       &device);
+    }
+
     if(vkr != VK_SUCCESS)
     {
-      RDCERR("Failed to create logical device: %s", ToStr(vkr).c_str());
+      SET_ERROR_RESULT(m_FailedReplayResult, ResultCode::APIReplayFailed,
+                       "Error creating logical device, VkResult: %s", ToStr(vkr).c_str());
       return false;
     }
 
@@ -2296,19 +3860,83 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
     AddResource(Device, ResourceType::Device, "Device");
     DerivedResource(origPhysDevice, Device);
 
+// we unset the extension because it may be a 'shared' extension that's available at both instance
+// and device. Only set it to enabled if it's really enabled for this device. This can happen with a
+// device extension that is reported by another physical device than the one selected - it becomes
+// available at instance level (e.g. for physical device queries) but is not available at *this*
+// device level.
 #undef CheckExt
-#define CheckExt(name, ver)                                         \
-  if(!strcmp(createInfo.ppEnabledExtensionNames[i], "VK_" #name) || \
-     (int)renderdocAppInfo.apiVersion >= ver)                       \
-  {                                                                 \
-    m_EnabledExtensions.ext_##name = true;                          \
-  }
+#define CheckExt(name, ver) m_EnabledExtensions.ext_##name = false;
 
+    CheckDeviceExts();
+
+    uint32_t effectiveApiVersion = RDCMIN(m_EnabledExtensions.vulkanVersion, physProps.apiVersion);
+
+#undef CheckExt
+#define CheckExt(name, ver)                \
+  if(effectiveApiVersion >= ver)           \
+  {                                        \
+    m_EnabledExtensions.ext_##name = true; \
+  }
+    CheckDeviceExts();
+
+#undef CheckExt
+#define CheckExt(name, ver)                                       \
+  if(!strcmp(createInfo.ppEnabledExtensionNames[i], "VK_" #name)) \
+  {                                                               \
+    m_EnabledExtensions.ext_##name = true;                        \
+  }
     for(uint32_t i = 0; i < createInfo.enabledExtensionCount; i++)
     {
       CheckDeviceExts();
     }
 
+    // for cases where a promoted extension isn't supported as the extension itself, manually
+    // disable them when the feature bit is false.
+
+    if(effectiveApiVersion >= VK_MAKE_VERSION(1, 2, 0))
+    {
+      if(supportedExtensions.find(VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME) ==
+             supportedExtensions.end() &&
+         !vulkan12Features.bufferDeviceAddress)
+        m_EnabledExtensions.ext_KHR_buffer_device_address = false;
+
+      if(supportedExtensions.find(VK_EXT_SCALAR_BLOCK_LAYOUT_EXTENSION_NAME) ==
+             supportedExtensions.end() &&
+         !vulkan12Features.scalarBlockLayout)
+        m_EnabledExtensions.ext_EXT_scalar_block_layout = false;
+
+      if(supportedExtensions.find(VK_KHR_DRAW_INDIRECT_COUNT_EXTENSION_NAME) ==
+             supportedExtensions.end() &&
+         !vulkan12Features.drawIndirectCount)
+        m_EnabledExtensions.ext_KHR_draw_indirect_count = false;
+
+      if(supportedExtensions.find(VK_EXT_SAMPLER_FILTER_MINMAX_EXTENSION_NAME) ==
+             supportedExtensions.end() &&
+         !vulkan12Features.samplerFilterMinmax)
+        m_EnabledExtensions.ext_EXT_sampler_filter_minmax = false;
+
+      // these features are required so this should never happen
+      if(supportedExtensions.find(VK_KHR_SEPARATE_DEPTH_STENCIL_LAYOUTS_EXTENSION_NAME) ==
+             supportedExtensions.end() &&
+         !vulkan12Features.separateDepthStencilLayouts)
+      {
+        RDCWARN(
+            "Required feature 'separateDepthStencilLayouts' not supported by 1.2 physical device.");
+        m_EnabledExtensions.ext_KHR_separate_depth_stencil_layouts = false;
+      }
+    }
+
+    // we also need to check for feature enablement - if an extension is promoted that doesn't mean
+    // it's enabled
+
+    if(m_EnabledExtensions.ext_KHR_synchronization2)
+    {
+      if(!vulkan13Features.synchronization2 && !sync2.synchronization2)
+        m_EnabledExtensions.ext_KHR_synchronization2 = false;
+    }
+
+    InitInstanceExtensionTables(m_Instance, &m_EnabledExtensions);
     InitDeviceExtensionTables(device, &m_EnabledExtensions);
 
     RDCASSERT(m_Device == VK_NULL_HANDLE);    // MULTIDEVICE
@@ -2325,7 +3953,7 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
                                           qFamilyIdx};
       vkr = ObjDisp(device)->CreateCommandPool(Unwrap(device), &poolInfo, NULL,
                                                &m_InternalCmds.cmdpool);
-      RDCASSERTEQUAL(vkr, VK_SUCCESS);
+      CheckVkResult(vkr);
 
       GetResourceManager()->WrapResource(Unwrap(device), m_InternalCmds.cmdpool);
     }
@@ -2338,13 +3966,17 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
       uint32_t qidx = createInfo.pQueueCreateInfos[i].queueFamilyIndex;
       m_ExternalQueues.resize(RDCMAX((uint32_t)m_ExternalQueues.size(), qidx + 1));
 
+      ImageBarrierSequence::SetMaxQueueFamilyIndex(qidx);
+
       VkCommandPoolCreateInfo poolInfo = {
-          VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, NULL,
-          VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, qidx,
+          VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+          NULL,
+          VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+          qidx,
       };
       vkr = ObjDisp(device)->CreateCommandPool(Unwrap(device), &poolInfo, NULL,
                                                &m_ExternalQueues[qidx].pool);
-      RDCASSERTEQUAL(vkr, VK_SUCCESS);
+      CheckVkResult(vkr);
 
       GetResourceManager()->WrapResource(Unwrap(device), m_ExternalQueues[qidx].pool);
 
@@ -2356,30 +3988,57 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
           1,
       };
 
-      vkr = ObjDisp(device)->AllocateCommandBuffers(Unwrap(device), &cmdInfo,
-                                                    &m_ExternalQueues[qidx].buffer);
-      RDCASSERTEQUAL(vkr, VK_SUCCESS);
+      VkFenceCreateInfo fenceInfo = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, NULL,
+                                     VK_FENCE_CREATE_SIGNALED_BIT};
+      VkSemaphoreCreateInfo semInfo = {VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
 
-      if(m_SetDeviceLoaderData)
-        m_SetDeviceLoaderData(device, m_ExternalQueues[qidx].buffer);
-      else
-        SetDispatchTableOverMagicNumber(device, m_ExternalQueues[qidx].buffer);
+      for(size_t x = 0; x < ARRAY_COUNT(m_ExternalQueues[i].ring); x++)
+      {
+        vkr = ObjDisp(device)->AllocateCommandBuffers(Unwrap(device), &cmdInfo,
+                                                      &m_ExternalQueues[qidx].ring[x].acquire);
+        CheckVkResult(vkr);
 
-      GetResourceManager()->WrapResource(Unwrap(device), m_ExternalQueues[qidx].buffer);
+        if(m_SetDeviceLoaderData)
+          m_SetDeviceLoaderData(device, m_ExternalQueues[qidx].ring[x].acquire);
+        else
+          SetDispatchTableOverMagicNumber(device, m_ExternalQueues[qidx].ring[x].acquire);
+
+        GetResourceManager()->WrapResource(Unwrap(device), m_ExternalQueues[qidx].ring[x].acquire);
+
+        vkr = ObjDisp(device)->AllocateCommandBuffers(Unwrap(device), &cmdInfo,
+                                                      &m_ExternalQueues[qidx].ring[x].release);
+        CheckVkResult(vkr);
+
+        if(m_SetDeviceLoaderData)
+          m_SetDeviceLoaderData(device, m_ExternalQueues[qidx].ring[x].release);
+        else
+          SetDispatchTableOverMagicNumber(device, m_ExternalQueues[qidx].ring[x].release);
+
+        GetResourceManager()->WrapResource(Unwrap(device), m_ExternalQueues[qidx].ring[x].release);
+
+        vkr = ObjDisp(device)->CreateSemaphore(Unwrap(device), &semInfo, NULL,
+                                               &m_ExternalQueues[qidx].ring[x].fromext);
+        CheckVkResult(vkr);
+
+        GetResourceManager()->WrapResource(Unwrap(device), m_ExternalQueues[qidx].ring[x].fromext);
+
+        vkr = ObjDisp(device)->CreateSemaphore(Unwrap(device), &semInfo, NULL,
+                                               &m_ExternalQueues[qidx].ring[x].toext);
+        CheckVkResult(vkr);
+
+        GetResourceManager()->WrapResource(Unwrap(device), m_ExternalQueues[qidx].ring[x].toext);
+
+        vkr = ObjDisp(device)->CreateFence(Unwrap(device), &fenceInfo, NULL,
+                                           &m_ExternalQueues[qidx].ring[x].fence);
+        CheckVkResult(vkr);
+
+        GetResourceManager()->WrapResource(Unwrap(device), m_ExternalQueues[qidx].ring[x].fence);
+      }
     }
 
-    ObjDisp(physicalDevice)
-        ->GetPhysicalDeviceProperties(Unwrap(physicalDevice), &m_PhysicalDeviceData.props);
+    m_Replay->SetDriverInformation(m_PhysicalDeviceData.props, m_PhysicalDeviceData.driverProps);
 
-    ObjDisp(physicalDevice)
-        ->GetPhysicalDeviceMemoryProperties(Unwrap(physicalDevice), &m_PhysicalDeviceData.memProps);
-
-    ObjDisp(physicalDevice)
-        ->GetPhysicalDeviceFeatures(Unwrap(physicalDevice), &m_PhysicalDeviceData.features);
-
-    m_PhysicalDeviceData.driverInfo = VkDriverInfo(m_PhysicalDeviceData.props);
-
-    m_Replay.SetDriverInformation(m_PhysicalDeviceData.props);
+    m_PhysicalDeviceData.enabledFeatures = enabledFeatures;
 
     // MoltenVK reports 0x3fffffff for this limit so just ignore that value if it comes up
     RDCASSERT(m_PhysicalDeviceData.props.limits.maxBoundDescriptorSets <
@@ -2387,37 +4046,26 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
                   m_PhysicalDeviceData.props.limits.maxBoundDescriptorSets >= 0x10000000,
               m_PhysicalDeviceData.props.limits.maxBoundDescriptorSets);
 
-    for(int i = VK_FORMAT_BEGIN_RANGE + 1; i < VK_FORMAT_END_RANGE; i++)
-      ObjDisp(physicalDevice)
-          ->GetPhysicalDeviceFormatProperties(Unwrap(physicalDevice), VkFormat(i),
-                                              &m_PhysicalDeviceData.fmtprops[i]);
+    m_PhysicalDeviceData.queueCount = (uint32_t)queueProps.size();
+    for(size_t i = 0; i < queueProps.size(); i++)
+      m_PhysicalDeviceData.queueProps[i] = queueProps[i];
 
-    m_PhysicalDeviceData.queueCount = qCount;
-    memcpy(m_PhysicalDeviceData.queueProps, props, qCount * sizeof(VkQueueFamilyProperties));
-
-    m_PhysicalDeviceData.readbackMemIndex =
-        m_PhysicalDeviceData.GetMemoryIndex(~0U, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, 0);
-    m_PhysicalDeviceData.uploadMemIndex =
-        m_PhysicalDeviceData.GetMemoryIndex(~0U, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, 0);
-    m_PhysicalDeviceData.GPULocalMemIndex = m_PhysicalDeviceData.GetMemoryIndex(
-        ~0U, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
-
-    for(size_t i = 0; i < m_ReplayPhysicalDevices.size(); i++)
-    {
-      if(physicalDevice == m_ReplayPhysicalDevices[i])
-      {
-        m_PhysicalDeviceData.memIdxMap = m_MemIdxMaps[i];
-        break;
-      }
-    }
+    ChooseMemoryIndices();
 
     APIProps.vendor = GetDriverInfo().Vendor();
+
+    // temporarily disable the debug message sink, to ignore any false positive messages from our
+    // init
+    ScopedDebugMessageSink *sink = GetDebugMessageSink();
+    SetDebugMessageSink(NULL);
 
     m_ShaderCache = new VulkanShaderCache(this);
 
     m_DebugManager = new VulkanDebugManager(this);
 
-    m_Replay.CreateResources();
+    m_Replay->CreateResources();
+
+    SetDebugMessageSink(sink);
   }
 
   return true;
@@ -2439,13 +4087,22 @@ VkResult WrappedVulkan::vkCreateDevice(VkPhysicalDevice physicalDevice,
           "For KHR/EXT extensions file an issue on github to request support: "
           "https://github.com/baldurk/renderdoc");
 
+      SendUserDebugMessage(
+          StringFormat::Fmt("RenderDoc does not support requested device extension: %s.",
+                            createInfo.ppEnabledExtensionNames[i]));
+
       return VK_ERROR_EXTENSION_NOT_PRESENT;
     }
   }
 
-  std::vector<const char *> Extensions(
-      createInfo.ppEnabledExtensionNames,
-      createInfo.ppEnabledExtensionNames + createInfo.enabledExtensionCount);
+  if(m_Device != VK_NULL_HANDLE)
+  {
+    SendUserDebugMessage("RenderDoc does not support multiple simultaneous logical devices.");
+    return VK_ERROR_INITIALIZATION_FAILED;
+  }
+
+  rdcarray<const char *> Extensions(createInfo.ppEnabledExtensionNames,
+                                    createInfo.enabledExtensionCount);
 
   // enable VK_KHR_driver_properties if it's available
   {
@@ -2472,78 +4129,24 @@ VkResult WrappedVulkan::vkCreateDevice(VkPhysicalDevice physicalDevice,
   createInfo.ppEnabledExtensionNames = Extensions.data();
   createInfo.enabledExtensionCount = (uint32_t)Extensions.size();
 
-  uint32_t qCount = 0;
   VkResult vkr = VK_SUCCESS;
 
-  ObjDisp(physicalDevice)->GetPhysicalDeviceQueueFamilyProperties(Unwrap(physicalDevice), &qCount, NULL);
+  rdcarray<VkQueueFamilyProperties> queueProps;
 
-  VkQueueFamilyProperties *props = new VkQueueFamilyProperties[qCount];
-  ObjDisp(physicalDevice)->GetPhysicalDeviceQueueFamilyProperties(Unwrap(physicalDevice), &qCount, props);
+  {
+    uint32_t qCount = 0;
+    ObjDisp(physicalDevice)->GetPhysicalDeviceQueueFamilyProperties(Unwrap(physicalDevice), &qCount, NULL);
+
+    queueProps.resize(qCount);
+    ObjDisp(physicalDevice)
+        ->GetPhysicalDeviceQueueFamilyProperties(Unwrap(physicalDevice), &qCount, queueProps.data());
+  }
 
   // find a queue that supports all capabilities, and if one doesn't exist, add it.
-  bool found = false;
   uint32_t qFamilyIdx = 0;
 
-  // we need graphics, and if there is a graphics queue there must be a graphics & compute queue.
-  VkQueueFlags search = (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT);
-
-  // for queue priorities, if we need it
-  float one = 1.0f;
-
-  // if we need to change the requested queues, it will point to this
-  VkDeviceQueueCreateInfo *modQueues = NULL;
-
-  for(uint32_t i = 0; i < createInfo.queueCreateInfoCount; i++)
-  {
-    uint32_t idx = createInfo.pQueueCreateInfos[i].queueFamilyIndex;
-    RDCASSERT(idx < qCount);
-
-    // this requested queue is one we can use too
-    if((props[idx].queueFlags & search) == search && createInfo.pQueueCreateInfos[i].queueCount > 0)
-    {
-      qFamilyIdx = idx;
-      found = true;
-      break;
-    }
-  }
-
-  // if we didn't find it, search for which queue family we should add a request for
-  if(!found)
-  {
-    RDCDEBUG("App didn't request a queue family we can use - adding our own");
-
-    for(uint32_t i = 0; i < qCount; i++)
-    {
-      if((props[i].queueFlags & search) == search)
-      {
-        qFamilyIdx = i;
-        found = true;
-        break;
-      }
-    }
-
-    if(!found)
-    {
-      SAFE_DELETE_ARRAY(props);
-      RDCERR("Can't add a queue with required properties for RenderDoc! Unsupported configuration");
-      return VK_ERROR_INITIALIZATION_FAILED;
-    }
-
-    // we found the queue family, add it
-    modQueues = new VkDeviceQueueCreateInfo[createInfo.queueCreateInfoCount + 1];
-    for(uint32_t i = 0; i < createInfo.queueCreateInfoCount; i++)
-      modQueues[i] = createInfo.pQueueCreateInfos[i];
-
-    modQueues[createInfo.queueCreateInfoCount].queueFamilyIndex = qFamilyIdx;
-    modQueues[createInfo.queueCreateInfoCount].queueCount = 1;
-    modQueues[createInfo.queueCreateInfoCount].pQueuePriorities = &one;
-    modQueues[createInfo.queueCreateInfoCount].sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
-    modQueues[createInfo.queueCreateInfoCount].pNext = NULL;
-    modQueues[createInfo.queueCreateInfoCount].flags = 0;
-
-    createInfo.pQueueCreateInfos = modQueues;
-    createInfo.queueCreateInfoCount++;
-  }
+  if(!SelectGraphicsComputeQueue(queueProps, createInfo, qFamilyIdx))
+    return VK_ERROR_INITIALIZATION_FAILED;
 
   m_QueueFamilies.resize(createInfo.queueCreateInfoCount);
   m_QueueFamilyCounts.resize(createInfo.queueCreateInfoCount);
@@ -2552,16 +4155,15 @@ VkResult WrappedVulkan::vkCreateDevice(VkPhysicalDevice physicalDevice,
   {
     uint32_t family = createInfo.pQueueCreateInfos[i].queueFamilyIndex;
     uint32_t count = createInfo.pQueueCreateInfos[i].queueCount;
-    m_QueueFamilies.resize(RDCMAX(m_QueueFamilies.size(), size_t(family + 1)));
-    m_QueueFamilyCounts.resize(RDCMAX(m_QueueFamilies.size(), size_t(family + 1)));
+    m_QueueFamilies.resize(RDCMAX(m_QueueFamilies.size(), size_t(family) + 1));
+    m_QueueFamilyCounts.resize(RDCMAX(m_QueueFamilies.size(), size_t(family) + 1));
 
     m_QueueFamilies[family] = new VkQueue[count];
     m_QueueFamilyCounts[family] = count;
     for(uint32_t q = 0; q < count; q++)
       m_QueueFamilies[family][q] = VK_NULL_HANDLE;
 
-    if(std::find(m_QueueFamilyIndices.begin(), m_QueueFamilyIndices.end(), family) ==
-       m_QueueFamilyIndices.end())
+    if(!m_QueueFamilyIndices.contains(family))
       m_QueueFamilyIndices.push_back(family);
   }
 
@@ -2577,7 +4179,6 @@ VkResult WrappedVulkan::vkCreateDevice(VkPhysicalDevice physicalDevice,
 
   if(layerCreateInfo == NULL)
   {
-    SAFE_DELETE_ARRAY(props);
     RDCERR("Couldn't find loader device create info, which is required. Incompatible loader?");
     return VK_ERROR_INITIALIZATION_FAILED;
   }
@@ -2587,7 +4188,7 @@ VkResult WrappedVulkan::vkCreateDevice(VkPhysicalDevice physicalDevice,
   // move chain on for next layer
   layerCreateInfo->u.pLayerInfo = layerCreateInfo->u.pLayerInfo->pNext;
 
-  PFN_vkCreateDevice createFunc = (PFN_vkCreateDevice)gipa(VK_NULL_HANDLE, "vkCreateDevice");
+  PFN_vkCreateDevice createFunc = (PFN_vkCreateDevice)gipa(Unwrap(m_Instance), "vkCreateDevice");
 
   // now search again through for the loader data callback (if it exists)
   layerCreateInfo = (VkLayerDeviceCreateInfo *)pCreateInfo->pNext;
@@ -2609,10 +4210,9 @@ VkResult WrappedVulkan::vkCreateDevice(VkPhysicalDevice physicalDevice,
     m_SetDeviceLoaderData = layerCreateInfo->u.pfnSetDeviceLoaderData;
   }
 
-  // patch enabled features
+  // patch enabled features needed at capture time
 
   VkPhysicalDeviceFeatures availFeatures;
-
   ObjDisp(physicalDevice)->GetPhysicalDeviceFeatures(Unwrap(physicalDevice), &availFeatures);
 
   // default to all off. This is equivalent to createInfo.pEnabledFeatures == NULL
@@ -2626,6 +4226,14 @@ VkResult WrappedVulkan::vkCreateDevice(VkPhysicalDevice physicalDevice,
 
   VkPhysicalDeviceFeatures2 *enabledFeatures2 = (VkPhysicalDeviceFeatures2 *)FindNextStruct(
       &createInfo, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2);
+  /*
+  VkPhysicalDeviceVulkan11Features *enabledFeaturesVK11 =
+      (VkPhysicalDeviceVulkan11Features *)FindNextStruct(
+          &createInfo, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES);
+          */
+  VkPhysicalDeviceVulkan12Features *enabledFeaturesVK12 =
+      (VkPhysicalDeviceVulkan12Features *)FindNextStruct(
+          &createInfo, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES);
 
   // VkPhysicalDeviceFeatures2 takes priority
   if(enabledFeatures2)
@@ -2633,42 +4241,32 @@ VkResult WrappedVulkan::vkCreateDevice(VkPhysicalDevice physicalDevice,
   else if(createInfo.pEnabledFeatures)
     enabledFeatures = *createInfo.pEnabledFeatures;
 
+  // enable this feature as it's needed at capture time to save MSAA initial states
   if(availFeatures.shaderStorageImageWriteWithoutFormat)
     enabledFeatures.shaderStorageImageWriteWithoutFormat = true;
   else
     RDCWARN(
-        "shaderStorageImageWriteWithoutFormat = false, save/load from 2DMS textures will not be "
-        "possible");
+        "shaderStorageImageWriteWithoutFormat = false, multisampled textures will have empty "
+        "contents at frame start.");
 
+  // even though we don't actually do any multisampled stores, this is needed to be able to create
+  // MSAA images with STORAGE_BIT usage
   if(availFeatures.shaderStorageImageMultisample)
     enabledFeatures.shaderStorageImageMultisample = true;
   else
     RDCWARN(
-        "shaderStorageImageMultisample = false, save/load from 2DMS textures will not be "
-        "possible");
-
-  if(availFeatures.sampleRateShading)
-    enabledFeatures.sampleRateShading = true;
-  else
-    RDCWARN(
-        "sampleRateShading = false, save/load from depth 2DMS textures will not be "
-        "possible");
-
-  if(availFeatures.occlusionQueryPrecise)
-    enabledFeatures.occlusionQueryPrecise = true;
-  else
-    RDCWARN("occlusionQueryPrecise = false, samples passed counter will not be available");
-
-  if(availFeatures.pipelineStatisticsQuery)
-    enabledFeatures.pipelineStatisticsQuery = true;
-  else
-    RDCWARN("pipelineStatisticsQuery = false, pipeline counters will not work");
+        "shaderStorageImageMultisample = false, multisampled textures will have empty "
+        "contents at frame start.");
 
   // patch the enabled features
   if(enabledFeatures2)
     enabledFeatures2->features = enabledFeatures;
   else
     createInfo.pEnabledFeatures = &enabledFeatures;
+
+  // we need to enable non-subsampled images because we're going to remove subsampled bit from
+  // images, and we want to ensure that it's legal! We verified that this is OK before whitelisting
+  // the extension
 
   VkPhysicalDeviceFragmentDensityMapFeaturesEXT *fragmentDensityMapFeatures =
       (VkPhysicalDeviceFragmentDensityMapFeaturesEXT *)FindNextStruct(
@@ -2678,26 +4276,42 @@ VkResult WrappedVulkan::vkCreateDevice(VkPhysicalDevice physicalDevice,
     fragmentDensityMapFeatures->fragmentDensityMapNonSubsampledImages = true;
   }
 
-  VkPhysicalDeviceBufferDeviceAddressFeaturesEXT *bufferAddressFeatures =
+  VkPhysicalDeviceBufferDeviceAddressFeaturesEXT *bufferAddressFeaturesEXT =
       (VkPhysicalDeviceBufferDeviceAddressFeaturesEXT *)FindNextStruct(
           &createInfo, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES_EXT);
+  VkPhysicalDeviceBufferDeviceAddressFeatures *bufferAddressFeaturesCoreKHR =
+      (VkPhysicalDeviceBufferDeviceAddressFeatures *)FindNextStruct(
+          &createInfo, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES);
 
-  if(bufferAddressFeatures)
-  {
-    // we must turn on bufferDeviceAddressCaptureReplay. We verified that this feature was available
-    // before we whitelisted the extension
-    bufferAddressFeatures->bufferDeviceAddressCaptureReplay = VK_TRUE;
-  }
+  // we must turn on bufferDeviceAddressCaptureReplay. We verified that this feature was available
+  // before we whitelisted the extension/feature
+  if(enabledFeaturesVK12 && enabledFeaturesVK12->bufferDeviceAddress)
+    enabledFeaturesVK12->bufferDeviceAddressCaptureReplay = VK_TRUE;
+
+  if(bufferAddressFeaturesCoreKHR)
+    bufferAddressFeaturesCoreKHR->bufferDeviceAddressCaptureReplay = VK_TRUE;
+
+  if(bufferAddressFeaturesEXT)
+    bufferAddressFeaturesEXT->bufferDeviceAddressCaptureReplay = VK_TRUE;
+
+  // check features that we care about at capture time
+
+  const VkPhysicalDeviceSeparateDepthStencilLayoutsFeatures *separateDepthStencilFeatures =
+      (const VkPhysicalDeviceSeparateDepthStencilLayoutsFeatures *)FindNextStruct(
+          &createInfo, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SEPARATE_DEPTH_STENCIL_LAYOUTS_FEATURES);
+
+  if(separateDepthStencilFeatures)
+    m_SeparateDepthStencil |= (separateDepthStencilFeatures->separateDepthStencilLayouts != VK_FALSE);
 
   VkResult ret;
   SERIALISE_TIME_CALL(ret = createFunc(Unwrap(physicalDevice), &createInfo, pAllocator, pDevice));
 
-  // don't serialise out any of the pNext stuff for layer initialisation
-  RemoveNextStruct(&createInfo, VK_STRUCTURE_TYPE_LOADER_DEVICE_CREATE_INFO);
-
   if(ret == VK_SUCCESS)
   {
     InitDeviceTable(*pDevice, gdpa);
+
+    RDCLOG("Created capture device from physical device %d",
+           m_PhysicalDevices.indexOf(physicalDevice));
 
     ResourceId id = GetResourceManager()->WrapResource(*pDevice, *pDevice);
 
@@ -2705,11 +4319,16 @@ VkResult WrappedVulkan::vkCreateDevice(VkPhysicalDevice physicalDevice,
     {
       Chunk *chunk = NULL;
 
+      VkDeviceCreateInfo serialiseCreateInfo = *pCreateInfo;
+
+      // don't serialise out any of the pNext stuff for layer initialisation
+      RemoveNextStruct(&serialiseCreateInfo, VK_STRUCTURE_TYPE_LOADER_DEVICE_CREATE_INFO);
+
       {
         CACHE_THREAD_SERIALISER();
 
         SCOPED_SERIALISE_CHUNK(VulkanChunk::vkCreateDevice);
-        Serialise_vkCreateDevice(ser, physicalDevice, &createInfo, NULL, pDevice);
+        Serialise_vkCreateDevice(ser, physicalDevice, &serialiseCreateInfo, NULL, pDevice);
 
         chunk = scope.Get();
       }
@@ -2719,14 +4338,16 @@ VkResult WrappedVulkan::vkCreateDevice(VkPhysicalDevice physicalDevice,
 
       record->AddChunk(chunk);
 
-      record->memIdxMap = GetRecord(physicalDevice)->memIdxMap;
-
       record->instDevInfo = new InstanceDeviceInfo();
 
       record->instDevInfo->brokenGetDeviceProcAddr =
           GetRecord(m_Instance)->instDevInfo->brokenGetDeviceProcAddr;
 
-      record->instDevInfo->vulkanVersion = GetRecord(m_Instance)->instDevInfo->vulkanVersion;
+      VkPhysicalDeviceProperties physProps;
+      ObjDisp(physicalDevice)->GetPhysicalDeviceProperties(Unwrap(physicalDevice), &physProps);
+
+      record->instDevInfo->vulkanVersion =
+          RDCMIN(physProps.apiVersion, GetRecord(m_Instance)->instDevInfo->vulkanVersion);
 
 #undef CheckExt
 #define CheckExt(name, ver) \
@@ -2749,7 +4370,7 @@ VkResult WrappedVulkan::vkCreateDevice(VkPhysicalDevice physicalDevice,
 #undef CheckExt
 #define CheckExt(name, ver)                                         \
   if(!strcmp(createInfo.ppEnabledExtensionNames[i], "VK_" #name) || \
-     GetRecord(m_Instance)->instDevInfo->vulkanVersion >= ver)      \
+     record->instDevInfo->vulkanVersion >= ver)                     \
   {                                                                 \
     record->instDevInfo->ext_##name = true;                         \
   }
@@ -2758,6 +4379,8 @@ VkResult WrappedVulkan::vkCreateDevice(VkPhysicalDevice physicalDevice,
       {
         CheckDeviceExts();
       }
+
+      m_EnabledExtensions = *record->instDevInfo;
 
       InitDeviceExtensionTables(*pDevice, record->instDevInfo);
     }
@@ -2782,7 +4405,7 @@ VkResult WrappedVulkan::vkCreateDevice(VkPhysicalDevice physicalDevice,
                                           qFamilyIdx};
       vkr = ObjDisp(device)->CreateCommandPool(Unwrap(device), &poolInfo, NULL,
                                                &m_InternalCmds.cmdpool);
-      RDCASSERTEQUAL(vkr, VK_SUCCESS);
+      CheckVkResult(vkr);
 
       GetResourceManager()->WrapResource(Unwrap(device), m_InternalCmds.cmdpool);
     }
@@ -2794,13 +4417,17 @@ VkResult WrappedVulkan::vkCreateDevice(VkPhysicalDevice physicalDevice,
       uint32_t qidx = createInfo.pQueueCreateInfos[i].queueFamilyIndex;
       m_ExternalQueues.resize(RDCMAX((uint32_t)m_ExternalQueues.size(), qidx + 1));
 
+      ImageBarrierSequence::SetMaxQueueFamilyIndex(qidx);
+
       VkCommandPoolCreateInfo poolInfo = {
-          VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, NULL,
-          VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, qidx,
+          VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+          NULL,
+          VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+          qidx,
       };
       vkr = ObjDisp(device)->CreateCommandPool(Unwrap(device), &poolInfo, NULL,
                                                &m_ExternalQueues[qidx].pool);
-      RDCASSERTEQUAL(vkr, VK_SUCCESS);
+      CheckVkResult(vkr);
 
       GetResourceManager()->WrapResource(Unwrap(device), m_ExternalQueues[qidx].pool);
 
@@ -2812,16 +4439,52 @@ VkResult WrappedVulkan::vkCreateDevice(VkPhysicalDevice physicalDevice,
           1,
       };
 
-      vkr = ObjDisp(device)->AllocateCommandBuffers(Unwrap(device), &cmdInfo,
-                                                    &m_ExternalQueues[qidx].buffer);
-      RDCASSERTEQUAL(vkr, VK_SUCCESS);
+      VkFenceCreateInfo fenceInfo = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, NULL,
+                                     VK_FENCE_CREATE_SIGNALED_BIT};
+      VkSemaphoreCreateInfo semInfo = {VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
 
-      if(m_SetDeviceLoaderData)
-        m_SetDeviceLoaderData(device, m_ExternalQueues[qidx].buffer);
-      else
-        SetDispatchTableOverMagicNumber(device, m_ExternalQueues[qidx].buffer);
+      for(size_t x = 0; x < ARRAY_COUNT(m_ExternalQueues[i].ring); x++)
+      {
+        vkr = ObjDisp(device)->AllocateCommandBuffers(Unwrap(device), &cmdInfo,
+                                                      &m_ExternalQueues[qidx].ring[x].acquire);
+        CheckVkResult(vkr);
 
-      GetResourceManager()->WrapResource(Unwrap(device), m_ExternalQueues[qidx].buffer);
+        if(m_SetDeviceLoaderData)
+          m_SetDeviceLoaderData(device, m_ExternalQueues[qidx].ring[x].acquire);
+        else
+          SetDispatchTableOverMagicNumber(device, m_ExternalQueues[qidx].ring[x].acquire);
+
+        GetResourceManager()->WrapResource(Unwrap(device), m_ExternalQueues[qidx].ring[x].acquire);
+
+        vkr = ObjDisp(device)->AllocateCommandBuffers(Unwrap(device), &cmdInfo,
+                                                      &m_ExternalQueues[qidx].ring[x].release);
+        CheckVkResult(vkr);
+
+        if(m_SetDeviceLoaderData)
+          m_SetDeviceLoaderData(device, m_ExternalQueues[qidx].ring[x].release);
+        else
+          SetDispatchTableOverMagicNumber(device, m_ExternalQueues[qidx].ring[x].release);
+
+        GetResourceManager()->WrapResource(Unwrap(device), m_ExternalQueues[qidx].ring[x].release);
+
+        vkr = ObjDisp(device)->CreateSemaphore(Unwrap(device), &semInfo, NULL,
+                                               &m_ExternalQueues[qidx].ring[x].fromext);
+        CheckVkResult(vkr);
+
+        GetResourceManager()->WrapResource(Unwrap(device), m_ExternalQueues[qidx].ring[x].fromext);
+
+        vkr = ObjDisp(device)->CreateSemaphore(Unwrap(device), &semInfo, NULL,
+                                               &m_ExternalQueues[qidx].ring[x].toext);
+        CheckVkResult(vkr);
+
+        GetResourceManager()->WrapResource(Unwrap(device), m_ExternalQueues[qidx].ring[x].toext);
+
+        vkr = ObjDisp(device)->CreateFence(Unwrap(device), &fenceInfo, NULL,
+                                           &m_ExternalQueues[qidx].ring[x].fence);
+        CheckVkResult(vkr);
+
+        GetResourceManager()->WrapResource(Unwrap(device), m_ExternalQueues[qidx].ring[x].fence);
+      }
     }
 
     ObjDisp(physicalDevice)
@@ -2831,26 +4494,31 @@ VkResult WrappedVulkan::vkCreateDevice(VkPhysicalDevice physicalDevice,
         ->GetPhysicalDeviceMemoryProperties(Unwrap(physicalDevice), &m_PhysicalDeviceData.memProps);
 
     ObjDisp(physicalDevice)
-        ->GetPhysicalDeviceFeatures(Unwrap(physicalDevice), &m_PhysicalDeviceData.features);
+        ->GetPhysicalDeviceFeatures(Unwrap(physicalDevice), &m_PhysicalDeviceData.availFeatures);
+    m_PhysicalDeviceData.enabledFeatures = enabledFeatures;
 
-    m_PhysicalDeviceData.driverInfo = VkDriverInfo(m_PhysicalDeviceData.props);
+    GetPhysicalDeviceDriverProperties(ObjDisp(physicalDevice), Unwrap(physicalDevice),
+                                      m_PhysicalDeviceData.driverProps);
 
-    for(int i = VK_FORMAT_BEGIN_RANGE + 1; i < VK_FORMAT_END_RANGE; i++)
-      ObjDisp(physicalDevice)
-          ->GetPhysicalDeviceFormatProperties(Unwrap(physicalDevice), VkFormat(i),
-                                              &m_PhysicalDeviceData.fmtprops[i]);
+    m_PhysicalDeviceData.driverInfo =
+        VkDriverInfo(m_PhysicalDeviceData.props, m_PhysicalDeviceData.driverProps, true);
 
-    m_PhysicalDeviceData.readbackMemIndex =
-        m_PhysicalDeviceData.GetMemoryIndex(~0U, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, 0);
-    m_PhysicalDeviceData.uploadMemIndex =
-        m_PhysicalDeviceData.GetMemoryIndex(~0U, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, 0);
-    m_PhysicalDeviceData.GPULocalMemIndex = m_PhysicalDeviceData.GetMemoryIndex(
-        ~0U, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+    // hack for steamdeck, set soft memory limit to 200MB if it's not specified
+    if(m_PhysicalDeviceData.driverProps.driverID == VK_DRIVER_ID_MESA_RADV &&
+       m_PhysicalDeviceData.props.vendorID == 0x1002 && m_PhysicalDeviceData.props.deviceID == 0x163F)
+    {
+      CaptureOptions opts = RenderDoc::Inst().GetCaptureOptions();
+      if(opts.softMemoryLimit == 0)
+        opts.softMemoryLimit = 200;
+      RenderDoc::Inst().SetCaptureOptions(opts);
+      RDCLOG("Forcing 200MB soft memory limit");
+    }
 
-    m_PhysicalDeviceData.queueCount = qCount;
-    memcpy(m_PhysicalDeviceData.queueProps, props, qCount * sizeof(VkQueueFamilyProperties));
+    ChooseMemoryIndices();
 
-    m_PhysicalDeviceData.fakeMemProps = GetRecord(physicalDevice)->memProps;
+    m_PhysicalDeviceData.queueCount = (uint32_t)queueProps.size();
+    for(size_t i = 0; i < queueProps.size(); i++)
+      m_PhysicalDeviceData.queueProps[i] = queueProps[i];
 
     m_ShaderCache = new VulkanShaderCache(this);
 
@@ -2859,9 +4527,6 @@ VkResult WrappedVulkan::vkCreateDevice(VkPhysicalDevice physicalDevice,
     m_DebugManager = new VulkanDebugManager(this);
   }
 
-  SAFE_DELETE_ARRAY(props);
-  SAFE_DELETE_ARRAY(modQueues);
-
   FirstFrame();
 
   return ret;
@@ -2869,10 +4534,24 @@ VkResult WrappedVulkan::vkCreateDevice(VkPhysicalDevice physicalDevice,
 
 void WrappedVulkan::vkDestroyDevice(VkDevice device, const VkAllocationCallbacks *pAllocator)
 {
+  if(device == VK_NULL_HANDLE)
+    return;
+
+  if(m_MemoryFreeThread)
+  {
+    Threading::JoinThread(m_MemoryFreeThread);
+    Threading::CloseThread(m_MemoryFreeThread);
+    m_MemoryFreeThread = 0;
+  }
+
   // flush out any pending commands/semaphores
   SubmitCmds();
   SubmitSemaphores();
   FlushQ();
+
+  // idle the device as well so that external queues are idle.
+  VkResult vkr = ObjDisp(m_Device)->DeviceWaitIdle(Unwrap(m_Device));
+  CheckVkResult(vkr);
 
   // MULTIDEVICE this function will need to check if the device is the one we
   // used for debugmanager/cmd pool etc, and only remove child queues and
@@ -2909,9 +4588,25 @@ void WrappedVulkan::vkDestroyDevice(VkDevice device, const VkAllocationCallbacks
 
   for(size_t i = 0; i < m_ExternalQueues.size(); i++)
   {
-    if(m_ExternalQueues[i].buffer != VK_NULL_HANDLE)
+    if(m_ExternalQueues[i].pool != VK_NULL_HANDLE)
     {
-      GetResourceManager()->ReleaseWrappedResource(m_ExternalQueues[i].buffer);
+      for(size_t x = 0; x < ARRAY_COUNT(m_ExternalQueues[i].ring); x++)
+      {
+        GetResourceManager()->ReleaseWrappedResource(m_ExternalQueues[i].ring[x].acquire);
+        GetResourceManager()->ReleaseWrappedResource(m_ExternalQueues[i].ring[x].release);
+
+        ObjDisp(m_Device)->DestroySemaphore(Unwrap(m_Device),
+                                            Unwrap(m_ExternalQueues[i].ring[x].fromext), NULL);
+        GetResourceManager()->ReleaseWrappedResource(m_ExternalQueues[i].ring[x].fromext);
+
+        ObjDisp(m_Device)->DestroySemaphore(Unwrap(m_Device),
+                                            Unwrap(m_ExternalQueues[i].ring[x].toext), NULL);
+        GetResourceManager()->ReleaseWrappedResource(m_ExternalQueues[i].ring[x].toext);
+
+        ObjDisp(m_Device)->DestroyFence(Unwrap(m_Device), Unwrap(m_ExternalQueues[i].ring[x].fence),
+                                        NULL);
+        GetResourceManager()->ReleaseWrappedResource(m_ExternalQueues[i].ring[x].fence);
+      }
 
       ObjDisp(m_Device)->DestroyCommandPool(Unwrap(m_Device), Unwrap(m_ExternalQueues[i].pool), NULL);
       GetResourceManager()->ReleaseWrappedResource(m_ExternalQueues[i].pool);
@@ -2922,6 +4617,11 @@ void WrappedVulkan::vkDestroyDevice(VkDevice device, const VkAllocationCallbacks
 
   m_QueueFamilyIdx = ~0U;
   m_PrevQueue = m_Queue = VK_NULL_HANDLE;
+
+  m_QueueFamilies.clear();
+  m_QueueFamilyCounts.clear();
+  m_QueueFamilyIndices.clear();
+  m_ExternalQueues.clear();
 
   // destroy the API device immediately. There should be no more
   // resources left in the resource manager device/physical device/instance.
@@ -2938,7 +4638,7 @@ void WrappedVulkan::vkDestroyDevice(VkDevice device, const VkAllocationCallbacks
 template <typename SerialiserType>
 bool WrappedVulkan::Serialise_vkDeviceWaitIdle(SerialiserType &ser, VkDevice device)
 {
-  SERIALISE_ELEMENT(device);
+  SERIALISE_ELEMENT(device).Important();
 
   SERIALISE_CHECK_READ_ERRORS();
 

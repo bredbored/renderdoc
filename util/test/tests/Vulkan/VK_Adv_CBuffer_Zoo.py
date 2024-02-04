@@ -6,16 +6,11 @@ class VK_Adv_CBuffer_Zoo(rdtest.TestCase):
     demos_test_name = 'VK_Adv_CBuffer_Zoo'
 
     def check_capture(self):
-        draw = self.find_draw("Draw")
+        action = self.find_action("Draw")
 
-        self.check(draw is not None)
+        self.check(action is not None)
 
-        self.controller.SetFrameEvent(draw.eventId, False)
-
-        # Make an output so we can pick pixels
-        out: rd.ReplayOutput = self.controller.CreateOutput(rd.CreateHeadlessWindowingData(100, 100), rd.ReplayOutputType.Texture)
-
-        self.check(out is not None)
+        self.controller.SetFrameEvent(action.eventId, False)
 
         pipe: rd.PipeState = self.controller.GetPipelineState()
 
@@ -24,9 +19,10 @@ class VK_Adv_CBuffer_Zoo(rdtest.TestCase):
         cbuf: rd.BoundCBuffer = pipe.GetConstantBuffer(stage, 0, 0)
 
         var_check = rdtest.ConstantBufferChecker(
-            self.controller.GetCBufferVariableContents(pipe.GetShader(stage),
+            self.controller.GetCBufferVariableContents(pipe.GetGraphicsPipelineObject(),
+                                                       pipe.GetShader(stage), stage,
                                                        pipe.GetShaderEntryPoint(stage), 0,
-                                                       cbuf.resourceId, cbuf.byteOffset))
+                                                       cbuf.resourceId, cbuf.byteOffset, cbuf.byteSize))
 
         # For more detailed reference for the below checks, see the commented definition of the cbuffer
         # in the shader source code in the demo itself
@@ -226,19 +222,6 @@ class VK_Adv_CBuffer_Zoo(rdtest.TestCase):
 
         rdtest.log.success("CBuffer variables are as expected")
 
-        tex = rd.TextureDisplay()
-        tex.resourceId = pipe.GetOutputTargets()[0].resourceId
-        out.SetTextureDisplay(tex)
-
-        texdetails = self.get_texture(tex.resourceId)
-
-        picked: rd.PixelValue = out.PickPixel(tex.resourceId, False,
-                                              int(texdetails.width / 2), int(texdetails.height / 2), 0, 0, 0)
-
-        # We just output green from the shader when the value is as expected
-        if not rdtest.value_compare(picked.floatValue, [0.0, 1.0, 0.0, 0.0]):
-            raise rdtest.TestFailureException("Picked value {} doesn't match expectation".format(picked.floatValue))
+        self.check_pixel_value(pipe.GetOutputTargets()[0].resourceId, 0.5, 0.5, [0.0, 1.0, 0.0, 0.0])
 
         rdtest.log.success("Picked value is as expected")
-
-        out.Shutdown()

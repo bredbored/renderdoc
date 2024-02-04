@@ -52,7 +52,7 @@ The following libraries and components are incorporated into RenderDoc, listed h
 
   Used for parsing command line arguments to renderdoccmd.
 
-* `include-bin <https://github.com/tanakh/cmdline>`_ - Copyright 2016 Hubert Jarosz, distributed under the zlib license.
+* `include-bin <https://github.com/Marqin/include-bin>`_ - Copyright 2016 Eveline Jarosz, distributed under the zlib license.
 
   Used to compile in data files embedded into the source on non-Windows platforms.
 
@@ -108,6 +108,34 @@ The following libraries and components are incorporated into RenderDoc, listed h
 
   Used to recover debug information from DXBC shaders on D3D11/D3D12.
 
+* `Compressonator <https://github.com/GPUOpen-Tools/compressonator/>`_ - Copyright (c) 2018 Advanced Micro Devices, Inc. Copyright (c) 2004-2006 ATI Technologies Inc. Distributed under the MIT License.
+
+  Used to provide shell thumbnail previews for block compressed DDS files.
+
+* `nvapi open source SDK <http://download.nvidia.com/XFree86/nvapi-open-source-sdk/>`_ - Copyright (c) 2019, NVIDIA CORPORATION. Distributed under the MIT License.
+
+  Used to intercept nvapi calls on D3D11/D3D12.
+
+* `half.hpp <http://half.sourceforge.net/>`_ - Copyright (c) 2012-2019 Christian Rau. Distributed under the MIT License.
+
+  Used to emulate half-precision operations in shader debugging.
+
+* `Superluminal <https://superluminal.eu/>`_ - Copyright (c) 2019-2020 Superluminal. Distributed under the BSD License.
+
+  Used to emit profiling events in development builds.
+
+* `AGS <https://github.com/GPUOpen-LibrariesAndSDKs/AGS_SDK/>`_ - Copyright (c) 2020 Advanced Micro Devices, Inc. Distributed under the MIT License.
+
+  Used to intercept and test AGS calls on D3D11/D3D12.
+
+* `md5 hashing <http://openwall.info/wiki/people/solar/software/public-domain-source-code/md5>`_ - Released to the Public Domain by Alexander Peslyak.
+
+  Used for calculating DXBC container hash.
+
+* `NVIDIA Nsight Perf SDK <https://developer.nvidia.com/nsight-perf-sdk>`_ - Redistributable portions distributed under the NVIDIA Nsight Perf SDK license available in the RenderDoc source repository or in the SDK.
+
+  Provides hardware-specific counters over and above what individual hardware-agnostic graphics APIs are able to provide.
+
 Thanks
 ------
 
@@ -162,6 +190,13 @@ There have been many people who have helped in the creation of RenderDoc. Whethe
 * Benson Joeris
 * Haiyu Zhen
 * Alex Kharlamov
+* Steve Karolewics
+* Kevin McCullough
+* Ting Cai
+* Zi Ming He
+* Orson Baines
+* John Kattukudiyil
+* Tony Tascioglu
 
 Contributors
 ------------
@@ -174,3 +209,6 @@ The following list highlights notable open source contributions. Many other peop
 * Adrian Bucur - Added custom SPIR-V disassembler support.
 * James Fulop - Updated the vertex picking algorithm.
 * Balazs Torok - Implemented the RenderDoc in-application overlay for D3D9.
+* Steve Karolewics - Implemented DXBC shader debugging support for D3D12.
+* Aliya Pazylbekova - Implemented pixel history support for Vulkan.
+* Orson Baines, Zi Ming He, John Kattukudiyil, Ting Cai, Tony Tascioglu - Implemented pixel history support for OpenGL.

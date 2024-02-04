@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -24,7 +24,7 @@
 
 #include "gl_test.h"
 
-TEST(GL_SPIRV_Shader, OpenGLGraphicsTest)
+RD_TEST(GL_SPIRV_Shader, OpenGLGraphicsTest)
 {
   static constexpr const char *Description = "Draws using a SPIR-V shader pipeline.";
 
@@ -71,6 +71,18 @@ void main()
 }
 
 )EOSHADER";
+  void Prepare(int argc, char **argv)
+  {
+    OpenGLGraphicsTest::Prepare(argc, argv);
+
+    if(!Avail.empty())
+      return;
+
+    if(!SpvCompilationSupported())
+      Avail = InternalSpvCompiler() ? "Internal SPIR-V compiler did not initialise"
+                                    : "Couldn't find 'glslc' or 'glslangValidator' in PATH - "
+                                      "required for SPIR-V compilation";
+  }
 
   int main()
   {
@@ -79,12 +91,6 @@ void main()
     // initialise, create window, create context, etc
     if(!Init())
       return 3;
-
-    if(!SpvCompilationSupported())
-    {
-      TEST_ERROR("Can't run SPIR-V test without glslc in PATH");
-      return 2;
-    }
 
     GLuint vao = MakeVAO();
     glBindVertexArray(vao);
@@ -109,13 +115,25 @@ void main()
 
     uint32_t pixels[] = {
         // row 0
-        0xff0e1f00, 0xfff0b207, 0xff02ff00, 0xff03ff00,
+        0xff0e1f00,
+        0xfff0b207,
+        0xff02ff00,
+        0xff03ff00,
         // row 1
-        0xff090f00, 0xff081eb0, 0xff010005, 0xff905f00,
+        0xff090f00,
+        0xff081eb0,
+        0xff010005,
+        0xff905f00,
         // row 2
-        0xff502f03, 0xff004550, 0xff1020a0, 0xff120000,
+        0xff502f03,
+        0xff004550,
+        0xff1020a0,
+        0xff120000,
         // row 3
-        0xff0d3f00, 0xff6091d0, 0xff304ff0, 0xff800000,
+        0xff0d3f00,
+        0xff6091d0,
+        0xff304ff0,
+        0xff800000,
     };
 
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 4, 4, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
@@ -218,7 +236,7 @@ void main()
 
     while(Running())
     {
-      float col[] = {0.4f, 0.5f, 0.6f, 1.0f};
+      float col[] = {0.2f, 0.2f, 0.2f, 1.0f};
       glClearBufferfv(GL_COLOR, 0, col);
 
       GLsizei w = GLsizei(screenWidth) >> 1;

@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2016-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -26,13 +26,15 @@
 #include <QMenu>
 #include <QMouseEvent>
 #include <QPainter>
+#include <QStylePainter>
 #include <QSvgRenderer>
 #include <QToolButton>
 #include <QXmlStreamWriter>
-#include "3rdparty/toolwindowmanager/ToolWindowManager.h"
 #include "Code/QRDUtils.h"
 #include "Code/Resources.h"
 #include "Widgets/Extended/RDLabel.h"
+#include "Widgets/Extended/RDTreeWidget.h"
+#include "toolwindowmanager/ToolWindowManager.h"
 #include "D3D11PipelineStateViewer.h"
 #include "D3D12PipelineStateViewer.h"
 #include "GLPipelineStateViewer.h"
@@ -79,36 +81,121 @@ static uint32_t byteSize(const ResourceFormat &fmt)
   return fmt.compByteWidth * fmt.compCount;
 }
 
-static QString padding(uint32_t bytes)
+RDPreviewTooltip::RDPreviewTooltip(PipelineStateViewer *parent, CustomPaintWidget *thumbnail,
+                                   ICaptureContext &ctx)
+    : QFrame(parent), m_Ctx(ctx)
 {
-  if(bytes == 0)
-    return QString();
+  int margin = style()->pixelMetric(QStyle::PM_ToolTipLabelFrameWidth, NULL, this);
+  int opacity = style()->styleHint(QStyle::SH_ToolTipLabel_Opacity, NULL, this);
 
-  QString ret;
+  pipe = parent;
 
-  if(bytes > 4)
+  setWindowFlags(Qt::ToolTip | Qt::WindowStaysOnTopHint);
+  setAttribute(Qt::WA_TransparentForMouseEvents);
+  setForegroundRole(QPalette::ToolTipText);
+  setBackgroundRole(QPalette::ToolTipBase);
+  setFrameStyle(QFrame::NoFrame);
+  setWindowOpacity(opacity / 255.0);
+  setSizePolicy(QSizePolicy::Minimum, QSizePolicy::Minimum);
+
+  QHBoxLayout *hbox = new QHBoxLayout;
+  QVBoxLayout *vbox = new QVBoxLayout;
+  hbox->setSpacing(0);
+  hbox->setContentsMargins(0, 0, 0, 0);
+  vbox->setSpacing(2);
+  vbox->setContentsMargins(6, 3, 6, 3);
+
+  label = new QLabel(this);
+  label->setAlignment(Qt::AlignLeft);
+
+  title = new QLabel(this);
+  title->setAlignment(Qt::AlignLeft);
+
+  setLayout(vbox);
+  vbox->addWidget(title);
+  vbox->addLayout(hbox);
+
+  hbox->addWidget(thumbnail);
+  hbox->addStretch();
+
+  vbox->addWidget(label);
+}
+
+void RDPreviewTooltip::hideTip()
+{
+  hide();
+}
+
+QSize RDPreviewTooltip::configureTip(QWidget *widget, QModelIndex idx, QString text)
+{
+  ResourceId id = pipe->updateThumbnail(widget, idx);
+  if(id != ResourceId())
   {
-    ret += lit("xint pad[%1];").arg(bytes / 4);
-
-    bytes = bytes % 4;
+    title->setText(m_Ctx.GetResourceName(id));
+    title->show();
   }
+  else
+  {
+    title->hide();
+  }
+  label->setText(text);
+  label->setVisible(!text.isEmpty());
+  layout()->update();
+  layout()->activate();
+  return minimumSizeHint();
+}
 
-  if(bytes == 4)
-    ret += lit("xint pad;");
-  else if(bytes == 3)
-    ret += lit("xshort pad; xbyte pad;");
-  else if(bytes == 2)
-    ret += lit("xshort pad;");
-  else if(bytes == 1)
-    ret += lit("xbyte pad;");
+void RDPreviewTooltip::showTip(QPoint pos)
+{
+  move(pos);
+  resize(minimumSize());
+  show();
+}
 
-  return ret + lit("\n");
+bool RDPreviewTooltip::forceTip(QWidget *widget, QModelIndex idx)
+{
+  return pipe->hasThumbnail(widget, idx);
+}
+
+void RDPreviewTooltip::paintEvent(QPaintEvent *ev)
+{
+  QStylePainter p(this);
+  QStyleOptionFrame opt;
+  opt.init(this);
+  p.drawPrimitive(QStyle::PE_PanelTipLabel, opt);
+  p.end();
+
+  QWidget::paintEvent(ev);
+}
+
+void RDPreviewTooltip::resizeEvent(QResizeEvent *e)
+{
+  QStyleHintReturnMask frameMask;
+  QStyleOption option;
+  option.init(this);
+  if(style()->styleHint(QStyle::SH_ToolTip_Mask, &option, this, &frameMask))
+    setMask(frameMask.region);
+
+  QWidget::resizeEvent(e);
 }
 
 PipelineStateViewer::PipelineStateViewer(ICaptureContext &ctx, QWidget *parent)
     : QFrame(parent), ui(new Ui::PipelineStateViewer), m_Ctx(ctx)
 {
   ui->setupUi(this);
+
+  ui->thumbnail->SetContext(m_Ctx);
+  ui->layout->removeWidget(ui->thumbnail);
+
+  m_Tooltip = new RDPreviewTooltip(this, ui->thumbnail, m_Ctx);
+
+  QColor c = palette().color(QPalette::ToolTipBase).toRgb();
+
+  m_TexDisplay.backgroundColor = FloatVector();
+  m_TexDisplay.backgroundColor.w = 1.0f;
+
+  // auto-fit and center scale
+  m_TexDisplay.scale = -1.0f;
 
   m_D3D11 = NULL;
   m_D3D12 = NULL;
@@ -120,8 +207,6 @@ PipelineStateViewer::PipelineStateViewer(ICaptureContext &ctx, QWidget *parent)
   for(size_t i = 0; i < ARRAY_COUNT(editMenus); i++)
     editMenus[i] = new QMenu(this);
 
-  setToD3D11();
-
   m_Ctx.AddCaptureViewer(this);
 }
 
@@ -131,6 +216,8 @@ PipelineStateViewer::~PipelineStateViewer()
 
   m_Ctx.BuiltinWindowClosed(this);
   m_Ctx.RemoveCaptureViewer(this);
+
+  delete m_Tooltip;
 
   delete ui;
 }
@@ -148,6 +235,33 @@ void PipelineStateViewer::OnCaptureLoaded()
 
   if(m_Current)
     m_Current->OnCaptureLoaded();
+
+  if(!m_Ctx.APIProps().remoteReplay)
+  {
+    WindowingData thumbData = ui->thumbnail->GetWidgetWindowingData();
+
+    m_Ctx.Replay().BlockInvoke([thumbData, this](IReplayController *r) {
+      m_Output = r->CreateOutput(thumbData, ReplayOutputType::Texture);
+
+      ui->thumbnail->SetOutput(m_Output);
+
+      RT_UpdateAndDisplay(r);
+    });
+  }
+  else
+  {
+    m_Output = NULL;
+  }
+}
+
+void PipelineStateViewer::RT_UpdateAndDisplay(IReplayController *r)
+{
+  if(m_Output != NULL)
+  {
+    m_Output->SetTextureDisplay(m_TexDisplay);
+
+    GUIInvoke::call(this, [this]() { ui->thumbnail->update(); });
+  }
 }
 
 void PipelineStateViewer::OnCaptureClosed()
@@ -158,6 +272,8 @@ void PipelineStateViewer::OnCaptureClosed()
 
 void PipelineStateViewer::OnEventChanged(uint32_t eventId)
 {
+  RENDERDOC_PROFILEFUNCTION();
+
   if(m_Ctx.APIProps().pipelineType == GraphicsAPI::D3D11)
     setToD3D11();
   else if(m_Ctx.APIProps().pipelineType == GraphicsAPI::D3D12)
@@ -369,24 +485,30 @@ div.stage table tr td { border-right: 1px solid #AAAAAA; background-color: #EEEE
 
           xml.writeStartElement(lit("h3"));
           {
-            QString context = tr("Frame %1").arg(m_Ctx.FrameInfo().frameNumber);
+            uint32_t frameNumber = m_Ctx.FrameInfo().frameNumber;
 
-            const DrawcallDescription *draw = m_Ctx.CurDrawcall();
+            QString context = frameNumber == ~0U ? tr("Capture") : tr("Frame %1").arg(frameNumber);
 
-            QList<const DrawcallDescription *> drawstack;
-            const DrawcallDescription *parent = draw->parent;
+            const ActionDescription *action = m_Ctx.CurAction();
+
+            QList<const ActionDescription *> actionstack;
+            const ActionDescription *parent = action ? action->parent : NULL;
             while(parent)
             {
-              drawstack.push_front(parent);
+              actionstack.push_front(parent);
               parent = parent->parent;
             }
 
-            for(const DrawcallDescription *d : drawstack)
+            for(const ActionDescription *d : actionstack)
             {
-              context += QFormatStr(" > %1").arg(d->name);
+              context += QFormatStr(" > %1").arg(d->customName);
             }
 
-            context += QFormatStr(" => %1").arg(draw->name);
+            if(action)
+              context +=
+                  QFormatStr(" => %1").arg(m_Ctx.GetEventBrowser()->GetEventName(action->eventId));
+            else
+              context += tr(" => Capture Start");
 
             xml.writeCharacters(context);
           }
@@ -615,255 +737,15 @@ void PipelineStateViewer::setMeshViewPixmap(RDLabel *meshView)
   });
 }
 
-QString PipelineStateViewer::declareStruct(QList<QString> &declaredStructs, const QString &name,
-                                           const rdcarray<ShaderConstant> &members,
-                                           uint32_t requiredByteStride)
-{
-  QString ret;
-
-  ret = lit("struct %1\n{\n").arg(name);
-
-  for(int i = 0; i < members.count(); i++)
-  {
-    QString arraySize;
-    if(members[i].type.descriptor.elements > 1)
-      arraySize = QFormatStr("[%1]").arg(members[i].type.descriptor.elements);
-
-    QString varTypeName = members[i].type.descriptor.name;
-
-    if(!members[i].type.members.isEmpty())
-    {
-      // GL structs don't give us typenames (boo!) so give them unique names. This will mean some
-      // structs get duplicated if they're used in multiple places, but not much we can do about
-      // that.
-      if(varTypeName.isEmpty() || varTypeName == lit("struct"))
-        varTypeName = lit("anon%1").arg(declaredStructs.size());
-
-      if(!declaredStructs.contains(varTypeName))
-      {
-        declaredStructs.push_back(varTypeName);
-        ret = declareStruct(declaredStructs, varTypeName, members[i].type.members,
-                            members[i].type.descriptor.arrayByteStride) +
-              lit("\n") + ret;
-      }
-    }
-
-    ret += QFormatStr("    %1 %2%3;\n").arg(varTypeName).arg(members[i].name).arg(arraySize);
-  }
-
-  if(requiredByteStride > 0)
-  {
-    uint32_t structStart = 0;
-
-    const ShaderConstant *lastChild = &members.back();
-
-    structStart += lastChild->byteOffset;
-    while(!lastChild->type.members.isEmpty())
-    {
-      lastChild = &lastChild->type.members.back();
-      structStart += lastChild->byteOffset;
-    }
-
-    uint32_t size = lastChild->type.descriptor.rows * lastChild->type.descriptor.columns;
-    if(lastChild->type.descriptor.type == VarType::Double ||
-       lastChild->type.descriptor.type == VarType::ULong ||
-       lastChild->type.descriptor.type == VarType::SLong)
-      size *= 8;
-    else if(lastChild->type.descriptor.type == VarType::Float ||
-            lastChild->type.descriptor.type == VarType::UInt ||
-            lastChild->type.descriptor.type == VarType::SInt)
-      size *= 4;
-    else if(lastChild->type.descriptor.type == VarType::Half ||
-            lastChild->type.descriptor.type == VarType::UShort ||
-            lastChild->type.descriptor.type == VarType::SShort)
-      size *= 2;
-
-    if(lastChild->type.descriptor.elements > 1)
-      size *= lastChild->type.descriptor.elements;
-
-    uint32_t padBytes = requiredByteStride - (lastChild->byteOffset + size);
-
-    if(padBytes > 0)
-      ret += lit("    ") + padding(padBytes);
-  }
-
-  ret += lit("}\n");
-
-  return ret;
-}
-
-QString PipelineStateViewer::GenerateBufferFormatter(const ShaderResource &res,
-                                                     const ResourceFormat &viewFormat,
-                                                     uint64_t &baseByteOffset)
-{
-  QString format;
-
-  if(!res.variableType.members.empty())
-  {
-    if(m_Ctx.APIProps().pipelineType == GraphicsAPI::Vulkan ||
-       m_Ctx.APIProps().pipelineType == GraphicsAPI::OpenGL)
-    {
-      const rdcarray<ShaderConstant> &members = res.variableType.members;
-
-      format += QFormatStr("struct %1\n{\n").arg(res.name);
-
-      // GL/Vulkan allow fixed-sized members before the array-of-structs. This can't be
-      // represented in a buffer format so we skip it
-      if(members.count() > 1)
-      {
-        format += tr("    // members skipped as they are fixed size:\n");
-        baseByteOffset += members.back().byteOffset;
-      }
-
-      QString varTypeName;
-      QString comment = lit("// ");
-      for(int i = 0; i < members.count(); i++)
-      {
-        QString arraySize;
-        if(members[i].type.descriptor.elements > 1)
-          arraySize = QFormatStr("[%1]").arg(members[i].type.descriptor.elements);
-
-        varTypeName = members[i].type.descriptor.name;
-
-        if(i + 1 == members.count())
-        {
-          comment = arraySize = QString();
-
-          if(members.count() > 1)
-            format +=
-                lit("    // final array struct @ byte offset %1\n").arg(members.back().byteOffset);
-
-          // give GL nameless structs a better name
-          if(varTypeName.isEmpty() || varTypeName == lit("struct"))
-            varTypeName = lit("root_struct");
-        }
-
-        format +=
-            QFormatStr("    %1%2 %3%4;\n").arg(comment).arg(varTypeName).arg(members[i].name).arg(arraySize);
-      }
-
-      format += lit("}");
-
-      // if the last member is a struct, declare it
-      if(!members.back().type.members.isEmpty())
-      {
-        QList<QString> declaredStructs;
-        format = declareStruct(declaredStructs, varTypeName, members.back().type.members,
-                               members.back().type.descriptor.arrayByteStride) +
-                 lit("\n") + format;
-      }
-    }
-    else
-    {
-      QList<QString> declaredStructs;
-      format = declareStruct(declaredStructs, res.variableType.descriptor.name,
-                             res.variableType.members, 0);
-    }
-  }
-  else
-  {
-    const auto &desc = res.variableType.descriptor;
-
-    if(viewFormat.type == ResourceFormatType::Undefined)
-    {
-      if(desc.type == VarType::Unknown)
-      {
-        format = desc.name;
-      }
-      else
-      {
-        if(desc.rowMajorStorage)
-          format += lit("row_major ");
-
-        format += ToQStr(desc.type);
-        if(desc.rows > 1 && desc.columns > 1)
-          format += QFormatStr("%1x%2").arg(desc.rows).arg(desc.columns);
-        else if(desc.columns > 1)
-          format += QString::number(desc.columns);
-
-        if(!desc.name.empty())
-          format += lit(" ") + desc.name;
-
-        if(desc.elements > 1)
-          format += QFormatStr("[%1]").arg(desc.elements);
-      }
-    }
-    else
-    {
-      if(viewFormat.type == ResourceFormatType::R10G10B10A2)
-      {
-        if(viewFormat.compType == CompType::UInt)
-          format = lit("uintten");
-        if(viewFormat.compType == CompType::UNorm)
-          format = lit("unormten");
-      }
-      else if(viewFormat.type == ResourceFormatType::R11G11B10)
-      {
-        format = lit("floateleven");
-      }
-      else
-      {
-        switch(viewFormat.compByteWidth)
-        {
-          case 1:
-          {
-            if(viewFormat.compType == CompType::UNorm || viewFormat.compType == CompType::UNormSRGB)
-              format = lit("unormb");
-            if(viewFormat.compType == CompType::SNorm)
-              format = lit("snormb");
-            if(viewFormat.compType == CompType::UInt)
-              format = lit("ubyte");
-            if(viewFormat.compType == CompType::SInt)
-              format = lit("byte");
-            break;
-          }
-          case 2:
-          {
-            if(viewFormat.compType == CompType::UNorm || viewFormat.compType == CompType::UNormSRGB)
-              format = lit("unormh");
-            if(viewFormat.compType == CompType::SNorm)
-              format = lit("snormh");
-            if(viewFormat.compType == CompType::UInt)
-              format = lit("ushort");
-            if(viewFormat.compType == CompType::SInt)
-              format = lit("short");
-            if(viewFormat.compType == CompType::Float)
-              format = lit("half");
-            break;
-          }
-          case 4:
-          {
-            if(viewFormat.compType == CompType::UNorm || viewFormat.compType == CompType::UNormSRGB)
-              format = lit("unormf");
-            if(viewFormat.compType == CompType::SNorm)
-              format = lit("snormf");
-            if(viewFormat.compType == CompType::UInt)
-              format = lit("uint");
-            if(viewFormat.compType == CompType::SInt)
-              format = lit("int");
-            if(viewFormat.compType == CompType::Float)
-              format = lit("float");
-            break;
-          }
-        }
-
-        format += QString::number(viewFormat.compCount);
-      }
-    }
-  }
-
-  return format;
-}
-
 void PipelineStateViewer::MakeShaderVariablesHLSL(bool cbufferContents,
                                                   const rdcarray<ShaderConstant> &vars,
                                                   QString &struct_contents, QString &struct_defs)
 {
   for(const ShaderConstant &v : vars)
   {
-    if(!v.type.members.isEmpty())
+    if(v.type.baseType == VarType::Struct)
     {
-      QString def = lit("struct %1 {\n").arg(v.type.descriptor.name);
+      QString def = lit("struct %1 {\n").arg(v.type.name);
 
       if(!struct_defs.contains(def))
       {
@@ -874,7 +756,14 @@ void PipelineStateViewer::MakeShaderVariablesHLSL(bool cbufferContents,
       }
     }
 
-    struct_contents += lit("\t%1 %2").arg(v.type.descriptor.name).arg(v.name);
+    if(v.type.elements > 1)
+    {
+      struct_contents += lit("\t%1 %2[%3]").arg(v.type.name).arg(v.name).arg(v.type.elements);
+    }
+    else
+    {
+      struct_contents += lit("\t%1 %2").arg(v.type.name).arg(v.name);
+    }
 
     if((v.byteOffset % 4) != 0)
       qWarning() << "Variable " << QString(v.name) << " is not DWORD aligned";
@@ -901,32 +790,79 @@ void PipelineStateViewer::MakeShaderVariablesHLSL(bool cbufferContents,
   }
 }
 
-QString PipelineStateViewer::GenerateHLSLStub(const ShaderReflection *shaderDetails,
+void PipelineStateViewer::showEvent(QShowEvent *event)
+{
+  // we didn't set any default pipeline state in case it would be overridden by the persist data.
+  // But if we don't have any persist data and we're about to show, default to D3D11.
+  if(m_Current == NULL)
+  {
+    setToD3D11();
+  }
+}
+
+void PipelineStateViewer::SetStencilLabelValue(QLabel *label, uint8_t value)
+{
+  label->setText(Formatter::Format(value, true));
+  label->setToolTip(tr("%1 / 0x%2 / 0b%3")
+                        .arg(value, 3, 10, QLatin1Char(' '))
+                        .arg(Formatter::Format(value, true))
+                        .arg(value, 8, 2, QLatin1Char('0')));
+}
+
+void PipelineStateViewer::SetStencilTreeItemValue(RDTreeWidgetItem *item, int column, uint8_t value)
+{
+  item->setText(column, Formatter::Format(value, true));
+  item->setToolTip(column, tr("%1 / 0x%2 / 0b%3")
+                               .arg(value, 3, 10, QLatin1Char(' '))
+                               .arg(Formatter::Format(value, true))
+                               .arg(value, 8, 2, QLatin1Char('0')));
+}
+
+QString PipelineStateViewer::GenerateHLSLStub(const ShaderBindpointMapping &bindpointMapping,
+                                              const ShaderReflection *shaderDetails,
                                               const QString &entryFunc)
 {
   QString hlsl = lit("// HLSL function stub generated\n\n");
 
-  const QString textureDim[ENUM_ARRAY_SIZE(TextureType)] = {
+  const QString textureDim[arraydim<TextureType>()] = {
       lit("Unknown"),          lit("Buffer"),      lit("Texture1D"),      lit("Texture1DArray"),
       lit("Texture2D"),        lit("TextureRect"), lit("Texture2DArray"), lit("Texture2DMS"),
       lit("Texture2DMSArray"), lit("Texture3D"),   lit("TextureCube"),    lit("TextureCubeArray"),
   };
 
+  // use bindpoint mapping
+
   for(const ShaderSampler &samp : shaderDetails->samplers)
   {
-    hlsl += lit("//SamplerComparisonState %1 : register(s%2); // can't disambiguate\n"
-                "SamplerState %1 : register(s%2); // can't disambiguate\n")
+    uint32_t reg = ~0U;
+
+    if(samp.bindPoint < bindpointMapping.samplers.count())
+      reg = bindpointMapping.samplers[samp.bindPoint].bind;
+    else
+      hlsl += lit("//");
+
+    hlsl += lit("SamplerState %1 : register(s%2); // can't disambiguate\n"
+                "//SamplerComparisonState %1 : register(s%2); // can't disambiguate\n")
                 .arg(samp.name)
-                .arg(samp.bindPoint);
+                .arg(reg);
   }
 
   for(int i = 0; i < 2; i++)
   {
+    const rdcarray<Bindpoint> &binds =
+        (i == 0 ? bindpointMapping.readOnlyResources : bindpointMapping.readWriteResources);
     const rdcarray<ShaderResource> &resources =
         (i == 0 ? shaderDetails->readOnlyResources : shaderDetails->readWriteResources);
     for(const ShaderResource &res : resources)
     {
       char regChar = 't';
+
+      uint32_t reg = ~0U;
+
+      if(res.bindPoint < binds.count())
+        reg = binds[res.bindPoint].bind;
+      else
+        hlsl += lit("//");
 
       if(i == 1)
       {
@@ -938,21 +874,21 @@ QString PipelineStateViewer::GenerateHLSLStub(const ShaderReflection *shaderDeta
       {
         hlsl += lit("%1<%2> %3 : register(%4%5);\n")
                     .arg(textureDim[(size_t)res.resType])
-                    .arg(res.variableType.descriptor.name)
+                    .arg(res.variableType.name)
                     .arg(res.name)
                     .arg(QLatin1Char(regChar))
-                    .arg(res.bindPoint);
+                    .arg(reg);
       }
       else
       {
-        if(res.variableType.descriptor.rows > 1)
+        if(res.variableType.rows > 1)
           hlsl += lit("Structured");
 
         hlsl += lit("Buffer<%1> %2 : register(%3%4);\n")
-                    .arg(res.variableType.descriptor.name)
+                    .arg(res.variableType.name)
                     .arg(res.name)
                     .arg(QLatin1Char(regChar))
-                    .arg(res.bindPoint);
+                    .arg(reg);
       }
     }
   }
@@ -966,12 +902,22 @@ QString PipelineStateViewer::GenerateHLSLStub(const ShaderReflection *shaderDeta
   {
     if(!cbuf.name.isEmpty() && !cbuf.variables.isEmpty())
     {
+      uint32_t reg = ~0U;
+
+      if(cbuf.bindPoint < bindpointMapping.constantBlocks.count())
+        reg = bindpointMapping.constantBlocks[cbuf.bindPoint].bind;
+      else
+        hlsl += lit("/*\n");
+
       QString cbufName = cbuf.name;
       if(cbufName == lit("$Globals"))
         cbufName = lit("_Globals");
-      cbuffers += lit("cbuffer %1 : register(b%2) {\n").arg(cbufName).arg(cbuf.bindPoint);
+      cbuffers += lit("cbuffer %1 : register(b%2) {\n").arg(cbufName).arg(reg);
       MakeShaderVariablesHLSL(true, cbuf.variables, cbuffers, hlsl);
       cbuffers += lit("};\n\n");
+
+      if(reg == ~0U)
+        hlsl += lit("*/\n");
     }
     cbufIdx++;
   }
@@ -982,18 +928,27 @@ QString PipelineStateViewer::GenerateHLSLStub(const ShaderReflection *shaderDeta
 
   hlsl += lit("struct InputStruct {\n");
   for(const SigParameter &sig : shaderDetails->inputSignature)
-    hlsl += lit("\t%1 %2 : %3;\n")
-                .arg(TypeString(sig))
-                .arg(!sig.varName.isEmpty() ? QString(sig.varName) : lit("param%1").arg(sig.regIndex))
-                .arg(D3DSemanticString(sig));
+  {
+    QString name = !sig.varName.isEmpty() ? QString(sig.varName) : lit("param%1").arg(sig.regIndex);
+
+    if(sig.varName.isEmpty() && sig.systemValue != ShaderBuiltin::Undefined)
+      name = D3DSemanticString(sig).replace(lit("SV_"), QString());
+
+    hlsl += lit("\t%1 %2 : %3;\n").arg(TypeString(sig)).arg(name).arg(D3DSemanticString(sig));
+  }
   hlsl += lit("};\n\n");
 
   hlsl += lit("struct OutputStruct {\n");
   for(const SigParameter &sig : shaderDetails->outputSignature)
-    hlsl += lit("\t%1 %2 : %3;\n")
-                .arg(TypeString(sig))
-                .arg(!sig.varName.isEmpty() ? QString(sig.varName) : lit("param%1").arg(sig.regIndex))
-                .arg(D3DSemanticString(sig));
+  {
+    QString name = !sig.varName.isEmpty() ? QString(sig.varName) : lit("param%1").arg(sig.regIndex);
+
+    if(sig.varName.isEmpty() && sig.systemValue != ShaderBuiltin::Undefined)
+      name = D3DSemanticString(sig).replace(lit("SV_"), QString());
+
+    hlsl += lit("\t%1 %2 : %3;\n").arg(TypeString(sig)).arg(name).arg(D3DSemanticString(sig));
+  }
+
   hlsl += lit("};\n\n");
 
   hlsl += lit("OutputStruct %1(in InputStruct IN)\n"
@@ -1023,53 +978,12 @@ void PipelineStateViewer::shaderEdit_clicked()
 
 IShaderViewer *PipelineStateViewer::EditShader(ResourceId id, ShaderStage shaderType,
                                                const rdcstr &entry, ShaderCompileFlags compileFlags,
-                                               ShaderEncoding encoding, const rdcstrpairs &files)
+                                               KnownShaderTool knownTool,
+                                               ShaderEncoding shaderEncoding,
+                                               const rdcstrpairs &files)
 {
-  auto saveCallback = [shaderType, id](ICaptureContext *ctx, IShaderViewer *viewer,
-                                       ShaderEncoding shaderEncoding, ShaderCompileFlags flags,
-                                       rdcstr entryFunc, bytebuf shaderBytes) {
-    if(shaderBytes.isEmpty())
-      return;
-
-    ANALYTIC_SET(UIFeatures.ShaderEditing, true);
-
-    // invoke off to the ReplayController to replace the capture's shader
-    // with our edited one
-    ctx->Replay().AsyncInvoke([ctx, entryFunc, shaderBytes, shaderEncoding, flags, shaderType, id,
-                               viewer](IReplayController *r) {
-      rdcstr errs;
-
-      ResourceId from = id;
-      ResourceId to;
-
-      rdctie(to, errs) =
-          r->BuildTargetShader(entryFunc.c_str(), shaderEncoding, shaderBytes, flags, shaderType);
-
-      GUIInvoke::call(viewer->Widget(), [viewer, errs]() { viewer->ShowErrors(errs); });
-      if(to == ResourceId())
-      {
-        r->RemoveReplacement(from);
-        GUIInvoke::call(viewer->Widget(), [ctx]() { ctx->RefreshStatus(); });
-      }
-      else
-      {
-        r->ReplaceResource(from, to);
-        GUIInvoke::call(viewer->Widget(), [ctx]() { ctx->RefreshStatus(); });
-      }
-    });
-  };
-
-  auto closeCallback = [id](ICaptureContext *ctx) {
-    // remove the replacement on close (we could make this more sophisticated if there
-    // was a place to control replaced resources/shaders).
-    ctx->Replay().AsyncInvoke([ctx, id](IReplayController *r) {
-      r->RemoveReplacement(id);
-      GUIInvoke::call(ctx->GetMainWindow()->Widget(), [ctx] { ctx->RefreshStatus(); });
-    });
-  };
-
-  IShaderViewer *sv = m_Ctx.EditShader(false, shaderType, entry, files, encoding, compileFlags,
-                                       saveCallback, closeCallback);
+  IShaderViewer *sv = m_Ctx.EditShader(id, shaderType, entry, files, knownTool, shaderEncoding,
+                                       compileFlags, NULL, NULL);
 
   m_Ctx.AddDockWindow(sv->Widget(), DockReference::AddTo, this);
 
@@ -1082,8 +996,22 @@ IShaderViewer *PipelineStateViewer::EditOriginalShaderSource(ResourceId id,
   QSet<uint> uniqueFiles;
   rdcstrpairs files;
 
-  for(const ShaderSourceFile &s : shaderDetails->debugInfo.files)
+  // add the entry point file first, if we have one
+  const int entryFile = shaderDetails->debugInfo.editBaseFile;
+
+  for(int i = -1; i < shaderDetails->debugInfo.files.count(); i++)
   {
+    int idx = i;
+    if(idx < 0)
+      idx = entryFile;
+    else if(idx == entryFile)
+      continue;
+
+    if(idx < 0)
+      continue;
+
+    const ShaderSourceFile &s = shaderDetails->debugInfo.files[idx];
+
     QString filename = s.filename;
 
     uint filenameHash = qHash(filename.toLower());
@@ -1099,7 +1027,8 @@ IShaderViewer *PipelineStateViewer::EditOriginalShaderSource(ResourceId id,
   }
 
   return EditShader(id, shaderDetails->stage, shaderDetails->entryPoint,
-                    shaderDetails->debugInfo.compileFlags, shaderDetails->debugInfo.encoding, files);
+                    shaderDetails->debugInfo.compileFlags, shaderDetails->debugInfo.compiler,
+                    shaderDetails->debugInfo.encoding, files);
 }
 
 IShaderViewer *PipelineStateViewer::EditDecompiledSource(const ShaderProcessingTool &tool,
@@ -1114,8 +1043,14 @@ IShaderViewer *PipelineStateViewer::EditDecompiledSource(const ShaderProcessingT
   rdcstrpairs files;
   files.push_back(rdcpair<rdcstr, rdcstr>("decompiled", source));
 
-  IShaderViewer *sv = EditShader(id, shaderDetails->stage, shaderDetails->entryPoint,
-                                 shaderDetails->debugInfo.compileFlags, tool.output, files);
+  ShaderCompileFlags flags;
+
+  for(const ShaderCompileFlag &flag : shaderDetails->debugInfo.compileFlags.flags)
+    if(flag.name == "@spirver")
+      flags.flags.push_back(flag);
+
+  IShaderViewer *sv = EditShader(id, shaderDetails->stage, shaderDetails->entryPoint, flags,
+                                 KnownShaderTool::Unknown, tool.output, files);
 
   sv->ShowErrors(out.log);
 
@@ -1124,6 +1059,7 @@ IShaderViewer *PipelineStateViewer::EditDecompiledSource(const ShaderProcessingT
 
 void PipelineStateViewer::SetupShaderEditButton(QToolButton *button, ResourceId pipelineId,
                                                 ResourceId shaderId,
+                                                const ShaderBindpointMapping &bindpointMapping,
                                                 const ShaderReflection *shaderDetails)
 {
   if(!shaderDetails || !button->isEnabled() || button->popupMode() != QToolButton::MenuButtonPopup)
@@ -1135,13 +1071,16 @@ void PipelineStateViewer::SetupShaderEditButton(QToolButton *button, ResourceId 
 
   rdcarray<ShaderEncoding> accepted = m_Ctx.TargetShaderEncodings();
 
+  const ShaderDebugInfo &dbg = shaderDetails->debugInfo;
+
   // if we have original source and it's in a known format, display it as the first most preferred
   // option
-  if(!shaderDetails->debugInfo.files.empty() &&
-     shaderDetails->debugInfo.encoding != ShaderEncoding::Unknown)
+  if(!dbg.files.empty() && dbg.encoding != ShaderEncoding::Unknown)
   {
-    QAction *action =
-        new QAction(tr("Edit Source - %1").arg(shaderDetails->debugInfo.files[0].filename), menu);
+    int entryFile = qMax(0, dbg.entryLocation.fileIndex);
+    if(dbg.editBaseFile >= 0 && dbg.editBaseFile < dbg.files.count())
+      entryFile = dbg.editBaseFile;
+    QAction *action = new QAction(tr("Edit Source - %1").arg(dbg.files[entryFile].filename), menu);
     action->setIcon(Icons::page_white_edit());
 
     QObject::connect(action, &QAction::triggered, [this, shaderId, shaderDetails]() {
@@ -1176,54 +1115,235 @@ void PipelineStateViewer::SetupShaderEditButton(QToolButton *button, ResourceId 
   {
     QString label = tr("Edit Generated Stub");
 
-    if(shaderDetails->encoding == ShaderEncoding::SPIRV)
+    if(shaderDetails->encoding == ShaderEncoding::SPIRV ||
+       shaderDetails->encoding == ShaderEncoding::OpenGLSPIRV)
       label = tr("Edit Pseudocode");
 
     QAction *action = new QAction(label, menu);
     action->setIcon(Icons::page_white_edit());
 
-    QObject::connect(action, &QAction::triggered, [this, pipelineId, shaderId, shaderDetails]() {
-      QString entry;
-      QString src;
+    QObject::connect(
+        action, &QAction::triggered, [this, pipelineId, shaderId, bindpointMapping, shaderDetails]() {
+          QString entry;
+          QString src;
 
-      if(shaderDetails->encoding == ShaderEncoding::SPIRV)
-      {
-        m_Ctx.Replay().AsyncInvoke([this, pipelineId, shaderId, shaderDetails](IReplayController *r) {
-          rdcstr disasm = r->DisassembleShader(pipelineId, shaderDetails, "");
+          if(shaderDetails->encoding == ShaderEncoding::SPIRV ||
+             shaderDetails->encoding == ShaderEncoding::OpenGLSPIRV)
+          {
+            m_Ctx.Replay().AsyncInvoke(
+                [this, pipelineId, shaderId, shaderDetails](IReplayController *r) {
+                  rdcstr disasm = r->DisassembleShader(pipelineId, shaderDetails, "");
 
-          QString editeddisasm =
-              tr("####          PSEUDOCODE SPIR-V DISASSEMBLY            ###\n") +
-              tr("#### Use a SPIR-V decompiler to get compileable source ###\n\n");
+                  QString editeddisasm =
+                      tr("####          PSEUDOCODE SPIR-V DISASSEMBLY            ###\n") +
+                      tr("#### Use a SPIR-V decompiler to get compileable source ###\n\n");
 
-          editeddisasm += disasm;
+                  editeddisasm += disasm;
 
-          GUIInvoke::call(this, [this, shaderId, shaderDetails, editeddisasm]() {
+                  GUIInvoke::call(this, [this, shaderId, shaderDetails, editeddisasm]() {
+                    rdcstrpairs files;
+                    files.push_back(rdcpair<rdcstr, rdcstr>("pseudocode", editeddisasm));
+
+                    EditShader(shaderId, shaderDetails->stage, shaderDetails->entryPoint,
+                               shaderDetails->debugInfo.compileFlags, KnownShaderTool::Unknown,
+                               ShaderEncoding::Unknown, files);
+                  });
+                });
+          }
+          else if(shaderDetails->encoding == ShaderEncoding::DXBC ||
+                  shaderDetails->encoding == ShaderEncoding::DXIL)
+          {
+            entry = lit("EditedShader%1S").arg(ToQStr(shaderDetails->stage, GraphicsAPI::D3D11)[0]);
+
             rdcstrpairs files;
-            files.push_back(rdcpair<rdcstr, rdcstr>("pseudocode", editeddisasm));
+            files.push_back(rdcpair<rdcstr, rdcstr>(
+                "decompiled_stub.hlsl", GenerateHLSLStub(bindpointMapping, shaderDetails, entry)));
 
-            EditShader(shaderId, shaderDetails->stage, shaderDetails->entryPoint,
-                       ShaderCompileFlags(), ShaderEncoding::Unknown, files);
-          });
+            EditShader(shaderId, shaderDetails->stage, entry, shaderDetails->debugInfo.compileFlags,
+                       KnownShaderTool::Unknown, ShaderEncoding::HLSL, files);
+          }
         });
-      }
-      else if(shaderDetails->encoding == ShaderEncoding::DXBC)
-      {
-        entry = lit("EditedShader%1S").arg(ToQStr(shaderDetails->stage, GraphicsAPI::D3D11)[0]);
-
-        rdcstrpairs files;
-        files.push_back(rdcpair<rdcstr, rdcstr>("decompiled_stub.hlsl",
-                                                GenerateHLSLStub(shaderDetails, entry)));
-
-        EditShader(shaderId, shaderDetails->stage, entry, ShaderCompileFlags(),
-                   ShaderEncoding::HLSL, files);
-      }
-
-    });
 
     menu->addAction(action);
   }
 
   button->setMenu(menu);
+}
+
+void PipelineStateViewer::AddResourceUsageEntry(QMenu &menu, uint32_t start, uint32_t end,
+                                                ResourceUsage usage)
+{
+  QAction *item = NULL;
+
+  if(start == end)
+    item = new QAction(
+        QFormatStr("EID %1: %2").arg(start).arg(ToQStr(usage, m_Ctx.APIProps().pipelineType)), this);
+  else
+    item = new QAction(
+        QFormatStr("EID %1-%2: %3").arg(start).arg(end).arg(ToQStr(usage, m_Ctx.APIProps().pipelineType)),
+        this);
+
+  QObject::connect(item, &QAction::triggered, [this, end]() { m_Ctx.SetEventID({}, end, end); });
+
+  menu.addAction(item);
+}
+
+void PipelineStateViewer::ShowResourceContextMenu(RDTreeWidget *widget, const QPoint &pos,
+                                                  ResourceId id, const rdcarray<EventUsage> &usage)
+{
+  RDTreeWidgetItem *item = widget->itemAt(pos);
+
+  QMenu contextMenu(this);
+
+  QAction copy(tr("&Copy"), this);
+
+  contextMenu.addAction(&copy);
+
+  copy.setIcon(Icons::copy());
+
+  QObject::connect(&copy, &QAction::triggered,
+                   [widget, pos, item]() { widget->copyItem(pos, item); });
+
+  QAction usageTitle(tr("Used:"), this);
+  QAction openResourceInspector(tr("Open in Resource Inspector"), this);
+
+  openResourceInspector.setIcon(Icons::link());
+
+  if(id != ResourceId())
+  {
+    contextMenu.addSeparator();
+    contextMenu.addAction(&openResourceInspector);
+    contextMenu.addAction(&usageTitle);
+
+    QObject::connect(&openResourceInspector, &QAction::triggered, [this, id]() {
+      m_Ctx.ShowResourceInspector();
+
+      m_Ctx.GetResourceInspector()->Inspect(id);
+    });
+
+    CombineUsageEvents(m_Ctx, usage,
+                       [this, &contextMenu](uint32_t start, uint32_t end, ResourceUsage use) {
+                         AddResourceUsageEntry(contextMenu, start, end, use);
+                       });
+  }
+
+  RDDialog::show(&contextMenu, widget->viewport()->mapToGlobal(pos));
+}
+
+ResourceId PipelineStateViewer::updateThumbnail(QWidget *widget, QModelIndex idx)
+{
+  ResourceId id;
+
+  if(!m_Output)
+    return id;
+
+  RDTreeWidget *treeWidget = qobject_cast<RDTreeWidget *>(widget);
+  if(treeWidget)
+  {
+    RDTreeWidgetItem *item = treeWidget->itemForIndex(idx);
+
+    if(item)
+    {
+      if(m_D3D11)
+        id = m_D3D11->GetResource(item);
+      else if(m_D3D12)
+        id = m_D3D12->GetResource(item);
+      else if(m_GL)
+        id = m_GL->GetResource(item);
+      else if(m_Vulkan)
+        id = m_Vulkan->GetResource(item);
+    }
+
+    TextureDescription *tex = m_Ctx.GetTexture(id);
+
+    if(tex)
+    {
+      m_TexDisplay.resourceId = id;
+      INVOKE_MEMFN(RT_UpdateAndDisplay);
+
+      float aspect = (float)tex->width / (float)qMax(1U, tex->height);
+
+      // keep height fixed at 100, and make width match the aspect ratio of the texture - up to 21:9
+      // ratio
+      ui->thumbnail->setFixedSize((int)qBound(100.0f, aspect * 100.0f, (21.0f / 9.0f) * 100.0f), 100);
+      ui->thumbnail->show();
+    }
+    else
+    {
+      ui->thumbnail->hide();
+    }
+  }
+
+  return id;
+}
+
+bool PipelineStateViewer::hasThumbnail(QWidget *widget, QModelIndex idx)
+{
+  if(!m_Output)
+    return false;
+
+  RDTreeWidget *treeWidget = qobject_cast<RDTreeWidget *>(widget);
+  if(treeWidget)
+  {
+    ResourceId id;
+
+    RDTreeWidgetItem *item = treeWidget->itemForIndex(idx);
+
+    if(item)
+    {
+      if(m_D3D11)
+        id = m_D3D11->GetResource(item);
+      else if(m_D3D12)
+        id = m_D3D12->GetResource(item);
+      else if(m_GL)
+        id = m_GL->GetResource(item);
+      else if(m_Vulkan)
+        id = m_Vulkan->GetResource(item);
+    }
+
+    if(id != ResourceId() && m_Ctx.GetTexture(id))
+      return true;
+  }
+
+  return false;
+}
+
+void PipelineStateViewer::SetupResourceView(RDTreeWidget *widget)
+{
+  auto handler = [this, widget](const QPoint &pos) {
+    RDTreeWidgetItem *item = widget->itemAt(pos);
+
+    ResourceId id;
+
+    if(m_D3D11)
+      id = m_D3D11->GetResource(item);
+    else if(m_D3D12)
+      id = m_D3D12->GetResource(item);
+    else if(m_GL)
+      id = m_GL->GetResource(item);
+    else if(m_Vulkan)
+      id = m_Vulkan->GetResource(item);
+
+    if(id != ResourceId())
+    {
+      m_Ctx.Replay().AsyncInvoke([this, widget, pos, id](IReplayController *r) {
+        rdcarray<EventUsage> usage = r->GetUsage(id);
+
+        GUIInvoke::call(this, [this, widget, pos, id, usage]() {
+          ShowResourceContextMenu(widget, pos, id, usage);
+        });
+      });
+    }
+    else
+    {
+      ShowResourceContextMenu(widget, pos, id, {});
+    }
+  };
+
+  widget->setContextMenuPolicy(Qt::CustomContextMenu);
+  QObject::connect(widget, &RDTreeWidget::customContextMenuRequested, handler);
+
+  widget->setCustomTooltip(m_Tooltip);
 }
 
 QString PipelineStateViewer::GetVBufferFormatString(uint32_t slot)
@@ -1237,19 +1357,9 @@ QString PipelineStateViewer::GetVBufferFormatString(uint32_t slot)
   uint32_t stride = vbs[slot].byteStride;
 
   // filter attributes to only the ones enabled and using this slot
-  for(size_t i = 0; i < attrs.size();)
-  {
-    if(!attrs[i].used || attrs[i].vertexBuffer != (int)slot)
-    {
-      attrs.erase(i);
-      // continue with same i
-    }
-    else
-    {
-      // move to next i
-      i++;
-    }
-  }
+  attrs.removeIf([slot](const VertexInputAttribute &attr) {
+    return (!attr.used || attr.vertexBuffer != (int)slot);
+  });
 
   // we now have all attributes in this buffer. Sort by offset
   std::sort(attrs.begin(), attrs.end(),
@@ -1289,6 +1399,8 @@ QString PipelineStateViewer::GetVBufferFormatString(uint32_t slot)
 
   uint32_t offset = 0;
 
+  format = lit("struct vbuffer {\n");
+
   for(size_t i = 0; i < attrs.size(); i++)
   {
     // we disallowed overlaps above, but we do allow *duplicates*. So if our offset has already
@@ -1296,8 +1408,11 @@ QString PipelineStateViewer::GetVBufferFormatString(uint32_t slot)
     if(attrs[i].byteOffset < offset)
       continue;
 
-    // declare any padding from previous element to this one
-    format += padding(attrs[i].byteOffset - offset);
+    // declare an explicit offset if there's a gap from previous element to this one
+    if(attrs[i].byteOffset > offset)
+      format += lit("  [[offset(%1)]]\n").arg(attrs[i].byteOffset);
+
+    format += lit("  ");
 
     const ResourceFormat &fmt = attrs[i].format;
 
@@ -1308,12 +1423,12 @@ QString PipelineStateViewer::GetVBufferFormatString(uint32_t slot)
       switch(fmt.type)
       {
         case ResourceFormatType::R10G10B10A2:
-          if(fmt.compType == CompType::UInt)
-            format += lit("uintten");
           if(fmt.compType == CompType::UNorm)
-            format += lit("unormten");
+            format += lit("[[packed(r10g10b10a2)]] [[unorm]] uint4");
+          else
+            format += lit("[[packed(r10g10b10a2)]] uint4");
           break;
-        case ResourceFormatType::R11G11B10: format += lit("floateleven"); break;
+        case ResourceFormatType::R11G11B10: format += lit("[[packed(r11g11b10)]] float3"); break;
         default: format += tr("// unknown type "); break;
       }
     }
@@ -1325,39 +1440,41 @@ QString PipelineStateViewer::GetVBufferFormatString(uint32_t slot)
 
       if(fmt.compType == CompType::UNorm || fmt.compType == CompType::UNormSRGB)
       {
-        format += lit("unorm%1").arg(widthchar[fmt.compByteWidth]);
+        format += lit("[[unorm]]");
       }
       else if(fmt.compType == CompType::SNorm)
       {
-        format += lit("snorm%1").arg(widthchar[fmt.compByteWidth]);
+        format += lit("[[snorm]]");
       }
-      else
-      {
-        if(fmt.compType == CompType::UInt)
-          format += lit("u");
 
-        if(fmt.compByteWidth == 1)
-        {
-          format += lit("byte");
-        }
-        else if(fmt.compByteWidth == 2)
-        {
-          if(fmt.compType == CompType::Float)
-            format += lit("half");
-          else
-            format += lit("short");
-        }
-        else if(fmt.compByteWidth == 4)
-        {
-          if(fmt.compType == CompType::Float)
-            format += lit("float");
-          else
-            format += lit("int");
-        }
-        else if(fmt.compByteWidth == 8)
-        {
+      if(fmt.compType == CompType::UInt || fmt.compType == CompType::UNorm ||
+         fmt.compType == CompType::UNormSRGB)
+        format += lit("u");
+
+      if(fmt.compByteWidth == 1)
+      {
+        format += lit("byte");
+      }
+      else if(fmt.compByteWidth == 2)
+      {
+        if(fmt.compType == CompType::Float)
+          format += lit("half");
+        else
+          format += lit("short");
+      }
+      else if(fmt.compByteWidth == 4)
+      {
+        if(fmt.compType == CompType::Float)
+          format += lit("float");
+        else
+          format += lit("int");
+      }
+      else if(fmt.compByteWidth == 8)
+      {
+        if(fmt.compType == CompType::Float)
           format += lit("double");
-        }
+        else
+          format += lit("long");
       }
 
       format += QString::number(fmt.compCount);
@@ -1367,6 +1484,7 @@ QString PipelineStateViewer::GetVBufferFormatString(uint32_t slot)
     QString sanitised_name = real_name;
 
     sanitised_name.replace(QLatin1Char('.'), QLatin1Char('_'))
+        .replace(QLatin1Char(':'), QLatin1Char('_'))
         .replace(QLatin1Char('['), QLatin1Char('_'))
         .replace(QLatin1Char(']'), QLatin1Char('_'));
 
@@ -1376,10 +1494,22 @@ QString PipelineStateViewer::GetVBufferFormatString(uint32_t slot)
       format += QFormatStr(" %1; // %2\n").arg(sanitised_name).arg(real_name);
   }
 
-  if(stride > 0)
-    format += padding(stride - offset);
+  format += lit("}\n\nvbuffer vertex[];");
+
+  if(stride > offset)
+    format = lit("[[size(%1)]]\n").arg(stride) + format;
+
+  format = lit("#pack(scalar) // vertex buffers can be tightly packed\n"
+               "\n") +
+           format;
 
   return format;
+}
+
+QColor PipelineStateViewer::GetViewDetailsColor()
+{
+  return QColor::fromHslF(0.45f, 1.0f,
+                          qBound(0.25, palette().color(QPalette::Base).lightnessF(), 0.75));
 }
 
 bool PipelineStateViewer::SaveShaderFile(const ShaderReflection *shader)
@@ -1389,17 +1519,18 @@ bool PipelineStateViewer::SaveShaderFile(const ShaderReflection *shader)
 
   QString filter;
 
-  if(m_Ctx.CurPipelineState().IsCaptureD3D11() || m_Ctx.CurPipelineState().IsCaptureD3D12())
+  switch(shader->encoding)
   {
-    filter = tr("DXBC Shader files (*.dxbc)");
-  }
-  else if(m_Ctx.CurPipelineState().IsCaptureGL())
-  {
-    filter = tr("GLSL files (*.glsl)");
-  }
-  else if(m_Ctx.CurPipelineState().IsCaptureVK())
-  {
-    filter = tr("SPIR-V files (*.spv)");
+    case ShaderEncoding::DXBC: filter = tr("DXBC Shader files (*.dxbc)"); break;
+    case ShaderEncoding::HLSL: filter = tr("HLSL files (*.hlsl)"); break;
+    case ShaderEncoding::GLSL: filter = tr("GLSL files (*.glsl)"); break;
+    case ShaderEncoding::SPIRV:
+    case ShaderEncoding::OpenGLSPIRV: filter = tr("SPIR-V files (*.spv)"); break;
+    case ShaderEncoding::SPIRVAsm:
+    case ShaderEncoding::OpenGLSPIRVAsm: filter = tr("SPIR-V assembly files (*.spvasm)"); break;
+    case ShaderEncoding::DXIL: filter = tr("DXIL Shader files (*.dxbc)"); break;
+    case ShaderEncoding::Unknown:
+    case ShaderEncoding::Count: filter = tr("All files (*.*)"); break;
   }
 
   QString filename = RDDialog::getSaveFileName(this, tr("Save Shader As"), QString(), filter);
@@ -1433,4 +1564,16 @@ bool PipelineStateViewer::SaveShaderFile(const ShaderReflection *shader)
   }
 
   return true;
+}
+
+void PipelineStateViewer::SelectPipelineStage(PipelineStage stage)
+{
+  if(m_D3D11)
+    m_D3D11->SelectPipelineStage(stage);
+  else if(m_D3D12)
+    m_D3D12->SelectPipelineStage(stage);
+  else if(m_GL)
+    m_GL->SelectPipelineStage(stage);
+  else if(m_Vulkan)
+    m_Vulkan->SelectPipelineStage(stage);
 }

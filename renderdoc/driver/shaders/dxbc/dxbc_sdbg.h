@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  * Copyright (c) 2014 Crytek
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -23,14 +23,12 @@
  * THE SOFTWARE.
  ******************************************************************************/
 
-#include <map>
-#include <string>
-#include <utility>
-#include <vector>
-
 #pragma once
 
-#include "dxbc_disassemble.h"
+#include <map>
+#include "api/replay/rdcarray.h"
+#include "api/replay/rdcstr.h"
+#include "dxbc_bytecode.h"
 
 namespace DXBC
 {
@@ -59,17 +57,10 @@ namespace DXBC
 //  * SDBGInputRegister
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-struct CountOffset
-{
-  int32_t count;
-  int32_t offset;
-};
-
 // Completely understood
 struct SDBGHeader
 {
-  int32_t
-      version;    // Always 0x00000054 it seems. Probably a version number, might be some other ID
+  int32_t version;    // Always 0x00000054 it seems. Probably a version number, might be some other ID
 
   int32_t compilerSigOffset;    // offset from asciiOffset at the end of this structure.
   int32_t entryFuncOffset;      // offset from asciiOffset at the end of this structure.
@@ -84,9 +75,8 @@ struct SDBGHeader
   CountOffset inputRegisters;    // This lists which bits of which inputs are used - e.g. the
                                  // components in input
                                  // signature elements and cbuffers.
-  CountOffset
-      symbolTable;    // This is a symbol table definitely, also includes 'virtual' symbols to match
-                      // up ASM instructions to lines.
+  CountOffset symbolTable;    // This is a symbol table definitely, also includes 'virtual' symbols
+                              // to match up ASM instructions to lines.
   CountOffset scopes;    // These are scopes - like for structures/functions. Also Globals/Locals
                          // lists of variables
                          // in scope for reference in ASM instructions
@@ -121,7 +111,7 @@ struct SDBGAsmInstruction
 {
   int32_t instructionNum;
 
-  OpcodeType opCode;
+  DXBCBytecode::OpcodeType opCode;
 
   int32_t unknown_a[2];
   int32_t destRegister;
@@ -247,19 +237,21 @@ struct SDBGType
 
 // SDBG chunk gets its own class since it's so complex. Deliberately fairly leaky too
 // since the data + use is a bit unclear still
-class SDBGChunk : public DXBCDebugChunk
+class SDBGChunk : public IDebugInfo
 {
 public:
   SDBGChunk(void *data);
 
-  std::string GetCompilerSig() const { return m_CompilerSig; }
-  std::string GetEntryFunction() const { return m_Entry; }
-  std::string GetShaderProfile() const { return m_Profile; }
-  uint32_t GetShaderCompileFlags() const { return m_ShaderFlags; }
+  rdcstr GetCompilerSig() const { return m_CompilerSig; }
+  rdcstr GetEntryFunction() const { return m_Entry; }
+  rdcstr GetShaderProfile() const { return m_Profile; }
+  ShaderCompileFlags GetShaderCompileFlags() const { return EncodeFlags(m_ShaderFlags, m_Profile); }
   void GetLineInfo(size_t instruction, uintptr_t offset, LineColumnInfo &lineInfo) const;
+  void GetCallstack(size_t instruction, uintptr_t offset, rdcarray<rdcstr> &callstack) const;
 
-  bool HasLocals() const;
-  void GetLocals(size_t instruction, uintptr_t offset, rdcarray<LocalVariableMapping> &locals) const;
+  bool HasSourceMapping() const;
+  void GetLocals(const DXBC::DXBCContainer *dxbc, size_t instruction, uintptr_t offset,
+                 rdcarray<SourceVariableMapping> &locals) const;
 
 private:
   SDBGChunk();
@@ -268,28 +260,28 @@ private:
 
   bool m_HasDebugInfo;
 
-  std::string GetSymbolName(int symbolID);
-  std::string GetSymbolName(int32_t symbolOffset, int32_t symbolLength);
+  rdcstr GetSymbolName(int symbolID);
+  rdcstr GetSymbolName(int32_t symbolOffset, int32_t symbolLength);
 
-  std::vector<SDBGAsmInstruction> m_Instructions;
-  std::vector<SDBGVariable> m_Variables;
-  std::vector<SDBGInputRegister> m_Inputs;
-  std::vector<SDBGSymbol> m_SymbolTable;
-  std::vector<SDBGScope> m_Scopes;
-  std::vector<SDBGType> m_Types;
-  std::vector<int32_t> m_Int32Database;
+  rdcarray<SDBGAsmInstruction> m_Instructions;
+  rdcarray<SDBGVariable> m_Variables;
+  rdcarray<SDBGInputRegister> m_Inputs;
+  rdcarray<SDBGSymbol> m_SymbolTable;
+  rdcarray<SDBGScope> m_Scopes;
+  rdcarray<SDBGType> m_Types;
+  rdcarray<int32_t> m_Int32Database;
 
   uint32_t m_ShaderFlags;
 
-  std::string m_CompilerSig;
-  std::string m_Entry;
-  std::string m_Profile;
+  rdcstr m_CompilerSig;
+  rdcstr m_Entry;
+  rdcstr m_Profile;
 
   // these don't need to be exposed, a more processed and friendly
   // version is exposed
   SDBGHeader m_Header;
-  std::vector<SDBGFileHeader> m_FileHeaders;
+  rdcarray<SDBGFileHeader> m_FileHeaders;
 
-  std::vector<char> m_RawData;
+  rdcarray<char> m_RawData;
 };
 };

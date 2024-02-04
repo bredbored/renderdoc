@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2016-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -32,18 +32,40 @@ ResourcePreview::ResourcePreview(ICaptureContext &c, IReplayOutput *output, QWid
 {
   ui->setupUi(this);
 
-  CustomPaintWidget *thumb = new CustomPaintWidget(&c, this);
-  thumb->setOutput(output);
-  thumb->setObjectName(ui->thumbnail->objectName());
-  thumb->setSizePolicy(ui->thumbnail->sizePolicy());
-  thumb->setMinimumSize(QSize(0, 0));
+  ui->thumbnail->SetContext(c);
+  ui->thumbnail->SetOutput(output);
+
+  Initialise();
+}
+
+ResourcePreview::ResourcePreview(bool, QWidget *parent)
+    : QFrame(parent), ui(new Ui::ResourcePreview)
+{
+  ui->setupUi(this);
 
   delete ui->thumbnail;
-  ui->thumbnail = thumb;
-  ui->gridLayout->addWidget(ui->thumbnail, 0, 0, 1, 2);
+  ui->thumbnail = NULL;
+  m_ManualThumbnail = new RDLabel();
+  m_ManualThumbnail->setGeometry(QRect(0, 0, 16, 16));
+  m_ManualThumbnail->setScaledContents(true);
+  m_ManualThumbnail->setSizePolicy(
+      QSizePolicy(QSizePolicy::MinimumExpanding, QSizePolicy::MinimumExpanding));
 
+  ui->gridLayout->addWidget(m_ManualThumbnail, 0, 0, 1, 2);
+
+  Initialise();
+}
+
+void ResourcePreview::Initialise()
+{
   setBackgroundRole(QPalette::Background);
-  setForegroundRole(QPalette::Highlight);
+  setForegroundRole(QPalette::Foreground);
+
+  QPalette Pal(palette());
+
+  Pal.setColor(QPalette::Highlight, QColor(Qt::red));
+
+  setPalette(Pal);
 
   setSelected(false);
 
@@ -58,15 +80,25 @@ ResourcePreview::ResourcePreview(ICaptureContext &c, IReplayOutput *output, QWid
   ui->descriptionLabel->setForegroundRole(QPalette::Foreground);
   ui->descriptionLabel->setFont(Formatter::PreferredFont());
 
-  QObject::connect(ui->thumbnail, &CustomPaintWidget::clicked, this, &ResourcePreview::clickEvent);
+  if(ui->thumbnail)
+    QObject::connect(ui->thumbnail, &CustomPaintWidget::clicked, this, &ResourcePreview::clickEvent);
+  else if(m_ManualThumbnail)
+    QObject::connect(m_ManualThumbnail, &RDLabel::clicked, this, &ResourcePreview::clickEvent);
   QObject::connect(ui->slotLabel, &RDLabel::clicked, this, &ResourcePreview::clickEvent);
   QObject::connect(ui->descriptionLabel, &RDLabel::clicked, this, &ResourcePreview::clickEvent);
 
-  QObject::connect(ui->thumbnail, &CustomPaintWidget::doubleClicked, this,
-                   &ResourcePreview::doubleClickEvent);
+  if(ui->thumbnail)
+    QObject::connect(ui->thumbnail, &CustomPaintWidget::doubleClicked, this,
+                     &ResourcePreview::doubleClickEvent);
+  else if(m_ManualThumbnail)
+    QObject::connect(m_ManualThumbnail, &RDLabel::doubleClicked, this,
+                     &ResourcePreview::doubleClickEvent);
   QObject::connect(ui->slotLabel, &RDLabel::doubleClicked, this, &ResourcePreview::doubleClickEvent);
   QObject::connect(ui->descriptionLabel, &RDLabel::doubleClicked, this,
                    &ResourcePreview::doubleClickEvent);
+
+  if(m_ManualThumbnail)
+    QObject::connect(m_ManualThumbnail, &RDLabel::resized, [this]() { emit resized(this); });
 }
 
 ResourcePreview::~ResourcePreview()
@@ -106,20 +138,38 @@ void ResourcePreview::setSelected(bool sel)
 {
   m_Selected = sel;
 
-  QPalette Pal(palette());
-
-  Pal.setColor(QPalette::Highlight, sel ? QColor(Qt::red) : Pal.color(QPalette::Foreground));
-
-  setPalette(Pal);
+  setForegroundRole(sel ? QPalette::Highlight : QPalette::Foreground);
 }
 
-void ResourcePreview::changeEvent(QEvent *event)
+WindowingData ResourcePreview::GetWidgetWindowingData()
 {
-  if(event->type() == QEvent::PaletteChange || event->type() == QEvent::StyleChange)
-    setSelected(m_Selected);
+  if(ui->thumbnail)
+    return ui->thumbnail->GetWidgetWindowingData();
+  return {};
 }
 
-QWidget *ResourcePreview::thumbWidget()
+QSize ResourcePreview::GetThumbSize()
 {
-  return ui->thumbnail;
+  if(ui->thumbnail)
+    return ui->thumbnail->size();
+
+  if(m_ManualThumbnail)
+    return m_ManualThumbnail->size();
+
+  return {};
+}
+
+void ResourcePreview::UpdateThumb(QSize s, const bytebuf &imgData)
+{
+  if(!m_ManualThumbnail)
+    return;
+
+  QImage thumb(imgData.data(), s.width(), s.height(), s.width() * 3, QImage::Format_RGB888);
+  m_ManualThumbnail->setPixmap(QPixmap::fromImage(thumb));
+}
+
+void ResourcePreview::resizeEvent(QResizeEvent *e)
+{
+  emit resized(this);
+  QFrame::resizeEvent(e);
 }

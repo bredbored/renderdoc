@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2017-2019 Baldur Karlsson
+ * Copyright (c) 2017-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -23,33 +23,83 @@
  ******************************************************************************/
 
 template <>
-rdcstr DoStringise(const ReplayStatus &el)
+rdcstr DoStringise(const SDBasic &el)
 {
-  BEGIN_ENUM_STRINGISE(ReplayStatus)
+  BEGIN_ENUM_STRINGISE(SDBasic);
+  {
+    STRINGISE_ENUM_CLASS(Chunk);
+    STRINGISE_ENUM_CLASS(Struct);
+    STRINGISE_ENUM_CLASS(Array);
+    STRINGISE_ENUM_CLASS(Null);
+    STRINGISE_ENUM_CLASS(Buffer);
+    STRINGISE_ENUM_CLASS(String);
+    STRINGISE_ENUM_CLASS(Enum);
+    STRINGISE_ENUM_CLASS(UnsignedInteger);
+    STRINGISE_ENUM_CLASS(SignedInteger);
+    STRINGISE_ENUM_CLASS(Float);
+    STRINGISE_ENUM_CLASS(Boolean);
+    STRINGISE_ENUM_CLASS(Character);
+  }
+  END_ENUM_STRINGISE();
+}
+
+template <>
+rdcstr DoStringise(const ResultCode &el)
+{
+  BEGIN_ENUM_STRINGISE(ResultCode)
   {
     STRINGISE_ENUM_CLASS_NAMED(Succeeded, "Success");
     STRINGISE_ENUM_CLASS_NAMED(UnknownError, "Unknown error");
     STRINGISE_ENUM_CLASS_NAMED(InternalError, "Internal error");
     STRINGISE_ENUM_CLASS_NAMED(FileNotFound, "File not found");
     STRINGISE_ENUM_CLASS_NAMED(InjectionFailed, "RenderDoc injection failed");
-    STRINGISE_ENUM_CLASS_NAMED(IncompatibleProcess, "Process is incompatible");
+    STRINGISE_ENUM_CLASS_NAMED(IncompatibleProcess,
+                               "Process is incompatible with this build of RenderDoc");
     STRINGISE_ENUM_CLASS_NAMED(NetworkIOFailed, "Network I/O operation failed");
     STRINGISE_ENUM_CLASS_NAMED(NetworkRemoteBusy, "Remote side of network connection is busy");
-    STRINGISE_ENUM_CLASS_NAMED(NetworkVersionMismatch, "Version mismatch between network clients");
+    STRINGISE_ENUM_CLASS_NAMED(NetworkVersionMismatch, "Incompatible version");
     STRINGISE_ENUM_CLASS_NAMED(FileIOFailed, "File I/O failed");
-    STRINGISE_ENUM_CLASS_NAMED(FileIncompatibleVersion, "File of incompatible version");
-    STRINGISE_ENUM_CLASS_NAMED(FileCorrupted, "File corrupted");
-    STRINGISE_ENUM_CLASS_NAMED(APIUnsupported, "API is unsupported");
-    STRINGISE_ENUM_CLASS_NAMED(APIInitFailed, "API initialisation failed");
-    STRINGISE_ENUM_CLASS_NAMED(APIIncompatibleVersion,
-                               "Captured API data has an incompatible version");
+    STRINGISE_ENUM_CLASS_NAMED(
+        FileIncompatibleVersion,
+        "Capture file incompatible due to being made on an different major version of RenderDoc");
+    STRINGISE_ENUM_CLASS_NAMED(FileCorrupted, "File is corrupted");
+    STRINGISE_ENUM_CLASS_NAMED(FileUnrecognised, "File format is unrecognised");
+    STRINGISE_ENUM_CLASS_NAMED(
+        ImageUnsupported, "The image file or format is unrecognised or not supported in this form");
+    STRINGISE_ENUM_CLASS_NAMED(APIUnsupported, "API used in this capture is unsupported");
+    STRINGISE_ENUM_CLASS_NAMED(APIInitFailed,
+                               "API initialisation failed while loading the capture");
+    STRINGISE_ENUM_CLASS_NAMED(
+        APIIncompatibleVersion,
+        "Captured API data was made on a newer incompatible version of RenderDoc");
     STRINGISE_ENUM_CLASS_NAMED(
         APIHardwareUnsupported,
-        "Current hardware unsupported or incompatible with captured hardware");
+        "Current replaying hardware unsupported or incompatible with captured hardware");
     STRINGISE_ENUM_CLASS_NAMED(APIDataCorrupted,
                                "Replaying the capture encountered invalid/corrupted data");
     STRINGISE_ENUM_CLASS_NAMED(APIReplayFailed, "Replaying the capture failed at the API level");
     STRINGISE_ENUM_CLASS_NAMED(JDWPFailure, "JDWP debugger connection could not be established");
+    STRINGISE_ENUM_CLASS_NAMED(
+        AndroidGrantPermissionsFailed,
+        "Failed to grant runtime permissions when installing Android remote server");
+    STRINGISE_ENUM_CLASS_NAMED(
+        AndroidABINotFound,
+        "Couldn't determine supported ABIs when installing Android remote server");
+    STRINGISE_ENUM_CLASS_NAMED(
+        AndroidAPKFolderNotFound,
+        "Couldn't find the folder which contains the Android remote server APK");
+    STRINGISE_ENUM_CLASS_NAMED(AndroidAPKInstallFailed,
+                               "Failed to install Android remote server for unknown reasons");
+    STRINGISE_ENUM_CLASS_NAMED(AndroidAPKVerifyFailed,
+                               "Failed to verify installed Android remote server");
+    STRINGISE_ENUM_CLASS_NAMED(RemoteServerConnectionLost, "Connection lost to remote server");
+    STRINGISE_ENUM_CLASS_NAMED(OutOfMemory, "Encountered an out of memory error");
+    STRINGISE_ENUM_CLASS_NAMED(DeviceLost, "Encountered a GPU device lost error");
+    STRINGISE_ENUM_CLASS_NAMED(DataNotAvailable,
+                               "Data was requested through RenderDoc's API which is not available");
+    STRINGISE_ENUM_CLASS_NAMED(InvalidParameter,
+                               "An invalid parameter was passed to RenderDoc's API");
+    STRINGISE_ENUM_CLASS_NAMED(CompressionFailed, "Compression or decompression failed");
   }
   END_ENUM_STRINGISE();
 }
@@ -60,11 +110,14 @@ rdcstr DoStringise(const WindowingSystem &el)
   BEGIN_ENUM_STRINGISE(WindowingSystem)
   {
     STRINGISE_ENUM_CLASS(Unknown);
+    STRINGISE_ENUM_CLASS(Headless);
     STRINGISE_ENUM_CLASS(Win32);
     STRINGISE_ENUM_CLASS(Xlib);
     STRINGISE_ENUM_CLASS(XCB);
     STRINGISE_ENUM_CLASS(Android);
     STRINGISE_ENUM_CLASS(MacOS);
+    STRINGISE_ENUM_CLASS(GGP);
+    STRINGISE_ENUM_CLASS(Wayland);
   }
   END_ENUM_STRINGISE();
 }
@@ -121,7 +174,6 @@ rdcstr DoStringise(const CompType &el)
     STRINGISE_ENUM_CLASS(UScaled);
     STRINGISE_ENUM_CLASS(SScaled);
     STRINGISE_ENUM_CLASS_NAMED(Depth, "Depth/Stencil");
-    STRINGISE_ENUM_CLASS(Double);
     STRINGISE_ENUM_CLASS_NAMED(UNormSRGB, "sRGB");
   }
   END_ENUM_STRINGISE();
@@ -286,6 +338,34 @@ rdcstr DoStringise(const ConservativeRaster &el)
 }
 
 template <>
+rdcstr DoStringise(const ShadingRateCombiner &el)
+{
+  BEGIN_ENUM_STRINGISE(ShadingRateCombiner)
+  {
+    STRINGISE_ENUM_CLASS(Keep);
+    STRINGISE_ENUM_CLASS(Replace);
+    STRINGISE_ENUM_CLASS(Min);
+    STRINGISE_ENUM_CLASS(Max);
+    STRINGISE_ENUM_CLASS(Multiply);
+  }
+  END_ENUM_STRINGISE();
+}
+
+template <>
+rdcstr DoStringise(const LineRaster &el)
+{
+  BEGIN_ENUM_STRINGISE(LineRaster)
+  {
+    STRINGISE_ENUM_CLASS(Default);
+    STRINGISE_ENUM_CLASS(Rectangular);
+    STRINGISE_ENUM_CLASS(Bresenham);
+    STRINGISE_ENUM_CLASS(RectangularSmooth);
+    STRINGISE_ENUM_CLASS(RectangularD3D);
+  }
+  END_ENUM_STRINGISE();
+}
+
+template <>
 rdcstr DoStringise(const FilterMode &el)
 {
   BEGIN_ENUM_STRINGISE(FilterMode)
@@ -428,12 +508,12 @@ rdcstr DoStringise(const QualityHint &el)
 template <>
 rdcstr DoStringise(const TextureFilter &el)
 {
-  std::string filter = "";
-  std::string filtPrefix = "";
-  std::string filtVal = "";
+  rdcstr filter = "";
+  rdcstr filtPrefix = "";
+  rdcstr filtVal = "";
 
-  std::string filters[] = {ToStr(el.minify), ToStr(el.magnify), ToStr(el.mip)};
-  std::string filterPrefixes[] = {"Min", "Mag", "Mip"};
+  rdcstr filters[] = {ToStr(el.minify), ToStr(el.magnify), ToStr(el.mip)};
+  rdcstr filterPrefixes[] = {"Min", "Mag", "Mip"};
 
   for(int a = 0; a < 3; a++)
   {
@@ -573,6 +653,7 @@ rdcstr DoStringise(const ShaderBuiltin &el)
     STRINGISE_ENUM_CLASS_NAMED(DispatchSize, "Dispatch Size");
     STRINGISE_ENUM_CLASS_NAMED(DispatchThreadIndex, "Dispatch Thread Index");
     STRINGISE_ENUM_CLASS_NAMED(GroupIndex, "Group Index");
+    STRINGISE_ENUM_CLASS_NAMED(GroupSize, "Group Size");
     STRINGISE_ENUM_CLASS_NAMED(GroupFlatIndex, "Group Flat Index");
     STRINGISE_ENUM_CLASS_NAMED(GroupThreadIndex, "Group Thread Index");
     STRINGISE_ENUM_CLASS_NAMED(GSInstanceIndex, "GS Instance Index");
@@ -589,7 +670,29 @@ rdcstr DoStringise(const ShaderBuiltin &el)
     STRINGISE_ENUM_CLASS_NAMED(DepthOutput, "Depth Output");
     STRINGISE_ENUM_CLASS_NAMED(DepthOutputGreaterEqual, "Depth Output (GEqual)");
     STRINGISE_ENUM_CLASS_NAMED(DepthOutputLessEqual, "Depth Output (LEqual)");
+    STRINGISE_ENUM_CLASS_NAMED(BaseVertex, "Base Vertex");
+    STRINGISE_ENUM_CLASS_NAMED(BaseInstance, "Base Instance");
+    STRINGISE_ENUM_CLASS_NAMED(DrawIndex, "Draw Index");
     STRINGISE_ENUM_CLASS_NAMED(StencilReference, "Stencil Ref Value");
+    STRINGISE_ENUM_CLASS_NAMED(PointCoord, "Point Co-ord");
+    STRINGISE_ENUM_CLASS_NAMED(IsHelper, "Is Helper");
+    STRINGISE_ENUM_CLASS_NAMED(SubgroupSize, "Subgroup Size");
+    STRINGISE_ENUM_CLASS_NAMED(NumSubgroups, "Num Subgroups");
+    STRINGISE_ENUM_CLASS_NAMED(SubgroupIndexInWorkgroup, "Subgroup Index in Workgroup");
+    STRINGISE_ENUM_CLASS_NAMED(IndexInSubgroup, "Index in Subgroup");
+    STRINGISE_ENUM_CLASS_NAMED(SubgroupEqualMask, "Subgroup Equal Mask");
+    STRINGISE_ENUM_CLASS_NAMED(SubgroupGreaterEqualMask, "Subgroup Greater-Equal Mask");
+    STRINGISE_ENUM_CLASS_NAMED(SubgroupGreaterMask, "Subgroup Greater Mask");
+    STRINGISE_ENUM_CLASS_NAMED(SubgroupLessEqualMask, "Subgroup Less-Equal Mask");
+    STRINGISE_ENUM_CLASS_NAMED(SubgroupLessMask, "Subgroup Less Mask");
+    STRINGISE_ENUM_CLASS_NAMED(DeviceIndex, "Device Index");
+    STRINGISE_ENUM_CLASS_NAMED(IsFullyCovered, "Is Fully Covered");
+    STRINGISE_ENUM_CLASS_NAMED(FragAreaSize, "Fragment Area Size");
+    STRINGISE_ENUM_CLASS_NAMED(FragInvocationCount, "Fragment Invocation Count");
+    STRINGISE_ENUM_CLASS_NAMED(PackedFragRate, "Packed Fragment Rate");
+    STRINGISE_ENUM_CLASS_NAMED(Barycentrics, "Barycentrics");
+    STRINGISE_ENUM_CLASS_NAMED(CullPrimitive, "Cull Primitive Output");
+    STRINGISE_ENUM_CLASS_NAMED(OutputIndices, "Output Indices");
   }
   END_ENUM_STRINGISE();
 }
@@ -599,6 +702,7 @@ rdcstr DoStringise(const BindType &el)
 {
   BEGIN_ENUM_STRINGISE(BindType)
   {
+    STRINGISE_ENUM_CLASS_NAMED(Unknown, "Unknown");
     STRINGISE_ENUM_CLASS_NAMED(ConstantBuffer, "Constants");
     STRINGISE_ENUM_CLASS_NAMED(Sampler, "Sampler");
     STRINGISE_ENUM_CLASS_NAMED(ImageSampler, "Image&Sampler");
@@ -608,6 +712,8 @@ rdcstr DoStringise(const BindType &el)
     STRINGISE_ENUM_CLASS_NAMED(ReadWriteTBuffer, "RW TexBuffer");
     STRINGISE_ENUM_CLASS_NAMED(ReadOnlyBuffer, "Buffer");
     STRINGISE_ENUM_CLASS_NAMED(ReadWriteBuffer, "RW Buffer");
+    STRINGISE_ENUM_CLASS_NAMED(ReadOnlyResource, "Resource");
+    STRINGISE_ENUM_CLASS_NAMED(ReadWriteResource, "RW Resource");
     STRINGISE_ENUM_CLASS_NAMED(InputAttachment, "Input");
   }
   END_ENUM_STRINGISE();
@@ -727,6 +833,7 @@ rdcstr DoStringise(const ResourceUsage &el)
     STRINGISE_ENUM_CLASS_NAMED(Indirect, "Indirect parameters");
 
     STRINGISE_ENUM_CLASS_NAMED(Clear, "Clear");
+    STRINGISE_ENUM_CLASS_NAMED(Discard, "Discard");
 
     STRINGISE_ENUM_CLASS_NAMED(GenMips, "Mip Generation");
     STRINGISE_ENUM_CLASS_NAMED(Resolve, "Resolve - Source&Dest");
@@ -737,6 +844,8 @@ rdcstr DoStringise(const ResourceUsage &el)
     STRINGISE_ENUM_CLASS_NAMED(CopyDst, "Copy - Destination");
 
     STRINGISE_ENUM_CLASS_NAMED(Barrier, "Barrier");
+
+    STRINGISE_ENUM_CLASS_NAMED(CPUWrite, "CPU Write");
   }
   END_ENUM_STRINGISE();
 }
@@ -757,19 +866,28 @@ rdcstr DoStringise(const VarType &el)
     STRINGISE_ENUM_CLASS_NAMED(ULong, "ulong");
     STRINGISE_ENUM_CLASS_NAMED(SByte, "byte");
     STRINGISE_ENUM_CLASS_NAMED(UByte, "ubyte");
+    STRINGISE_ENUM_CLASS_NAMED(Bool, "bool");
+    STRINGISE_ENUM_CLASS_NAMED(Enum, "enum");
+    STRINGISE_ENUM_CLASS_NAMED(Struct, "struct");
+    STRINGISE_ENUM_CLASS_NAMED(GPUPointer, "pointer");
+    STRINGISE_ENUM_CLASS_NAMED(ConstantBlock, "cbuffer");
+    STRINGISE_ENUM_CLASS_NAMED(ReadOnlyResource, "resource");
+    STRINGISE_ENUM_CLASS_NAMED(ReadWriteResource, "rwresource");
+    STRINGISE_ENUM_CLASS_NAMED(Sampler, "sampler");
     STRINGISE_ENUM_CLASS_NAMED(Unknown, "unknown");
   }
   END_ENUM_STRINGISE();
 }
 
 template <>
-rdcstr DoStringise(const RegisterType &el)
+rdcstr DoStringise(const DebugVariableType &el)
 {
-  BEGIN_ENUM_STRINGISE(RegisterType)
+  BEGIN_ENUM_STRINGISE(DebugVariableType)
   {
-    STRINGISE_ENUM_CLASS(Temporary);
-    STRINGISE_ENUM_CLASS(IndexedTemporary);
-    STRINGISE_ENUM_CLASS(Output);
+    STRINGISE_ENUM_CLASS(Undefined);
+    STRINGISE_ENUM_CLASS(Input);
+    STRINGISE_ENUM_CLASS(Constant);
+    STRINGISE_ENUM_CLASS(Variable);
   }
   END_ENUM_STRINGISE();
 }
@@ -801,6 +919,8 @@ rdcstr DoStringise(const GPUCounter &el)
     STRINGISE_ENUM_CLASS(GSInvocations);
     STRINGISE_ENUM_CLASS(PSInvocations);
     STRINGISE_ENUM_CLASS(CSInvocations);
+    STRINGISE_ENUM_CLASS(TSInvocations);
+    STRINGISE_ENUM_CLASS(MSInvocations);
   }
   END_ENUM_STRINGISE();
 }
@@ -831,6 +951,8 @@ rdcstr DoStringise(const ShaderStage &el)
     STRINGISE_ENUM_CLASS(Geometry);
     STRINGISE_ENUM_CLASS(Pixel);
     STRINGISE_ENUM_CLASS(Compute);
+    STRINGISE_ENUM_CLASS(Task);
+    STRINGISE_ENUM_CLASS(Mesh);
   }
   END_ENUM_STRINGISE();
 }
@@ -840,10 +962,11 @@ rdcstr DoStringise(const MeshDataStage &el)
 {
   BEGIN_ENUM_STRINGISE(MeshDataStage)
   {
-    STRINGISE_ENUM_CLASS(Unknown);
     STRINGISE_ENUM_CLASS(VSIn);
     STRINGISE_ENUM_CLASS(VSOut);
     STRINGISE_ENUM_CLASS(GSOut);
+    STRINGISE_ENUM_CLASS(TaskOut);
+    STRINGISE_ENUM_CLASS(MeshOut);
   }
   END_ENUM_STRINGISE();
 }
@@ -887,6 +1010,7 @@ rdcstr DoStringise(const GPUVendor &el)
     STRINGISE_ENUM_CLASS(Qualcomm);
     STRINGISE_ENUM_CLASS(Verisilicon);
     STRINGISE_ENUM_CLASS(Software);
+    STRINGISE_ENUM_CLASS(Samsung);
   }
   END_ENUM_STRINGISE();
 }
@@ -915,6 +1039,31 @@ rdcstr DoStringise(const ShaderEncoding &el)
     STRINGISE_ENUM_CLASS_NAMED(SPIRV, "SPIR-V");
     STRINGISE_ENUM_CLASS_NAMED(SPIRVAsm, "SPIR-V Asm");
     STRINGISE_ENUM_CLASS(HLSL);
+    STRINGISE_ENUM_CLASS(DXIL);
+    STRINGISE_ENUM_CLASS_NAMED(OpenGLSPIRV, "SPIR-V (OpenGL)");
+    STRINGISE_ENUM_CLASS_NAMED(OpenGLSPIRVAsm, "SPIR-V Asm (OpenGL)");
+  }
+  END_ENUM_STRINGISE();
+}
+
+template <>
+rdcstr DoStringise(const KnownShaderTool &el)
+{
+  BEGIN_ENUM_STRINGISE(KnownShaderTool);
+  {
+    STRINGISE_ENUM_CLASS_NAMED(Unknown, "Custom Tool");
+    STRINGISE_ENUM_CLASS_NAMED(SPIRV_Cross, "SPIRV-Cross");
+    STRINGISE_ENUM_CLASS_NAMED(spirv_dis, "spirv-dis");
+    STRINGISE_ENUM_CLASS_NAMED(glslangValidatorGLSL, "glslang (GLSL)");
+    STRINGISE_ENUM_CLASS_NAMED(glslangValidatorHLSL, "glslang (HLSL)");
+    STRINGISE_ENUM_CLASS_NAMED(spirv_as, "spirv-as");
+    STRINGISE_ENUM_CLASS_NAMED(dxcSPIRV, "dxc (SPIR-V)");
+    STRINGISE_ENUM_CLASS_NAMED(dxcDXIL, "dxc (DXIL)");
+    STRINGISE_ENUM_CLASS_NAMED(fxc, "fxc");
+    STRINGISE_ENUM_CLASS_NAMED(glslangValidatorGLSL_OpenGL, "glslang (GLSL to OpenGL SPIR-V)");
+    STRINGISE_ENUM_CLASS_NAMED(SPIRV_Cross_OpenGL, "SPIRV-Cross (OpenGL SPIR-V)");
+    STRINGISE_ENUM_CLASS_NAMED(spirv_as_OpenGL, "spirv-as (OpenGL SPIR-V)");
+    STRINGISE_ENUM_CLASS_NAMED(spirv_dis_OpenGL, "spirv-dis (OpenGL SPIR-V)");
   }
   END_ENUM_STRINGISE();
 }
@@ -931,6 +1080,23 @@ rdcstr DoStringise(const SectionType &el)
     STRINGISE_ENUM_CLASS_NAMED(ResourceRenames, "renderdoc/ui/resrenames");
     STRINGISE_ENUM_CLASS_NAMED(AMDRGPProfile, "amd/rgp/profile");
     STRINGISE_ENUM_CLASS_NAMED(ExtendedThumbnail, "renderdoc/internal/exthumb");
+    STRINGISE_ENUM_CLASS_NAMED(EmbeddedLogfile, "renderdoc/internal/logfile");
+    STRINGISE_ENUM_CLASS_NAMED(EditedShaders, "renderdoc/ui/edits");
+    STRINGISE_ENUM_CLASS_NAMED(D3D12Core, "renderdoc/internal/d3d12core");
+    STRINGISE_ENUM_CLASS_NAMED(D3D12SDKLayers, "renderdoc/internal/d3d12sdklayers");
+  }
+  END_ENUM_STRINGISE();
+}
+
+template <>
+rdcstr DoStringise(const ReplayOptimisationLevel &el)
+{
+  BEGIN_ENUM_STRINGISE(ReplayOptimisationLevel);
+  {
+    STRINGISE_ENUM_CLASS_NAMED(NoOptimisation, "No Optimisation");
+    STRINGISE_ENUM_CLASS(Conservative);
+    STRINGISE_ENUM_CLASS(Balanced);
+    STRINGISE_ENUM_CLASS(Fastest);
   }
   END_ENUM_STRINGISE();
 }
@@ -981,6 +1147,25 @@ rdcstr DoStringise(const SectionFlags &el)
 }
 
 template <>
+rdcstr DoStringise(const ShaderVariableFlags &el)
+{
+  BEGIN_BITFIELD_STRINGISE(ShaderVariableFlags);
+  {
+    STRINGISE_BITFIELD_CLASS_VALUE_NAMED(NoFlags, "None");
+
+    STRINGISE_BITFIELD_CLASS_BIT(RowMajorMatrix);
+    STRINGISE_BITFIELD_CLASS_BIT(HexDisplay);
+    STRINGISE_BITFIELD_CLASS_BIT(RGBDisplay);
+    STRINGISE_BITFIELD_CLASS_BIT(R11G11B10);
+    STRINGISE_BITFIELD_CLASS_BIT(R10G10B10A2);
+    STRINGISE_BITFIELD_CLASS_BIT(UNorm);
+    STRINGISE_BITFIELD_CLASS_BIT(SNorm);
+    STRINGISE_BITFIELD_CLASS_BIT(Truncated);
+  }
+  END_BITFIELD_STRINGISE();
+}
+
+template <>
 rdcstr DoStringise(const ShaderEvents &el)
 {
   BEGIN_BITFIELD_STRINGISE(ShaderEvents);
@@ -1026,21 +1211,22 @@ rdcstr DoStringise(const BufferCategory &el)
 }
 
 template <>
-rdcstr DoStringise(const DrawFlags &el)
+rdcstr DoStringise(const ActionFlags &el)
 {
-  BEGIN_BITFIELD_STRINGISE(DrawFlags);
+  BEGIN_BITFIELD_STRINGISE(ActionFlags);
   {
     STRINGISE_BITFIELD_CLASS_VALUE_NAMED(NoFlags, "None");
 
     STRINGISE_BITFIELD_CLASS_BIT(Clear);
     STRINGISE_BITFIELD_CLASS_BIT(Drawcall);
     STRINGISE_BITFIELD_CLASS_BIT(Dispatch);
+    STRINGISE_BITFIELD_CLASS_BIT(MeshDispatch);
     STRINGISE_BITFIELD_CLASS_BIT(CmdList);
     STRINGISE_BITFIELD_CLASS_BIT(SetMarker);
     STRINGISE_BITFIELD_CLASS_BIT(PushMarker);
     STRINGISE_BITFIELD_CLASS_BIT(PopMarker);
     STRINGISE_BITFIELD_CLASS_BIT(Present);
-    STRINGISE_BITFIELD_CLASS_BIT(MultiDraw);
+    STRINGISE_BITFIELD_CLASS_BIT(MultiAction);
     STRINGISE_BITFIELD_CLASS_BIT(Copy);
     STRINGISE_BITFIELD_CLASS_BIT(Resolve);
     STRINGISE_BITFIELD_CLASS_BIT(GenMips);
@@ -1054,7 +1240,7 @@ rdcstr DoStringise(const DrawFlags &el)
     STRINGISE_BITFIELD_CLASS_BIT(ClearDepthStencil);
     STRINGISE_BITFIELD_CLASS_BIT(BeginPass);
     STRINGISE_BITFIELD_CLASS_BIT(EndPass);
-    STRINGISE_BITFIELD_CLASS_BIT(APICalls);
+    STRINGISE_BITFIELD_CLASS_BIT(CommandBufferBoundary);
   }
   END_BITFIELD_STRINGISE();
 }
@@ -1073,6 +1259,8 @@ rdcstr DoStringise(const ShaderStageMask &el)
     STRINGISE_BITFIELD_CLASS_BIT(Geometry);
     STRINGISE_BITFIELD_CLASS_BIT(Pixel);
     STRINGISE_BITFIELD_CLASS_BIT(Compute);
+    STRINGISE_BITFIELD_CLASS_BIT(Task);
+    STRINGISE_BITFIELD_CLASS_BIT(Mesh);
   }
   END_BITFIELD_STRINGISE();
 }

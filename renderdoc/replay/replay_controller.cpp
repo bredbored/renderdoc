@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  * Copyright (c) 2014 Crytek
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -40,130 +40,6 @@
 #include "strings/string_utils.h"
 #include "tinyexr/tinyexr.h"
 
-float ConvertComponent(const ResourceFormat &fmt, const byte *data)
-{
-  if(fmt.compByteWidth == 8)
-  {
-    // we just downcast
-    const uint64_t *u64 = (const uint64_t *)data;
-    const int64_t *i64 = (const int64_t *)data;
-
-    if(fmt.compType == CompType::Double || fmt.compType == CompType::Float)
-    {
-      return float(*(const double *)u64);
-    }
-    else if(fmt.compType == CompType::UInt || fmt.compType == CompType::UScaled)
-    {
-      return float(*u64);
-    }
-    else if(fmt.compType == CompType::SInt || fmt.compType == CompType::SScaled)
-    {
-      return float(*i64);
-    }
-  }
-  else if(fmt.compByteWidth == 4)
-  {
-    const uint32_t *u32 = (const uint32_t *)data;
-    const int32_t *i32 = (const int32_t *)data;
-
-    if(fmt.compType == CompType::Float || fmt.compType == CompType::Depth)
-    {
-      return *(const float *)u32;
-    }
-    else if(fmt.compType == CompType::UInt || fmt.compType == CompType::UScaled)
-    {
-      return float(*u32);
-    }
-    else if(fmt.compType == CompType::SInt || fmt.compType == CompType::SScaled)
-    {
-      return float(*i32);
-    }
-  }
-  else if(fmt.compByteWidth == 3 && fmt.compType == CompType::Depth)
-  {
-    // 24-bit depth is a weird edge case we need to assemble it by hand
-    const uint8_t *u8 = (const uint8_t *)data;
-
-    uint32_t depth = 0;
-    depth |= uint32_t(u8[1]);
-    depth |= uint32_t(u8[2]) << 8;
-    depth |= uint32_t(u8[3]) << 16;
-
-    return float(depth) / float(16777215.0f);
-  }
-  else if(fmt.compByteWidth == 2)
-  {
-    const uint16_t *u16 = (const uint16_t *)data;
-    const int16_t *i16 = (const int16_t *)data;
-
-    if(fmt.compType == CompType::Float)
-    {
-      return ConvertFromHalf(*u16);
-    }
-    else if(fmt.compType == CompType::UInt || fmt.compType == CompType::UScaled)
-    {
-      return float(*u16);
-    }
-    else if(fmt.compType == CompType::SInt || fmt.compType == CompType::SScaled)
-    {
-      return float(*i16);
-    }
-    // 16-bit depth is UNORM
-    else if(fmt.compType == CompType::UNorm || fmt.compType == CompType::Depth)
-    {
-      return float(*u16) / 65535.0f;
-    }
-    else if(fmt.compType == CompType::SNorm)
-    {
-      float f = -1.0f;
-
-      if(*i16 == -32768)
-        f = -1.0f;
-      else
-        f = ((float)*i16) / 32767.0f;
-
-      return f;
-    }
-  }
-  else if(fmt.compByteWidth == 1)
-  {
-    const uint8_t *u8 = (const uint8_t *)data;
-    const int8_t *i8 = (const int8_t *)data;
-
-    if(fmt.compType == CompType::UInt || fmt.compType == CompType::UScaled)
-    {
-      return float(*u8);
-    }
-    else if(fmt.compType == CompType::SInt || fmt.compType == CompType::SScaled)
-    {
-      return float(*i8);
-    }
-    else if(fmt.compType == CompType::UNormSRGB)
-    {
-      return SRGB8_lookuptable[*u8];
-    }
-    else if(fmt.compType == CompType::UNorm)
-    {
-      return float(*u8) / 255.0f;
-    }
-    else if(fmt.compType == CompType::SNorm)
-    {
-      float f = -1.0f;
-
-      if(*i8 == -128)
-        f = -1.0f;
-      else
-        f = ((float)*i8) / 127.0f;
-
-      return f;
-    }
-  }
-
-  RDCERR("Unexpected format to convert from %u %u", fmt.compByteWidth, fmt.compType);
-
-  return 0.0f;
-}
-
 static void fileWriteFunc(void *context, void *data, int size)
 {
   FileIO::fwrite(data, 1, size, (FILE *)context);
@@ -177,55 +53,36 @@ ReplayController::ReplayController()
 
   m_EventID = 100000;
 
-  m_D3D11PipelineState = NULL;
-  m_D3D12PipelineState = NULL;
-  m_GLPipelineState = NULL;
-  m_VulkanPipelineState = NULL;
-
-  if(RenderDoc::Inst().GetCrashHandler())
-    RenderDoc::Inst().GetCrashHandler()->RegisterMemoryRegion(this, sizeof(ReplayController));
+  RenderDoc::Inst().RegisterMemoryRegion(this, sizeof(ReplayController));
 }
 
 ReplayController::~ReplayController()
 {
   CHECK_REPLAY_THREAD();
-
-  RDCLOG("Shutting down replay renderer");
-
-  for(size_t i = 0; i < m_Outputs.size(); i++)
-    SAFE_DELETE(m_Outputs[i]);
-
-  m_Outputs.clear();
-
-  for(auto it = m_CustomShaders.begin(); it != m_CustomShaders.end(); ++it)
-    m_pDevice->FreeCustomShader(*it);
-
-  m_CustomShaders.clear();
-
-  for(auto it = m_TargetResources.begin(); it != m_TargetResources.end(); ++it)
-    m_pDevice->FreeTargetResource(*it);
-
-  m_TargetResources.clear();
-
-  if(m_pDevice)
-    m_pDevice->Shutdown();
-  m_pDevice = NULL;
 }
 
 void ReplayController::SetFrameEvent(uint32_t eventId, bool force)
 {
   CHECK_REPLAY_THREAD();
+  RENDERDOC_PROFILEFUNCTION();
+
+  // use remapped event if there's a match
+  auto it = m_EventRemap.find(eventId);
+  if(it != m_EventRemap.end())
+    eventId = it->second;
 
   if(eventId != m_EventID || force)
   {
     m_EventID = eventId;
 
     m_pDevice->ReplayLog(eventId, eReplay_WithoutDraw);
+    FatalErrorCheck();
 
     for(size_t i = 0; i < m_Outputs.size(); i++)
       m_Outputs[i]->SetFrameEvent(eventId);
 
     m_pDevice->ReplayLog(eventId, eReplay_OnlyDraw);
+    FatalErrorCheck();
 
     FetchPipelineState(eventId);
   }
@@ -235,28 +92,28 @@ const D3D11Pipe::State *ReplayController::GetD3D11PipelineState()
 {
   CHECK_REPLAY_THREAD();
 
-  return m_D3D11PipelineState;
+  return m_APIProps.pipelineType == GraphicsAPI::D3D11 ? &m_D3D11PipelineState : NULL;
 }
 
 const D3D12Pipe::State *ReplayController::GetD3D12PipelineState()
 {
   CHECK_REPLAY_THREAD();
 
-  return m_D3D12PipelineState;
+  return m_APIProps.pipelineType == GraphicsAPI::D3D12 ? &m_D3D12PipelineState : NULL;
 }
 
 const GLPipe::State *ReplayController::GetGLPipelineState()
 {
   CHECK_REPLAY_THREAD();
 
-  return m_GLPipelineState;
+  return m_APIProps.pipelineType == GraphicsAPI::OpenGL ? &m_GLPipelineState : NULL;
 }
 
 const VKPipe::State *ReplayController::GetVulkanPipelineState()
 {
   CHECK_REPLAY_THREAD();
 
-  return m_VulkanPipelineState;
+  return m_APIProps.pipelineType == GraphicsAPI::Vulkan ? &m_VulkanPipelineState : NULL;
 }
 
 const PipeState &ReplayController::GetPipelineState()
@@ -266,34 +123,41 @@ const PipeState &ReplayController::GetPipelineState()
   return m_PipeState;
 }
 
-rdcarray<rdcstr> ReplayController::GetDisassemblyTargets()
+rdcarray<rdcstr> ReplayController::GetDisassemblyTargets(bool withPipeline)
 {
   CHECK_REPLAY_THREAD();
 
   rdcarray<rdcstr> ret;
 
-  std::vector<std::string> targets = m_pDevice->GetDisassemblyTargets();
+  rdcarray<rdcstr> targets = m_pDevice->GetDisassemblyTargets(withPipeline);
 
   ret.reserve(targets.size());
-  for(const std::string &t : targets)
+  for(const rdcstr &t : targets)
     ret.push_back(t);
 
-  for(const std::string &t : m_GCNTargets)
+  for(const rdcstr &t : m_GCNTargets)
     ret.push_back(t);
 
   return ret;
 }
 
 rdcstr ReplayController::DisassembleShader(ResourceId pipeline, const ShaderReflection *refl,
-                                           const char *target)
+                                           const rdcstr &target)
 {
   CHECK_REPLAY_THREAD();
 
-  for(const std::string &t : m_GCNTargets)
+  RENDERDOC_PROFILEFUNCTION();
+
+  if(refl == NULL)
+    return "; Error: No shader specified";
+
+  for(const rdcstr &t : m_GCNTargets)
     if(t == target)
       return GCNISA::Disassemble(refl->encoding, refl->stage, refl->rawBytes, target);
 
-  return m_pDevice->DisassembleShader(pipeline, refl, target);
+  rdcstr ret = m_pDevice->DisassembleShader(m_pDevice->GetLiveID(pipeline), refl, target);
+  FatalErrorCheck();
+  return ret;
 }
 
 FrameDescription ReplayController::GetFrameInfo()
@@ -307,37 +171,37 @@ const SDFile &ReplayController::GetStructuredFile()
 {
   CHECK_REPLAY_THREAD();
 
-  return m_pDevice->GetStructuredFile();
+  return *m_pDevice->GetStructuredFile();
 }
 
-DrawcallDescription *ReplayController::GetDrawcallByEID(uint32_t eventId)
+ActionDescription *ReplayController::GetActionByEID(uint32_t eventId)
 {
   CHECK_REPLAY_THREAD();
 
-  if(eventId >= m_Drawcalls.size())
+  if(eventId >= m_Actions.size())
     return NULL;
 
-  return m_Drawcalls[eventId];
+  return m_Actions[eventId];
 }
 
-const rdcarray<DrawcallDescription> &ReplayController::GetDrawcalls()
+const rdcarray<ActionDescription> &ReplayController::GetRootActions()
 {
   CHECK_REPLAY_THREAD();
 
-  return m_FrameRecord.drawcallList;
+  return m_FrameRecord.actionList;
 }
 
-bool ReplayController::ContainsMarker(const rdcarray<DrawcallDescription> &draws)
+bool ReplayController::ContainsMarker(const rdcarray<ActionDescription> &actions)
 {
   CHECK_REPLAY_THREAD();
 
   bool ret = false;
 
-  for(const DrawcallDescription &d : draws)
+  for(const ActionDescription &a : actions)
   {
-    ret |= (d.flags & DrawFlags::PushMarker) &&
-           !(d.flags & (DrawFlags::CmdList | DrawFlags::MultiDraw)) && !d.children.empty();
-    ret |= ContainsMarker(d.children);
+    ret |= (a.flags & ActionFlags::PushMarker) &&
+           !(a.flags & (ActionFlags::CmdList | ActionFlags::MultiAction)) && !a.children.empty();
+    ret |= ContainsMarker(a.children);
 
     if(ret)
       break;
@@ -346,16 +210,16 @@ bool ReplayController::ContainsMarker(const rdcarray<DrawcallDescription> &draws
   return ret;
 }
 
-bool ReplayController::PassEquivalent(const DrawcallDescription &a, const DrawcallDescription &b)
+bool ReplayController::PassEquivalent(const ActionDescription &a, const ActionDescription &b)
 {
   CHECK_REPLAY_THREAD();
 
-  // don't group draws and compute executes
-  if((a.flags & DrawFlags::Dispatch) != (b.flags & DrawFlags::Dispatch))
+  // don't group actions and compute executes
+  if((a.flags & ActionFlags::Dispatch) != (b.flags & ActionFlags::Dispatch))
     return false;
 
   // don't group present with anything
-  if((a.flags & DrawFlags::Present) != (b.flags & DrawFlags::Present))
+  if((a.flags & ActionFlags::Present) != (b.flags & ActionFlags::Present))
     return false;
 
   // don't group things with different depth outputs
@@ -408,7 +272,7 @@ bool ReplayController::PassEquivalent(const DrawcallDescription &a, const Drawca
 
   // use a kind of heuristic to group together passes where the outputs are similar enough.
   // could be useful for example if you're rendering to a gbuffer and sometimes you render
-  // without one target, but the draws are still batched up.
+  // without one target, but the actions are still batched up.
   if(numSame > RDCMAX(numAOuts, numBOuts) / 2 && RDCMAX(numAOuts, numBOuts) > 1)
     return true;
 
@@ -422,12 +286,15 @@ void ReplayController::AddFakeMarkers()
 {
   CHECK_REPLAY_THREAD();
 
-  rdcarray<DrawcallDescription> &draws = m_FrameRecord.drawcallList;
+  rdcarray<ActionDescription> &actions = m_FrameRecord.actionList;
 
-  if(ContainsMarker(draws))
+  if(ContainsMarker(actions))
     return;
 
-  std::vector<DrawcallDescription> ret;
+  uint32_t newEventId = actions.back().events.back().eventId + 1;
+  uint32_t newActionId = actions.back().actionId + 1;
+
+  rdcarray<ActionDescription> ret;
 
   int depthpassID = 1;
   int copypassID = 1;
@@ -435,34 +302,34 @@ void ReplayController::AddFakeMarkers()
   int passID = 1;
 
   int start = 0;
-  int refdraw = 0;
+  int refaction = 0;
 
-  DrawFlags drawFlags = DrawFlags::Copy | DrawFlags::Resolve | DrawFlags::SetMarker |
-                        DrawFlags::APICalls | DrawFlags::CmdList;
+  ActionFlags actionFlags =
+      ActionFlags::Copy | ActionFlags::Resolve | ActionFlags::SetMarker | ActionFlags::CmdList;
 
-  for(int32_t i = 1; i < draws.count(); i++)
+  for(int32_t i = 1; i < actions.count(); i++)
   {
-    if(draws[refdraw].flags & drawFlags)
+    if(actions[refaction].flags & actionFlags)
     {
-      refdraw = i;
+      refaction = i;
       continue;
     }
 
-    if(draws[i].flags & drawFlags)
+    if(actions[i].flags & actionFlags)
       continue;
 
-    if(PassEquivalent(draws[i], draws[refdraw]))
+    if(PassEquivalent(actions[i], actions[refaction]))
       continue;
 
     int end = i - 1;
 
-    if(end - start < 2 || !draws[i].children.empty() || !draws[refdraw].children.empty())
+    if(end - start < 2 || !actions[i].children.empty() || !actions[refaction].children.empty())
     {
       for(int j = start; j <= end; j++)
-        ret.push_back(draws[j]);
+        ret.push_back(actions[j]);
 
       start = i;
-      refdraw = i;
+      refaction = i;
       continue;
     }
 
@@ -474,74 +341,85 @@ void ReplayController::AddFakeMarkers()
     {
       int outCount = 0;
 
-      if(!(draws[j].flags & (DrawFlags::Copy | DrawFlags::Resolve | DrawFlags::Clear)))
+      if(!(actions[j].flags & (ActionFlags::Copy | ActionFlags::Resolve | ActionFlags::Clear |
+                               ActionFlags::PassBoundary | ActionFlags::SetMarker)))
         copyOnly = false;
 
-      for(ResourceId o : draws[j].outputs)
+      for(ResourceId o : actions[j].outputs)
         if(o != ResourceId())
           outCount++;
       minOutCount = RDCMIN(minOutCount, outCount);
       maxOutCount = RDCMAX(maxOutCount, outCount);
     }
 
-    DrawcallDescription mark;
+    ActionDescription mark;
 
-    mark.eventId = draws[start].eventId;
-    mark.drawcallId = draws[start].drawcallId;
+    mark.eventId = newEventId++;
+    mark.actionId = newActionId++;
 
-    mark.flags = DrawFlags::PushMarker;
-    memcpy(mark.outputs, draws[end].outputs, sizeof(mark.outputs));
-    mark.depthOut = draws[end].depthOut;
-
-    mark.name = "Guessed Pass";
+    mark.flags = ActionFlags::PushMarker;
+    mark.outputs = actions[end].outputs;
+    mark.depthOut = actions[end].depthOut;
 
     minOutCount = RDCMAX(1, minOutCount);
 
-    const char *targets = draws[end].depthOut == ResourceId() ? "Targets" : "Targets + Depth";
+    const char *targets = actions[end].depthOut == ResourceId() ? "Targets" : "Targets + Depth";
 
     if(copyOnly)
-      mark.name = StringFormat::Fmt("Copy/Clear Pass #%d", copypassID++);
-    else if(draws[refdraw].flags & DrawFlags::Dispatch)
-      mark.name = StringFormat::Fmt("Compute Pass #%d", computepassID++);
+      mark.customName = StringFormat::Fmt("Copy/Clear Pass #%d", copypassID++);
+    else if(actions[refaction].flags & ActionFlags::Dispatch)
+      mark.customName = StringFormat::Fmt("Compute Pass #%d", computepassID++);
     else if(maxOutCount == 0)
-      mark.name = StringFormat::Fmt("Depth-only Pass #%d", depthpassID++);
+      mark.customName = StringFormat::Fmt("Depth-only Pass #%d", depthpassID++);
     else if(minOutCount == maxOutCount)
-      mark.name = StringFormat::Fmt("Colour Pass #%d (%d %s)", passID++, minOutCount, targets);
+      mark.customName = StringFormat::Fmt("Colour Pass #%d (%d %s)", passID++, minOutCount, targets);
     else
-      mark.name = StringFormat::Fmt("Colour Pass #%d (%d-%d %s)", passID++, minOutCount,
-                                    maxOutCount, targets);
+      mark.customName = StringFormat::Fmt("Colour Pass #%d (%d-%d %s)", passID++, minOutCount,
+                                          maxOutCount, targets);
 
     mark.children.resize(end - start + 1);
 
     for(int j = start; j <= end; j++)
-      mark.children[j - start] = draws[j];
+      mark.children[j - start] = actions[j];
+
+    APIEvent ev;
+    ev.eventId = mark.eventId;
+    ev.fileOffset = mark.children[0].events.back().fileOffset;
+    ev.chunkIndex = APIEvent::NoChunk;
+    mark.events.push_back(ev);
+
+    // when this event is selected, instead select the first the event before the first child's
+    // first event. This is effectively what would be the case if there was a real marker here.
+    m_EventRemap[mark.eventId] = mark.children[0].events[0].eventId - 1;
 
     ret.push_back(mark);
 
     start = i;
-    refdraw = i;
+    refaction = i;
   }
 
-  if(start < draws.count())
+  if(start < actions.count())
   {
-    for(int j = start; j < draws.count(); j++)
-      ret.push_back(draws[j]);
+    for(int j = start; j < actions.count(); j++)
+      ret.push_back(actions[j]);
   }
 
-  m_FrameRecord.drawcallList = ret;
+  m_FrameRecord.actionList = ret;
 
   // re-configure the previous/next pointeres
-  m_Drawcalls.clear();
-  SetupDrawcallPointers(m_Drawcalls, m_FrameRecord.drawcallList);
+  m_Actions.clear();
+  SetupActionPointers(m_Actions, m_FrameRecord.actionList);
 }
 
 rdcarray<CounterResult> ReplayController::FetchCounters(const rdcarray<GPUCounter> &counters)
 {
   CHECK_REPLAY_THREAD();
 
-  std::vector<GPUCounter> counterArray(counters.begin(), counters.end());
+  RENDERDOC_PROFILEFUNCTION();
 
-  return m_pDevice->FetchCounters(counterArray);
+  rdcarray<CounterResult> ret = m_pDevice->FetchCounters(counters);
+  FatalErrorCheck();
+  return ret;
 }
 
 rdcarray<GPUCounter> ReplayController::EnumerateCounters()
@@ -593,11 +471,12 @@ rdcarray<ShaderEntryPoint> ReplayController::GetShaderEntryPoints(ResourceId sha
   return m_pDevice->GetShaderEntryPoints(m_pDevice->GetLiveID(shader));
 }
 
-ShaderReflection *ReplayController::GetShader(ResourceId shader, ShaderEntryPoint entry)
+const ShaderReflection *ReplayController::GetShader(ResourceId pipeline, ResourceId shader,
+                                                    ShaderEntryPoint entry)
 {
   CHECK_REPLAY_THREAD();
 
-  return m_pDevice->GetShader(m_pDevice->GetLiveID(shader), entry);
+  return m_pDevice->GetShader(m_pDevice->GetLiveID(pipeline), m_pDevice->GetLiveID(shader), entry);
 }
 
 rdcarray<EventUsage> ReplayController::GetUsage(ResourceId id)
@@ -614,19 +493,20 @@ MeshFormat ReplayController::GetPostVSData(uint32_t instID, uint32_t viewID, Mes
 {
   CHECK_REPLAY_THREAD();
 
-  DrawcallDescription *draw = GetDrawcallByEID(m_EventID);
+  ActionDescription *action = GetActionByEID(m_EventID);
 
-  MeshFormat ret;
-  RDCEraseEl(ret);
-
-  if(draw == NULL || !(draw->flags & DrawFlags::Drawcall))
+  if(action == NULL || !(action->flags & (ActionFlags::MeshDispatch | ActionFlags::Drawcall)))
     return MeshFormat();
 
-  instID = RDCMIN(instID, draw->numInstances - 1);
+  instID = RDCMIN(instID, action->numInstances - 1);
 
-  m_pDevice->InitPostVSBuffers(draw->eventId);
+  m_pDevice->InitPostVSBuffers(action->eventId);
+  FatalErrorCheck();
 
-  return m_pDevice->GetPostVSBuffers(draw->eventId, instID, viewID, stage);
+  MeshFormat ret = m_pDevice->GetPostVSBuffers(action->eventId, instID, viewID, stage);
+  FatalErrorCheck();
+
+  return ret;
 }
 
 bytebuf ReplayController::GetBufferData(ResourceId buff, uint64_t offset, uint64_t len)
@@ -642,18 +522,20 @@ bytebuf ReplayController::GetBufferData(ResourceId buff, uint64_t offset, uint64
 
   if(liveId == ResourceId())
   {
-    RDCERR("Couldn't get Live ID for %llu getting buffer data", buff);
+    RDCERR("Couldn't get Live ID for %s getting buffer data", ToStr(buff).c_str());
     return retData;
   }
 
   m_pDevice->GetBufferData(liveId, offset, len, retData);
+  FatalErrorCheck();
 
   return retData;
 }
 
-bytebuf ReplayController::GetTextureData(ResourceId tex, uint32_t arrayIdx, uint32_t mip)
+bytebuf ReplayController::GetTextureData(ResourceId tex, const Subresource &sub)
 {
   CHECK_REPLAY_THREAD();
+  RENDERDOC_PROFILEFUNCTION();
 
   bytebuf ret;
 
@@ -661,31 +543,32 @@ bytebuf ReplayController::GetTextureData(ResourceId tex, uint32_t arrayIdx, uint
 
   if(liveId == ResourceId())
   {
-    RDCERR("Couldn't get Live ID for %llu getting texture data", tex);
+    RDCERR("Couldn't get Live ID for %s getting texture data", ToStr(tex).c_str());
     return ret;
   }
 
-  m_pDevice->GetTextureData(liveId, arrayIdx, mip, GetTextureDataParams(), ret);
+  m_pDevice->GetTextureData(liveId, sub, GetTextureDataParams(), ret);
+  FatalErrorCheck();
 
   return ret;
 }
 
-bool ReplayController::SaveTexture(const TextureSave &saveData, const char *path)
+ResultDetails ReplayController::SaveTexture(const TextureSave &saveData, const rdcstr &path)
 {
   CHECK_REPLAY_THREAD();
+  RENDERDOC_PROFILEFUNCTION();
 
   TextureSave sd = saveData;    // mutable copy
   ResourceId liveid = m_pDevice->GetLiveID(sd.resourceId);
 
   if(liveid == ResourceId())
   {
-    RDCERR("Couldn't get Live ID for %llu getting texture data", sd.resourceId);
-    return false;
+    RETURN_ERROR_RESULT(ResultCode::InvalidParameter,
+                        "Couldn't get Live ID for %s getting texture data",
+                        ToStr(sd.resourceId).c_str());
   }
 
   TextureDescription td = m_pDevice->GetTexture(liveid);
-
-  bool success = false;
 
   // clamp sample/mip/slice indices
   if(td.msSamp == 1)
@@ -696,7 +579,7 @@ bool ReplayController::SaveTexture(const TextureSave &saveData, const char *path
   else
   {
     if(sd.sample.sampleIndex != ~0U)
-      sd.sample.sampleIndex = RDCCLAMP(sd.sample.sampleIndex, 0U, td.msSamp);
+      sd.sample.sampleIndex = RDCCLAMP((uint32_t)sd.sample.sampleIndex, 0U, td.msSamp);
   }
 
   // don't support cube cruciform for non cubemaps, or
@@ -724,8 +607,11 @@ bool ReplayController::SaveTexture(const TextureSave &saveData, const char *path
   // store sample count so we know how many 'slices' is one real slice
   // multisampled textures cannot have mips, subresource layout is same as would be for mips:
   // [slice0 sample0], [slice0 sample1], [slice1 sample0], [slice1 sample1]
-  uint32_t sampleCount = td.msSamp;
+  uint32_t sampleCount = RDCMAX(td.msSamp, 1U);
   bool multisampled = td.msSamp > 1;
+
+  if(sd.sample.mapToArray)
+    sd.sample.sampleIndex = 0;
 
   bool resolveSamples = (sd.sample.sampleIndex == ~0U);
 
@@ -738,7 +624,7 @@ bool ReplayController::SaveTexture(const TextureSave &saveData, const char *path
 
   // treat any multisampled texture as if it were an array
   // of <sample count> dimension (on top of potential existing array
-  // dimension). GetTextureData() uses the same convention.
+  // dimension).
   if(td.msSamp > 1)
   {
     td.arraysize *= td.msSamp;
@@ -833,7 +719,7 @@ bool ReplayController::SaveTexture(const TextureSave &saveData, const char *path
     // otherwise take all mips, as by default
   }
 
-  std::vector<byte *> subdata;
+  rdcarray<byte *> subdata;
 
   bool downcast = false;
 
@@ -856,7 +742,7 @@ bool ReplayController::SaveTexture(const TextureSave &saveData, const char *path
   // for non-HDR always downcast if we're not already RGBA8 unorm
   if(sd.destType != FileType::DDS && sd.destType != FileType::HDR && sd.destType != FileType::EXR &&
      (td.format.compByteWidth != 1 || td.format.compCount != 4 ||
-      td.format.compType != CompType::UNorm || td.format.BGRAOrder()))
+      td.format.compType != CompType::UNorm || td.format.BGRAOrder() || td.format.Special()))
     downcast = true;
 
   // for HDR & EXR we can convert from most regular types as well as 10.10.10.2 and 11.11.10
@@ -870,9 +756,21 @@ bool ReplayController::SaveTexture(const TextureSave &saveData, const char *path
 
   if(downcast)
   {
-    // if the source and destination are more than 1 byte per component, remap to RGBA32
-    if(td.format.compByteWidth > 1 && (sd.destType == FileType::DDS ||
-                                       sd.destType == FileType::HDR || sd.destType == FileType::EXR))
+    const bool destHDR = (sd.destType == FileType::DDS || sd.destType == FileType::HDR ||
+                          sd.destType == FileType::EXR);
+
+    const bool sourceHDR =
+        td.format.compByteWidth > 1 || td.format.type == ResourceFormatType::D16S8 ||
+        td.format.type == ResourceFormatType::D24S8 || td.format.type == ResourceFormatType::D32S8 ||
+        td.format.type == ResourceFormatType::R11G11B10 ||
+        td.format.type == ResourceFormatType::R10G10B10A2 ||
+        td.format.type == ResourceFormatType::R9G9B9E5 || td.format.type == ResourceFormatType::BC6 ||
+        td.format.type == ResourceFormatType::BC7 || td.format.type == ResourceFormatType::YUV10 ||
+        td.format.type == ResourceFormatType::YUV12 || td.format.type == ResourceFormatType::YUV16;
+
+    // if the source and destination have more than 1 byte per component, remap to RGBA32 to avoid
+    // precision loss
+    if(sourceHDR && destHDR)
     {
       remap = RemapTexture::RGBA32;
       td.format.compByteWidth = 4;
@@ -934,8 +832,10 @@ bool ReplayController::SaveTexture(const TextureSave &saveData, const char *path
       case ResourceFormatType::YUV12:
       case ResourceFormatType::YUV16:
       case ResourceFormatType::R4G4:
-        RDCERR("Unsupported file format %u", td.format.type);
-        return false;
+      {
+        RETURN_ERROR_RESULT(ResultCode::ImageUnsupported, "Unsupported file format %s",
+                            ToStr(td.format.type).c_str());
+      }
       default: bytesPerPixel = td.format.compCount * td.format.compByteWidth;
     }
 
@@ -954,23 +854,27 @@ bool ReplayController::SaveTexture(const TextureSave &saveData, const char *path
 
       GetTextureDataParams params;
       params.forDiskSave = true;
-      params.typeHint = sd.typeHint;
+      params.standardLayout = true;
+      params.typeCast = sd.typeCast;
       params.resolve = resolveSamples;
       params.remap = remap;
       params.blackPoint = sd.comp.blackPoint;
       params.whitePoint = sd.comp.whitePoint;
 
+      Subresource sub = {mip, slice / sampleCount, slice % sampleCount};
+
       bytebuf data;
-      m_pDevice->GetTextureData(liveid, slice, mip, params, data);
+      m_pDevice->GetTextureData(liveid, sub, params, data);
+      FatalErrorCheck();
 
       if(data.empty())
       {
-        RDCERR("Couldn't get bytes for mip %u, slice %u", mip, slice);
-
         for(size_t i = 0; i < subdata.size(); i++)
           delete[] subdata[i];
 
-        return false;
+        RETURN_ERROR_RESULT(ResultCode::DataNotAvailable,
+                            "Couldn't readback bytes for mip %u, slice %u, sample %u", sub.mip,
+                            sub.slice, sub.sample);
       }
 
       if(td.depth == 1)
@@ -1004,7 +908,7 @@ bool ReplayController::SaveTexture(const TextureSave &saveData, const char *path
       {
         byte *depthslice = new byte[mipSlicePitch];
         byte *b = data.data() + mipSlicePitch * sliceOffset;
-        memcpy(depthslice, b, slicePitch);
+        memcpy(depthslice, b, mipSlicePitch);
         subdata.push_back(depthslice);
 
         continue;
@@ -1162,15 +1066,15 @@ bool ReplayController::SaveTexture(const TextureSave &saveData, const char *path
           case 4:
             memcpy(&subdata[0][(y * td.width + x) * pixelStride + 3 * compWidth], &max,
                    td.format.compByteWidth);
-          // deliberate fallthrough
+            DELIBERATE_FALLTHROUGH();
           case 3:
             memcpy(&subdata[0][(y * td.width + x) * pixelStride + 2 * compWidth], &val,
                    td.format.compByteWidth);
-          // deliberate fallthrough
+            DELIBERATE_FALLTHROUGH();
           case 2:
             memcpy(&subdata[0][(y * td.width + x) * pixelStride + 1 * compWidth], &val,
                    td.format.compByteWidth);
-          // deliberate fallthrough
+            DELIBERATE_FALLTHROUGH();
           case 1:
             memcpy(&subdata[0][(y * td.width + x) * pixelStride + 0 * compWidth], &val,
                    td.format.compByteWidth);
@@ -1204,9 +1108,9 @@ bool ReplayController::SaveTexture(const TextureSave &saveData, const char *path
                               : RenderDoc::Inst().DarkCheckerboardColor();
           }
 
-          col.x = powf(col.x, 1.0f / 2.2f);
-          col.y = powf(col.y, 1.0f / 2.2f);
-          col.z = powf(col.z, 1.0f / 2.2f);
+          col.x = ConvertLinearToSRGB(col.x);
+          col.y = ConvertLinearToSRGB(col.y);
+          col.z = ConvertLinearToSRGB(col.z);
 
           FloatVector pixel = FloatVector(float(r) / 255.0f, float(g) / 255.0f, float(b) / 255.0f,
                                           float(a) / 255.0f);
@@ -1265,67 +1169,63 @@ bool ReplayController::SaveTexture(const TextureSave &saveData, const char *path
     rowPitch = td.width * 3;
   }
 
-  FILE *f = FileIO::fopen(path, "wb");
+  FILE *f = FileIO::fopen(path, FileIO::WriteBinary);
+
+  RDResult res;
 
   if(!f)
   {
-    success = false;
-    RDCERR("Couldn't write to path %s, error: %s", path, FileIO::ErrorString().c_str());
+    RETURN_ERROR_RESULT(ResultCode::FileIOFailed, "Couldn't write to path %s, error: %s",
+                        path.c_str(), FileIO::ErrorString().c_str());
   }
   else
   {
     if(sd.destType == FileType::DDS)
     {
-      dds_data ddsData;
+      write_dds_data ddsData;
+
+      ResourceFormat saveFmt = td.format;
+      // use typeCast to inform typeless saving, otherwise it will get lost
+      if(saveFmt.compType == CompType::Typeless)
+        saveFmt.compType = sd.typeCast;
 
       ddsData.width = td.width;
       ddsData.height = td.height;
       ddsData.depth = td.depth;
-      ddsData.format = td.format;
+      ddsData.format = saveFmt;
       ddsData.mips = numMips;
       ddsData.slices = numSlices / td.depth;
-      ddsData.subdata = &subdata[0];
+      ddsData.subresources = subdata;
       ddsData.cubemap = td.cubemap && numSlices == 6;
 
       if(singleSlice)
         ddsData.depth = ddsData.slices = 1;
 
-      success = write_dds_to_file(f, ddsData);
+      res = write_dds_to_file(f, ddsData);
     }
     else if(sd.destType == FileType::BMP)
     {
       int ret = stbi_write_bmp_to_func(fileWriteFunc, (void *)f, td.width, td.height, numComps,
                                        subdata[0]);
-      success = (ret != 0);
 
-      if(!success)
-        RDCERR("stbi_write_bmp_to_func failed: %d", ret);
+      if(ret == 0)
+        SET_ERROR_RESULT(res, ResultCode::InternalError, "Failed to write BMP image");
     }
     else if(sd.destType == FileType::PNG)
     {
-      // discard alpha if requested
-      for(uint32_t p = 0; sd.alpha == AlphaMapping::Discard && p < td.width * td.height; p++)
-        subdata[0][p * 4 + 3] = 255;
-
       int ret = stbi_write_png_to_func(fileWriteFunc, (void *)f, td.width, td.height, numComps,
                                        subdata[0], rowPitch);
-      success = (ret != 0);
 
-      if(!success)
-        RDCERR("stbi_write_png_to_func failed: %d", ret);
+      if(ret == 0)
+        SET_ERROR_RESULT(res, ResultCode::InternalError, "Failed to write PNG image");
     }
     else if(sd.destType == FileType::TGA)
     {
-      // discard alpha if requested
-      for(uint32_t p = 0; sd.alpha == AlphaMapping::Discard && p < td.width * td.height; p++)
-        subdata[0][p * 4 + 3] = 255;
-
       int ret = stbi_write_tga_to_func(fileWriteFunc, (void *)f, td.width, td.height, numComps,
                                        subdata[0]);
-      success = (ret != 0);
 
-      if(!success)
-        RDCERR("stbi_write_tga_to_func failed: %d", ret);
+      if(ret == 0)
+        SET_ERROR_RESULT(res, ResultCode::InternalError, "Failed to write TGA image");
     }
     else if(sd.destType == FileType::JPG)
     {
@@ -1339,14 +1239,13 @@ bool ReplayController::SaveTexture(const TextureSave &saveData, const char *path
 
       char *jpgdst = new char[len];
 
-      success = jpge::compress_image_to_jpeg_file_in_memory(jpgdst, len, td.width, td.height,
-                                                            numComps, subdata[0], p);
-
-      if(!success)
-        RDCERR("jpge::compress_image_to_jpeg_file_in_memory failed");
+      bool success = jpge::compress_image_to_jpeg_file_in_memory(jpgdst, len, td.width, td.height,
+                                                                 numComps, subdata[0], p);
 
       if(success)
         fwrite(jpgdst, 1, len, f);
+      else
+        SET_ERROR_RESULT(res, ResultCode::InternalError, "Failed to write JPG image");
 
       delete[] jpgdst;
     }
@@ -1371,11 +1270,11 @@ bool ReplayController::SaveTexture(const TextureSave &saveData, const char *path
 
       ResourceFormat saveFmt = td.format;
       if(saveFmt.compType == CompType::Typeless)
-        saveFmt.compType = sd.typeHint;
+        saveFmt.compType = sd.typeCast;
       if(saveFmt.compType == CompType::Typeless)
         saveFmt.compType = saveFmt.compByteWidth == 4 ? CompType::Float : CompType::UNorm;
 
-      uint32_t pixStride = saveFmt.compCount * saveFmt.compByteWidth;
+      uint32_t pixStride = saveFmt.ElementSize();
 
       // 24-bit depth still has a stride of 4 bytes.
       if(saveFmt.compType == CompType::Depth && pixStride == 3)
@@ -1385,97 +1284,52 @@ bool ReplayController::SaveTexture(const TextureSave &saveData, const char *path
       {
         for(uint32_t x = 0; x < td.width; x++)
         {
-          float r = 0.0f;
-          float g = 0.0f;
-          float b = 0.0f;
-          float a = 1.0f;
-
-          if(saveFmt.type == ResourceFormatType::R10G10B10A2)
-          {
-            uint32_t *u32 = (uint32_t *)srcData;
-
-            Vec4f vec = ConvertFromR10G10B10A2(*u32);
-
-            r = vec.x;
-            g = vec.y;
-            b = vec.z;
-            a = vec.w;
-
-            srcData += 4;
-          }
-          else if(saveFmt.type == ResourceFormatType::R11G11B10)
-          {
-            uint32_t *u32 = (uint32_t *)srcData;
-
-            Vec3f vec = ConvertFromR11G11B10(*u32);
-
-            r = vec.x;
-            g = vec.y;
-            b = vec.z;
-            a = 1.0f;
-
-            srcData += 4;
-          }
-          else
-          {
-            if(saveFmt.compCount >= 1)
-              r = ConvertComponent(saveFmt, srcData + saveFmt.compByteWidth * 0);
-            if(saveFmt.compCount >= 2)
-              g = ConvertComponent(saveFmt, srcData + saveFmt.compByteWidth * 1);
-            if(saveFmt.compCount >= 3)
-              b = ConvertComponent(saveFmt, srcData + saveFmt.compByteWidth * 2);
-            if(saveFmt.compCount >= 4)
-              a = ConvertComponent(saveFmt, srcData + saveFmt.compByteWidth * 3);
-
-            srcData += pixStride;
-          }
-
-          if(saveFmt.BGRAOrder())
-            std::swap(r, b);
+          FloatVector pixel = DecodeFormattedComponents(saveFmt, srcData);
+          srcData += pixStride;
 
           // HDR can't represent negative values
           if(sd.destType == FileType::HDR)
           {
-            r = RDCMAX(r, 0.0f);
-            g = RDCMAX(g, 0.0f);
-            b = RDCMAX(b, 0.0f);
-            a = RDCMAX(a, 0.0f);
+            pixel.x = RDCMAX(pixel.x, 0.0f);
+            pixel.y = RDCMAX(pixel.y, 0.0f);
+            pixel.z = RDCMAX(pixel.z, 0.0f);
+            pixel.w = RDCMAX(pixel.w, 0.0f);
           }
 
           if(sd.channelExtract == 0)
           {
-            g = b = r;
-            a = 1.0f;
+            pixel.y = pixel.z = pixel.x;
+            pixel.w = 1.0f;
           }
-          if(sd.channelExtract == 1)
+          else if(sd.channelExtract == 1)
           {
-            r = b = g;
-            a = 1.0f;
+            pixel.x = pixel.z = pixel.y;
+            pixel.w = 1.0f;
           }
-          if(sd.channelExtract == 2)
+          else if(sd.channelExtract == 2)
           {
-            r = g = b;
-            a = 1.0f;
+            pixel.x = pixel.y = pixel.z;
+            pixel.w = 1.0f;
           }
-          if(sd.channelExtract == 3)
+          else if(sd.channelExtract == 3)
           {
-            r = g = b = a;
-            a = 1.0f;
+            pixel.x = pixel.y = pixel.z = pixel.w;
+            pixel.w = 1.0f;
           }
 
           if(fldata)
           {
-            fldata[(y * td.width + x) * 4 + 0] = r;
-            fldata[(y * td.width + x) * 4 + 1] = g;
-            fldata[(y * td.width + x) * 4 + 2] = b;
-            fldata[(y * td.width + x) * 4 + 3] = a;
+            fldata[(y * td.width + x) * 4 + 0] = pixel.x;
+            fldata[(y * td.width + x) * 4 + 1] = pixel.y;
+            fldata[(y * td.width + x) * 4 + 2] = pixel.z;
+            fldata[(y * td.width + x) * 4 + 3] = pixel.w;
           }
           else
           {
-            abgr[0][(y * td.width + x)] = a;
-            abgr[1][(y * td.width + x)] = b;
-            abgr[2][(y * td.width + x)] = g;
-            abgr[3][(y * td.width + x)] = r;
+            abgr[0][(y * td.width + x)] = pixel.w;
+            abgr[1][(y * td.width + x)] = pixel.z;
+            abgr[2][(y * td.width + x)] = pixel.y;
+            abgr[3][(y * td.width + x)] = pixel.x;
           }
         }
       }
@@ -1483,10 +1337,9 @@ bool ReplayController::SaveTexture(const TextureSave &saveData, const char *path
       if(sd.destType == FileType::HDR)
       {
         int ret = stbi_write_hdr_to_func(fileWriteFunc, (void *)f, td.width, td.height, 4, fldata);
-        success = (ret != 0);
 
-        if(!success)
-          RDCERR("stbi_write_hdr_to_func failed: %d", ret);
+        if(ret == 0)
+          SET_ERROR_RESULT(res, ResultCode::InternalError, "Failed to write HDR image");
       }
       else if(sd.destType == FileType::EXR)
       {
@@ -1503,10 +1356,21 @@ bool ReplayController::SaveTexture(const TextureSave &saveData, const char *path
         int reqTypes[4] = {TINYEXR_PIXELTYPE_HALF, TINYEXR_PIXELTYPE_HALF, TINYEXR_PIXELTYPE_HALF,
                            TINYEXR_PIXELTYPE_HALF};
 
+        if(saveFmt.compByteWidth == 4)
+        {
+          for(size_t channel = 0; channel < 4; channel++)
+          {
+            reqTypes[channel] = TINYEXR_PIXELTYPE_FLOAT;
+          }
+        }
+
         // must be in this order as many viewers don't pay attention to channels and just assume
         // they are in this order
         EXRChannelInfo bgraChannels[4] = {
-            {"A"}, {"B"}, {"G"}, {"R"},
+            {"A"},
+            {"B"},
+            {"G"},
+            {"R"},
         };
 
         exrHeader.num_channels = 4;
@@ -1521,11 +1385,10 @@ bool ReplayController::SaveTexture(const TextureSave &saveData, const char *path
 
         size_t ret = SaveEXRImageToMemory(&exrImage, &exrHeader, &mem, &err);
 
-        success = (ret > 0);
-        if(success)
+        if(ret > 0)
           FileIO::fwrite(mem, 1, ret, f);
         else
-          RDCERR("Error saving EXR file %d: '%s'", ret, err);
+          SET_ERROR_RESULT(res, ResultCode::InternalError, "Failed to write EXR image: %s", err);
 
         free(mem);
       }
@@ -1549,16 +1412,19 @@ bool ReplayController::SaveTexture(const TextureSave &saveData, const char *path
   for(size_t i = 0; i < subdata.size(); i++)
     delete[] subdata[i];
 
-  return success;
+  return res;
 }
 
-rdcarray<PixelModification> ReplayController::PixelHistory(ResourceId target, uint32_t x,
-                                                           uint32_t y, uint32_t slice, uint32_t mip,
-                                                           uint32_t sampleIdx, CompType typeHint)
+rdcarray<PixelModification> ReplayController::PixelHistory(ResourceId target, uint32_t x, uint32_t y,
+                                                           const Subresource &sub, CompType typeCast)
 {
   CHECK_REPLAY_THREAD();
 
+  RENDERDOC_PROFILEFUNCTION();
+
   rdcarray<PixelModification> ret;
+
+  Subresource subresource = sub;
 
   for(size_t t = 0; t < m_Textures.size(); t++)
   {
@@ -1566,16 +1432,24 @@ rdcarray<PixelModification> ReplayController::PixelHistory(ResourceId target, ui
     {
       if(x >= m_Textures[t].width || y >= m_Textures[t].height)
       {
-        RDCDEBUG("PixelHistory out of bounds on %llu (%u,%u) vs (%u,%u)", target, x, y,
+        RDCDEBUG("PixelHistory out of bounds on %s (%u,%u) vs (%u,%u)", ToStr(target).c_str(), x, y,
                  m_Textures[t].width, m_Textures[t].height);
         return ret;
       }
 
       if(m_Textures[t].msSamp == 1)
-        sampleIdx = ~0U;
+        subresource.sample = ~0U;
 
-      slice = RDCCLAMP(slice, 0U, m_Textures[t].arraysize);
-      mip = RDCCLAMP(mip, 0U, m_Textures[t].mips);
+      if(m_Textures[t].dimension == 3)
+      {
+        subresource.slice = RDCCLAMP(subresource.slice, 0U, m_Textures[t].depth >> subresource.mip);
+      }
+      else
+      {
+        subresource.slice = RDCCLAMP(subresource.slice, 0U, m_Textures[t].arraysize);
+      }
+
+      subresource.mip = RDCCLAMP(subresource.mip, 0U, m_Textures[t].mips - 1);
 
       break;
     }
@@ -1586,9 +1460,9 @@ rdcarray<PixelModification> ReplayController::PixelHistory(ResourceId target, ui
   if(id == ResourceId())
     return ret;
 
-  std::vector<EventUsage> usage = m_pDevice->GetUsage(id);
+  rdcarray<EventUsage> usage = m_pDevice->GetUsage(id);
 
-  std::vector<EventUsage> events;
+  rdcarray<EventUsage> events;
 
   for(size_t i = 0; i < usage.size(); i++)
   {
@@ -1605,6 +1479,8 @@ rdcarray<PixelModification> ReplayController::PixelHistory(ResourceId target, ui
       case ResourceUsage::GS_Constants:
       case ResourceUsage::PS_Constants:
       case ResourceUsage::CS_Constants:
+      case ResourceUsage::TS_Constants:
+      case ResourceUsage::MS_Constants:
       case ResourceUsage::All_Constants:
       case ResourceUsage::VS_Resource:
       case ResourceUsage::HS_Resource:
@@ -1612,6 +1488,8 @@ rdcarray<PixelModification> ReplayController::PixelHistory(ResourceId target, ui
       case ResourceUsage::GS_Resource:
       case ResourceUsage::PS_Resource:
       case ResourceUsage::CS_Resource:
+      case ResourceUsage::TS_Resource:
+      case ResourceUsage::MS_Resource:
       case ResourceUsage::All_Resource:
       case ResourceUsage::InputTarget:
       case ResourceUsage::CopySrc:
@@ -1619,6 +1497,14 @@ rdcarray<PixelModification> ReplayController::PixelHistory(ResourceId target, ui
       case ResourceUsage::Barrier:
       case ResourceUsage::Indirect:
         // read-only, not a valid pixel history event
+        continue;
+
+      case ResourceUsage::CPUWrite:
+        // writing but CPU-only, don't include
+        continue;
+
+      case ResourceUsage::Discard:
+        // writing but not something pixel history should handle
         continue;
 
       case ResourceUsage::Unused:
@@ -1629,6 +1515,8 @@ rdcarray<PixelModification> ReplayController::PixelHistory(ResourceId target, ui
       case ResourceUsage::GS_RWResource:
       case ResourceUsage::PS_RWResource:
       case ResourceUsage::CS_RWResource:
+      case ResourceUsage::TS_RWResource:
+      case ResourceUsage::MS_RWResource:
       case ResourceUsage::All_RWResource:
       case ResourceUsage::ColorTarget:
       case ResourceUsage::DepthStencilTarget:
@@ -1647,7 +1535,7 @@ rdcarray<PixelModification> ReplayController::PixelHistory(ResourceId target, ui
 
   if(events.empty())
   {
-    RDCDEBUG("Target %llu not written to before %u", target, m_EventID);
+    RDCDEBUG("Target %s not written to before %u", ToStr(target).c_str(), m_EventID);
     return ret;
   }
 
@@ -1656,23 +1544,77 @@ rdcarray<PixelModification> ReplayController::PixelHistory(ResourceId target, ui
   if(id == ResourceId())
     return ret;
 
-  ret = m_pDevice->PixelHistory(events, id, x, y, slice, mip, sampleIdx, typeHint);
+  ret = m_pDevice->PixelHistory(events, id, x, y, subresource, typeCast);
+  FatalErrorCheck();
 
   SetFrameEvent(m_EventID, true);
 
   return ret;
 }
 
-ShaderDebugTrace *ReplayController::DebugVertex(uint32_t vertid, uint32_t instid, uint32_t idx,
-                                                uint32_t instOffset, uint32_t vertOffset)
+PixelValue ReplayController::PickPixel(ResourceId tex, uint32_t x, uint32_t y,
+                                       const Subresource &sub, CompType typeCast)
+{
+  CHECK_REPLAY_THREAD();
+  RENDERDOC_PROFILEFUNCTION();
+
+  PixelValue ret;
+
+  RDCEraseEl(ret.floatValue);
+
+  if(tex == ResourceId())
+    return ret;
+
+  m_pDevice->PickPixel(m_pDevice->GetLiveID(tex), x, y, sub, typeCast, ret.floatValue.data());
+  FatalErrorCheck();
+
+  return ret;
+}
+
+rdcpair<PixelValue, PixelValue> ReplayController::GetMinMax(ResourceId textureId,
+                                                            const Subresource &sub, CompType typeCast)
 {
   CHECK_REPLAY_THREAD();
 
-  ShaderDebugTrace *ret = new ShaderDebugTrace;
+  PixelValue minval = {{0.0f, 0.0f, 0.0f, 0.0f}};
+  PixelValue maxval = {{1.0f, 1.0f, 1.0f, 1.0f}};
 
-  *ret = m_pDevice->DebugVertex(m_EventID, vertid, instid, idx, instOffset, vertOffset);
+  m_pDevice->GetMinMax(m_pDevice->GetLiveID(textureId), sub, typeCast, &minval.floatValue[0],
+                       &maxval.floatValue[0]);
+  FatalErrorCheck();
+
+  return make_rdcpair(minval, maxval);
+}
+
+rdcarray<uint32_t> ReplayController::GetHistogram(ResourceId textureId, const Subresource &sub,
+                                                  CompType typeCast, float minval, float maxval,
+                                                  const rdcfixedarray<bool, 4> &channels)
+{
+  CHECK_REPLAY_THREAD();
+
+  rdcarray<uint32_t> hist;
+
+  m_pDevice->GetHistogram(m_pDevice->GetLiveID(textureId), sub, typeCast, minval, maxval, channels,
+                          hist);
+  FatalErrorCheck();
+
+  return hist;
+}
+
+ShaderDebugTrace *ReplayController::DebugVertex(uint32_t vertid, uint32_t instid, uint32_t idx,
+                                                uint32_t view)
+{
+  CHECK_REPLAY_THREAD();
+
+  RENDERDOC_PROFILEFUNCTION();
+
+  ShaderDebugTrace *ret = m_pDevice->DebugVertex(m_EventID, vertid, instid, idx, view);
+  FatalErrorCheck();
 
   SetFrameEvent(m_EventID, true);
+
+  if(ret->debugger)
+    m_Debuggers.push_back(ret->debugger);
 
   return ret;
 }
@@ -1682,25 +1624,46 @@ ShaderDebugTrace *ReplayController::DebugPixel(uint32_t x, uint32_t y, uint32_t 
 {
   CHECK_REPLAY_THREAD();
 
-  ShaderDebugTrace *ret = new ShaderDebugTrace;
+  RENDERDOC_PROFILEFUNCTION();
 
-  *ret = m_pDevice->DebugPixel(m_EventID, x, y, sample, primitive);
+  ShaderDebugTrace *ret = m_pDevice->DebugPixel(m_EventID, x, y, sample, primitive);
+  FatalErrorCheck();
 
   SetFrameEvent(m_EventID, true);
+
+  if(ret->debugger)
+    m_Debuggers.push_back(ret->debugger);
 
   return ret;
 }
 
-ShaderDebugTrace *ReplayController::DebugThread(const uint32_t groupid[3], const uint32_t threadid[3],
+ShaderDebugTrace *ReplayController::DebugThread(const rdcfixedarray<uint32_t, 3> &groupid,
+                                                const rdcfixedarray<uint32_t, 3> &threadid,
                                                 std::function<bool()> cancelled)
 {
   CHECK_REPLAY_THREAD();
 
-  ShaderDebugTrace *ret = new ShaderDebugTrace;
+  RENDERDOC_PROFILEFUNCTION();
 
-  *ret = m_pDevice->DebugThread(m_EventID, groupid, threadid, cancelled);
+  ShaderDebugTrace *ret = m_pDevice->DebugThread(m_EventID, groupid, threadid, cancelled);
+  FatalErrorCheck();
 
   SetFrameEvent(m_EventID, true);
+
+  if(ret->debugger)
+    m_Debuggers.push_back(ret->debugger);
+
+  return ret;
+}
+
+rdcarray<ShaderDebugState> ReplayController::ContinueDebug(ShaderDebugger *debugger)
+{
+  CHECK_REPLAY_THREAD();
+
+  RENDERDOC_PROFILEFUNCTION();
+
+  rdcarray<ShaderDebugState> ret = m_pDevice->ContinueDebug(debugger);
+  FatalErrorCheck();
 
   return ret;
 }
@@ -1709,28 +1672,43 @@ void ReplayController::FreeTrace(ShaderDebugTrace *trace)
 {
   CHECK_REPLAY_THREAD();
 
-  delete trace;
+  if(trace)
+  {
+    m_Debuggers.removeOne(trace->debugger);
+    m_pDevice->FreeDebugger(trace->debugger);
+    delete trace;
+  }
 }
 
 rdcarray<ShaderVariable> ReplayController::GetCBufferVariableContents(
-    ResourceId shader, const char *entryPoint, uint32_t cbufslot, ResourceId buffer, uint64_t offs)
+    ResourceId pipeline, ResourceId shader, ShaderStage stage, const rdcstr &entryPoint,
+    uint32_t cbufslot, ResourceId buffer, uint64_t offset, uint64_t length)
 {
   CHECK_REPLAY_THREAD();
+
+  RENDERDOC_PROFILEFUNCTION();
 
   bytebuf data;
   if(buffer != ResourceId())
   {
     buffer = m_pDevice->GetLiveID(buffer);
     if(buffer != ResourceId())
-      m_pDevice->GetBufferData(buffer, offs, 0, data);
+    {
+      m_pDevice->GetBufferData(buffer, offset, length, data);
+      FatalErrorCheck();
+    }
   }
 
   rdcarray<ShaderVariable> v;
 
+  pipeline = m_pDevice->GetLiveID(pipeline);
   shader = m_pDevice->GetLiveID(shader);
 
   if(shader != ResourceId())
-    m_pDevice->FillCBufferVariables(shader, entryPoint, cbufslot, v, data);
+  {
+    m_pDevice->FillCBufferVariables(pipeline, shader, stage, entryPoint, cbufslot, v, data);
+    FatalErrorCheck();
+  }
 
   return v;
 }
@@ -1754,7 +1732,9 @@ rdcstr ReplayController::CreateRGPProfile(WindowingData window)
     return "";
   }
 
-  std::string path = FileIO::GetTempFolderFilename() + "/renderdoc_rgp_capture.rgp";
+  rdcstr path = FileIO::GetTempFolderFilename() + "/renderdoc_rgp_capture.rgp";
+
+  FileIO::Delete(path);
 
   ReplayOutput *output = CreateOutput(window, ReplayOutputType::Texture);
 
@@ -1765,6 +1745,8 @@ rdcstr ReplayController::CreateRGPProfile(WindowingData window)
   for(int i = 0; i < 5; i++)
   {
     m_pDevice->ReplayLog(10000000, eReplay_Full);
+    if(FatalErrorCheck())
+      return "";
     output->Display();
   }
 
@@ -1790,12 +1772,16 @@ rdcstr ReplayController::CreateRGPProfile(WindowingData window)
 
     output->Display();
     m_pDevice->ReplayLog(10000000, eReplay_Full);
+    if(FatalErrorCheck())
+      return "";
   }
 
   output->Display();
 
   // restore back to where we were
   m_pDevice->ReplayLog(m_EventID, eReplay_Full);
+  if(FatalErrorCheck())
+    return "";
 
   ShutdownOutput(output);
 
@@ -1821,10 +1807,9 @@ void ReplayController::ReplayLoop(WindowingData window, ResourceId texid)
 
   TextureDisplay d;
   d.resourceId = texid;
-  d.mip = 0;
-  d.sampleIdx = ~0U;
+  d.subresource = {0, 0, ~0U};
   d.overlay = DebugOverlay::NoOverlay;
-  d.typeHint = CompType::Typeless;
+  d.typeCast = CompType::Typeless;
   d.hdrMultiplier = -1.0f;
   d.linearDisplayAsGamma = true;
   d.flipY = false;
@@ -1833,7 +1818,6 @@ void ReplayController::ReplayLoop(WindowingData window, ResourceId texid)
   d.scale = 1.0f;
   d.xOffset = 0.0f;
   d.yOffset = 0.0f;
-  d.sliceFace = 0;
   d.rawOutput = false;
   d.red = d.green = d.blue = true;
   d.alpha = false;
@@ -1845,12 +1829,14 @@ void ReplayController::ReplayLoop(WindowingData window, ResourceId texid)
   while(Atomic::CmpExch32(&m_ReplayLoopCancel, 0, 0) == 0)
   {
     m_pDevice->ReplayLog(10000000, eReplay_Full);
+    FatalErrorCheck();
 
     output->Display();
   }
 
   // restore back to where we were
   m_pDevice->ReplayLog(m_EventID, eReplay_Full);
+  FatalErrorCheck();
 
   ShutdownOutput(output);
 
@@ -1860,8 +1846,6 @@ void ReplayController::ReplayLoop(WindowingData window, ResourceId texid)
 
 void ReplayController::CancelReplayLoop()
 {
-  CHECK_REPLAY_THREAD();
-
   Atomic::Inc32(&m_ReplayLoopCancel);
 
   // wait for it to actually finish before returning
@@ -1877,11 +1861,7 @@ ReplayOutput *ReplayController::CreateOutput(WindowingData window, ReplayOutputT
 
   m_Outputs.push_back(out);
 
-  m_pDevice->ReplayLog(m_EventID, eReplay_WithoutDraw);
-
   out->SetFrameEvent(m_EventID);
-
-  m_pDevice->ReplayLog(m_EventID, eReplay_OnlyDraw);
 
   return out;
 }
@@ -1890,24 +1870,90 @@ void ReplayController::ShutdownOutput(IReplayOutput *output)
 {
   CHECK_REPLAY_THREAD();
 
-  for(auto it = m_Outputs.begin(); it != m_Outputs.end(); ++it)
-  {
-    if((IReplayOutput *)*it == output)
+  size_t sz = m_Outputs.size();
+  m_Outputs.removeOneIf([output](const ReplayOutput *o) {
+    if((IReplayOutput *)o == output)
     {
-      delete *it;
-      m_Outputs.erase(it);
-      return;
+      delete o;
+      return true;
     }
-  }
 
-  RDCERR("Unrecognised output");
+    return false;
+  });
+
+  if(m_Outputs.size() == sz)
+    RDCERR("Unrecognised output");
 }
 
 void ReplayController::Shutdown()
 {
   CHECK_REPLAY_THREAD();
 
+  RDCLOG("Shutting down replay renderer");
+
+  for(size_t i = 0; i < m_Outputs.size(); i++)
+    SAFE_DELETE(m_Outputs[i]);
+
+  m_Outputs.clear();
+
+  for(auto it = m_CustomShaders.begin(); it != m_CustomShaders.end(); ++it)
+    m_pDevice->FreeCustomShader(*it);
+
+  m_CustomShaders.clear();
+
+  for(auto it = m_TargetResources.begin(); it != m_TargetResources.end(); ++it)
+    m_pDevice->FreeTargetResource(*it);
+
+  m_TargetResources.clear();
+
+  if(m_pDevice)
+    m_pDevice->Shutdown();
+  m_pDevice = NULL;
+
   delete this;
+}
+
+bool ReplayController::FatalErrorCheck()
+{
+  // we've already processed the fatal error if we have a status
+  if(m_FatalError != ResultCode::Succeeded)
+    return false;
+
+  m_FatalError = m_pDevice->FatalErrorCheck();
+
+  if(m_FatalError != ResultCode::Succeeded)
+  {
+    RDCLOG("Fatal error detected: %s (%s) at event %u", ToStr(m_FatalError.code).c_str(),
+           m_FatalError.message.c_str(), m_EventID);
+
+    IReplayDriver *old = m_pDevice;
+
+    // replace our driver with a dummy
+    m_pDevice = m_pDevice->MakeDummyDriver();
+
+    // replace the outputs as well
+    for(size_t i = 0; i < m_Outputs.size(); i++)
+    {
+      old->DestroyOutputWindow(m_Outputs[i]->m_MainOutput.outputID);
+      old->DestroyOutputWindow(m_Outputs[i]->m_PixelContext.outputID);
+      m_Outputs[i]->ClearThumbnails();
+
+      m_Outputs[i]->m_pDevice = m_pDevice;
+    }
+
+    // delete the old replay
+    old->Shutdown();
+
+    // reset pipeline states to default
+    m_D3D11PipelineState = D3D11Pipe::State();
+    m_D3D12PipelineState = D3D12Pipe::State();
+    m_GLPipelineState = GLPipe::State();
+    m_VulkanPipelineState = VKPipe::State();
+
+    return true;
+  }
+
+  return false;
 }
 
 rdcarray<ShaderEncoding> ReplayController::GetCustomShaderEncodings()
@@ -1915,6 +1961,13 @@ rdcarray<ShaderEncoding> ReplayController::GetCustomShaderEncodings()
   CHECK_REPLAY_THREAD();
 
   return m_pDevice->GetCustomShaderEncodings();
+}
+
+rdcarray<ShaderSourcePrefix> ReplayController::GetCustomShaderSourcePrefixes()
+{
+  CHECK_REPLAY_THREAD();
+
+  return m_pDevice->GetCustomShaderSourcePrefixes();
 }
 
 rdcarray<ShaderEncoding> ReplayController::GetTargetShaderEncodings()
@@ -1925,10 +1978,15 @@ rdcarray<ShaderEncoding> ReplayController::GetTargetShaderEncodings()
 }
 
 rdcpair<ResourceId, rdcstr> ReplayController::BuildTargetShader(
-    const char *entry, ShaderEncoding sourceEncoding, bytebuf source,
+    const rdcstr &entry, ShaderEncoding sourceEncoding, bytebuf source,
     const ShaderCompileFlags &compileFlags, ShaderStage type)
 {
   CHECK_REPLAY_THREAD();
+
+  RENDERDOC_PROFILEFUNCTION();
+
+  if(source.empty())
+    return rdcpair<ResourceId, rdcstr>(ResourceId(), "0-byte shader is not valid");
 
   rdcarray<ShaderEncoding> encodings = m_pDevice->GetTargetShaderEncodings();
 
@@ -1938,7 +1996,7 @@ rdcpair<ResourceId, rdcstr> ReplayController::BuildTargetShader(
         StringFormat::Fmt("Shader Encoding '%s' is not supported", ToStr(sourceEncoding).c_str()));
 
   ResourceId id;
-  std::string errs;
+  rdcstr errs;
 
   switch(type)
   {
@@ -1947,11 +2005,14 @@ rdcpair<ResourceId, rdcstr> ReplayController::BuildTargetShader(
     case ShaderStage::Domain:
     case ShaderStage::Geometry:
     case ShaderStage::Pixel:
-    case ShaderStage::Compute: break;
+    case ShaderStage::Compute:
+    case ShaderStage::Task:
+    case ShaderStage::Mesh: break;
     default: RDCERR("Unexpected type in BuildShader!"); return rdcpair<ResourceId, rdcstr>();
   }
 
-  m_pDevice->BuildTargetShader(sourceEncoding, source, entry, compileFlags, type, &id, &errs);
+  m_pDevice->BuildTargetShader(sourceEncoding, source, entry, compileFlags, type, id, errs);
+  FatalErrorCheck();
 
   if(id != ResourceId())
     m_TargetResources.insert(id);
@@ -1959,14 +2020,24 @@ rdcpair<ResourceId, rdcstr> ReplayController::BuildTargetShader(
   return rdcpair<ResourceId, rdcstr>(id, errs);
 }
 
+void ReplayController::SetCustomShaderIncludes(const rdcarray<rdcstr> &directories)
+{
+  CHECK_REPLAY_THREAD();
+
+  m_pDevice->SetCustomShaderIncludes(directories);
+}
+
 rdcpair<ResourceId, rdcstr> ReplayController::BuildCustomShader(
-    const char *entry, ShaderEncoding sourceEncoding, bytebuf source,
+    const rdcstr &entry, ShaderEncoding sourceEncoding, bytebuf source,
     const ShaderCompileFlags &compileFlags, ShaderStage type)
 {
   CHECK_REPLAY_THREAD();
 
   ResourceId id;
-  std::string errs;
+  rdcstr errs;
+
+  if(source.empty())
+    return rdcpair<ResourceId, rdcstr>(ResourceId(), "0-byte shader is not valid");
 
   switch(type)
   {
@@ -1975,13 +2046,16 @@ rdcpair<ResourceId, rdcstr> ReplayController::BuildCustomShader(
     case ShaderStage::Domain:
     case ShaderStage::Geometry:
     case ShaderStage::Pixel:
-    case ShaderStage::Compute: break;
+    case ShaderStage::Compute:
+    case ShaderStage::Task:
+    case ShaderStage::Mesh: break;
     default: RDCERR("Unexpected type in BuildShader!"); return rdcpair<ResourceId, rdcstr>();
   }
 
   RDCLOG("Building custom shader");
 
-  m_pDevice->BuildCustomShader(sourceEncoding, source, entry, compileFlags, type, &id, &errs);
+  m_pDevice->BuildCustomShader(sourceEncoding, source, entry, compileFlags, type, id, errs);
+  FatalErrorCheck();
 
   if(id != ResourceId())
   {
@@ -2017,6 +2091,7 @@ void ReplayController::ReplaceResource(ResourceId from, ResourceId to)
   CHECK_REPLAY_THREAD();
 
   m_pDevice->ReplaceResource(from, to);
+  FatalErrorCheck();
 
   SetFrameEvent(m_EventID, true);
 
@@ -2030,6 +2105,7 @@ void ReplayController::RemoveReplacement(ResourceId id)
   CHECK_REPLAY_THREAD();
 
   m_pDevice->RemoveReplacement(id);
+  FatalErrorCheck();
 
   SetFrameEvent(m_EventID, true);
 
@@ -2038,24 +2114,26 @@ void ReplayController::RemoveReplacement(ResourceId id)
       m_Outputs[i]->Display();
 }
 
-ReplayStatus ReplayController::CreateDevice(RDCFile *rdc)
+RDResult ReplayController::CreateDevice(RDCFile *rdc, const ReplayOptions &opts)
 {
   CHECK_REPLAY_THREAD();
 
-  IReplayDriver *driver = NULL;
-  ReplayStatus status = RenderDoc::Inst().CreateReplayDriver(rdc, &driver);
+  RENDERDOC_PROFILEFUNCTION();
 
-  if(driver && status == ReplayStatus::Succeeded)
+  IReplayDriver *driver = NULL;
+  RDResult result = RenderDoc::Inst().CreateReplayDriver(rdc, opts, &driver);
+
+  if(driver && result == ResultCode::Succeeded)
   {
     RDCLOG("Created replay driver.");
     return PostCreateInit(driver, rdc);
   }
 
   RDCERR("Couldn't create a replay device.");
-  return status;
+  return result;
 }
 
-ReplayStatus ReplayController::SetDevice(IReplayDriver *device)
+RDResult ReplayController::SetDevice(IReplayDriver *device)
 {
   CHECK_REPLAY_THREAD();
 
@@ -2066,56 +2144,57 @@ ReplayStatus ReplayController::SetDevice(IReplayDriver *device)
   }
 
   RDCERR("Given invalid replay driver.");
-  return ReplayStatus::InternalError;
+  return ResultCode::InternalError;
 }
 
-ReplayStatus ReplayController::PostCreateInit(IReplayDriver *device, RDCFile *rdc)
+RDResult ReplayController::PostCreateInit(IReplayDriver *device, RDCFile *rdc)
 {
   CHECK_REPLAY_THREAD();
 
+  RENDERDOC_PROFILEFUNCTION();
+
   m_pDevice = device;
-
-  ReplayStatus status = m_pDevice->ReadLogInitialisation(rdc, false);
-
-  if(status != ReplayStatus::Succeeded)
-    return status;
 
   m_APIProps = m_pDevice->GetAPIProperties();
 
-  // fetch GCN ISA targets
-  GCNISA::GetTargets(m_APIProps.pipelineType, m_GCNTargets);
+  GCNISA::CacheSupport(m_APIProps.pipelineType);
 
-  {
-    std::vector<ResourceId> ids = m_pDevice->GetBuffers();
+  RDResult result = m_pDevice->ReadLogInitialisation(rdc, false);
+  FatalErrorCheck();
+  if(m_FatalError != ResultCode::Succeeded)
+    return m_FatalError;
 
-    m_Buffers.resize(ids.size());
+  m_pDevice->SetPipelineStates(&m_D3D11PipelineState, &m_D3D12PipelineState, &m_GLPipelineState,
+                               &m_VulkanPipelineState);
 
-    for(size_t i = 0; i < ids.size(); i++)
-      m_Buffers[i] = m_pDevice->GetBuffer(ids[i]);
-  }
+  GCNISA::GetTargets(m_APIProps.pipelineType, m_pDevice->GetDriverInfo(), m_GCNTargets);
 
-  {
-    std::vector<ResourceId> ids = m_pDevice->GetTextures();
+  if(result != ResultCode::Succeeded)
+    return result;
 
-    m_Textures.resize(ids.size());
-
-    for(size_t i = 0; i < ids.size(); i++)
-      m_Textures[i] = m_pDevice->GetTexture(ids[i]);
-  }
-
+  m_Buffers = m_pDevice->GetBuffers();
+  FatalErrorCheck();
+  m_Textures = m_pDevice->GetTextures();
+  FatalErrorCheck();
   m_Resources = m_pDevice->GetResources();
+  FatalErrorCheck();
 
   m_FrameRecord = m_pDevice->GetFrameRecord();
+  FatalErrorCheck();
 
-  if(m_FrameRecord.drawcallList.empty())
-    return ReplayStatus::APIReplayFailed;
+  if(m_FatalError != ResultCode::Succeeded)
+    return m_FatalError;
 
-  m_Drawcalls.clear();
-  SetupDrawcallPointers(m_Drawcalls, m_FrameRecord.drawcallList);
+  if(m_FrameRecord.actionList.empty())
+    return ResultCode::APIReplayFailed;
 
-  FetchPipelineState(m_Drawcalls.back()->eventId);
+  m_Actions.clear();
+  SetupActionPointers(m_Actions, m_FrameRecord.actionList);
 
-  return ReplayStatus::Succeeded;
+  FetchPipelineState(m_Actions.back()->eventId);
+  FatalErrorCheck();
+
+  return m_FatalError;
 }
 
 void ReplayController::FileChanged()
@@ -2136,13 +2215,17 @@ void ReplayController::FetchPipelineState(uint32_t eventId)
 {
   CHECK_REPLAY_THREAD();
 
+  RENDERDOC_PROFILEFUNCTION();
+
   m_pDevice->SavePipelineState(eventId);
+  FatalErrorCheck();
 
-  m_D3D11PipelineState = m_pDevice->GetD3D11PipelineState();
-  m_D3D12PipelineState = m_pDevice->GetD3D12PipelineState();
-  m_GLPipelineState = m_pDevice->GetGLPipelineState();
-  m_VulkanPipelineState = m_pDevice->GetVulkanPipelineState();
-
-  m_PipeState.SetStates(m_APIProps, m_D3D11PipelineState, m_D3D12PipelineState, m_GLPipelineState,
-                        m_VulkanPipelineState);
+  if(m_APIProps.pipelineType == GraphicsAPI::D3D11)
+    m_PipeState.SetState(&m_D3D11PipelineState);
+  else if(m_APIProps.pipelineType == GraphicsAPI::D3D12)
+    m_PipeState.SetState(&m_D3D12PipelineState);
+  else if(m_APIProps.pipelineType == GraphicsAPI::OpenGL)
+    m_PipeState.SetState(&m_GLPipelineState);
+  else if(m_APIProps.pipelineType == GraphicsAPI::Vulkan)
+    m_PipeState.SetState(&m_VulkanPipelineState);
 }

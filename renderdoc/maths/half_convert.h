@@ -94,7 +94,7 @@ inline float ConvertFromHalf(uint16_t comp)
   if(exponent == 0x00)
   {
     if(mantissa == 0)
-      return 0.0f;
+      return sign ? -0.0f : 0.0f;
 
     // subnormal
     float ret = (float)mantissa;
@@ -125,8 +125,13 @@ inline float ConvertFromHalf(uint16_t comp)
     {
       int i;
       float f;
-    } nan;
-    nan.i = 0x7F800001;
-    return nan.f;
+    } ret;
+
+    if(mantissa == 0)
+      ret.i = (sign ? 0x80000000 : 0) | 0x7F800000;
+    else
+      ret.i = 0x7F800001;
+
+    return ret.f;
   }
 }

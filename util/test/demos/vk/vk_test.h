@@ -1,26 +1,26 @@
 /******************************************************************************
-* The MIT License (MIT)
-*
-* Copyright (c) 2018-2019 Baldur Karlsson
-*
-* Permission is hereby granted, free of charge, to any person obtaining a copy
-* of this software and associated documentation files (the "Software"), to deal
-* in the Software without restriction, including without limitation the rights
-* to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-* copies of the Software, and to permit persons to whom the Software is
-* furnished to do so, subject to the following conditions:
-*
-* The above copyright notice and this permission notice shall be included in
-* all copies or substantial portions of the Software.
-*
-* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-* AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-* OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-* THE SOFTWARE.
-******************************************************************************/
+ * The MIT License (MIT)
+ *
+ * Copyright (c) 2019-2023 Baldur Karlsson
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ ******************************************************************************/
 
 #pragma once
 
@@ -33,35 +33,21 @@
 #include "vk_helpers.h"
 #include "vk_test.h"
 
+struct VulkanGraphicsTest;
+
 struct AllocatedBuffer
 {
-  VmaAllocator allocator;
-  VkBuffer buffer;
-  VmaAllocation alloc;
+  VulkanGraphicsTest *test = NULL;
+  VmaAllocator allocator = NULL;
+  VkBuffer buffer = VK_NULL_HANDLE;
+  VmaAllocation alloc = {};
 
   AllocatedBuffer() {}
-  AllocatedBuffer(VmaAllocator allocator, const VkBufferCreateInfo &bufInfo,
-                  const VmaAllocationCreateInfo &allocInfo)
-  {
-    create(allocator, bufInfo, allocInfo);
-  }
-  AllocatedBuffer(const AllocatedBuffer &) = delete;
-  AllocatedBuffer &operator=(const AllocatedBuffer &) = delete;
+  AllocatedBuffer(VulkanGraphicsTest *test, const VkBufferCreateInfo &bufInfo,
+                  const VmaAllocationCreateInfo &allocInfo);
 
-  void create(VmaAllocator vma, const VkBufferCreateInfo &bufInfo,
-              const VmaAllocationCreateInfo &allocInfo)
-  {
-    allocator = vma;
-    VkBuffer buf;
-    vmaCreateBuffer(allocator, &bufInfo, &allocInfo, &buf, &alloc, NULL);
-    buffer = VkBuffer(buf);
-  }
+  void free();
 
-  ~AllocatedBuffer()
-  {
-    if(buffer != VK_NULL_HANDLE)
-      vmaDestroyBuffer(allocator, (VkBuffer)buffer, alloc);
-  }
   template <typename T, size_t N>
   void upload(const T (&data)[N])
   {
@@ -92,33 +78,17 @@ struct AllocatedBuffer
 
 struct AllocatedImage
 {
-  VmaAllocator allocator;
-  VkImage image;
-  VmaAllocation alloc;
+  VulkanGraphicsTest *test = NULL;
+  VmaAllocator allocator = NULL;
+  VkImage image = VK_NULL_HANDLE;
+  VmaAllocation alloc = {};
+  VkImageCreateInfo createInfo;
 
   AllocatedImage() {}
-  AllocatedImage(VmaAllocator allocator, const VkImageCreateInfo &imgInfo,
-                 const VmaAllocationCreateInfo &allocInfo)
-  {
-    create(allocator, imgInfo, allocInfo);
-  }
-  AllocatedImage(const AllocatedImage &) = delete;
-  AllocatedImage &operator=(const AllocatedImage &) = delete;
+  AllocatedImage(VulkanGraphicsTest *test, const VkImageCreateInfo &imgInfo,
+                 const VmaAllocationCreateInfo &allocInfo);
 
-  void create(VmaAllocator vma, const VkImageCreateInfo &imgInfo,
-              const VmaAllocationCreateInfo &allocInfo)
-  {
-    allocator = vma;
-    VkImage img;
-    vmaCreateImage(allocator, &imgInfo, &allocInfo, &img, &alloc, NULL);
-    image = VkImage(img);
-  }
-
-  ~AllocatedImage()
-  {
-    if(image != VK_NULL_HANDLE)
-      vmaDestroyImage(allocator, (VkImage)image, alloc);
-  }
+  void free();
 };
 
 #define CHECK_VKR(cmd)                                                               \
@@ -137,7 +107,27 @@ struct AllocatedImage
 
 struct VulkanGraphicsTest;
 
-struct VulkanWindow : public GraphicsWindow
+struct VulkanCommands
+{
+public:
+  VulkanCommands(VulkanGraphicsTest *test);
+  ~VulkanCommands();
+  VkCommandBuffer GetCommandBuffer(VkCommandBufferLevel level);
+  void Submit(const std::vector<VkCommandBuffer> &cmds, const std::vector<VkCommandBuffer> &seccmds,
+              VkQueue q, VkSemaphore wait, VkSemaphore signal);
+  void ProcessCompletions();
+
+private:
+  VulkanGraphicsTest *m_Test;
+
+  VkCommandPool cmdPool;
+  std::set<VkFence> fences;
+
+  std::vector<VkCommandBuffer> freeCommandBuffers[2];
+  std::vector<std::pair<VkCommandBuffer, VkFence>> pendingCommandBuffers[2];
+};
+
+struct VulkanWindow : public GraphicsWindow, public VulkanCommands
 {
   VkFormat format;
   uint32_t imgIndex = 0;
@@ -148,6 +138,9 @@ struct VulkanWindow : public GraphicsWindow
   VulkanWindow(VulkanGraphicsTest *test, GraphicsWindow *win);
   virtual ~VulkanWindow();
   void Shutdown();
+
+  vkh::RenderPassBeginInfo beginRP() { return vkh::RenderPassBeginInfo(rp, GetFB(), scissor); }
+  void setViewScissor(VkCommandBuffer cmd);
 
   size_t GetCount() { return imgs.size(); }
   VkImage GetImage(size_t idx = ~0U)
@@ -169,11 +162,10 @@ struct VulkanWindow : public GraphicsWindow
     return fbs[idx];
   }
   bool Initialised() { return swap != VK_NULL_HANDLE; }
-  VkCommandBuffer GetCommandBuffer(VkCommandBufferLevel level);
   void Submit(int index, int totalSubmits, const std::vector<VkCommandBuffer> &cmds,
               const std::vector<VkCommandBuffer> &seccmds, VkQueue q);
+  static void MultiPresent(VkQueue queue, std::vector<VulkanWindow *> windows);
   void Present(VkQueue q);
-  void Acquire();
 
   // forward GraphicsWindow functions to internal window
   void Resize(int width, int height) { m_Win->Resize(width, height); }
@@ -182,19 +174,15 @@ private:
   bool CreateSwapchain();
   void DestroySwapchain();
 
+  void Acquire();
+  void PostPresent(VkResult vkr);
+
   VkSurfaceKHR surface = VK_NULL_HANDLE;
   VkSwapchainKHR swap = VK_NULL_HANDLE;
   std::vector<VkImage> imgs;
   std::vector<VkImageView> imgviews;
   VkSemaphore renderStartSemaphore = VK_NULL_HANDLE, renderEndSemaphore = VK_NULL_HANDLE;
   std::vector<VkFramebuffer> fbs;
-
-  VkCommandPool cmdPool;
-  std::set<VkFence> fences;
-
-  std::vector<VkCommandBuffer> freeCommandBuffers[VK_COMMAND_BUFFER_LEVEL_RANGE_SIZE];
-  std::vector<std::pair<VkCommandBuffer, VkFence>>
-      pendingCommandBuffers[VK_COMMAND_BUFFER_LEVEL_RANGE_SIZE];
 
   GraphicsWindow *m_Win;
   VulkanGraphicsTest *m_Test;
@@ -212,18 +200,25 @@ struct VulkanGraphicsTest : public GraphicsTest
   VulkanWindow *MakeWindow(int width, int height, const char *title);
 
   bool Running();
-  VkImage StartUsingBackbuffer(VkCommandBuffer cmd, VkAccessFlags nextUse, VkImageLayout layout,
+  VkImage StartUsingBackbuffer(VkCommandBuffer cmd,
+                               VkAccessFlags nextUse = VK_ACCESS_TRANSFER_WRITE_BIT |
+                                                       VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                               VkImageLayout layout = VK_IMAGE_LAYOUT_GENERAL,
                                VulkanWindow *window = NULL);
-  void FinishUsingBackbuffer(VkCommandBuffer cmd, VkAccessFlags prevUse, VkImageLayout layout,
+  void FinishUsingBackbuffer(VkCommandBuffer cmd,
+                             VkAccessFlags prevUse = VK_ACCESS_TRANSFER_WRITE_BIT |
+                                                     VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                             VkImageLayout layout = VK_IMAGE_LAYOUT_GENERAL,
                              VulkanWindow *window = NULL);
   void Submit(int index, int totalSubmits, const std::vector<VkCommandBuffer> &cmds,
-              const std::vector<VkCommandBuffer> &seccmds = {}, VulkanWindow *window = NULL,
-              VkQueue q = VK_NULL_HANDLE);
-  void Present(VulkanWindow *window = NULL, VkQueue q = VK_NULL_HANDLE);
+              const std::vector<VkCommandBuffer> &seccmds = {});
+  void SubmitAndPresent(const std::vector<VkCommandBuffer> &cmds);
+  void Present();
 
-  VkPipelineShaderStageCreateInfo CompileShaderModule(const std::string &source_text,
-                                                      ShaderLang lang, ShaderStage stage,
-                                                      const char *entry_point = "main");
+  VkPipelineShaderStageCreateInfo CompileShaderModule(
+      const std::string &source_text, ShaderLang lang, ShaderStage stage,
+      const char *entry_point = "main", const std::map<std::string, std::string> &macros = {},
+      SPIRVTarget target = SPIRVTarget::vulkan);
   VkCommandBuffer GetCommandBuffer(VkCommandBufferLevel level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
                                    VulkanWindow *window = NULL);
 
@@ -231,6 +226,16 @@ struct VulkanGraphicsTest : public GraphicsTest
   void pushMarker(VkCommandBuffer cmd, const std::string &name);
   void setMarker(VkCommandBuffer cmd, const std::string &name);
   void popMarker(VkCommandBuffer cmd);
+
+  void pushMarker(VkQueue queue, const std::string &name);
+  void setMarker(VkQueue queue, const std::string &name);
+  void popMarker(VkQueue queue);
+
+  void blitToSwap(VkCommandBuffer cmd, VkImage src, VkImageLayout srcLayout, VkImage dst,
+                  VkImageLayout dstLayout);
+
+  void uploadBufferToImage(VkImage destImage, VkExtent3D destExtent, VkBuffer srcBuffer,
+                           VkImageLayout finalLayout);
 
   template <typename T>
   void setName(T obj, const std::string &name);
@@ -244,22 +249,46 @@ struct VulkanGraphicsTest : public GraphicsTest
   VkBufferView createBufferView(const VkBufferViewCreateInfo *info);
   VkPipelineLayout createPipelineLayout(const VkPipelineLayoutCreateInfo *info);
   VkDescriptorSetLayout createDescriptorSetLayout(const VkDescriptorSetLayoutCreateInfo *info);
+  VkSampler createSampler(const VkSamplerCreateInfo *info);
 
   void getPhysFeatures2(void *nextStruct);
+  void getPhysProperties2(void *nextStruct);
 
   std::mutex mutex;
 
+  // instance version
+  uint32_t instVersion;
+  // device version
+  uint32_t devVersion;
+
+  // a custom struct to pass to vkInstanceCreateInfo::pNext
+  const void *instInfoNext = NULL;
+
   // requested features
   VkPhysicalDeviceFeatures features = {};
+  VkPhysicalDeviceFeatures optFeatures = {};
 
   // enabled instance extensions
   std::vector<const char *> instExts;
+  std::vector<const char *> instLayers;
 
   // required extensions before Init(), enabled extensions after Init()
   std::vector<const char *> devExts;
 
   // optional extensions, will be added to devExts if supported (allows fallback paths)
   std::vector<const char *> optDevExts;
+
+  VkQueueFlags queueFlagsRequired = VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT;
+  VkQueueFlags queueFlagsBanned = 0;
+
+  bool forceGraphicsQueue = false;
+  bool forceComputeQueue = false;
+  bool forceTransferQueue = false;
+  uint32_t graphicsQueueFamilyIndex = ~0U;
+  uint32_t computeQueueFamilyIndex = ~0U;
+  uint32_t transferQueueFamilyIndex = ~0U;
+
+  bool hasExt(const char *ext);
 
   // a custom struct to pass to vkDeviceCreateInfo::pNext
   const void *devInfoNext = NULL;
@@ -286,10 +315,20 @@ struct VulkanGraphicsTest : public GraphicsTest
   std::vector<VkBufferView> bufferviews;
   std::vector<VkPipelineLayout> pipelayouts;
   std::vector<VkDescriptorSetLayout> setlayouts;
+  std::vector<VkSampler> samplers;
+
+  std::map<VkImage, VmaAllocation> imageAllocs;
+  std::map<VkBuffer, VmaAllocation> bufferAllocs;
 
   VulkanWindow *mainWindow = NULL;
 
+  VulkanCommands *headlessCmds = NULL;
+
+  VkPipeline DefaultTriPipe;
+  AllocatedBuffer DefaultTriVB;
+
   // VMA
+  bool vmaDedicated = false;
   VmaAllocator allocator = VK_NULL_HANDLE;
 
 private:
@@ -297,3 +336,7 @@ private:
 
   GraphicsWindow *MakePlatformWindow(int width, int height, const char *title);
 };
+
+extern std::string VKFullscreenQuadVertex;
+extern std::string VKDefaultVertex;
+extern std::string VKDefaultPixel;

@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -24,55 +24,11 @@
 
 #include "gl_test.h"
 
-TEST(GL_Simple_Triangle, OpenGLGraphicsTest)
+RD_TEST(GL_Simple_Triangle, OpenGLGraphicsTest)
 {
   static constexpr const char *Description =
       "Just draws a simple triangle, using normal pipeline. Basic test that can be used "
       "for any dead-simple tests that don't require any particular API use";
-
-  std::string common = R"EOSHADER(
-
-#version 420 core
-
-#define v2f v2f_block \
-{                     \
-	vec4 pos;           \
-	vec4 col;           \
-	vec4 uv;            \
-}
-
-)EOSHADER";
-
-  std::string vertex = R"EOSHADER(
-
-layout(location = 0) in vec3 Position;
-layout(location = 1) in vec4 Color;
-layout(location = 2) in vec2 UV;
-
-out v2f vertOut;
-
-void main()
-{
-	vertOut.pos = vec4(Position.xyz, 1);
-	gl_Position = vertOut.pos;
-	vertOut.col = Color;
-	vertOut.uv = vec4(UV.xy, 0, 1);
-}
-
-)EOSHADER";
-
-  std::string pixel = R"EOSHADER(
-
-in v2f vertIn;
-
-layout(location = 0, index = 0) out vec4 Color;
-
-void main()
-{
-	Color = vertIn.col;
-}
-
-)EOSHADER";
 
   int main()
   {
@@ -85,23 +41,37 @@ void main()
 
     GLuint vb = MakeBuffer();
     glBindBuffer(GL_ARRAY_BUFFER, vb);
-    glBufferStorage(GL_ARRAY_BUFFER, sizeof(DefaultTri), DefaultTri, 0);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(DefaultTri), DefaultTri, GL_STATIC_DRAW);
 
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(DefaultA2V), (void *)(0));
-    glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, sizeof(DefaultA2V), (void *)(sizeof(Vec3f)));
-    glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, sizeof(DefaultA2V),
-                          (void *)(sizeof(Vec3f) + sizeof(Vec4f)));
+    ConfigureDefaultVAO();
 
-    glEnableVertexAttribArray(0);
-    glEnableVertexAttribArray(1);
-    glEnableVertexAttribArray(2);
+    GLuint program = MakeProgram(GLDefaultVertex, GLDefaultPixel);
 
-    GLuint program = MakeProgram(common + vertex, common + pixel);
+    // make a simple texture so that the structured data includes texture initial states
+    GLuint tex = MakeTexture();
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA32F, 4, 4);
+
+    float col[] = {0.2f, 0.2f, 0.2f, 1.0f};
+    float textureColourData[4 * 4 * 4];
+    for(int i = 0; i < 4 * 4; ++i)
+    {
+      for(int c = 0; c < 4; ++c)
+        textureColourData[i * 4 + c] = col[c];
+    }
+
+    GLuint texMS = MakeTexture();
+    glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, texMS);
+    glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 4, GL_RGBA16F, 4, 4, GL_TRUE);
 
     while(Running())
     {
-      float col[] = {0.4f, 0.5f, 0.6f, 1.0f};
       glClearBufferfv(GL_COLOR, 0, col);
+
+      glBindTexture(GL_TEXTURE_2D, tex);
+      glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 4, 4, GL_RGBA, GL_FLOAT, textureColourData);
+
+      glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, texMS);
 
       glBindVertexArray(vao);
 

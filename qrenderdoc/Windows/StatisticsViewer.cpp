@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2017-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -176,7 +176,7 @@ void StatisticsViewer::AppendShaderStatistics()
 {
   const FrameDescription &frameInfo = m_Ctx.FrameInfo();
 
-  const ShaderChangeStats *shaders = frameInfo.stats.shaders;
+  const rdcarray<ShaderChangeStats> &shaders = frameInfo.stats.shaders;
   ShaderChangeStats totalShadersPerStage;
   memset(&totalShadersPerStage, 0, sizeof(totalShadersPerStage));
   for(auto s : indices<ShaderStage>())
@@ -221,7 +221,7 @@ void StatisticsViewer::AppendConstantBindStatistics()
   // structure for a given type with known integral types (or arrays
   // thereof), but given we're heading for a Qt/C++ rewrite of the UI
   // perhaps best not to dwell too long on that
-  ConstantBindStats totalConstantsPerStage[ENUM_ARRAY_SIZE(ShaderStage)];
+  ConstantBindStats totalConstantsPerStage[arraydim<ShaderStage>()];
   memset(&totalConstantsPerStage, 0, sizeof(totalConstantsPerStage));
   for(auto s : indices<ShaderStage>())
   {
@@ -230,7 +230,7 @@ void StatisticsViewer::AppendConstantBindStatistics()
   }
 
   {
-    const ConstantBindStats *constants = frameInfo.stats.constants;
+    const rdcarray<ConstantBindStats> &constants = frameInfo.stats.constants;
     for(auto s : indices<ShaderStage>())
     {
       totalConstantsPerStage[s].calls += constants[s].calls;
@@ -313,7 +313,7 @@ void StatisticsViewer::AppendSamplerBindStatistics()
   // #mivance see AppendConstantBindStatistics
   const SamplerBindStats &reference = frameInfo.stats.samplers[0];
 
-  SamplerBindStats totalSamplersPerStage[ENUM_ARRAY_SIZE(ShaderStage)];
+  SamplerBindStats totalSamplersPerStage[arraydim<ShaderStage>()];
   memset(&totalSamplersPerStage, 0, sizeof(totalSamplersPerStage));
   for(auto s : indices<ShaderStage>())
   {
@@ -321,7 +321,7 @@ void StatisticsViewer::AppendSamplerBindStatistics()
   }
 
   {
-    const SamplerBindStats *samplers = frameInfo.stats.samplers;
+    const rdcarray<SamplerBindStats> &samplers = frameInfo.stats.samplers;
     for(auto s : indices<ShaderStage>())
     {
       totalSamplersPerStage[s].calls += samplers[s].calls;
@@ -379,7 +379,7 @@ void StatisticsViewer::AppendResourceBindStatistics()
   // #mivance see AppendConstantBindStatistics
   const ResourceBindStats &reference = frameInfo.stats.resources[0];
 
-  ResourceBindStats totalResourcesPerStage[ENUM_ARRAY_SIZE(ShaderStage)];
+  ResourceBindStats totalResourcesPerStage[arraydim<ShaderStage>()];
   memset(&totalResourcesPerStage, 0, sizeof(totalResourcesPerStage));
   for(auto s : indices<ShaderStage>())
   {
@@ -388,7 +388,7 @@ void StatisticsViewer::AppendResourceBindStatistics()
   }
 
   {
-    const ResourceBindStats *resources = frameInfo.stats.resources;
+    const rdcarray<ResourceBindStats> &resources = frameInfo.stats.resources;
     for(auto s : indices<ShaderStage>())
     {
       totalResourcesPerStage[s].calls += resources[s].calls;
@@ -623,23 +623,23 @@ void StatisticsViewer::AppendDetailedInformation()
   AppendOutputStatistics();
 }
 
-void StatisticsViewer::CountContributingEvents(const DrawcallDescription &draw, uint32_t &drawCount,
+void StatisticsViewer::CountContributingEvents(const ActionDescription &action, uint32_t &drawCount,
                                                uint32_t &dispatchCount, uint32_t &diagnosticCount)
 {
-  const DrawFlags diagnosticMask =
-      DrawFlags::SetMarker | DrawFlags::PushMarker | DrawFlags::PopMarker;
-  DrawFlags diagnosticMasked = draw.flags & diagnosticMask;
+  const ActionFlags diagnosticMask =
+      ActionFlags::SetMarker | ActionFlags::PushMarker | ActionFlags::PopMarker;
+  ActionFlags diagnosticMasked = action.flags & diagnosticMask;
 
-  if(diagnosticMasked != DrawFlags::NoFlags)
+  if(diagnosticMasked != ActionFlags::NoFlags)
     diagnosticCount += 1;
 
-  if(draw.flags & DrawFlags::Drawcall)
+  if(action.flags & (ActionFlags::MeshDispatch | ActionFlags::Drawcall))
     drawCount += 1;
 
-  if(draw.flags & DrawFlags::Dispatch)
+  if(action.flags & ActionFlags::Dispatch)
     dispatchCount += 1;
 
-  for(const DrawcallDescription &c : draw.children)
+  for(const ActionDescription &c : action.children)
     CountContributingEvents(c, drawCount, dispatchCount, diagnosticCount);
 }
 
@@ -685,16 +685,16 @@ void StatisticsViewer::AppendAPICallSummary()
 
 void StatisticsViewer::GenerateReport()
 {
-  const rdcarray<DrawcallDescription> &curDraws = m_Ctx.CurDrawcalls();
+  const rdcarray<ActionDescription> &curActions = m_Ctx.CurRootActions();
 
   uint32_t drawCount = 0;
   uint32_t dispatchCount = 0;
   uint32_t diagnosticCount = 0;
-  for(const DrawcallDescription &d : curDraws)
-    CountContributingEvents(d, drawCount, dispatchCount, diagnosticCount);
+  for(const ActionDescription &action : curActions)
+    CountContributingEvents(action, drawCount, dispatchCount, diagnosticCount);
 
   uint32_t numAPIcalls =
-      m_Ctx.GetLastDrawcall()->eventId - (drawCount + dispatchCount + diagnosticCount);
+      m_Ctx.GetLastAction()->eventId - (drawCount + dispatchCount + diagnosticCount);
 
   int numTextures = m_Ctx.GetTextures().count();
   int numBuffers = m_Ctx.GetBuffers().count();
@@ -820,7 +820,7 @@ StatisticsViewer::StatisticsViewer(ICaptureContext &ctx, QWidget *parent)
 {
   ui->setupUi(this);
 
-  ui->statistics->setFont(QFontDatabase::systemFont(QFontDatabase::FixedFont));
+  ui->statistics->setFont(Formatter::FixedFont());
 
   m_Ctx.AddCaptureViewer(this);
 }

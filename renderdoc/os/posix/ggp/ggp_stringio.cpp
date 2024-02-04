@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -22,6 +22,7 @@
  * THE SOFTWARE.
  ******************************************************************************/
 
+#include <ctype.h>
 #include <dlfcn.h>
 #include <errno.h>
 #include <iconv.h>
@@ -33,11 +34,10 @@
 #include <time.h>
 #include <unistd.h>
 #include "api/app/renderdoc_app.h"
+#include "common/common.h"
 #include "common/threading.h"
 #include "os/os_specific.h"
 #include "strings/string_utils.h"
-
-using std::string;
 
 namespace Keyboard
 {
@@ -50,11 +50,11 @@ bool PlatformHasKeyInput()
   return false;
 }
 
-void AddInputWindow(void *wnd)
+void AddInputWindow(WindowingSystem windowSystem, void *wnd)
 {
 }
 
-void RemoveInputWindow(void *wnd)
+void RemoveInputWindow(WindowingSystem windowSystem, void *wnd)
 {
 }
 
@@ -66,12 +66,12 @@ bool GetKeyState(int key)
 
 namespace FileIO
 {
-string GetTempRootPath()
+rdcstr GetTempRootPath()
 {
   return "/tmp";
 }
 
-string GetAppFolderFilename(const string &filename)
+rdcstr GetAppFolderFilename(const rdcstr &filename)
 {
   const char *homedir = NULL;
   if(getenv("HOME") != NULL)
@@ -85,31 +85,37 @@ string GetAppFolderFilename(const string &filename)
     homedir = getpwuid(getuid())->pw_dir;
   }
 
-  string ret = string(homedir) + "/.renderdoc/";
+  rdcstr ret = rdcstr(homedir ? homedir : "") + "/.renderdoc/";
 
   mkdir(ret.c_str(), S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH);
 
   return ret + filename;
 }
 
-void GetExecutableFilename(string &selfName)
+rdcstr DefaultFindFileInPath(const rdcstr &fileName);
+rdcstr FindFileInPath(const rdcstr &fileName)
+{
+  return DefaultFindFileInPath(fileName);
+}
+
+void GetExecutableFilename(rdcstr &selfName)
 {
   char path[512] = {0};
   readlink("/proc/self/exe", path, 511);
 
-  selfName = string(path);
+  selfName = rdcstr(path);
 }
 
 int LibraryLocator = 42;
 
-void GetLibraryFilename(string &selfName)
+void GetLibraryFilename(rdcstr &selfName)
 {
   // this is a hack, but the only reliable way to find the absolute path to the library.
   // dladdr would be fine but it returns the wrong result for symbols in the library
 
-  string librenderdoc_path;
+  rdcstr librenderdoc_path;
 
-  FILE *f = fopen("/proc/self/maps", "r");
+  FILE *f = fopen("/proc/self/maps", FileIO::ReadText);
 
   if(f)
   {
@@ -182,7 +188,7 @@ void GetLibraryFilename(string &selfName)
       char *end = strchr(c, '\n');
 
       if(end)
-        librenderdoc_path = string(c, end - c);
+        librenderdoc_path = rdcstr(c, end - c);
     }
 
     delete[] map_string;
@@ -225,13 +231,13 @@ void Shutdown()
   iconvUTF82Wide = (iconv_t)-1;
 }
 
-std::string Wide2UTF8(const std::wstring &s)
+rdcstr Wide2UTF8(const rdcwstr &s)
 {
   // include room for null terminator, assuming unicode input (not ucs)
   // utf-8 characters can be max 4 bytes.
   size_t len = (s.length() + 1) * 4;
 
-  std::vector<char> charBuffer(len);
+  rdcarray<char> charBuffer(len);
 
   size_t ret;
 
@@ -266,16 +272,16 @@ std::string Wide2UTF8(const std::wstring &s)
   // convert to string from null-terminated string - utf-8 never contains
   // 0 bytes before the null terminator, and this way we don't care if
   // charBuffer is larger than the string
-  return std::string(&charBuffer[0]);
+  return rdcstr(&charBuffer[0]);
 }
 
-std::wstring UTF82Wide(const std::string &s)
+rdcwstr UTF82Wide(const rdcstr &s)
 {
   // include room for null terminator, for ascii input we need at least as many output chars as
   // input.
   size_t len = s.length() + 1;
 
-  std::vector<wchar_t> wcharBuffer(len);
+  rdcarray<wchar_t> wcharBuffer(len);
 
   size_t ret;
 
@@ -308,7 +314,7 @@ std::wstring UTF82Wide(const std::string &s)
   }
 
   // convert to string from null-terminated string
-  return std::wstring(&wcharBuffer[0]);
+  return rdcwstr(&wcharBuffer[0]);
 }
 };
 

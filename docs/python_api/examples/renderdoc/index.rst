@@ -26,9 +26,10 @@ In order to help with this, the examples are organised such that most code is wr
         cap.Shutdown()
 
 .. toctree::
-    iter_draws
+    iter_actions
     fetch_shader
     fetch_counters
     save_texture
     decode_mesh
     display_window
+    remote_capture

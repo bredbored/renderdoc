@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2018-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -22,22 +22,22 @@
  * THE SOFTWARE.
  ******************************************************************************/
 
-#include "maths/camera.h"
 #include "maths/formatpacking.h"
 #include "maths/matrix.h"
 #include "d3d11_context.h"
 #include "d3d11_debug.h"
 #include "d3d11_device.h"
+#include "d3d11_replay.h"
 #include "d3d11_resources.h"
 
 #include "data/hlsl/hlsl_cbuffers.h"
 
-D3D11DebugManager::CacheElem &D3D11DebugManager::GetCachedElem(ResourceId id, CompType typeHint,
+D3D11DebugManager::CacheElem &D3D11DebugManager::GetCachedElem(ResourceId id, CompType typeCast,
                                                                bool raw)
 {
   for(auto it = m_ShaderItemCache.begin(); it != m_ShaderItemCache.end(); ++it)
   {
-    if(it->id == id && it->typeHint == typeHint && it->raw == raw)
+    if(it->id == id && it->typeCast == typeCast && it->raw == raw)
       return *it;
   }
 
@@ -48,11 +48,11 @@ D3D11DebugManager::CacheElem &D3D11DebugManager::GetCachedElem(ResourceId id, Co
     m_ShaderItemCache.pop_back();
   }
 
-  m_ShaderItemCache.push_front(CacheElem(id, typeHint, raw));
+  m_ShaderItemCache.insert(0, CacheElem(id, typeCast, raw));
   return m_ShaderItemCache.front();
 }
 
-TextureShaderDetails D3D11DebugManager::GetShaderDetails(ResourceId id, CompType typeHint,
+TextureShaderDetails D3D11DebugManager::GetShaderDetails(ResourceId id, CompType typeCast,
                                                          bool rawOutput)
 {
   TextureShaderDetails details;
@@ -60,7 +60,7 @@ TextureShaderDetails D3D11DebugManager::GetShaderDetails(ResourceId id, CompType
 
   bool foundResource = false;
 
-  CacheElem &cache = GetCachedElem(id, typeHint, rawOutput);
+  CacheElem &cache = GetCachedElem(id, typeCast, rawOutput);
 
   bool msaaDepth = false;
 
@@ -89,7 +89,7 @@ TextureShaderDetails D3D11DebugManager::GetShaderDetails(ResourceId id, CompType
     details.texArraySize = desc1d.ArraySize;
     details.texMips = desc1d.MipLevels;
 
-    srvFormat = GetTypedFormat(details.texFmt, typeHint);
+    srvFormat = GetTypedFormat(details.texFmt, typeCast);
 
     details.srvResource = wrapTex1D;
 
@@ -151,10 +151,11 @@ TextureShaderDetails D3D11DebugManager::GetShaderDetails(ResourceId id, CompType
       details.texType = eTexType_2DMS;
     }
 
-    if(mode == TEXDISPLAY_DEPTH_TARGET || IsDepthFormat(details.texFmt))
+    if(mode == TEXDISPLAY_DEPTH_TARGET || IsDepthFormat(details.texFmt) ||
+       IsDepthFormat(GetTypedFormat(details.texFmt, typeCast)))
     {
       details.texType = eTexType_Depth;
-      details.texFmt = GetTypedFormat(details.texFmt, typeHint);
+      details.texFmt = GetTypedFormat(details.texFmt, typeCast);
     }
 
     // backbuffer is always interpreted as SRGB data regardless of format specified:
@@ -178,7 +179,7 @@ TextureShaderDetails D3D11DebugManager::GetShaderDetails(ResourceId id, CompType
         details.texFmt = GetSRGBFormat(wrapTex2D->m_RealDescriptor->Format);
     }
 
-    srvFormat = GetTypedFormat(details.texFmt, typeHint);
+    srvFormat = GetTypedFormat(details.texFmt, typeCast);
 
     details.srvResource = wrapTex2D;
 
@@ -245,7 +246,7 @@ TextureShaderDetails D3D11DebugManager::GetShaderDetails(ResourceId id, CompType
     details.texArraySize = 1;
     details.texMips = desc3d.MipLevels;
 
-    srvFormat = GetTypedFormat(details.texFmt, typeHint);
+    srvFormat = GetTypedFormat(details.texFmt, typeCast);
 
     details.srvResource = wrapTex3D;
 
@@ -390,6 +391,7 @@ TextureShaderDetails D3D11DebugManager::GetShaderDetails(ResourceId id, CompType
       RDCERR("Failed to create cache SRV 0, type %d HRESULT: %s", details.texType, ToStr(hr).c_str());
   }
 
+  details.srvFormat = srvFormat;
   details.srv[details.texType] = cache.srv[0];
 
   if(IsYUVFormat(srvFormat))
@@ -447,11 +449,13 @@ TextureShaderDetails D3D11DebugManager::GetShaderDetails(ResourceId id, CompType
   return details;
 }
 
-bool D3D11Replay::RenderTextureInternal(TextureDisplay cfg, bool blendAlpha)
+bool D3D11Replay::RenderTextureInternal(TextureDisplay cfg, TexDisplayFlags flags)
 {
   TexDisplayVSCBuffer vertexData = {};
   TexDisplayPSCBuffer pixelData = {};
   HeatmapData heatmapData = {};
+
+  bool blendAlpha = (flags & eTexDisplay_BlendAlpha) != 0;
 
   {
     if(cfg.overlay == DebugOverlay::QuadOverdrawDraw || cfg.overlay == DebugOverlay::QuadOverdrawPass)
@@ -479,13 +483,6 @@ bool D3D11Replay::RenderTextureInternal(TextureDisplay cfg, bool blendAlpha)
   vertexData.Position.x = x * (2.0f / m_OutputWidth);
   vertexData.Position.y = -y * (2.0f / m_OutputHeight);
 
-  vertexData.ScreenAspect.x =
-      (m_OutputHeight / m_OutputWidth);    // 0.5 = character width / character height
-  vertexData.ScreenAspect.y = 1.0f;
-
-  vertexData.TextureResolution.x = 1.0f / vertexData.ScreenAspect.x;
-  vertexData.TextureResolution.y = 1.0f;
-
   if(cfg.rangeMax <= cfg.rangeMin)
     cfg.rangeMax += 0.00001f;
 
@@ -497,7 +494,7 @@ bool D3D11Replay::RenderTextureInternal(TextureDisplay cfg, bool blendAlpha)
   pixelData.RangeMinimum = cfg.rangeMin;
   pixelData.InverseRangeSize = 1.0f / (cfg.rangeMax - cfg.rangeMin);
 
-  if(_isnan(pixelData.InverseRangeSize) || !_finite(pixelData.InverseRangeSize))
+  if(!RDCISFINITE(pixelData.InverseRangeSize))
   {
     pixelData.InverseRangeSize = FLT_MAX;
   }
@@ -509,13 +506,27 @@ bool D3D11Replay::RenderTextureInternal(TextureDisplay cfg, bool blendAlpha)
 
   pixelData.FlipY = cfg.flipY ? 1 : 0;
 
-  TextureShaderDetails details = GetDebugManager()->GetShaderDetails(cfg.resourceId, cfg.typeHint,
-                                                                     cfg.rawOutput ? true : false);
+  CompType typeCast = cfg.typeCast;
 
-  int sampleIdx = (int)RDCCLAMP(cfg.sampleIdx, 0U, details.sampleCount - 1);
+  // we create all proxy textures as typeless to allow us to cast, but that means if the remote API
+  // gave us a typed texture and then wants to view it 'typeless' (i.e. as it was created) we need
+  // to restore that type here.
+  //
+  // we also override the typecast for depth here, to allow handling of S8 textures
+  if(typeCast == CompType::Typeless || typeCast == CompType::Depth)
+  {
+    auto it = m_ProxyResourceOrigInfo.find(cfg.resourceId);
+    if(it != m_ProxyResourceOrigInfo.end())
+      typeCast = it->second.format.compType;
+  }
+
+  TextureShaderDetails details =
+      GetDebugManager()->GetShaderDetails(cfg.resourceId, typeCast, cfg.rawOutput ? true : false);
+
+  int sampleIdx = (int)RDCCLAMP(cfg.subresource.sample, 0U, details.sampleCount - 1);
 
   // hacky resolve
-  if(cfg.sampleIdx == ~0U)
+  if(cfg.subresource.sample == ~0U)
     sampleIdx = -int(details.sampleCount);
 
   pixelData.SampleIdx = sampleIdx;
@@ -534,17 +545,13 @@ bool D3D11Replay::RenderTextureInternal(TextureDisplay cfg, bool blendAlpha)
   float tex_x = float(details.texWidth);
   float tex_y = float(details.texType == eTexType_1D ? 100 : details.texHeight);
 
-  vertexData.TextureResolution.x *= tex_x / m_OutputWidth;
-  vertexData.TextureResolution.y *= tex_y / m_OutputHeight;
-
-  pixelData.TextureResolutionPS.x = float(RDCMAX(1U, details.texWidth >> cfg.mip));
-  pixelData.TextureResolutionPS.y = float(RDCMAX(1U, details.texHeight >> cfg.mip));
-  pixelData.TextureResolutionPS.z = float(RDCMAX(1U, details.texDepth >> cfg.mip));
+  pixelData.TextureResolutionPS.x = float(RDCMAX(1U, details.texWidth >> cfg.subresource.mip));
+  pixelData.TextureResolutionPS.y = float(RDCMAX(1U, details.texHeight >> cfg.subresource.mip));
+  pixelData.TextureResolutionPS.z = float(RDCMAX(1U, details.texDepth >> cfg.subresource.mip));
 
   if(details.texArraySize > 1 && details.texType != eTexType_3D)
     pixelData.TextureResolutionPS.z = float(details.texArraySize);
 
-  vertexData.Scale = cfg.scale;
   pixelData.ScalePS = cfg.scale;
 
   pixelData.YUVDownsampleRate = details.YUVDownsampleRate;
@@ -555,22 +562,26 @@ bool D3D11Replay::RenderTextureInternal(TextureDisplay cfg, bool blendAlpha)
     float xscale = m_OutputWidth / tex_x;
     float yscale = m_OutputHeight / tex_y;
 
-    vertexData.Scale = RDCMIN(xscale, yscale);
+    cfg.scale = RDCMIN(xscale, yscale);
 
     if(yscale > xscale)
     {
       vertexData.Position.x = 0;
-      vertexData.Position.y = tex_y * vertexData.Scale / m_OutputHeight - 1.0f;
+      vertexData.Position.y = tex_y * cfg.scale / m_OutputHeight - 1.0f;
     }
     else
     {
       vertexData.Position.y = 0;
-      vertexData.Position.x = 1.0f - tex_x * vertexData.Scale / m_OutputWidth;
+      vertexData.Position.x = 1.0f - tex_x * cfg.scale / m_OutputWidth;
     }
   }
 
+  // normalisation factor for output * selected scale * viewport scale
+  vertexData.VertexScale.x = (tex_x / m_OutputWidth) * cfg.scale * 2.0f;
+  vertexData.VertexScale.y = (tex_y / m_OutputHeight) * cfg.scale * 2.0f;
+
   ID3D11PixelShader *customPS = NULL;
-  ID3D11Buffer *customBuff = NULL;
+  ID3D11Buffer *customBuffs[2] = {};
 
   if(cfg.customShaderId != ResourceId())
   {
@@ -581,7 +592,7 @@ bool D3D11Replay::RenderTextureInternal(TextureDisplay cfg, bool blendAlpha)
       auto dxbc = it->second->GetDXBC();
 
       RDCASSERT(dxbc);
-      RDCASSERT(dxbc->m_Type == D3D11_ShaderType_Pixel);
+      RDCASSERT(dxbc->m_Type == DXBC::ShaderType::Pixel);
 
       if(m_pDevice->GetResourceManager()->HasLiveResource(cfg.customShaderId))
       {
@@ -589,11 +600,29 @@ bool D3D11Replay::RenderTextureInternal(TextureDisplay cfg, bool blendAlpha)
             (WrappedID3D11Shader<ID3D11PixelShader> *)m_pDevice->GetResourceManager()->GetLiveResource(
                 cfg.customShaderId);
 
+        RD_CustomShader_CBuffer_Type customCBuffer = {};
+
+        customCBuffer.TexDim.x = details.texWidth;
+        customCBuffer.TexDim.y = details.texHeight;
+        customCBuffer.TexDim.z =
+            details.texType == eTexType_3D ? details.texDepth : details.texArraySize;
+        customCBuffer.TexDim.w = details.texMips;
+        customCBuffer.SelectedMip = cfg.subresource.mip;
+        customCBuffer.SelectedSliceFace = cfg.subresource.slice;
+        customCBuffer.SelectedSample = sampleIdx;
+        customCBuffer.TextureType = (uint32_t)details.texType;
+        customCBuffer.YUVDownsampleRate = details.YUVDownsampleRate;
+        customCBuffer.YUVAChannels = details.YUVAChannels;
+        customCBuffer.SelectedRange.x = cfg.rangeMin;
+        customCBuffer.SelectedRange.y = cfg.rangeMax;
+
+        customBuffs[0] = GetDebugManager()->MakeCBuffer(&customCBuffer, sizeof(customCBuffer));
+
         customPS = wrapped;
 
-        for(size_t i = 0; i < dxbc->m_CBuffers.size(); i++)
+        for(size_t i = 0; i < dxbc->GetReflection()->CBuffers.size(); i++)
         {
-          const DXBC::CBuffer &cbuf = dxbc->m_CBuffers[i];
+          const DXBC::CBuffer &cbuf = dxbc->GetReflection()->CBuffers[i];
           if(cbuf.name == "$Globals")
           {
             float *cbufData = new float[cbuf.descriptor.byteSize / sizeof(float) + 1];
@@ -605,10 +634,9 @@ bool D3D11Replay::RenderTextureInternal(TextureDisplay cfg, bool blendAlpha)
 
               if(var.name == "RENDERDOC_TexDim")
               {
-                if(var.type.descriptor.rows == 1 && var.type.descriptor.cols == 4 &&
-                   var.type.descriptor.type == DXBC::VARTYPE_UINT)
+                if(var.type.rows == 1 && var.type.cols == 4 && var.type.varType == VarType::UInt)
                 {
-                  uint32_t *d = (uint32_t *)(byteData + var.descriptor.offset);
+                  uint32_t *d = (uint32_t *)(byteData + var.offset);
 
                   d[0] = details.texWidth;
                   d[1] = details.texHeight;
@@ -623,24 +651,23 @@ bool D3D11Replay::RenderTextureInternal(TextureDisplay cfg, bool blendAlpha)
               }
               else if(var.name == "RENDERDOC_YUVDownsampleRate")
               {
-                Vec4u *d = (Vec4u *)(byteData + var.descriptor.offset);
+                Vec4u *d = (Vec4u *)(byteData + var.offset);
 
                 *d = details.YUVDownsampleRate;
               }
               else if(var.name == "RENDERDOC_YUVAChannels")
               {
-                Vec4u *d = (Vec4u *)(byteData + var.descriptor.offset);
+                Vec4u *d = (Vec4u *)(byteData + var.offset);
 
                 *d = details.YUVAChannels;
               }
               else if(var.name == "RENDERDOC_SelectedMip")
               {
-                if(var.type.descriptor.rows == 1 && var.type.descriptor.cols == 1 &&
-                   var.type.descriptor.type == DXBC::VARTYPE_UINT)
+                if(var.type.rows == 1 && var.type.cols == 1 && var.type.varType == VarType::UInt)
                 {
-                  uint32_t *d = (uint32_t *)(byteData + var.descriptor.offset);
+                  uint32_t *d = (uint32_t *)(byteData + var.offset);
 
-                  d[0] = cfg.mip;
+                  d[0] = cfg.subresource.mip;
                 }
                 else
                 {
@@ -650,12 +677,11 @@ bool D3D11Replay::RenderTextureInternal(TextureDisplay cfg, bool blendAlpha)
               }
               else if(var.name == "RENDERDOC_SelectedSliceFace")
               {
-                if(var.type.descriptor.rows == 1 && var.type.descriptor.cols == 1 &&
-                   var.type.descriptor.type == DXBC::VARTYPE_UINT)
+                if(var.type.rows == 1 && var.type.cols == 1 && var.type.varType == VarType::UInt)
                 {
-                  uint32_t *d = (uint32_t *)(byteData + var.descriptor.offset);
+                  uint32_t *d = (uint32_t *)(byteData + var.offset);
 
-                  d[0] = cfg.sliceFace;
+                  d[0] = cfg.subresource.slice;
                 }
                 else
                 {
@@ -665,12 +691,11 @@ bool D3D11Replay::RenderTextureInternal(TextureDisplay cfg, bool blendAlpha)
               }
               else if(var.name == "RENDERDOC_SelectedSample")
               {
-                if(var.type.descriptor.rows == 1 && var.type.descriptor.cols == 1 &&
-                   var.type.descriptor.type == DXBC::VARTYPE_INT)
+                if(var.type.rows == 1 && var.type.cols == 1 && var.type.varType == VarType::SInt)
                 {
-                  int32_t *d = (int32_t *)(byteData + var.descriptor.offset);
+                  int32_t *d = (int32_t *)(byteData + var.offset);
 
-                  d[0] = cfg.sampleIdx;
+                  d[0] = sampleIdx;
                 }
                 else
                 {
@@ -680,10 +705,9 @@ bool D3D11Replay::RenderTextureInternal(TextureDisplay cfg, bool blendAlpha)
               }
               else if(var.name == "RENDERDOC_TextureType")
               {
-                if(var.type.descriptor.rows == 1 && var.type.descriptor.cols == 1 &&
-                   var.type.descriptor.type == DXBC::VARTYPE_UINT)
+                if(var.type.rows == 1 && var.type.cols == 1 && var.type.varType == VarType::UInt)
                 {
-                  uint32_t *d = (uint32_t *)(byteData + var.descriptor.offset);
+                  uint32_t *d = (uint32_t *)(byteData + var.offset);
 
                   d[0] = details.texType;
                 }
@@ -693,13 +717,43 @@ bool D3D11Replay::RenderTextureInternal(TextureDisplay cfg, bool blendAlpha)
                           var.name.c_str());
                 }
               }
+              else if(var.name == "RENDERDOC_SelectedRangeMin")
+              {
+                float *d = (float *)(byteData + var.offset);
+                d[0] = cfg.rangeMin;
+              }
+              else if(var.name == "RENDERDOC_SelectedRangeMax")
+              {
+                float *d = (float *)(byteData + var.offset);
+                d[0] = cfg.rangeMax;
+              }
               else
               {
                 RDCWARN("Custom shader: Variable not recognised: %s", var.name.c_str());
               }
             }
 
-            customBuff = GetDebugManager()->MakeCBuffer(cbufData, cbuf.descriptor.byteSize);
+            if(cbuf.reg == 0)
+            {
+              // with the prefix added, binding 0 should be 'reserved' for the modern cbuffer.
+              // we can still make this work, but it's unexpected
+              RDCWARN(
+                  "Unexpected globals cbuffer at binding 0, expected binding 1 after prefix "
+                  "cbuffer");
+              customBuffs[0] = GetDebugManager()->MakeCBuffer(cbufData, cbuf.descriptor.byteSize);
+            }
+            else if(cbuf.reg == 1)
+            {
+              customBuffs[1] = GetDebugManager()->MakeCBuffer(cbufData, cbuf.descriptor.byteSize);
+            }
+            else
+            {
+              RDCERR(
+                  "Globals cbuffer at binding %d, unexpected and not handled - these constants "
+                  "will be "
+                  "undefined",
+                  cbuf.reg);
+            }
 
             SAFE_DELETE_ARRAY(cbufData);
           }
@@ -708,16 +762,25 @@ bool D3D11Replay::RenderTextureInternal(TextureDisplay cfg, bool blendAlpha)
     }
   }
 
-  vertexData.Scale *= 2.0f;    // viewport is -1 -> 1
-
-  pixelData.MipLevel = (float)cfg.mip;
+  pixelData.MipLevel = (float)cfg.subresource.mip;
   pixelData.OutputDisplayFormat = RESTYPE_TEX2D;
-  pixelData.Slice = float(RDCCLAMP(cfg.sliceFace, 0U, details.texArraySize - 1));
+  pixelData.Slice = float(RDCCLAMP(cfg.subresource.slice, 0U, details.texArraySize - 1));
 
   if(details.texType == eTexType_3D)
   {
     pixelData.OutputDisplayFormat = RESTYPE_TEX3D;
-    pixelData.Slice = float(cfg.sliceFace >> cfg.mip);
+    float slice =
+        float(RDCCLAMP(cfg.subresource.slice, 0U, (details.texDepth >> cfg.subresource.mip) - 1));
+
+    // when sampling linearly, we need to add half a pixel to ensure we only sample the desired
+    // slice
+    if(cfg.subresource.mip == 0 && cfg.scale < 1.0f && !IsUIntFormat(details.srvFormat) &&
+       !IsIntFormat(details.srvFormat))
+      slice += 0.5f;
+    else
+      slice += 0.001f;
+
+    pixelData.Slice = slice;
   }
   else if(details.texType == eTexType_1D)
   {
@@ -756,19 +819,17 @@ bool D3D11Replay::RenderTextureInternal(TextureDisplay cfg, bool blendAlpha)
 
   int srvOffset = 0;
 
-  if(IsUIntFormat(details.texFmt) ||
-     (IsTypelessFormat(details.texFmt) && cfg.typeHint == CompType::UInt))
+  if(IsUIntFormat(details.texFmt) || (IsTypelessFormat(details.texFmt) && typeCast == CompType::UInt))
   {
     pixelData.OutputDisplayFormat |= TEXDISPLAY_UINT_TEX;
     srvOffset = 10;
   }
-  if(IsIntFormat(details.texFmt) ||
-     (IsTypelessFormat(details.texFmt) && cfg.typeHint == CompType::SInt))
+  if(IsIntFormat(details.texFmt) || (IsTypelessFormat(details.texFmt) && typeCast == CompType::SInt))
   {
     pixelData.OutputDisplayFormat |= TEXDISPLAY_SINT_TEX;
     srvOffset = 20;
   }
-  if(!IsSRGBFormat(details.texFmt) && cfg.linearDisplayAsGamma)
+  if(!IsSRGBFormat(details.texFmt) && !IsSRGBFormat(details.srvFormat) && cfg.linearDisplayAsGamma)
   {
     pixelData.OutputDisplayFormat |= TEXDISPLAY_GAMMA_CURVE;
   }
@@ -791,16 +852,24 @@ bool D3D11Replay::RenderTextureInternal(TextureDisplay cfg, bool blendAlpha)
 
     m_pImmediateContext->RSSetState(m_General.RasterState);
 
-    if(customPS == NULL)
+    if(customPS)
     {
-      m_pImmediateContext->PSSetShader(m_TexRender.TexDisplayPS, NULL, 0);
-      m_pImmediateContext->PSSetConstantBuffers(0, 1, &psCBuffer);
-      m_pImmediateContext->PSSetConstantBuffers(1, 1, &psHeatCBuffer);
+      m_pImmediateContext->PSSetShader(customPS, NULL, 0);
+      m_pImmediateContext->PSSetConstantBuffers(0, 2, customBuffs);
     }
     else
     {
-      m_pImmediateContext->PSSetShader(customPS, NULL, 0);
-      m_pImmediateContext->PSSetConstantBuffers(0, 1, &customBuff);
+      m_pImmediateContext->PSSetConstantBuffers(0, 1, &psCBuffer);
+      m_pImmediateContext->PSSetConstantBuffers(1, 1, &psHeatCBuffer);
+
+      if(flags & eTexDisplay_RemapFloat)
+        m_pImmediateContext->PSSetShader(m_TexRender.TexRemapPS[0], NULL, 0);
+      else if(flags & eTexDisplay_RemapUInt)
+        m_pImmediateContext->PSSetShader(m_TexRender.TexRemapPS[1], NULL, 0);
+      else if(flags & eTexDisplay_RemapSInt)
+        m_pImmediateContext->PSSetShader(m_TexRender.TexRemapPS[2], NULL, 0);
+      else
+        m_pImmediateContext->PSSetShader(m_TexRender.TexDisplayPS, NULL, 0);
     }
 
     ID3D11UnorderedAccessView *NullUAVs[D3D11_1_UAV_SLOT_COUNT] = {0};

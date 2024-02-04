@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2016-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -22,6 +22,7 @@
  * THE SOFTWARE.
  ******************************************************************************/
 
+#include "core/settings.h"
 #include "driver/dxgi/dxgi_common.h"
 #include "d3d12_command_list.h"
 #include "d3d12_command_queue.h"
@@ -29,6 +30,8 @@
 #include "d3d12_device.h"
 #include "d3d12_manager.h"
 #include "d3d12_resources.h"
+
+RDOC_EXTERN_CONFIG(bool, D3D12_Debug_SingleSubmitFlushing);
 
 bool D3D12ResourceManager::Prepare_InitialState(ID3D12DeviceChild *res)
 {
@@ -49,19 +52,28 @@ bool D3D12ResourceManager::Prepare_InitialState(ID3D12DeviceChild *res)
   }
   else if(type == Resource_Resource)
   {
-    WrappedID3D12Resource1 *r = (WrappedID3D12Resource1 *)res;
-    ID3D12Pageable *pageable = r;
+    WrappedID3D12Resource *r = (WrappedID3D12Resource *)res;
+    ID3D12Pageable *unwrappedPageable = r->UnwrappedResidencyPageable();
 
     bool nonresident = false;
-    if(!r->Resident())
+    if(!r->IsResident())
       nonresident = true;
 
     D3D12_RESOURCE_DESC desc = r->GetDesc();
 
+    D3D12InitialContents initContents;
+
+    Sparse::PageTable *sparseTable = NULL;
+
+    if(GetRecord(r)->sparseTable)
+      sparseTable = new Sparse::PageTable(*GetRecord(r)->sparseTable);
+
     if(desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
     {
-      D3D12_HEAP_PROPERTIES heapProps;
-      r->GetHeapProperties(&heapProps, NULL);
+      D3D12_HEAP_PROPERTIES heapProps = {};
+
+      if(sparseTable == NULL)
+        r->GetHeapProperties(&heapProps, NULL);
 
       HRESULT hr = S_OK;
 
@@ -91,30 +103,24 @@ bool D3D12ResourceManager::Prepare_InitialState(ID3D12DeviceChild *res)
         return true;
       }
 
-      heapProps.Type = D3D12_HEAP_TYPE_READBACK;
-      heapProps.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
-      heapProps.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
-      heapProps.CreationNodeMask = 1;
-      heapProps.VisibleNodeMask = 1;
+      const bool isUploadHeap = (heapProps.Type == D3D12_HEAP_TYPE_UPLOAD);
 
       desc.Flags = D3D12_RESOURCE_FLAG_NONE;
 
       ID3D12Resource *copyDst = NULL;
-      hr = m_Device->GetReal()->CreateCommittedResource(&heapProps, D3D12_HEAP_FLAG_NONE, &desc,
-                                                        D3D12_RESOURCE_STATE_COPY_DEST, NULL,
-                                                        __uuidof(ID3D12Resource), (void **)&copyDst);
+      hr = m_Device->CreateInitialStateBuffer(desc, &copyDst);
 
       if(nonresident)
-        m_Device->MakeResident(1, &pageable);
+        m_Device->GetReal()->MakeResident(1, &unwrappedPageable);
 
-      const std::vector<D3D12_RESOURCE_STATES> &states =
-          m_Device->GetSubresourceStates(GetResID(res));
+      const SubresourceStateVector &states = m_Device->GetSubresourceStates(GetResID(res));
       RDCASSERT(states.size() == 1);
 
       D3D12_RESOURCE_BARRIER barrier;
-      const bool isUploadHeap = (heapProps.Type == D3D12_HEAP_TYPE_UPLOAD);
-      const bool needsTransition =
-          !isUploadHeap && ((states[0] & D3D12_RESOURCE_STATE_COPY_SOURCE) == 0);
+      // upload heap resources can't be transitioned, and any resources in the new layouts don't
+      // need to either since each submit does a big flush
+      const bool needsTransition = !isUploadHeap && states[0].IsStates() &&
+                                   (states[0].ToStates() & D3D12_RESOURCE_STATE_COPY_SOURCE) == 0;
 
       if(needsTransition)
       {
@@ -122,7 +128,7 @@ bool D3D12ResourceManager::Prepare_InitialState(ID3D12DeviceChild *res)
         barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
         barrier.Transition.pResource = r->GetReal();
         barrier.Transition.Subresource = (UINT)0;
-        barrier.Transition.StateBefore = states[0];
+        barrier.Transition.StateBefore = states[0].ToStates();
         barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
       }
 
@@ -155,31 +161,30 @@ bool D3D12ResourceManager::Prepare_InitialState(ID3D12DeviceChild *res)
         m_Device->ExecuteLists(NULL, true);
         m_Device->FlushLists();
 
-        m_Device->Evict(1, &pageable);
+        m_Device->GetReal()->Evict(1, &unwrappedPageable);
       }
-      else
+      else if(D3D12_Debug_SingleSubmitFlushing())
       {
-#if ENABLED(SINGLE_FLUSH_VALIDATE)
         m_Device->CloseInitialStateList();
         m_Device->ExecuteLists(NULL, true);
         m_Device->FlushLists(true);
-#endif
       }
 
-      SetInitialContents(GetResID(r), D3D12InitialContents(copyDst));
-      return true;
+      initContents = D3D12InitialContents(copyDst);
     }
     else
     {
       if(nonresident)
-        m_Device->MakeResident(1, &pageable);
+        m_Device->GetReal()->MakeResident(1, &unwrappedPageable);
 
       ID3D12Resource *arrayTexture = NULL;
-      D3D12_RESOURCE_STATES destState = D3D12_RESOURCE_STATE_COPY_SOURCE;
+      BarrierSet::AccessType accessType = BarrierSet::CopySourceAccess;
       ID3D12Resource *unwrappedCopySource = r->GetReal();
 
       bool isDepth =
           IsDepthFormat(desc.Format) || (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) != 0;
+
+      bool isMSAA = false;
 
       if(desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && desc.SampleDesc.Count > 1)
       {
@@ -207,39 +212,16 @@ bool D3D12ResourceManager::Prepare_InitialState(ID3D12DeviceChild *res)
             __uuidof(ID3D12Resource), (void **)&arrayTexture);
         RDCASSERTEQUAL(hr, S_OK);
 
-        destState = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        accessType = BarrierSet::SRVAccess;
+        isMSAA = true;
       }
 
-      ID3D12GraphicsCommandList *list = Unwrap(m_Device->GetInitialStateList());
+      ID3D12GraphicsCommandListX *list = m_Device->GetInitialStateList();
 
-      std::vector<D3D12_RESOURCE_BARRIER> barriers;
+      BarrierSet barriers;
 
-      {
-        const std::vector<D3D12_RESOURCE_STATES> &states =
-            m_Device->GetSubresourceStates(GetResID(r));
-
-        barriers.reserve(states.size());
-
-        for(size_t i = 0; i < states.size(); i++)
-        {
-          if(states[i] & destState)
-            continue;
-
-          D3D12_RESOURCE_BARRIER barrier;
-          barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-          barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
-          barrier.Transition.pResource = r->GetReal();
-          barrier.Transition.Subresource = (UINT)i;
-          barrier.Transition.StateBefore = states[i];
-          barrier.Transition.StateAfter = destState;
-
-          barriers.push_back(barrier);
-        }
-
-        // transition to copy dest
-        if(!barriers.empty())
-          list->ResourceBarrier((UINT)barriers.size(), &barriers[0]);
-      }
+      barriers.Configure(r, m_Device->GetSubresourceStates(GetResID(r)), accessType);
+      barriers.Apply(list);
 
       if(arrayTexture)
       {
@@ -250,10 +232,10 @@ bool D3D12ResourceManager::Prepare_InitialState(ID3D12DeviceChild *res)
         m_Device->FlushLists();
 
         // expand multisamples out to array
-        m_Device->GetDebugManager()->CopyTex2DMSToArray(arrayTexture, r->GetReal());
+        m_Device->GetDebugManager()->CopyTex2DMSToArray(NULL, arrayTexture, r->GetReal());
 
         // open the initial state list again for the remainder of the work
-        list = Unwrap(m_Device->GetInitialStateList());
+        list = m_Device->GetInitialStateList();
 
         D3D12_RESOURCE_BARRIER b = {};
         b.Transition.pResource = arrayTexture;
@@ -261,17 +243,11 @@ bool D3D12ResourceManager::Prepare_InitialState(ID3D12DeviceChild *res)
         b.Transition.StateBefore =
             isDepth ? D3D12_RESOURCE_STATE_DEPTH_WRITE : D3D12_RESOURCE_STATE_RENDER_TARGET;
         b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-        list->ResourceBarrier(1, &b);
+        // arrayTexture is not wrapped so we need to call the unwrapped command directly
+        Unwrap(list)->ResourceBarrier(1, &b);
 
         unwrappedCopySource = arrayTexture;
       }
-
-      D3D12_HEAP_PROPERTIES heapProps;
-      heapProps.Type = D3D12_HEAP_TYPE_READBACK;
-      heapProps.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
-      heapProps.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
-      heapProps.CreationNodeMask = 1;
-      heapProps.VisibleNodeMask = 1;
 
       D3D12_RESOURCE_DESC bufDesc;
 
@@ -285,7 +261,7 @@ bool D3D12ResourceManager::Prepare_InitialState(ID3D12DeviceChild *res)
       bufDesc.MipLevels = 1;
       bufDesc.SampleDesc.Count = 1;
       bufDesc.SampleDesc.Quality = 0;
-      bufDesc.Width = 1;
+      bufDesc.Width = 0;
 
       UINT numSubresources = desc.MipLevels;
       if(desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D)
@@ -302,32 +278,59 @@ bool D3D12ResourceManager::Prepare_InitialState(ID3D12DeviceChild *res)
         numSubresources *= planes;
       }
 
-      D3D12_PLACED_SUBRESOURCE_FOOTPRINT *layouts =
-          new D3D12_PLACED_SUBRESOURCE_FOOTPRINT[numSubresources];
+      D3D12_PLACED_SUBRESOURCE_FOOTPRINT layout = {};
 
-      m_Device->GetCopyableFootprints(&desc, 0, numSubresources, 0, layouts, NULL, NULL,
-                                      &bufDesc.Width);
+      rdcarray<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> copyLayouts;
+      rdcarray<uint32_t> subresources;
+
+      if(IsBlockFormat(desc.Format) && (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
+      {
+        RDCDEBUG("Removing UAV flag from BCn desc to allow GetCopyableFootprints");
+        desc.Flags &= ~D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+      }
+
+      for(UINT i = 0; i < numSubresources; i++)
+      {
+        // skip non-MSAA sparse subresources that are not mapped at all
+        if(!isMSAA && sparseTable && !sparseTable->getPageRangeMapping(i).isMapped())
+          continue;
+
+        UINT64 subSize = 0;
+        m_Device->GetCopyableFootprints(&desc, i, 1, bufDesc.Width, &layout, NULL, NULL, &subSize);
+
+        if(subSize == ~0ULL)
+        {
+          RDCERR("Failed to call GetCopyableFootprints on %s! skipping copy", ToStr(id).c_str());
+          continue;
+        }
+
+        copyLayouts.push_back(layout);
+        subresources.push_back(i);
+        bufDesc.Width += subSize;
+        bufDesc.Width = AlignUp<UINT64>(bufDesc.Width, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
+      }
+
+      if(bufDesc.Width == 0)
+        bufDesc.Width = 1U;
 
       ID3D12Resource *copyDst = NULL;
-      HRESULT hr = m_Device->GetReal()->CreateCommittedResource(
-          &heapProps, D3D12_HEAP_FLAG_NONE, &bufDesc, D3D12_RESOURCE_STATE_COPY_DEST, NULL,
-          __uuidof(ID3D12Resource), (void **)&copyDst);
+      HRESULT hr = m_Device->CreateInitialStateBuffer(bufDesc, &copyDst);
 
       if(SUCCEEDED(hr))
       {
-        for(UINT i = 0; i < numSubresources; i++)
+        for(UINT i = 0; i < copyLayouts.size(); i++)
         {
           D3D12_TEXTURE_COPY_LOCATION dst, src;
 
           src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
           src.pResource = unwrappedCopySource;
-          src.SubresourceIndex = i;
+          src.SubresourceIndex = subresources[i];
 
           dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
           dst.pResource = copyDst;
-          dst.PlacedFootprint = layouts[i];
+          dst.PlacedFootprint = copyLayouts[i];
 
-          list->CopyTextureRegion(&dst, 0, 0, 0, &src, NULL);
+          Unwrap(list)->CopyTextureRegion(&dst, 0, 0, 0, &src, NULL);
         }
       }
       else
@@ -335,12 +338,14 @@ bool D3D12ResourceManager::Prepare_InitialState(ID3D12DeviceChild *res)
         RDCERR("Couldn't create readback buffer: HRESULT: %s", ToStr(hr).c_str());
       }
 
-      // transition back
-      for(size_t i = 0; i < barriers.size(); i++)
-        std::swap(barriers[i].Transition.StateBefore, barriers[i].Transition.StateAfter);
+      // If we're not a sparse single-sampled texture, we copy the whole resource with all
+      // subresources. (In the loop above the continue will never be hit, so we can indicate quickly
+      // here that all subresources are present without needing to have {0...n}
+      if(isMSAA || sparseTable == NULL)
+        subresources = {~0U};
 
-      if(!barriers.empty())
-        list->ResourceBarrier((UINT)barriers.size(), &barriers[0]);
+      // transition back
+      barriers.Unapply(list);
 
       if(nonresident || arrayTexture)
       {
@@ -350,23 +355,25 @@ bool D3D12ResourceManager::Prepare_InitialState(ID3D12DeviceChild *res)
         m_Device->FlushLists();
 
         if(nonresident)
-          m_Device->Evict(1, &pageable);
+          m_Device->GetReal()->Evict(1, &unwrappedPageable);
       }
-      else
+      else if(D3D12_Debug_SingleSubmitFlushing())
       {
-#if ENABLED(SINGLE_FLUSH_VALIDATE)
         m_Device->CloseInitialStateList();
         m_Device->ExecuteLists(NULL, true);
         m_Device->FlushLists(true);
-#endif
       }
 
       SAFE_RELEASE(arrayTexture);
-      SAFE_DELETE_ARRAY(layouts);
 
-      SetInitialContents(GetResID(r), D3D12InitialContents(copyDst));
-      return true;
+      initContents = D3D12InitialContents(copyDst);
+      initContents.subresources = subresources;
     }
+
+    initContents.sparseTable = sparseTable;
+
+    SetInitialContents(GetResID(r), initContents);
+    return true;
   }
   else
   {
@@ -390,11 +397,16 @@ uint64_t D3D12ResourceManager::GetSize_InitialState(ResourceId id, const D3D12In
   {
     ID3D12Resource *buf = (ID3D12Resource *)data.resource;
 
+    uint64_t ret = WriteSerialiser::GetChunkAlignment() + 64;
+
+    if(data.sparseTable)
+      ret += 16 + data.sparseTable->GetSerialiseSize();
+
     // readback heaps have already been copied to a buffer, so use that length
     if(data.tag == D3D12InitialContents::MapDirect)
-      return WriteSerialiser::GetChunkAlignment() + 16 + uint64_t(data.dataSize);
+      return ret + uint64_t(data.dataSize);
 
-    return WriteSerialiser::GetChunkAlignment() + 16 + uint64_t(buf ? buf->GetDesc().Width : 0);
+    return ret + uint64_t(buf ? buf->GetDesc().Width : 0);
   }
   else
   {
@@ -402,6 +414,122 @@ uint64_t D3D12ResourceManager::GetSize_InitialState(ResourceId id, const D3D12In
   }
 
   return 16;
+}
+
+SparseBinds::SparseBinds(const Sparse::PageTable &table)
+{
+  const uint32_t pageSize = 64 * 1024;
+
+  // in theory some of these subresources may share a single binding but we don't try to extract
+  // that out again. If we can get one bind per subresource and avoid falling down to per-page
+  // mappings we're happy
+  for(uint32_t sub = 0; sub < RDCMAX(1U, table.getNumSubresources());)
+  {
+    const Sparse::PageRangeMapping &mapping =
+        table.isSubresourceInMipTail(sub) ? table.getMipTailMapping(sub) : table.getSubresource(sub);
+
+    if(mapping.hasSingleMapping())
+    {
+      Bind bind;
+      bind.heap = mapping.singleMapping.memory;
+      bind.rangeOffset = uint32_t(mapping.singleMapping.offset / pageSize);
+      bind.rangeCount = uint32_t(table.isSubresourceInMipTail(sub)
+                                     ? (table.getMipTailSliceSize() + pageSize - 1) / pageSize
+                                     : (table.getSubresourceByteSize(sub) + pageSize - 1) / pageSize);
+      bind.regionStart = {0, 0, 0, sub};
+      bind.regionSize = {bind.rangeCount, FALSE, bind.rangeCount, 1, 1};
+      bind.rangeFlag = D3D12_TILE_RANGE_FLAG_NONE;
+      if(bind.heap == ResourceId())
+        bind.rangeFlag = D3D12_TILE_RANGE_FLAG_NULL;
+      else if(mapping.singlePageReused)
+        bind.rangeFlag = D3D12_TILE_RANGE_FLAG_REUSE_SINGLE_TILE;
+      binds.push_back(bind);
+    }
+    else
+    {
+      Sparse::Coord texelShape = table.calcSubresourcePageDim(sub);
+
+      // march the pages for this subresource in linear order
+      for(uint32_t page = 0; page < mapping.pages.size(); page++)
+      {
+        Bind bind;
+        bind.heap = mapping.pages[page].memory;
+        bind.rangeOffset = uint32_t(mapping.pages[page].offset / pageSize);
+
+        // do simple coalescing. If the previous bind was in the same heap, one tile back, make it
+        // cover this tile
+        if(page > 0 && binds.back().heap == bind.heap &&
+           (binds.back().rangeOffset + binds.back().rangeCount == bind.rangeOffset ||
+            binds.back().heap == ResourceId()))
+        {
+          binds.back().regionSize.NumTiles++;
+          binds.back().regionSize.Width++;
+          binds.back().rangeCount++;
+          continue;
+        }
+
+        // otherwise add a new bind
+        if(table.isSubresourceInMipTail(sub))
+        {
+          bind.regionStart = {page, 0, 0, sub};
+        }
+        else
+        {
+          bind.regionStart.Subresource = sub;
+          // set the starting co-ord as appropriate for this page
+          bind.regionStart.X = page % texelShape.x;
+          bind.regionStart.Y = (page / texelShape.x) % texelShape.y;
+          bind.regionStart.Z = page / (texelShape.x * texelShape.y);
+        }
+
+        bind.rangeCount = 1;
+        bind.regionSize = {1, FALSE, 1, 1, 1};
+        bind.rangeFlag = D3D12_TILE_RANGE_FLAG_NONE;
+        if(bind.heap == ResourceId())
+          bind.rangeFlag = D3D12_TILE_RANGE_FLAG_NULL;
+
+        binds.push_back(bind);
+      }
+    }
+
+    if(table.isSubresourceInMipTail(sub))
+    {
+      // move to the next subresource after the miptail, since we handle the miptail all at once
+      sub = ((sub / table.getMipCount()) + 1) * table.getMipCount();
+    }
+    else
+    {
+      sub++;
+    }
+  }
+}
+
+SparseBinds::SparseBinds(int)
+{
+  null = true;
+}
+
+void SparseBinds::Apply(WrappedID3D12Device *device, ID3D12Resource *resource)
+{
+  if(null)
+  {
+    D3D12_TILE_RANGE_FLAGS rangeFlags = D3D12_TILE_RANGE_FLAG_NULL;
+
+    // do a single whole-resource bind of NULL
+    device->GetQueue()->UpdateTileMappings(resource, 1, NULL, NULL, NULL, 1, &rangeFlags, NULL,
+                                           NULL, D3D12_TILE_MAPPING_FLAG_NONE);
+  }
+  else
+  {
+    D3D12ResourceManager *rm = device->GetResourceManager();
+    for(const Bind &bind : binds)
+    {
+      device->GetQueue()->UpdateTileMappings(
+          resource, 1, &bind.regionStart, &bind.regionSize,
+          bind.heap == ResourceId() ? NULL : (ID3D12Heap *)rm->GetLiveResource(bind.heap), 1,
+          &bind.rangeFlag, &bind.rangeOffset, &bind.rangeCount, D3D12_TILE_MAPPING_FLAG_NONE);
+    }
+  }
 }
 
 template <typename SerialiserType>
@@ -413,7 +541,7 @@ bool D3D12ResourceManager::Serialise_InitialState(SerialiserType &ser, ResourceI
 
   bool ret = true;
 
-  SERIALISE_ELEMENT(id).TypedAs("ID3D12DeviceChild *"_lit);
+  SERIALISE_ELEMENT(id).TypedAs("ID3D12DeviceChild *"_lit).Important();
   SERIALISE_ELEMENT_LOCAL(type, record->type);
 
   if(IsReplayingAndReading())
@@ -426,8 +554,15 @@ bool D3D12ResourceManager::Serialise_InitialState(SerialiserType &ser, ResourceI
     D3D12Descriptor *Descriptors = initial ? initial->descriptors : NULL;
     uint32_t numElems = initial ? initial->numDescriptors : 0;
 
+    // there's no point in setting up a lazy array when we're structured exporting because we KNOW
+    // we're going to need all the data anyway.
+    if(!IsStructuredExporting(m_State))
+      ser.SetLazyThreshold(1000);
+
     SERIALISE_ELEMENT_ARRAY(Descriptors, numElems);
-    SERIALISE_ELEMENT(numElems);
+    SERIALISE_ELEMENT(numElems).Named("NumDescriptors"_lit).Important();
+
+    ser.SetLazyThreshold(0);
 
     SERIALISE_CHECK_READ_ERRORS();
 
@@ -457,11 +592,14 @@ bool D3D12ResourceManager::Serialise_InitialState(SerialiserType &ser, ResourceI
         return false;
       }
 
-      copyheap = new WrappedID3D12DescriptorHeap(copyheap, m_Device, desc);
+      copyheap = new WrappedID3D12DescriptorHeap(copyheap, m_Device, desc, heap->GetNumDescriptors());
 
       D3D12_CPU_DESCRIPTOR_HANDLE handle = copyheap->GetCPUDescriptorHandleForHeapStart();
 
       UINT increment = m_Device->GetDescriptorHandleIncrementSize(desc.Type);
+
+      // only iterate over the 'real' number of descriptors, not the number after we've patched
+      desc.NumDescriptors = heap->GetNumDescriptors();
 
       for(uint32_t i = 0; i < RDCMIN(numElems, desc.NumDescriptors); i++)
       {
@@ -485,6 +623,32 @@ bool D3D12ResourceManager::Serialise_InitialState(SerialiserType &ser, ResourceI
     if(IsReplayingAndReading())
     {
       liveRes = (ID3D12Resource *)GetLiveResource(id);
+    }
+
+    SparseBinds *sparseBinds = NULL;
+    rdcarray<uint32_t> subresourcesIncluded;
+    if(initial)
+      subresourcesIncluded = initial->subresources;
+
+    // default to {~0U} if this isn't present, which means 'all subresources serialised', since an
+    // empty array is valid and means NO subresources were serialised.
+    if(ser.VersionAtLeast(0xE))
+    {
+      SERIALISE_ELEMENT(subresourcesIncluded);
+    }
+    else
+    {
+      subresourcesIncluded = {~0U};
+    }
+
+    if(ser.VersionAtLeast(0xB))
+    {
+      Sparse::PageTable *sparseTable = initial ? initial->sparseTable : NULL;
+
+      SERIALISE_ELEMENT_OPT(sparseTable);
+
+      if(sparseTable)
+        sparseBinds = new SparseBinds(*sparseTable);
     }
 
     if(ser.IsWriting())
@@ -529,9 +693,16 @@ bool D3D12ResourceManager::Serialise_InitialState(SerialiserType &ser, ResourceI
       D3D12_RESOURCE_DESC resDesc = liveRes->GetDesc();
 
       D3D12_HEAP_PROPERTIES heapProps = {};
-      liveRes->GetHeapProperties(&heapProps, NULL);
+      if(!m_Device->IsSparseResource(GetResID(liveRes)))
+        liveRes->GetHeapProperties(&heapProps, NULL);
 
-      if(heapProps.Type == D3D12_HEAP_TYPE_UPLOAD)
+      const bool isCPUCopyHeap =
+          heapProps.Type == D3D12_HEAP_TYPE_CUSTOM &&
+          (heapProps.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_WRITE_BACK ||
+           heapProps.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE) &&
+          heapProps.MemoryPoolPreference == D3D12_MEMORY_POOL_L0;
+
+      if(heapProps.Type == D3D12_HEAP_TYPE_UPLOAD || isCPUCopyHeap)
       {
         // if destination is on the upload heap, it's impossible to copy via the device,
         // so we have to CPU copy. To save time and make a more optimal copy, we just keep the data
@@ -602,7 +773,8 @@ bool D3D12ResourceManager::Serialise_InitialState(SerialiserType &ser, ResourceI
 
     // not using SERIALISE_ELEMENT_ARRAY so we can deliberately avoid allocation - we serialise
     // directly into upload memory
-    ser.Serialise("ResourceContents"_lit, ResourceContents, ContentsLength, SerialiserFlags::NoFlags);
+    ser.Serialise("ResourceContents"_lit, ResourceContents, ContentsLength, SerialiserFlags::NoFlags)
+        .Important();
 
     if(mappedBuffer)
       mappedBuffer->Unmap(0, NULL);
@@ -616,6 +788,10 @@ bool D3D12ResourceManager::Serialise_InitialState(SerialiserType &ser, ResourceI
       D3D12InitialContents initContents(D3D12InitialContents::Copy, type);
       initContents.resourceType = Resource_Resource;
       initContents.resource = mappedBuffer;
+
+      initContents.sparseBinds = sparseBinds;
+
+      initContents.subresources = subresourcesIncluded;
 
       D3D12_RESOURCE_DESC resDesc = liveRes->GetDesc();
 
@@ -632,9 +808,13 @@ bool D3D12ResourceManager::Serialise_InitialState(SerialiserType &ser, ResourceI
         else
         {
           D3D12_HEAP_PROPERTIES heapProps = {};
-          liveRes->GetHeapProperties(&heapProps, NULL);
+          if(!m_Device->IsSparseResource(GetResID(liveRes)))
+            liveRes->GetHeapProperties(&heapProps, NULL);
 
           ID3D12GraphicsCommandList *list = Unwrap(m_Device->GetInitialStateList());
+
+          if(!list)
+            return false;
 
           D3D12_RESOURCE_DESC arrayDesc = resDesc;
           arrayDesc.Alignment = 0;
@@ -646,10 +826,13 @@ bool D3D12ResourceManager::Serialise_InitialState(SerialiserType &ser, ResourceI
           bool isDepth = IsDepthFormat(resDesc.Format) ||
                          (resDesc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) != 0;
 
+          if(isDepth)
+            arrayDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+
           D3D12_RESOURCE_DESC msaaDesc = resDesc;
-          arrayDesc.Alignment = 0;
-          arrayDesc.Flags = isDepth ? D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL
-                                    : D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+          msaaDesc.Alignment = 0;
+          msaaDesc.Flags = isDepth ? D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL
+                                   : D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
 
           ID3D12Resource *arrayTex = NULL;
           HRESULT hr = m_Device->CreateCommittedResource(
@@ -735,6 +918,9 @@ bool D3D12ResourceManager::Serialise_InitialState(SerialiserType &ser, ResourceI
           {
             list = Unwrap(m_Device->GetInitialStateList());
 
+            if(!list)
+              return false;
+
             D3D12_RESOURCE_BARRIER b = {};
             b.Transition.pResource = Unwrap(msaaTex);
             b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
@@ -777,7 +963,7 @@ template bool D3D12ResourceManager::Serialise_InitialState(WriteSerialiser &ser,
                                                            D3D12ResourceRecord *record,
                                                            const D3D12InitialContents *initial);
 
-void D3D12ResourceManager::Create_InitialState(ResourceId id, ID3D12DeviceChild *live, bool hasData)
+void D3D12ResourceManager::Create_InitialState(ResourceId id, ID3D12DeviceChild *live, bool)
 {
   D3D12ResourceType type = IdentifyTypeByPtr(live);
 
@@ -791,7 +977,74 @@ void D3D12ResourceManager::Create_InitialState(ResourceId id, ID3D12DeviceChild 
   {
     D3D12NOTIMP("Creating init states for resources");
 
-    // not handling any missing states at the moment
+    ID3D12Resource *res = ((ID3D12Resource *)live);
+
+    D3D12_RESOURCE_DESC resDesc = res->GetDesc();
+
+    D3D12_HEAP_PROPERTIES heapProps = {};
+    if(!m_Device->IsSparseResource(GetResID(live)))
+      res->GetHeapProperties(&heapProps, NULL);
+
+    const bool isCPUCopyHeap = heapProps.Type == D3D12_HEAP_TYPE_CUSTOM &&
+                               (heapProps.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_WRITE_BACK ||
+                                heapProps.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE) &&
+                               heapProps.MemoryPoolPreference == D3D12_MEMORY_POOL_L0;
+
+    if(heapProps.Type == D3D12_HEAP_TYPE_UPLOAD || isCPUCopyHeap)
+    {
+      // if destination is on the upload heap, it's impossible to copy via the device,
+      // so we have to CPU copy. To save time and make a more optimal copy, we just keep the data
+      // CPU-side
+      D3D12InitialContents initContents(D3D12InitialContents::Copy, Resource_Resource);
+      uint64_t size = RDCMAX(resDesc.Width, 64ULL);
+      initContents.srcData = AllocAlignedBuffer(size);
+      memset(initContents.srcData, 0, (size_t)size);
+      SetInitialContents(id, initContents);
+    }
+    else
+    {
+      // create a GPU-local copy of the resource
+      heapProps.Type = D3D12_HEAP_TYPE_DEFAULT;
+      heapProps.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+      heapProps.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+      heapProps.CreationNodeMask = 1;
+      heapProps.VisibleNodeMask = 1;
+
+      bool isDepth = IsDepthFormat(resDesc.Format) ||
+                     (resDesc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) != 0;
+
+      resDesc.Alignment = 0;
+      resDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
+
+      if(resDesc.SampleDesc.Count > 1)
+      {
+        if(isDepth)
+          resDesc.Flags |= D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+        else
+          resDesc.Flags |= D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+      }
+
+      ID3D12Resource *copy = NULL;
+      HRESULT hr = m_Device->CreateCommittedResource(&heapProps, D3D12_HEAP_FLAG_NONE, &resDesc,
+                                                     D3D12_RESOURCE_STATE_COMMON, NULL,
+                                                     __uuidof(ID3D12Resource), (void **)&copy);
+      if(FAILED(hr))
+      {
+        RDCERR("Couldn't create initial state copy: %s", ToStr(hr).c_str());
+        m_Device->CheckHRESULT(hr);
+      }
+      else
+      {
+        D3D12InitialContents initContents(D3D12InitialContents::ForceCopy, type);
+        initContents.resourceType = Resource_Resource;
+        initContents.resource = copy;
+
+        if(m_Device->IsSparseResource(GetResID(live)))
+          initContents.sparseBinds = new SparseBinds(0);
+
+        SetInitialContents(id, initContents);
+      }
+    }
   }
   else
   {
@@ -802,26 +1055,34 @@ void D3D12ResourceManager::Create_InitialState(ResourceId id, ID3D12DeviceChild 
 void D3D12ResourceManager::Apply_InitialState(ID3D12DeviceChild *live,
                                               const D3D12InitialContents &data)
 {
+  if(m_Device->HasFatalError())
+    return;
+
   D3D12ResourceType type = (D3D12ResourceType)data.resourceType;
 
   if(type == Resource_DescriptorHeap)
   {
-    ID3D12DescriptorHeap *dstheap = (ID3D12DescriptorHeap *)live;
-    ID3D12DescriptorHeap *srcheap = (ID3D12DescriptorHeap *)data.resource;
+    WrappedID3D12DescriptorHeap *dstheap = (WrappedID3D12DescriptorHeap *)live;
+    WrappedID3D12DescriptorHeap *srcheap = (WrappedID3D12DescriptorHeap *)data.resource;
 
     if(srcheap)
     {
       // copy the whole heap
       m_Device->CopyDescriptorsSimple(
-          srcheap->GetDesc().NumDescriptors, dstheap->GetCPUDescriptorHandleForHeapStart(),
+          srcheap->GetNumDescriptors(), dstheap->GetCPUDescriptorHandleForHeapStart(),
           srcheap->GetCPUDescriptorHandleForHeapStart(), srcheap->GetDesc().Type);
     }
   }
   else if(type == Resource_Resource)
   {
-    if(data.tag == D3D12InitialContents::Copy)
+    ResourceId id = GetResID(live);
+
+    if(IsActiveReplaying(m_State) && m_Device->IsReadOnlyResource(id))
     {
-      ID3D12Resource *copyDst = Unwrap((ID3D12Resource *)live);
+    }
+    else if(data.tag == D3D12InitialContents::Copy || data.tag == D3D12InitialContents::ForceCopy)
+    {
+      ID3D12Resource *copyDst = (ID3D12Resource *)live;
 
       if(!copyDst)
       {
@@ -830,12 +1091,29 @@ void D3D12ResourceManager::Apply_InitialState(ID3D12DeviceChild *live,
       }
 
       D3D12_HEAP_PROPERTIES heapProps = {};
-      copyDst->GetHeapProperties(&heapProps, NULL);
+      if(data.sparseBinds)
+      {
+        if(IsLoading(m_State) || m_Device->GetQueue()->IsSparseUpdatedResource(GetResID(live)))
+          data.sparseBinds->Apply(m_Device, (ID3D12Resource *)live);
+
+        if(m_Device->HasFatalError())
+          return;
+      }
+      else
+      {
+        copyDst->GetHeapProperties(&heapProps, NULL);
+      }
+
+      const bool isCPUCopyHeap =
+          heapProps.Type == D3D12_HEAP_TYPE_CUSTOM &&
+          (heapProps.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_WRITE_BACK ||
+           heapProps.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE) &&
+          heapProps.MemoryPoolPreference == D3D12_MEMORY_POOL_L0;
 
       // if destination is on the upload heap, it's impossible to copy via the device,
       // so we have to CPU copy. We assume that we detected this case above and never uploaded a
       // device copy in the first place, and just kept the data CPU-side to source from.
-      if(heapProps.Type == D3D12_HEAP_TYPE_UPLOAD)
+      if(heapProps.Type == D3D12_HEAP_TYPE_UPLOAD || isCPUCopyHeap)
       {
         byte *src = data.srcData, *dst = NULL;
 
@@ -849,7 +1127,8 @@ void D3D12ResourceManager::Apply_InitialState(ID3D12DeviceChild *live,
 
         if(copyDst->GetDesc().Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
         {
-          hr = copyDst->Map(0, NULL, (void **)&dst);
+          hr = Unwrap(copyDst)->Map(0, NULL, (void **)&dst);
+          m_Device->CheckHRESULT(hr);
 
           if(FAILED(hr))
           {
@@ -861,7 +1140,7 @@ void D3D12ResourceManager::Apply_InitialState(ID3D12DeviceChild *live,
             memcpy(dst, src, (size_t)copyDst->GetDesc().Width);
 
           if(dst)
-            copyDst->Unmap(0, NULL);
+            Unwrap(copyDst)->Unmap(0, NULL);
         }
         else
         {
@@ -881,7 +1160,8 @@ void D3D12ResourceManager::Apply_InitialState(ID3D12DeviceChild *live,
 
           for(UINT i = 0; i < numSubresources; i++)
           {
-            hr = copyDst->Map(i, NULL, (void **)&dst);
+            hr = Unwrap(copyDst)->Map(i, NULL, (void **)&dst);
+            m_Device->CheckHRESULT(hr);
 
             if(FAILED(hr))
             {
@@ -907,7 +1187,7 @@ void D3D12ResourceManager::Apply_InitialState(ID3D12DeviceChild *live,
             }
 
             if(dst)
-              copyDst->Unmap(i, NULL);
+              Unwrap(copyDst)->Unmap(i, NULL);
           }
 
           delete[] layouts;
@@ -925,47 +1205,29 @@ void D3D12ResourceManager::Apply_InitialState(ID3D12DeviceChild *live,
           return;
         }
 
-        ID3D12GraphicsCommandList *list = Unwrap(m_Device->GetInitialStateList());
+        ID3D12GraphicsCommandListX *list = m_Device->GetInitialStateList();
 
-        std::vector<D3D12_RESOURCE_BARRIER> barriers;
+        if(!list)
+          return;
 
-        const std::vector<D3D12_RESOURCE_STATES> &states =
-            m_Device->GetSubresourceStates(GetResID(live));
+        BarrierSet barriers;
 
-        barriers.reserve(states.size());
-
-        for(size_t i = 0; i < states.size(); i++)
-        {
-          if(states[i] & D3D12_RESOURCE_STATE_COPY_DEST)
-            continue;
-
-          D3D12_RESOURCE_BARRIER barrier;
-          barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-          barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
-          barrier.Transition.pResource = copyDst;
-          barrier.Transition.Subresource = (UINT)i;
-          barrier.Transition.StateBefore = states[i];
-          barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-
-          barriers.push_back(barrier);
-        }
-
-        // transition to copy dest
-        if(!barriers.empty())
-          list->ResourceBarrier((UINT)barriers.size(), &barriers[0]);
+        barriers.Configure(copyDst, m_Device->GetSubresourceStates(GetResID(live)),
+                           BarrierSet::CopyDestAccess);
+        barriers.Apply(list);
 
         if(copyDst->GetDesc().Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
         {
           D3D12_RESOURCE_DESC srcDesc = copySrc->GetDesc();
           D3D12_RESOURCE_DESC dstDesc = copyDst->GetDesc();
 
-          list->CopyBufferRegion(copyDst, 0, Unwrap(copySrc), 0,
-                                 RDCMIN(srcDesc.Width, dstDesc.Width));
+          list->CopyBufferRegion(copyDst, 0, copySrc, 0, RDCMIN(srcDesc.Width, dstDesc.Width));
         }
-        else if(copyDst->GetDesc().SampleDesc.Count > 1)
+        else if(copyDst->GetDesc().SampleDesc.Count > 1 || data.tag == D3D12InitialContents::ForceCopy)
         {
-          // MSAA texture was pre-uploaded and decoded, just copy the texture
-          list->CopyResource(copyDst, Unwrap(copySrc));
+          // MSAA texture was pre-uploaded and decoded, just copy the texture.
+          // Similarly for created initial states
+          list->CopyResource(copyDst, copySrc);
         }
         else
         {
@@ -977,7 +1239,7 @@ void D3D12ResourceManager::Apply_InitialState(ID3D12DeviceChild *live,
 
           // we only accounted for planes in version 0x6, before then we only copied the first plane
           // so the buffer won't have enough data
-          if(m_Device->GetLogVersion() >= 0x6)
+          if(m_Device->GetCaptureVersion() >= 0x6)
           {
             D3D12_FEATURE_DATA_FORMAT_INFO formatInfo = {};
             formatInfo.Format = desc.Format;
@@ -988,13 +1250,29 @@ void D3D12ResourceManager::Apply_InitialState(ID3D12DeviceChild *live,
             numSubresources *= planes;
           }
 
-          D3D12_PLACED_SUBRESOURCE_FOOTPRINT *layouts =
-              new D3D12_PLACED_SUBRESOURCE_FOOTPRINT[numSubresources];
+          const uint32_t *nextIncludedSubresource = data.subresources.begin();
+          // if no subresources were serialised, just skip!
+          if(data.subresources.empty())
+            numSubresources = 0;
+          // if ALL subresources were serialised, serialise them all
+          else if(*nextIncludedSubresource == ~0U)
+            nextIncludedSubresource = NULL;
 
-          m_Device->GetCopyableFootprints(&desc, 0, numSubresources, 0, layouts, NULL, NULL, NULL);
+          UINT64 offset = 0;
+          UINT64 subSize = 0;
+
+          if(IsBlockFormat(desc.Format) && (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
+          {
+            RDCDEBUG("Removing UAV flag from BCn desc to allow GetCopyableFootprints");
+            desc.Flags &= ~D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+          }
 
           for(UINT i = 0; i < numSubresources; i++)
           {
+            // if we have a list of subresources included, only copy those
+            if(nextIncludedSubresource && *nextIncludedSubresource != i)
+              continue;
+
             D3D12_TEXTURE_COPY_LOCATION dst, src;
 
             dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
@@ -1002,27 +1280,40 @@ void D3D12ResourceManager::Apply_InitialState(ID3D12DeviceChild *live,
             dst.SubresourceIndex = i;
 
             src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-            src.pResource = Unwrap(copySrc);
-            src.PlacedFootprint = layouts[i];
+            src.pResource = copySrc;
+
+            m_Device->GetCopyableFootprints(&desc, i, 1, offset, &src.PlacedFootprint, NULL, NULL,
+                                            &subSize);
+
+            if(subSize == ~0ULL)
+            {
+              RDCERR("Failed to call GetCopyableFootprints on %s! skipping copy", ToStr(id).c_str());
+              continue;
+            }
 
             list->CopyTextureRegion(&dst, 0, 0, 0, &src, NULL);
-          }
 
-          delete[] layouts;
+            offset += subSize;
+            offset = AlignUp<UINT64>(offset, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
+
+            if(nextIncludedSubresource)
+            {
+              nextIncludedSubresource++;
+              // no more subresource after this one were included, even if they exist
+              if(nextIncludedSubresource >= data.subresources.end())
+                break;
+            }
+          }
         }
 
-        // transition back to whatever it was before
-        for(size_t i = 0; i < barriers.size(); i++)
-          std::swap(barriers[i].Transition.StateBefore, barriers[i].Transition.StateAfter);
+        barriers.Unapply(list);
 
-        if(!barriers.empty())
-          list->ResourceBarrier((UINT)barriers.size(), &barriers[0]);
-
-#if ENABLED(SINGLE_FLUSH_VALIDATE)
-        m_Device->CloseInitialStateList();
-        m_Device->ExecuteLists(NULL, true);
-        m_Device->FlushLists(true);
-#endif
+        if(D3D12_Debug_SingleSubmitFlushing())
+        {
+          m_Device->CloseInitialStateList();
+          m_Device->ExecuteLists(NULL, true);
+          m_Device->FlushLists(true);
+        }
       }
     }
     else

@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2018-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -37,7 +37,7 @@
 ///////////////////////////////////////////////////////////////////////////////////
 ///////////////////////////////////////////////////////////////////////////////////
 
-TEST(VK_Video_Textures, VulkanGraphicsTest)
+RD_TEST(VK_Video_Textures, VulkanGraphicsTest)
 {
   static constexpr const char *Description = "Tests of YUV textures";
 
@@ -253,7 +253,8 @@ void main()
 
     pipeCreateInfo.vertexInputState.vertexBindingDescriptions = {vkh::vertexBind(0, DefaultA2V)};
     pipeCreateInfo.vertexInputState.vertexAttributeDescriptions = {
-        vkh::vertexAttr(0, 0, DefaultA2V, pos), vkh::vertexAttr(1, 0, DefaultA2V, col),
+        vkh::vertexAttr(0, 0, DefaultA2V, pos),
+        vkh::vertexAttr(1, 0, DefaultA2V, col),
         vkh::vertexAttr(2, 0, DefaultA2V, uv),
     };
 
@@ -273,7 +274,7 @@ void main()
         {Vec3f(1.0f, 1.0f, 0.0f), Vec4f(0.0f, 0.0f, 1.0f, 1.0f), Vec2f(1.0f, 0.0f)},
     };
 
-    AllocatedBuffer vb(allocator,
+    AllocatedBuffer vb(this,
                        vkh::BufferCreateInfo(sizeof(verts), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
                                                                 VK_BUFFER_USAGE_TRANSFER_DST_BIT),
                        VmaAllocationCreateInfo({0, VMA_MEMORY_USAGE_CPU_TO_GPU}));
@@ -311,9 +312,10 @@ void main()
     TextureData textures[20] = {};
     uint32_t texidx = 0;
 
-    AllocatedBuffer uploadBuf(allocator, vkh::BufferCreateInfo(rgba8.width * rgba8.height * 16,
-                                                               VK_BUFFER_USAGE_TRANSFER_SRC_BIT),
-                              VmaAllocationCreateInfo({0, VMA_MEMORY_USAGE_CPU_TO_GPU}));
+    AllocatedBuffer uploadBuf(
+        this,
+        vkh::BufferCreateInfo(rgba8.width * rgba8.height * 16, VK_BUFFER_USAGE_TRANSFER_SRC_BIT),
+        VmaAllocationCreateInfo({0, VMA_MEMORY_USAGE_CPU_TO_GPU}));
 
     auto make_tex = [&](const char *name, uint32_t subsampling, VkFormat texFmt, VkFormat viewFmt,
                         VkFormat view2Fmt, VkFormat view3Fmt, Vec4i config, void *data, size_t sz,
@@ -384,18 +386,20 @@ void main()
         TextureData &t = textures[texidx];
         t.name = name;
 
-        t.tex.create(allocator, vkh::ImageCreateInfo(
-                                    rgba8.width, rgba8.height, 0, texFmt,
-                                    VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, 1,
-                                    1, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT),
-                     VmaAllocationCreateInfo({0, VMA_MEMORY_USAGE_GPU_ONLY}));
+        t.tex = AllocatedImage(
+            this,
+            vkh::ImageCreateInfo(rgba8.width, rgba8.height, 0, texFmt,
+                                 VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, 1, 1,
+                                 VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT),
+            VmaAllocationCreateInfo({0, VMA_MEMORY_USAGE_GPU_ONLY}));
         Vec4i cbdata[2] = {
-            Vec4i(rgba8.width, rgba8.height, horizDownsampleFactor, vertDownsampleFactor), config,
+            Vec4i(rgba8.width, rgba8.height, horizDownsampleFactor, vertDownsampleFactor),
+            config,
         };
 
-        t.cb.create(allocator,
-                    vkh::BufferCreateInfo(sizeof(cbdata), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT),
-                    VmaAllocationCreateInfo({0, VMA_MEMORY_USAGE_CPU_TO_GPU}));
+        t.cb = AllocatedBuffer(
+            this, vkh::BufferCreateInfo(sizeof(cbdata), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT),
+            VmaAllocationCreateInfo({0, VMA_MEMORY_USAGE_CPU_TO_GPU}));
 
         t.cb.upload(cbdata);
 
@@ -574,7 +578,8 @@ void main()
 
       const byte *in = yuv8.data();
       byte *out[3] = {
-          triplane8.data(), triplane8.data() + rgba8.width * rgba8.height,
+          triplane8.data(),
+          triplane8.data() + rgba8.width * rgba8.height,
           triplane8.data() + rgba8.width * rgba8.height * 2,
       };
 
@@ -858,16 +863,10 @@ void main()
 
       for(size_t i = 0; i < ARRAY_COUNT(ycbcr); i++)
       {
-        VkSamplerCreateInfo sampInfo = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
         VkSamplerYcbcrConversionInfo ycbcrChain = {VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_INFO};
 
-        sampInfo.pNext = &ycbcrChain;
-
-        sampInfo.magFilter = VK_FILTER_LINEAR;
-        sampInfo.minFilter = VK_FILTER_LINEAR;
-
         ycbcrChain.conversion = ycbcr[i].conv;
-        vkCreateSampler(device, &sampInfo, NULL, &ycbcr[i].sampler);
+        ycbcr[i].sampler = createSampler(vkh::SamplerCreateInfo(VK_FILTER_LINEAR).next(&ycbcrChain));
 
         setlayout = createDescriptorSetLayout(vkh::DescriptorSetLayoutCreateInfo({
             {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT,
@@ -910,7 +909,7 @@ void main()
           StartUsingBackbuffer(cmd, VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_GENERAL);
 
       vkCmdClearColorImage(cmd, swapimg, VK_IMAGE_LAYOUT_GENERAL,
-                           vkh::ClearColorValue(0.4f, 0.5f, 0.6f, 1.0f), 1,
+                           vkh::ClearColorValue(0.2f, 0.2f, 0.2f, 1.0f), 1,
                            vkh::ImageSubresourceRange());
 
       vkCmdBeginRenderPass(
@@ -985,11 +984,7 @@ void main()
     vkDeviceWaitIdle(device);
 
     for(size_t i = 0; i < ARRAY_COUNT(ycbcr); i++)
-    {
-      vkDestroySampler(device, ycbcr[i].sampler, NULL);
-
       vkDestroySamplerYcbcrConversionKHR(device, ycbcr[i].conv, NULL);
-    }
 
     return 0;
   }

@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -28,13 +28,15 @@
 #include "driver/ihv/amd/amd_counters.h"
 #include "driver/ihv/intel/intel_counters.h"
 #include "driver/ihv/nv/nv_counters.h"
+#include "driver/ihv/nv/nv_d3d11_counters.h"
 #include "d3d11_context.h"
 #include "d3d11_debug.h"
 #include "d3d11_device.h"
+#include "d3d11_replay.h"
 
-std::vector<GPUCounter> D3D11Replay::EnumerateCounters()
+rdcarray<GPUCounter> D3D11Replay::EnumerateCounters()
 {
-  std::vector<GPUCounter> ret;
+  rdcarray<GPUCounter> ret;
 
   ret.push_back(GPUCounter::EventGPUDuration);
   ret.push_back(GPUCounter::InputVerticesRead);
@@ -52,20 +54,22 @@ std::vector<GPUCounter> D3D11Replay::EnumerateCounters()
 
   if(m_pAMDCounters)
   {
-    std::vector<GPUCounter> amdCounters = m_pAMDCounters->GetPublicCounterIds();
-    ret.insert(ret.end(), amdCounters.begin(), amdCounters.end());
+    ret.append(m_pAMDCounters->GetPublicCounterIds());
   }
 
   if(m_pNVCounters)
   {
-    std::vector<GPUCounter> nvCounters = m_pNVCounters->GetPublicCounterIds();
-    ret.insert(ret.end(), nvCounters.begin(), nvCounters.end());
+    ret.append(m_pNVCounters->GetPublicCounterIds());
+  }
+
+  if(m_pNVPerfCounters)
+  {
+    ret.append(m_pNVPerfCounters->EnumerateCounters());
   }
 
   if(m_pIntelCounters)
   {
-    std::vector<GPUCounter> intelCounters = m_pIntelCounters->GetPublicCounterIds();
-    ret.insert(ret.end(), intelCounters.begin(), intelCounters.end());
+    ret.append(m_pIntelCounters->GetPublicCounterIds());
   }
 
   return ret;
@@ -88,7 +92,11 @@ CounterDescription D3D11Replay::DescribeCounter(GPUCounter counterID)
   /////NV//////
   if(IsNvidiaCounter(counterID))
   {
-    if(m_pNVCounters)
+    if(m_pNVPerfCounters && m_pNVPerfCounters->HasCounter(counterID))
+    {
+      return m_pNVPerfCounters->DescribeCounter(counterID);
+    }
+    else if(m_pNVCounters)
     {
       return m_pNVCounters->GetCounterDescription(counterID);
     }
@@ -118,7 +126,7 @@ CounterDescription D3D11Replay::DescribeCounter(GPUCounter counterID)
       desc.description =
           "Time taken for this event on the GPU, as measured by delta between two GPU timestamps.";
       desc.resultByteWidth = 8;
-      desc.resultType = CompType::Double;
+      desc.resultType = CompType::Float;
       desc.unit = CounterUnit::Seconds;
       break;
     case GPUCounter::InputVerticesRead:
@@ -231,24 +239,25 @@ struct GPUTimer
 struct D3D11CounterContext
 {
   uint32_t eventStart;
-  std::vector<GPUTimer> timers;
+  rdcarray<GPUTimer> timers;
 };
 
-void D3D11Replay::FillTimers(D3D11CounterContext &ctx, const DrawcallDescription &drawnode)
+void D3D11Replay::FillTimers(D3D11CounterContext &ctx, const ActionDescription &actionnode)
 {
   const D3D11_QUERY_DESC qtimedesc = {D3D11_QUERY_TIMESTAMP, 0};
   const D3D11_QUERY_DESC qstatsdesc = {D3D11_QUERY_PIPELINE_STATISTICS, 0};
   const D3D11_QUERY_DESC qoccldesc = {D3D11_QUERY_OCCLUSION, 0};
 
-  if(drawnode.children.empty())
+  if(actionnode.children.empty())
     return;
 
-  for(size_t i = 0; i < drawnode.children.size(); i++)
+  for(size_t i = 0; i < actionnode.children.size(); i++)
   {
-    const DrawcallDescription &d = drawnode.children[i];
-    FillTimers(ctx, drawnode.children[i]);
+    const ActionDescription &a = actionnode.children[i];
+    FillTimers(ctx, actionnode.children[i]);
 
-    if(d.events.empty())
+    if(a.events.empty() ||
+       (a.flags & (ActionFlags::PushMarker | ActionFlags::SetMarker | ActionFlags::PopMarker)))
       continue;
 
     GPUTimer *timer = NULL;
@@ -259,20 +268,24 @@ void D3D11Replay::FillTimers(D3D11CounterContext &ctx, const DrawcallDescription
       ctx.timers.push_back(GPUTimer());
 
       timer = &ctx.timers.back();
-      timer->eventId = d.eventId;
+      timer->eventId = a.eventId;
       timer->before = timer->after = timer->stats = timer->occlusion = NULL;
 
       hr = m_pDevice->GetReal()->CreateQuery(&qtimedesc, &timer->before);
+      m_pDevice->CheckHRESULT(hr);
       RDCASSERTEQUAL(hr, S_OK);
       hr = m_pDevice->GetReal()->CreateQuery(&qtimedesc, &timer->after);
+      m_pDevice->CheckHRESULT(hr);
       RDCASSERTEQUAL(hr, S_OK);
       hr = m_pDevice->GetReal()->CreateQuery(&qstatsdesc, &timer->stats);
+      m_pDevice->CheckHRESULT(hr);
       RDCASSERTEQUAL(hr, S_OK);
       hr = m_pDevice->GetReal()->CreateQuery(&qoccldesc, &timer->occlusion);
+      m_pDevice->CheckHRESULT(hr);
       RDCASSERTEQUAL(hr, S_OK);
     }
 
-    m_pDevice->ReplayLog(ctx.eventStart, d.eventId, eReplay_WithoutDraw);
+    m_pDevice->ReplayLog(ctx.eventStart, a.eventId, eReplay_WithoutDraw);
 
     SerializeImmediateContext();
 
@@ -282,7 +295,7 @@ void D3D11Replay::FillTimers(D3D11CounterContext &ctx, const DrawcallDescription
       m_pImmediateContext->GetReal()->Begin(timer->occlusion);
     if(timer->before && timer->after)
       m_pImmediateContext->GetReal()->End(timer->before);
-    m_pDevice->ReplayLog(ctx.eventStart, d.eventId, eReplay_OnlyDraw);
+    m_pDevice->ReplayLog(ctx.eventStart, a.eventId, eReplay_OnlyDraw);
     if(timer->before && timer->after)
       m_pImmediateContext->GetReal()->End(timer->after);
     if(timer->occlusion)
@@ -290,7 +303,7 @@ void D3D11Replay::FillTimers(D3D11CounterContext &ctx, const DrawcallDescription
     if(timer->stats)
       m_pImmediateContext->GetReal()->End(timer->stats);
 
-    ctx.eventStart = d.eventId + 1;
+    ctx.eventStart = a.eventId + 1;
   }
 }
 
@@ -300,8 +313,10 @@ void D3D11Replay::SerializeImmediateContext()
   D3D11_QUERY_DESC desc = {D3D11_QUERY_EVENT};
 
   HRESULT hr = m_pDevice->GetReal()->CreateQuery(&desc, &query);
+  m_pDevice->CheckHRESULT(hr);
   if(FAILED(hr))
   {
+    RDCERR("Failed to create SerializeImmediateContext query HRESULT: %s", ToStr(hr).c_str());
     return;
   }
 
@@ -333,115 +348,114 @@ void D3D11Replay::SerializeImmediateContext()
 }
 
 void D3D11Replay::FillTimersAMD(uint32_t &eventStartID, uint32_t &sampleIndex,
-                                std::vector<uint32_t> &eventIDs, const DrawcallDescription &drawnode)
+                                rdcarray<uint32_t> &eventIDs, const ActionDescription &actionnode)
 {
-  if(drawnode.children.empty())
+  if(actionnode.children.empty())
     return;
 
-  for(size_t i = 0; i < drawnode.children.size(); i++)
+  for(size_t i = 0; i < actionnode.children.size(); i++)
   {
-    const DrawcallDescription &d = drawnode.children[i];
+    const ActionDescription &a = actionnode.children[i];
 
-    FillTimersAMD(eventStartID, sampleIndex, eventIDs, drawnode.children[i]);
+    FillTimersAMD(eventStartID, sampleIndex, eventIDs, actionnode.children[i]);
 
-    if(d.events.empty())
+    if(a.events.empty())
       continue;
 
-    eventIDs.push_back(d.eventId);
+    eventIDs.push_back(a.eventId);
 
-    m_pDevice->ReplayLog(eventStartID, d.eventId, eReplay_WithoutDraw);
+    m_pDevice->ReplayLog(eventStartID, a.eventId, eReplay_WithoutDraw);
 
     SerializeImmediateContext();
 
     m_pAMDCounters->BeginSample(sampleIndex);
 
-    m_pDevice->ReplayLog(eventStartID, d.eventId, eReplay_OnlyDraw);
+    m_pDevice->ReplayLog(eventStartID, a.eventId, eReplay_OnlyDraw);
 
     m_pAMDCounters->EndSample();
 
-    eventStartID = d.eventId + 1;
+    eventStartID = a.eventId + 1;
     sampleIndex++;
   }
 }
 
 void D3D11Replay::FillTimersNV(uint32_t &eventStartID, uint32_t &sampleIndex,
-                               std::vector<uint32_t> &eventIDs, const DrawcallDescription &drawnode)
+                               rdcarray<uint32_t> &eventIDs, const ActionDescription &actionnode)
 {
-  if(drawnode.children.empty())
+  if(actionnode.children.empty())
     return;
 
-  for(size_t i = 0; i < drawnode.children.size(); i++)
+  for(size_t i = 0; i < actionnode.children.size(); i++)
   {
-    const DrawcallDescription &d = drawnode.children[i];
+    const ActionDescription &a = actionnode.children[i];
 
-    FillTimersNV(eventStartID, sampleIndex, eventIDs, drawnode.children[i]);
+    FillTimersNV(eventStartID, sampleIndex, eventIDs, actionnode.children[i]);
 
-    if(d.events.empty() || (!(drawnode.children[i].flags & DrawFlags::Drawcall) &&
-                            !(drawnode.children[i].flags & DrawFlags::Dispatch)))
+    if(a.events.empty() || (!(actionnode.children[i].flags & ActionFlags::Drawcall) &&
+                            !(actionnode.children[i].flags & ActionFlags::Dispatch)))
       continue;
 
-    eventIDs.push_back(d.eventId);
+    eventIDs.push_back(a.eventId);
 
-    m_pDevice->ReplayLog(eventStartID, d.eventId, eReplay_WithoutDraw);
+    m_pDevice->ReplayLog(eventStartID, a.eventId, eReplay_WithoutDraw);
 
     SerializeImmediateContext();
 
     m_pNVCounters->BeginSample(sampleIndex);
 
-    m_pDevice->ReplayLog(eventStartID, d.eventId, eReplay_OnlyDraw);
+    m_pDevice->ReplayLog(eventStartID, a.eventId, eReplay_OnlyDraw);
 
     SerializeImmediateContext();
 
     m_pNVCounters->EndSample(sampleIndex);
 
-    eventStartID = d.eventId + 1;
+    eventStartID = a.eventId + 1;
     sampleIndex++;
   }
 }
 
 void D3D11Replay::FillTimersIntel(uint32_t &eventStartID, uint32_t &sampleIndex,
-                                  std::vector<uint32_t> &eventIDs,
-                                  const DrawcallDescription &drawnode)
+                                  rdcarray<uint32_t> &eventIDs, const ActionDescription &actionnode)
 {
-  if(drawnode.children.empty())
+  if(actionnode.children.empty())
     return;
 
-  for(size_t i = 0; i < drawnode.children.size(); i++)
+  for(size_t i = 0; i < actionnode.children.size(); i++)
   {
-    const DrawcallDescription &d = drawnode.children[i];
+    const ActionDescription &a = actionnode.children[i];
 
-    FillTimersIntel(eventStartID, sampleIndex, eventIDs, drawnode.children[i]);
+    FillTimersIntel(eventStartID, sampleIndex, eventIDs, actionnode.children[i]);
 
-    if(d.events.empty() || (!(drawnode.children[i].flags & DrawFlags::Drawcall) &&
-                            !(drawnode.children[i].flags & DrawFlags::Dispatch)))
+    if(a.events.empty() || (!(actionnode.children[i].flags & ActionFlags::Drawcall) &&
+                            !(actionnode.children[i].flags & ActionFlags::Dispatch)))
       continue;
 
-    eventIDs.push_back(d.eventId);
+    eventIDs.push_back(a.eventId);
 
-    m_pDevice->ReplayLog(eventStartID, d.eventId, eReplay_WithoutDraw);
+    m_pDevice->ReplayLog(eventStartID, a.eventId, eReplay_WithoutDraw);
 
     SerializeImmediateContext();
 
     m_pIntelCounters->BeginSample();
 
-    m_pDevice->ReplayLog(eventStartID, d.eventId, eReplay_OnlyDraw);
+    m_pDevice->ReplayLog(eventStartID, a.eventId, eReplay_OnlyDraw);
 
     SerializeImmediateContext();
 
     m_pIntelCounters->EndSample();
 
-    eventStartID = d.eventId + 1;
+    eventStartID = a.eventId + 1;
     sampleIndex++;
   }
 }
 
-std::vector<CounterResult> D3D11Replay::FetchCountersAMD(const std::vector<GPUCounter> &counters)
+rdcarray<CounterResult> D3D11Replay::FetchCountersAMD(const rdcarray<GPUCounter> &counters)
 {
   ID3D11Device *d3dDevice = m_pDevice->GetReal();
 
   if(!m_pAMDCounters->BeginMeasurementMode(AMDCounters::ApiType::Dx11, (void *)d3dDevice))
   {
-    return std::vector<CounterResult>();
+    return rdcarray<CounterResult>();
   }
 
   uint32_t sessionID = m_pAMDCounters->CreateSession();
@@ -462,7 +476,7 @@ std::vector<CounterResult> D3D11Replay::FetchCountersAMD(const std::vector<GPUCo
 
   uint32_t sampleIndex = 0;
 
-  std::vector<uint32_t> eventIDs;
+  rdcarray<uint32_t> eventIDs;
 
   for(uint32_t p = 0; p < passCount; p++)
   {
@@ -481,7 +495,7 @@ std::vector<CounterResult> D3D11Replay::FetchCountersAMD(const std::vector<GPUCo
 
   m_pAMDCounters->EndSesssion(sessionID);
 
-  std::vector<CounterResult> ret =
+  rdcarray<CounterResult> ret =
       m_pAMDCounters->GetCounterData(sessionID, sampleIndex, eventIDs, counters);
 
   m_pAMDCounters->EndMeasurementMode();
@@ -489,14 +503,13 @@ std::vector<CounterResult> D3D11Replay::FetchCountersAMD(const std::vector<GPUCo
   return ret;
 }
 
-std::vector<CounterResult> D3D11Replay::FetchCountersNV(const std::vector<GPUCounter> &counters)
+rdcarray<CounterResult> D3D11Replay::FetchCountersNV(const rdcarray<GPUCounter> &counters)
 {
-  const FrameRecord &frameRecord = m_pDevice->GetFrameRecord();
-  const FrameStatistics &frameStats = frameRecord.frameInfo.stats;
+  const FrameStatistics &frameStats = m_FrameRecord.frameInfo.stats;
 
   const uint32_t objectsCount = frameStats.draws.calls + frameStats.dispatches.calls + 1;
 
-  std::vector<CounterResult> ret;
+  rdcarray<CounterResult> ret;
 
   if(m_pNVCounters->PrepareExperiment(counters, objectsCount))
   {
@@ -504,7 +517,7 @@ std::vector<CounterResult> D3D11Replay::FetchCountersNV(const std::vector<GPUCou
 
     uint32_t passCount = m_pNVCounters->BeginExperiment();
     uint32_t sampleIndex = 0;
-    std::vector<uint32_t> eventIDs;
+    rdcarray<uint32_t> eventIDs;
 
     for(uint32_t passIdx = 0; passIdx < passCount; ++passIdx)
     {
@@ -524,7 +537,7 @@ std::vector<CounterResult> D3D11Replay::FetchCountersNV(const std::vector<GPUCou
   return ret;
 }
 
-std::vector<CounterResult> D3D11Replay::FetchCountersIntel(const std::vector<GPUCounter> &counters)
+rdcarray<CounterResult> D3D11Replay::FetchCountersIntel(const rdcarray<GPUCounter> &counters)
 {
   m_pIntelCounters->DisableAllCounters();
 
@@ -543,7 +556,7 @@ std::vector<CounterResult> D3D11Replay::FetchCountersIntel(const std::vector<GPU
 
   uint32_t sampleIndex = 0;
 
-  std::vector<uint32_t> eventIDs;
+  rdcarray<uint32_t> eventIDs;
 
   for(uint32_t p = 0; p < passCount; p++)
   {
@@ -563,9 +576,9 @@ std::vector<CounterResult> D3D11Replay::FetchCountersIntel(const std::vector<GPU
   return m_pIntelCounters->GetCounterData(eventIDs, counters);
 }
 
-std::vector<CounterResult> D3D11Replay::FetchCounters(const std::vector<GPUCounter> &counters)
+rdcarray<CounterResult> D3D11Replay::FetchCounters(const rdcarray<GPUCounter> &counters)
 {
-  std::vector<CounterResult> ret;
+  rdcarray<CounterResult> ret;
 
   if(counters.empty())
   {
@@ -575,14 +588,14 @@ std::vector<CounterResult> D3D11Replay::FetchCounters(const std::vector<GPUCount
 
   SCOPED_TIMER("Fetch Counters, counters to fetch %u", counters.size());
 
-  std::vector<GPUCounter> d3dCounters;
+  rdcarray<GPUCounter> d3dCounters;
   std::copy_if(counters.begin(), counters.end(), std::back_inserter(d3dCounters),
                [](const GPUCounter &c) { return IsGenericCounter(c); });
 
   if(m_pAMDCounters)
   {
     // Filter out the AMD counters
-    std::vector<GPUCounter> amdCounters;
+    rdcarray<GPUCounter> amdCounters;
     std::copy_if(counters.begin(), counters.end(), std::back_inserter(amdCounters),
                  [](const GPUCounter &c) { return IsAMDCounter(c); });
 
@@ -595,7 +608,7 @@ std::vector<CounterResult> D3D11Replay::FetchCounters(const std::vector<GPUCount
   if(m_pNVCounters)
   {
     // Filter out the AMD counters
-    std::vector<GPUCounter> nvCounters;
+    rdcarray<GPUCounter> nvCounters;
     std::copy_if(counters.begin(), counters.end(), std::back_inserter(nvCounters),
                  [](const GPUCounter &c) { return IsNvidiaCounter(c); });
 
@@ -605,9 +618,23 @@ std::vector<CounterResult> D3D11Replay::FetchCounters(const std::vector<GPUCount
     }
   }
 
+  if(m_pNVPerfCounters)
+  {
+    // Filter out the NvPerf counters
+    rdcarray<GPUCounter> nvPerfCounters;
+    std::copy_if(counters.begin(), counters.end(), std::back_inserter(nvPerfCounters),
+                 [=](const GPUCounter &c) { return m_pNVPerfCounters->HasCounter(c); });
+    if(!nvPerfCounters.empty())
+    {
+      rdcarray<CounterResult> results =
+          m_pNVPerfCounters->FetchCounters(nvPerfCounters, this, m_pDevice, m_pImmediateContext);
+      ret.append(results);
+    }
+  }
+
   if(m_pIntelCounters)
   {
-    std::vector<GPUCounter> intelCounters;
+    rdcarray<GPUCounter> intelCounters;
     std::copy_if(counters.begin(), counters.end(), std::back_inserter(intelCounters),
                  [](const GPUCounter &c) { return IsIntelCounter(c); });
 
@@ -631,6 +658,7 @@ std::vector<CounterResult> D3D11Replay::FetchCounters(const std::vector<GPUCount
   HRESULT hr = S_OK;
 
   hr = m_pDevice->CreateQuery(&disjointdesc, &disjoint);
+  m_pDevice->CheckHRESULT(hr);
   if(FAILED(hr))
   {
     RDCERR("Failed to create disjoint query HRESULT: %s", ToStr(hr).c_str());
@@ -638,6 +666,7 @@ std::vector<CounterResult> D3D11Replay::FetchCounters(const std::vector<GPUCount
   }
 
   hr = m_pDevice->CreateQuery(&qdesc, &start);
+  m_pDevice->CheckHRESULT(hr);
   if(FAILED(hr))
   {
     RDCERR("Failed to create start query HRESULT: %s", ToStr(hr).c_str());
@@ -760,6 +789,8 @@ std::vector<CounterResult> D3D11Replay::FetchCounters(const std::vector<GPUCount
                 ret.push_back(
                     CounterResult(ctx.timers[i].eventId, GPUCounter::SamplesPassed, occlusion));
                 break;
+
+              default: break;
             }
           }
         }
@@ -788,6 +819,8 @@ std::vector<CounterResult> D3D11Replay::FetchCounters(const std::vector<GPUCount
                 ret.push_back(
                     CounterResult(ctx.timers[i].eventId, d3dCounters[c], 0xFFFFFFFFFFFFFFFF));
                 break;
+
+              default: break;
             }
           }
         }

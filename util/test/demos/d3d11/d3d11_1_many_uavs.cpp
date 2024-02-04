@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -24,7 +24,7 @@
 
 #include "d3d11_test.h"
 
-TEST(D3D11_Many_UAVs, D3D11GraphicsTest)
+RD_TEST(D3D11_Many_UAVs, D3D11GraphicsTest)
 {
   static constexpr const char *Description =
       "Test using more than 8 compute shader UAVs (D3D11.1 feature)";
@@ -43,7 +43,7 @@ void main()
 
   int main()
   {
-    d3d11_1 = true;
+    feature_level = D3D_FEATURE_LEVEL_11_1;
 
     // initialise, create window, create device, etc
     if(!Init())
@@ -56,7 +56,7 @@ void main()
 
     while(Running())
     {
-      Vec4f col(0.4f, 0.5f, 0.6f, 1.0f);
+      Vec4f col(0.2f, 0.2f, 0.2f, 1.0f);
       ClearRenderTargetView(bbRTV, col);
 
       ctx->ClearUnorderedAccessViewUint(uav, (uint32_t *)&col.x);

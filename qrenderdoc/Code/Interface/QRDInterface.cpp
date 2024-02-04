@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2017-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -99,13 +99,14 @@ CaptureSettings::operator QVariant() const
   opts[lit("allowFullscreen")] = options.allowFullscreen;
   opts[lit("apiValidation")] = options.apiValidation;
   opts[lit("captureCallstacks")] = options.captureCallstacks;
-  opts[lit("captureCallstacksOnlyDraws")] = options.captureCallstacksOnlyDraws;
+  opts[lit("captureCallstacksOnlyDraws")] = options.captureCallstacksOnlyActions;
   opts[lit("delayForDebugger")] = options.delayForDebugger;
   opts[lit("verifyBufferAccess")] = options.verifyBufferAccess;
   opts[lit("hookIntoChildren")] = options.hookIntoChildren;
   opts[lit("refAllResources")] = options.refAllResources;
   opts[lit("captureAllCmdLists")] = options.captureAllCmdLists;
   opts[lit("debugOutputMute")] = options.debugOutputMute;
+  opts[lit("softMemoryLimit")] = options.softMemoryLimit;
   ret[lit("options")] = opts;
 
   ret[lit("queuedFrameCap")] = queuedFrameCap;
@@ -138,7 +139,7 @@ CaptureSettings::CaptureSettings(const QVariant &v)
   options.allowFullscreen = opts[lit("allowFullscreen")].toBool();
   options.apiValidation = opts[lit("apiValidation")].toBool();
   options.captureCallstacks = opts[lit("captureCallstacks")].toBool();
-  options.captureCallstacksOnlyDraws = opts[lit("captureCallstacksOnlyDraws")].toBool();
+  options.captureCallstacksOnlyActions = opts[lit("captureCallstacksOnlyDraws")].toBool();
   options.delayForDebugger = opts[lit("delayForDebugger")].toUInt();
   // old name for verifyBufferAccess was verifyMapWrites, so use that as a fallback
   if(opts.contains(lit("verifyBufferAccess")))
@@ -149,6 +150,7 @@ CaptureSettings::CaptureSettings(const QVariant &v)
   options.refAllResources = opts[lit("refAllResources")].toBool();
   options.captureAllCmdLists = opts[lit("captureAllCmdLists")].toBool();
   options.debugOutputMute = opts[lit("debugOutputMute")].toBool();
+  options.softMemoryLimit = opts[lit("softMemoryLimit")].toUInt();
 
   if(data.contains(lit("queuedFrameCap")))
     queuedFrameCap = data[lit("queuedFrameCap")].toUInt();
@@ -160,7 +162,7 @@ CaptureSettings::CaptureSettings(const QVariant &v)
     numQueuedFrames = 0;
 }
 
-rdcstr configFilePath(const rdcstr &filename)
+rdcstr ConfigFilePath(const rdcstr &filename)
 {
   QString path = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
 
@@ -169,17 +171,4 @@ rdcstr configFilePath(const rdcstr &filename)
     dir.mkdir(lit("."));
 
   return QDir::cleanPath(dir.absoluteFilePath(filename));
-}
-
-ICaptureContext *getCaptureContext(const QWidget *widget)
-{
-  void *ctxptr = NULL;
-
-  while(widget && !ctxptr)
-  {
-    ctxptr = widget->property("ICaptureContext").value<void *>();
-    widget = widget->parentWidget();
-  }
-
-  return (ICaptureContext *)ctxptr;
 }

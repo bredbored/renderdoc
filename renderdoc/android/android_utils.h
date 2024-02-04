@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2017-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -24,6 +24,7 @@
 
 #pragma once
 
+#include "api/replay/stringise.h"
 #include "android.h"
 
 // internal functions, shouldn't be used outside the android implementation - anything public goes
@@ -31,10 +32,10 @@
 
 namespace Android
 {
-Process::ProcessResult execScript(const std::string &script, const std::string &args,
-                                  const std::string &workDir = ".", bool silent = false);
-Process::ProcessResult execCommand(const std::string &exe, const std::string &args,
-                                   const std::string &workDir = ".", bool silent = false);
+Process::ProcessResult execScript(const rdcstr &script, const rdcstr &args,
+                                  const rdcstr &workDir = ".", bool silent = false);
+Process::ProcessResult execCommand(const rdcstr &exe, const rdcstr &args,
+                                   const rdcstr &workDir = ".", bool silent = false);
 
 enum class ToolDir
 {
@@ -44,13 +45,17 @@ enum class ToolDir
   BuildToolsLib,
   PlatformTools,
 };
-std::string getToolPath(ToolDir subdir, const std::string &toolname, bool checkExist);
-bool toolExists(const std::string &path);
+rdcstr getToolPath(ToolDir subdir, const rdcstr &toolname, bool checkExist);
+bool toolExists(const rdcstr &path);
 
-std::string GetFirstMatchingLine(const std::string &haystack, const std::string &needle);
+bool IsDebuggable(const rdcstr &deviceID, const rdcstr &packageName);
+bool HasRootAccess(const rdcstr &deviceID);
+rdcstr GetFirstMatchingLine(const rdcstr &haystack, const rdcstr &needle);
 
-bool IsSupported(std::string deviceID);
-std::string GetFriendlyName(std::string deviceID);
+bool IsSupported(rdcstr deviceID);
+bool SupportsNativeLayers(const rdcstr &deviceID);
+rdcstr DetermineInstalledABI(const rdcstr &deviceID, const rdcstr &packageName);
+rdcstr GetFriendlyName(const rdcstr &deviceID);
 
 // supported ABIs
 enum class ABI
@@ -62,12 +67,12 @@ enum class ABI
   x86_64,
 };
 
-ABI GetABI(const std::string &abiName);
-std::vector<ABI> GetSupportedABIs(const std::string &deviceID);
-std::string GetRenderDocPackageForABI(ABI abi, char sep = '.');
-std::string GetPathForPackage(const std::string &deviceID, const std::string &packageName);
-
-bool PatchManifest(std::vector<byte> &manifest);
+ABI GetABI(const rdcstr &abiName);
+rdcstr GetPlainABIName(ABI abi);
+rdcarray<ABI> GetSupportedABIs(const rdcstr &deviceID);
+rdcstr GetRenderDocPackageForABI(ABI abi);
+rdcstr GetPathForPackage(const rdcstr &deviceID, const rdcstr &packageName);
+rdcstr GetFolderName(const rdcstr &deviceID);
 };
 
 DECLARE_REFLECTION_ENUM(Android::ABI);

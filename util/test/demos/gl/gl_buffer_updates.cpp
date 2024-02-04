@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -24,7 +24,7 @@
 
 #include "gl_test.h"
 
-TEST(GL_Buffer_Updates, OpenGLGraphicsTest)
+RD_TEST(GL_Buffer_Updates, OpenGLGraphicsTest)
 {
   static constexpr const char *Description =
       "Test of buffer updates, both buffers that are updated regularly and get marked as "
@@ -55,7 +55,10 @@ layout(binding = 0, std140) uniform constsbuf
 
 void main()
 {
-	Color = col;
+  if(col == vec4(0.0, 1.0, 0.0, 1.0))
+    Color = col;
+  else
+    Color = vec4(1.0, 0.0, 0.0, 1.0);
 }
 
 )EOSHADER";
@@ -102,7 +105,8 @@ void main()
   BUFFER_TEST(NonCoherentMapFlush)               \
   BUFFER_TEST(NonCoherentMapFlushUnsynchronised) \
   BUFFER_TEST(OffsetMapWrite)                    \
-  BUFFER_TEST(OffsetMapFlush)
+  BUFFER_TEST(OffsetMapFlush)                    \
+  BUFFER_TEST(PersistentBufferFrameMapped)
 
 #undef BUFFER_TEST
 #define BUFFER_TEST(name) name,
@@ -217,16 +221,17 @@ void main()
                     GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT);
 
     ptrs[CoherentMapWriteInvalidateRange] = (Vec4f *)glMapBufferRange(
-        GL_UNIFORM_BUFFER, 0, sizeof(Vec4f), GL_MAP_COHERENT_BIT | GL_MAP_PERSISTENT_BIT |
-                                                 GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_RANGE_BIT);
+        GL_UNIFORM_BUFFER, 0, sizeof(Vec4f),
+        GL_MAP_COHERENT_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_RANGE_BIT);
 
     glBindBuffer(GL_UNIFORM_BUFFER, buffers[CoherentMapWriteInvalidateBuffer]);
     glBufferStorage(GL_UNIFORM_BUFFER, sizeof(Vec4f), &red,
                     GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT);
 
-    ptrs[CoherentMapWriteInvalidateBuffer] = (Vec4f *)glMapBufferRange(
-        GL_UNIFORM_BUFFER, 0, sizeof(Vec4f), GL_MAP_COHERENT_BIT | GL_MAP_PERSISTENT_BIT |
-                                                 GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
+    ptrs[CoherentMapWriteInvalidateBuffer] =
+        (Vec4f *)glMapBufferRange(GL_UNIFORM_BUFFER, 0, sizeof(Vec4f),
+                                  GL_MAP_COHERENT_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_WRITE_BIT |
+                                      GL_MAP_INVALIDATE_BUFFER_BIT);
 
     glBindBuffer(GL_UNIFORM_BUFFER, buffers[CoherentMapWriteUnsynchronised]);
     glBufferStorage(GL_UNIFORM_BUFFER, sizeof(Vec4f), &red,
@@ -263,6 +268,11 @@ void main()
     for(int i = 0; i < 100; i++)
       glBufferSubData(GL_UNIFORM_BUFFER, 0, sizeof(Vec4f), &cyan);
 
+    glBindBuffer(GL_UNIFORM_BUFFER, buffers[PersistentBufferFrameMapped]);
+    glBufferStorage(
+        GL_UNIFORM_BUFFER, sizeof(Vec4f), &red,
+        GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT | GL_DYNAMIC_STORAGE_BIT);
+
     // these buffers are used for indicating a CPU readback passed or failed
     GLuint pass = MakeBuffer();
     glBindBuffer(GL_UNIFORM_BUFFER, pass);
@@ -275,7 +285,7 @@ void main()
 
     while(Running())
     {
-      float col[] = {0.4f, 0.5f, 0.6f, 1.0f};
+      float col[] = {0.2f, 0.2f, 0.2f, 1.0f};
       glClearBufferfv(GL_COLOR, 0, col);
 
       glBindVertexArray(vao);
@@ -411,6 +421,15 @@ void main()
       if(ptr)
         ptr->x = 0.0f;
       glFlushMappedBufferRange(GL_UNIFORM_BUFFER, 0, sizeof(float));
+      glUnmapBuffer(GL_UNIFORM_BUFFER);
+
+      glBindBuffer(GL_UNIFORM_BUFFER, buffers[PersistentBufferFrameMapped]);
+      glBufferSubData(GL_UNIFORM_BUFFER, 0, sizeof(Vec4f), &cyan);
+
+      ptr = (Vec4f *)glMapBufferRange(GL_UNIFORM_BUFFER, sizeof(float) * 2, sizeof(float),
+                                      GL_MAP_PERSISTENT_BIT | GL_MAP_WRITE_BIT);
+      if(ptr)
+        ptr->x = 0.0f;
       glUnmapBuffer(GL_UNIFORM_BUFFER);
 
       const int squareSize = 50;

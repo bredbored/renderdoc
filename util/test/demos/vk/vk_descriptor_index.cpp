@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2018-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -38,16 +38,16 @@
 
 #endif
 
+#define DESC_ARRAY3_SIZE 3
+
 #define BUFIDX 15
 #define INDEX3 4
 #define INDEX1 49
 #define INDEX2 381
 #define NONUNIFORMIDX 20
+#define TEX3_INDEX 1
 
-#define STRINGISE2(a) #a
-#define STRINGISE(a) STRINGISE2(a)
-
-TEST(VK_Descriptor_Indexing, VulkanGraphicsTest)
+RD_TEST(VK_Descriptor_Indexing, VulkanGraphicsTest)
 {
   static constexpr const char *Description =
       "Draws a triangle using descriptor indexing with large descriptor sets.";
@@ -96,6 +96,7 @@ layout(push_constant) uniform PushData
   uint bufidx;
   uint idx1;
   uint idx2;
+  uint idx3;
 } push;
 
 struct tex_ref
@@ -110,8 +111,12 @@ layout(binding = 0, std430) buffer outbuftype {
 
 layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
 
+layout(constant_id = 1) const int spec_canary = 0;
+
 void main()
 {
+  if(spec_canary != 1337) return;
+
   outbuf[push.bufidx].outrefs[0].binding = 0;
   outbuf[push.bufidx].outrefs[0].idx = push.idx1;
   outbuf[push.bufidx].outrefs[1].binding = 2;
@@ -122,8 +127,11 @@ void main()
   outbuf[push.bufidx].outrefs[3].binding = 2;
   outbuf[push.bufidx].outrefs[3].idx = push.idx2+5;
 
+  outbuf[push.bufidx].outrefs[4].binding = 3;
+  outbuf[push.bufidx].outrefs[4].idx = push.idx3;
+
   // terminator
-  outbuf[push.bufidx].outrefs[4].binding = 100;
+  outbuf[push.bufidx].outrefs[5].binding = 100;
 }
 
 )EOSHADER";
@@ -149,29 +157,30 @@ layout(binding = 0, std430) buffer inbuftype {
   tex_ref inrefs[];
 } inbuf[];
 
-layout(binding = 1) uniform sampler2D tex1[)EOSHADER" STRINGISE(DESC_ARRAY1_SIZE) R"EOSHADER(];
+layout(binding = 1) uniform sampler2D tex1[)EOSHADER" STRINGIZE(DESC_ARRAY1_SIZE) R"EOSHADER(];
 layout(binding = 2) uniform sampler2D tex2[];
+layout(binding = 3) uniform sampler2D tex3[)EOSHADER" STRINGIZE(DESC_ARRAY3_SIZE) R"EOSHADER(];
 
 void add_color(sampler2D tex)
 {
   Color *= (vec4(0.25f) + texture(tex, vertIn.uv.xy));
 }
 
-void add_indirect_color2(sampler2D texs[)EOSHADER" STRINGISE(DESC_ARRAY1_SIZE) R"EOSHADER(], uint idx)
+void add_indirect_color2(sampler2D texs[)EOSHADER" STRINGIZE(DESC_ARRAY1_SIZE) R"EOSHADER(], uint idx)
 {
   add_color(texs[idx]);
 }
 
 void add_indirect_color(int dummy,
-                        sampler2D texs[)EOSHADER" STRINGISE(DESC_ARRAY1_SIZE) R"EOSHADER(], tex_ref t)
+                        sampler2D texs[)EOSHADER" STRINGIZE(DESC_ARRAY1_SIZE) R"EOSHADER(], tex_ref t)
 {
   // second array-param function call
   add_indirect_color2(texs, t.idx);
 }
 
 void dispatch_indirect_color(int dummy1,
-                             sampler2D texA[)EOSHADER" STRINGISE(DESC_ARRAY1_SIZE) R"EOSHADER(],
-                             sampler2D texB[)EOSHADER" STRINGISE(DESC_ARRAY1_SIZE) R"EOSHADER(],
+                             sampler2D texA[)EOSHADER" STRINGIZE(DESC_ARRAY1_SIZE) R"EOSHADER(],
+                             sampler2D texB[)EOSHADER" STRINGIZE(DESC_ARRAY1_SIZE) R"EOSHADER(],
                              float dummy2, tex_ref t)
 {
   if(t.binding == 0)
@@ -189,11 +198,15 @@ void dispatch_indirect_color(int dummy1,
 void add_parameterless()
 {
   // use array directly without it being a function parameter
-  Color += 0.1f * texture(tex1[)EOSHADER" STRINGISE(INDEX3) R"EOSHADER(], vertIn.uv.xy);
+  Color += 0.1f * texture(tex1[)EOSHADER" STRINGIZE(INDEX3) R"EOSHADER(], vertIn.uv.xy);
 }
+
+layout(constant_id = 2) const int spec_canary = 0;
 
 void main()
 {
+  if(spec_canary != 1338) { Color = vec4(1.0, 0.0, 0.0, 1.0); return; }
+
   if(vertIn.uv.y < 0.2f)
   {
     // nonuniform dynamic index
@@ -215,8 +228,10 @@ void main()
       // function call with array parameters
       if(t.binding < 2)
         dispatch_indirect_color(0, tex1, tex1, 5.0f, t);
-      else
+      else if(t.binding < 3)
         add_color(tex2[t.idx]);
+      else
+        add_color(tex3[t.idx]);
     }
   }
 }
@@ -264,8 +279,20 @@ void main()
     else if(!descIndexing.shaderSampledImageArrayNonUniformIndexing)
       Avail =
           "Descriptor indexing feature 'shaderSampledImageArrayNonUniformIndexing' not available";
+    else if(!descIndexing.descriptorBindingVariableDescriptorCount)
+      Avail =
+          "Descriptor indexing feature 'descriptorBindingVariableDescriptorCount' not available";
 
-    devInfoNext = &descIndexing;
+    static VkPhysicalDeviceDescriptorIndexingFeaturesEXT descIndexingEnable = {
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES_EXT,
+    };
+
+    descIndexingEnable.descriptorBindingPartiallyBound = VK_TRUE;
+    descIndexingEnable.runtimeDescriptorArray = VK_TRUE;
+    descIndexingEnable.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
+    descIndexingEnable.descriptorBindingVariableDescriptorCount = VK_TRUE;
+
+    devInfoNext = &descIndexingEnable;
   }
 
   int main()
@@ -278,27 +305,41 @@ void main()
         VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO_EXT,
     };
 
-    VkDescriptorBindingFlagsEXT bindFlags[3] = {
-        VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT_EXT, 0,
+    VkDescriptorBindingFlagsEXT bindFlags[4] = {
         VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT_EXT,
+        0,
+        VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT_EXT,
+        VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT_EXT,
     };
 
-    descFlags.bindingCount = 3;
+    descFlags.bindingCount = ARRAY_COUNT(bindFlags);
     descFlags.pBindingFlags = bindFlags;
 
     VkDescriptorSetLayout setlayout = createDescriptorSetLayout(
         vkh::DescriptorSetLayoutCreateInfo(
             {
                 {
-                    0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, DESC_ARRAY1_SIZE,
+                    0,
+                    VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                    DESC_ARRAY1_SIZE,
                     VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT,
                 },
                 {
-                    1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, DESC_ARRAY1_SIZE,
+                    1,
+                    VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                    DESC_ARRAY1_SIZE,
                     VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT,
                 },
                 {
-                    2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, DESC_ARRAY2_SIZE,
+                    2,
+                    VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                    DESC_ARRAY2_SIZE,
+                    VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT,
+                },
+                {
+                    3,
+                    VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                    UINT32_MAX,
                     VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT,
                 },
             })
@@ -320,7 +361,8 @@ void main()
 
     pipeCreateInfo.vertexInputState.vertexBindingDescriptions = {vkh::vertexBind(0, DefaultA2V)};
     pipeCreateInfo.vertexInputState.vertexAttributeDescriptions = {
-        vkh::vertexAttr(0, 0, DefaultA2V, pos), vkh::vertexAttr(1, 0, DefaultA2V, col),
+        vkh::vertexAttr(0, 0, DefaultA2V, pos),
+        vkh::vertexAttr(1, 0, DefaultA2V, col),
         vkh::vertexAttr(2, 0, DefaultA2V, uv),
     };
 
@@ -329,10 +371,28 @@ void main()
         CompileShaderModule(common + pixel, ShaderLang::glsl, ShaderStage::frag, "main"),
     };
 
+    VkPipelineShaderStageCreateInfo compshad =
+        CompileShaderModule(comp, ShaderLang::glsl, ShaderStage::comp, "main");
+
+    VkSpecializationMapEntry specmap[2] = {
+        {1, 0 * sizeof(uint32_t), sizeof(uint32_t)},
+        {2, 1 * sizeof(uint32_t), sizeof(uint32_t)},
+    };
+
+    uint32_t specvals[2] = {1337, 1338};
+
+    VkSpecializationInfo spec = {};
+    spec.mapEntryCount = ARRAY_COUNT(specmap);
+    spec.pMapEntries = specmap;
+    spec.dataSize = sizeof(specvals);
+    spec.pData = specvals;
+
+    pipeCreateInfo.stages[1].pSpecializationInfo = &spec;
+    compshad.pSpecializationInfo = &spec;
+
     VkPipeline pipe = createGraphicsPipeline(pipeCreateInfo);
 
-    VkPipeline comppipe = createComputePipeline(vkh::ComputePipelineCreateInfo(
-        layout, CompileShaderModule(comp, ShaderLang::glsl, ShaderStage::comp, "main")));
+    VkPipeline comppipe = createComputePipeline(vkh::ComputePipelineCreateInfo(layout, compshad));
 
     float left = float(NONUNIFORMIDX - 1.0f);
     float middle = float(NONUNIFORMIDX);
@@ -344,17 +404,18 @@ void main()
         {Vec3f(0.5f, -0.5f, 0.0f), Vec4f(0.0f, 0.0f, 1.0f, right), Vec2f(1.0f, 0.0f)},
     };
 
-    AllocatedBuffer vb(allocator,
+    AllocatedBuffer vb(this,
                        vkh::BufferCreateInfo(sizeof(tri), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
                                                               VK_BUFFER_USAGE_TRANSFER_DST_BIT),
                        VmaAllocationCreateInfo({0, VMA_MEMORY_USAGE_CPU_TO_GPU}));
 
     vb.upload(tri);
 
-    AllocatedImage img(allocator, vkh::ImageCreateInfo(
-                                      4, 4, 0, VK_FORMAT_R32G32B32A32_SFLOAT,
-                                      VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT),
-                       VmaAllocationCreateInfo({0, VMA_MEMORY_USAGE_GPU_ONLY}));
+    AllocatedImage img(
+        this,
+        vkh::ImageCreateInfo(4, 4, 0, VK_FORMAT_R32G32B32A32_SFLOAT,
+                             VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT),
+        VmaAllocationCreateInfo({0, VMA_MEMORY_USAGE_GPU_ONLY}));
 
     setName(img.image, "Colour Tex");
 
@@ -366,17 +427,18 @@ void main()
       pixels[i] = RANDF(0.2f, 1.0f);
 
     AllocatedBuffer uploadBuf(
-        allocator, vkh::BufferCreateInfo(sizeof(pixels), VK_BUFFER_USAGE_TRANSFER_SRC_BIT),
+        this, vkh::BufferCreateInfo(sizeof(pixels), VK_BUFFER_USAGE_TRANSFER_SRC_BIT),
         VmaAllocationCreateInfo({0, VMA_MEMORY_USAGE_CPU_TO_GPU}));
 
     uploadBuf.upload(pixels);
 
     // create an image with black contents for all the indices we aren't using
 
-    AllocatedImage badimg(allocator, vkh::ImageCreateInfo(4, 4, 0, VK_FORMAT_R32G32B32A32_SFLOAT,
-                                                          VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-                                                              VK_IMAGE_USAGE_SAMPLED_BIT),
-                          VmaAllocationCreateInfo({0, VMA_MEMORY_USAGE_GPU_ONLY}));
+    AllocatedImage badimg(
+        this,
+        vkh::ImageCreateInfo(4, 4, 0, VK_FORMAT_R32G32B32A32_SFLOAT,
+                             VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT),
+        VmaAllocationCreateInfo({0, VMA_MEMORY_USAGE_GPU_ONLY}));
 
     setName(badimg.image, "Black Tex");
 
@@ -429,27 +491,38 @@ void main()
 
     {
       CHECK_VKR(vkCreateDescriptorPool(
-          device, vkh::DescriptorPoolCreateInfo(
-                      8,
-                      {
-                          {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, DESC_ARRAY2_SIZE * 10},
-                          {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, DESC_ARRAY1_SIZE * 10},
-                      }),
+          device,
+          vkh::DescriptorPoolCreateInfo(
+              8,
+              {
+                  {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, DESC_ARRAY2_SIZE * 10},
+                  {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, DESC_ARRAY1_SIZE * 10},
+              }),
           NULL, &descpool));
 
-      CHECK_VKR(vkAllocateDescriptorSets(
-          device, vkh::DescriptorSetAllocateInfo(
-                      descpool, {setlayout, setlayout, setlayout, setlayout, setlayout}),
-          descset));
+      const static uint32_t numDescriptorSets = ARRAY_COUNT(descset);
+      std::vector<VkDescriptorSetLayout> setLayouts(numDescriptorSets, setlayout);
+      std::vector<uint32_t> counts(numDescriptorSets, DESC_ARRAY3_SIZE);
+
+      VkDescriptorSetVariableDescriptorCountAllocateInfoEXT countInfo = {
+          VK_STRUCTURE_TYPE_DESCRIPTOR_SET_VARIABLE_DESCRIPTOR_COUNT_ALLOCATE_INFO_EXT,
+          NULL,
+          numDescriptorSets,
+          counts.data(),
+      };
+
+      VkDescriptorSetAllocateInfo allocInfo = {
+          VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+          &countInfo,
+          descpool,
+          numDescriptorSets,
+          setLayouts.data(),
+      };
+
+      CHECK_VKR(vkAllocateDescriptorSets(device, &allocInfo, descset));
     }
 
-    VkSampler sampler = VK_NULL_HANDLE;
-
-    VkSamplerCreateInfo sampInfo = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
-    sampInfo.magFilter = VK_FILTER_LINEAR;
-    sampInfo.minFilter = VK_FILTER_LINEAR;
-
-    vkCreateSampler(device, &sampInfo, NULL, &sampler);
+    VkSampler sampler = createSampler(vkh::SamplerCreateInfo(VK_FILTER_LINEAR));
 
     vkh::DescriptorImageInfo iminfo(badimgview, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sampler);
     vkh::WriteDescriptorSet up(VK_NULL_HANDLE, 0, 0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
@@ -479,11 +552,17 @@ void main()
       up.descriptorCount = DESC_ARRAY2_SIZE - 20;
 
       ups.push_back(up);
+
+      up.dstBinding = 3;
+      up.dstArrayElement = 0;
+      up.descriptorCount = DESC_ARRAY3_SIZE;
+
+      ups.push_back(up);
     }
 
     vkh::updateDescriptorSets(device, ups);
 
-    AllocatedBuffer ssbo(allocator,
+    AllocatedBuffer ssbo(this,
                          vkh::BufferCreateInfo(1024 * 1024, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                                                                 VK_BUFFER_USAGE_TRANSFER_DST_BIT),
                          VmaAllocationCreateInfo({0, VMA_MEMORY_USAGE_GPU_ONLY}));
@@ -529,6 +608,11 @@ void main()
                 {
                     vkh::DescriptorImageInfo(imgview, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sampler),
                 }),
+            vkh::WriteDescriptorSet(
+                descset[0], 3, TEX3_INDEX, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                {
+                    vkh::DescriptorImageInfo(imgview, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sampler),
+                }),
         });
 
     while(Running())
@@ -541,7 +625,7 @@ void main()
           StartUsingBackbuffer(cmd, VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_GENERAL);
 
       vkCmdClearColorImage(cmd, swapimg, VK_IMAGE_LAYOUT_GENERAL,
-                           vkh::ClearColorValue(0.4f, 0.5f, 0.6f, 1.0f), 1,
+                           vkh::ClearColorValue(0.2f, 0.2f, 0.2f, 1.0f), 1,
                            vkh::ImageSubresourceRange());
 
       vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, comppipe);
@@ -549,27 +633,29 @@ void main()
       vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &descset[0], 0,
                               NULL);
 
-      Vec4i idx = {BUFIDX, INDEX1, INDEX2, 0};
+      Vec4i idx = {BUFIDX, INDEX1, INDEX2, TEX3_INDEX};
       vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT, 0,
                          sizeof(Vec4i), &idx);
 
       static_assert(BUFIDX < DESC_ARRAY1_SIZE, "Buffer index is out of bounds");
       static_assert(INDEX1 < DESC_ARRAY1_SIZE, "Index 1 is out of bounds");
       static_assert(INDEX2 < DESC_ARRAY2_SIZE, "Index 2 is out of bounds");
+      static_assert(TEX3_INDEX < DESC_ARRAY3_SIZE, "Index 3 is out of bounds");
 
       vkCmdFillBuffer(cmd, ssbo.buffer, 0, 1024 * 1024, 0);
 
       vkh::cmdPipelineBarrier(
-          cmd, {}, {vkh::BufferMemoryBarrier(VK_ACCESS_TRANSFER_WRITE_BIT,
-                                             VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
-                                             ssbo.buffer)});
+          cmd, {},
+          {vkh::BufferMemoryBarrier(VK_ACCESS_TRANSFER_WRITE_BIT,
+                                    VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                                    ssbo.buffer)});
 
       // read the push constants, transform, pass them through the specified buffer to draw below
       vkCmdDispatch(cmd, 1, 1, 1);
 
-      vkh::cmdPipelineBarrier(
-          cmd, {}, {vkh::BufferMemoryBarrier(VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
-                                             ssbo.buffer)});
+      vkh::cmdPipelineBarrier(cmd, {},
+                              {vkh::BufferMemoryBarrier(VK_ACCESS_SHADER_WRITE_BIT,
+                                                        VK_ACCESS_SHADER_READ_BIT, ssbo.buffer)});
 
       vkCmdBeginRenderPass(
           cmd, vkh::RenderPassBeginInfo(mainWindow->rp, mainWindow->GetFB(), mainWindow->scissor),
@@ -607,7 +693,6 @@ void main()
     vkDeviceWaitIdle(device);
 
     vkDestroyDescriptorPool(device, descpool, NULL);
-    vkDestroySampler(device, sampler, NULL);
 
     return 0;
   }

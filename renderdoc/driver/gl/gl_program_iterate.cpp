@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2017-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -51,10 +51,10 @@ DECLARE_REFLECTION_STRUCT(ProgramUniformValue);
 
 struct ProgramUniform
 {
-  std::string Basename;
+  rdcstr Basename;
   bool IsArray = false;
 
-  std::vector<ProgramUniformValue> Values;
+  rdcarray<ProgramUniformValue> Values;
 };
 
 DECLARE_REFLECTION_STRUCT(ProgramUniform);
@@ -63,7 +63,7 @@ struct ProgramBinding
 {
   ProgramBinding() = default;
   ProgramBinding(const char *n, int32_t b) : Name(n), Binding(b) {}
-  std::string Name;
+  rdcstr Name;
   int32_t Binding = -1;
 };
 
@@ -71,9 +71,9 @@ DECLARE_REFLECTION_STRUCT(ProgramBinding);
 
 struct ProgramUniforms
 {
-  std::vector<ProgramUniform> ValueUniforms;
-  std::vector<ProgramBinding> UBOBindings;
-  std::vector<ProgramBinding> SSBOBindings;
+  rdcarray<ProgramUniform> ValueUniforms;
+  rdcarray<ProgramBinding> UBOBindings;
+  rdcarray<ProgramBinding> SSBOBindings;
 };
 
 DECLARE_REFLECTION_STRUCT(ProgramUniforms);
@@ -86,142 +86,142 @@ struct UnrolledSPIRVConstant
   int32_t location = -1;
 };
 
-static GLenum MakeGLType(const ShaderVariableType &type)
+static GLenum MakeGLType(const ShaderConstantType &type)
 {
-  if(type.descriptor.type == VarType::Double)
+  if(type.baseType == VarType::Double)
   {
-    if(type.descriptor.columns == 4 && type.descriptor.rows == 4)
+    if(type.columns == 4 && type.rows == 4)
       return eGL_DOUBLE_MAT4;
-    if(type.descriptor.columns == 4 && type.descriptor.rows == 3)
+    if(type.columns == 4 && type.rows == 3)
       return eGL_DOUBLE_MAT4x3;
-    if(type.descriptor.columns == 4 && type.descriptor.rows == 2)
+    if(type.columns == 4 && type.rows == 2)
       return eGL_DOUBLE_MAT4x2;
-    if(type.descriptor.columns == 4 && type.descriptor.rows == 1)
+    if(type.columns == 4 && type.rows == 1)
       return eGL_DOUBLE_VEC4;
 
-    if(type.descriptor.columns == 3 && type.descriptor.rows == 4)
+    if(type.columns == 3 && type.rows == 4)
       return eGL_DOUBLE_MAT3x4;
-    if(type.descriptor.columns == 3 && type.descriptor.rows == 3)
+    if(type.columns == 3 && type.rows == 3)
       return eGL_DOUBLE_MAT3;
-    if(type.descriptor.columns == 3 && type.descriptor.rows == 2)
+    if(type.columns == 3 && type.rows == 2)
       return eGL_DOUBLE_MAT3x2;
-    if(type.descriptor.columns == 3 && type.descriptor.rows == 1)
+    if(type.columns == 3 && type.rows == 1)
       return eGL_DOUBLE_VEC3;
 
-    if(type.descriptor.columns == 2 && type.descriptor.rows == 4)
+    if(type.columns == 2 && type.rows == 4)
       return eGL_DOUBLE_MAT2x4;
-    if(type.descriptor.columns == 2 && type.descriptor.rows == 3)
+    if(type.columns == 2 && type.rows == 3)
       return eGL_DOUBLE_MAT2x4;
-    if(type.descriptor.columns == 2 && type.descriptor.rows == 2)
+    if(type.columns == 2 && type.rows == 2)
       return eGL_DOUBLE_MAT2;
-    if(type.descriptor.columns == 2 && type.descriptor.rows == 1)
+    if(type.columns == 2 && type.rows == 1)
       return eGL_DOUBLE_VEC2;
 
-    if(type.descriptor.columns == 1 && type.descriptor.rows == 4)
+    if(type.columns == 1 && type.rows == 4)
       return eGL_DOUBLE_VEC4;
-    if(type.descriptor.columns == 1 && type.descriptor.rows == 3)
+    if(type.columns == 1 && type.rows == 3)
       return eGL_DOUBLE_VEC3;
-    if(type.descriptor.columns == 1 && type.descriptor.rows == 2)
+    if(type.columns == 1 && type.rows == 2)
       return eGL_DOUBLE_VEC2;
 
-    if(type.descriptor.rows == 1 && type.descriptor.columns == 4)
+    if(type.rows == 1 && type.columns == 4)
       return eGL_DOUBLE_VEC4;
-    if(type.descriptor.rows == 1 && type.descriptor.columns == 3)
+    if(type.rows == 1 && type.columns == 3)
       return eGL_DOUBLE_VEC3;
-    if(type.descriptor.rows == 1 && type.descriptor.columns == 2)
+    if(type.rows == 1 && type.columns == 2)
       return eGL_DOUBLE_VEC2;
 
     return eGL_DOUBLE;
   }
-  else if(type.descriptor.type == VarType::Float)
+  else if(type.baseType == VarType::Float)
   {
-    if(type.descriptor.columns == 4 && type.descriptor.rows == 4)
+    if(type.columns == 4 && type.rows == 4)
       return eGL_FLOAT_MAT4;
-    if(type.descriptor.columns == 4 && type.descriptor.rows == 3)
+    if(type.columns == 4 && type.rows == 3)
       return eGL_FLOAT_MAT4x3;
-    if(type.descriptor.columns == 4 && type.descriptor.rows == 2)
+    if(type.columns == 4 && type.rows == 2)
       return eGL_FLOAT_MAT4x2;
-    if(type.descriptor.columns == 4 && type.descriptor.rows == 1)
+    if(type.columns == 4 && type.rows == 1)
       return eGL_FLOAT_VEC4;
 
-    if(type.descriptor.columns == 3 && type.descriptor.rows == 4)
+    if(type.columns == 3 && type.rows == 4)
       return eGL_FLOAT_MAT3x4;
-    if(type.descriptor.columns == 3 && type.descriptor.rows == 3)
+    if(type.columns == 3 && type.rows == 3)
       return eGL_FLOAT_MAT3;
-    if(type.descriptor.columns == 3 && type.descriptor.rows == 2)
+    if(type.columns == 3 && type.rows == 2)
       return eGL_FLOAT_MAT3x2;
-    if(type.descriptor.columns == 3 && type.descriptor.rows == 1)
+    if(type.columns == 3 && type.rows == 1)
       return eGL_FLOAT_VEC3;
 
-    if(type.descriptor.columns == 2 && type.descriptor.rows == 4)
+    if(type.columns == 2 && type.rows == 4)
       return eGL_FLOAT_MAT2x4;
-    if(type.descriptor.columns == 2 && type.descriptor.rows == 3)
+    if(type.columns == 2 && type.rows == 3)
       return eGL_FLOAT_MAT2x4;
-    if(type.descriptor.columns == 2 && type.descriptor.rows == 2)
+    if(type.columns == 2 && type.rows == 2)
       return eGL_FLOAT_MAT2;
-    if(type.descriptor.columns == 2 && type.descriptor.rows == 1)
+    if(type.columns == 2 && type.rows == 1)
       return eGL_FLOAT_VEC2;
 
-    if(type.descriptor.columns == 1 && type.descriptor.rows == 4)
+    if(type.columns == 1 && type.rows == 4)
       return eGL_FLOAT_VEC4;
-    if(type.descriptor.columns == 1 && type.descriptor.rows == 3)
+    if(type.columns == 1 && type.rows == 3)
       return eGL_FLOAT_VEC3;
-    if(type.descriptor.columns == 1 && type.descriptor.rows == 2)
+    if(type.columns == 1 && type.rows == 2)
       return eGL_FLOAT_VEC2;
-    if(type.descriptor.columns == 1 && type.descriptor.rows == 1)
+    if(type.columns == 1 && type.rows == 1)
       return eGL_FLOAT;
 
-    if(type.descriptor.rows == 1 && type.descriptor.columns == 4)
+    if(type.rows == 1 && type.columns == 4)
       return eGL_FLOAT_VEC4;
-    if(type.descriptor.rows == 1 && type.descriptor.columns == 3)
+    if(type.rows == 1 && type.columns == 3)
       return eGL_FLOAT_VEC3;
-    if(type.descriptor.rows == 1 && type.descriptor.columns == 2)
+    if(type.rows == 1 && type.columns == 2)
       return eGL_FLOAT_VEC2;
-    if(type.descriptor.rows == 1 && type.descriptor.columns == 1)
+    if(type.rows == 1 && type.columns == 1)
       return eGL_FLOAT;
 
     return eGL_FLOAT;
   }
-  else if(type.descriptor.type == VarType::SInt)
+  else if(type.baseType == VarType::SInt)
   {
-    if(type.descriptor.columns == 1 && type.descriptor.rows == 4)
+    if(type.columns == 1 && type.rows == 4)
       return eGL_INT_VEC4;
-    if(type.descriptor.columns == 1 && type.descriptor.rows == 3)
+    if(type.columns == 1 && type.rows == 3)
       return eGL_INT_VEC3;
-    if(type.descriptor.columns == 1 && type.descriptor.rows == 2)
+    if(type.columns == 1 && type.rows == 2)
       return eGL_INT_VEC2;
-    if(type.descriptor.columns == 1 && type.descriptor.rows == 1)
+    if(type.columns == 1 && type.rows == 1)
       return eGL_INT;
 
-    if(type.descriptor.rows == 1 && type.descriptor.columns == 4)
+    if(type.rows == 1 && type.columns == 4)
       return eGL_INT_VEC4;
-    if(type.descriptor.rows == 1 && type.descriptor.columns == 3)
+    if(type.rows == 1 && type.columns == 3)
       return eGL_INT_VEC3;
-    if(type.descriptor.rows == 1 && type.descriptor.columns == 2)
+    if(type.rows == 1 && type.columns == 2)
       return eGL_INT_VEC2;
-    if(type.descriptor.rows == 1 && type.descriptor.columns == 1)
+    if(type.rows == 1 && type.columns == 1)
       return eGL_INT;
 
     return eGL_INT;
   }
-  else if(type.descriptor.type == VarType::UInt)
+  else if(type.baseType == VarType::UInt)
   {
-    if(type.descriptor.columns == 1 && type.descriptor.rows == 4)
+    if(type.columns == 1 && type.rows == 4)
       return eGL_UNSIGNED_INT_VEC4;
-    if(type.descriptor.columns == 1 && type.descriptor.rows == 3)
+    if(type.columns == 1 && type.rows == 3)
       return eGL_UNSIGNED_INT_VEC3;
-    if(type.descriptor.columns == 1 && type.descriptor.rows == 2)
+    if(type.columns == 1 && type.rows == 2)
       return eGL_UNSIGNED_INT_VEC2;
-    if(type.descriptor.columns == 1 && type.descriptor.rows == 1)
+    if(type.columns == 1 && type.rows == 1)
       return eGL_UNSIGNED_INT;
 
-    if(type.descriptor.rows == 1 && type.descriptor.columns == 4)
+    if(type.rows == 1 && type.columns == 4)
       return eGL_UNSIGNED_INT_VEC4;
-    if(type.descriptor.rows == 1 && type.descriptor.columns == 3)
+    if(type.rows == 1 && type.columns == 3)
       return eGL_UNSIGNED_INT_VEC3;
-    if(type.descriptor.rows == 1 && type.descriptor.columns == 2)
+    if(type.rows == 1 && type.columns == 2)
       return eGL_UNSIGNED_INT_VEC2;
-    if(type.descriptor.rows == 1 && type.descriptor.columns == 1)
+    if(type.rows == 1 && type.columns == 1)
       return eGL_UNSIGNED_INT;
 
     return eGL_UNSIGNED_INT;
@@ -230,68 +230,6 @@ static GLenum MakeGLType(const ShaderVariableType &type)
   RDCERR("Unhandled GL type");
 
   return eGL_FLOAT;
-}
-
-static GLenum MakeGLType(const ShaderResource &res)
-{
-  if(res.variableType.descriptor.type == VarType::UInt)
-  {
-    switch(res.resType)
-    {
-      case TextureType::Buffer: return eGL_UNSIGNED_INT_SAMPLER_BUFFER;
-      case TextureType::Texture1D: return eGL_UNSIGNED_INT_SAMPLER_1D;
-      case TextureType::Texture1DArray: return eGL_UNSIGNED_INT_SAMPLER_1D_ARRAY;
-      case TextureType::Texture2D: return eGL_UNSIGNED_INT_SAMPLER_2D;
-      case TextureType::TextureRect: return eGL_UNSIGNED_INT_SAMPLER_2D_RECT;
-      case TextureType::Texture2DArray: return eGL_UNSIGNED_INT_SAMPLER_2D_ARRAY;
-      case TextureType::Texture2DMS: return eGL_UNSIGNED_INT_SAMPLER_2D_MULTISAMPLE;
-      case TextureType::Texture2DMSArray: return eGL_UNSIGNED_INT_SAMPLER_2D_MULTISAMPLE_ARRAY;
-      case TextureType::Texture3D: return eGL_UNSIGNED_INT_SAMPLER_3D;
-      case TextureType::TextureCube: return eGL_UNSIGNED_INT_SAMPLER_CUBE;
-      case TextureType::TextureCubeArray: return eGL_UNSIGNED_INT_SAMPLER_CUBE_MAP_ARRAY;
-      default: break;
-    }
-  }
-  else if(res.variableType.descriptor.type == VarType::SInt)
-  {
-    switch(res.resType)
-    {
-      case TextureType::Buffer: return eGL_INT_SAMPLER_BUFFER;
-      case TextureType::Texture1D: return eGL_INT_SAMPLER_1D;
-      case TextureType::Texture1DArray: return eGL_INT_SAMPLER_1D_ARRAY;
-      case TextureType::Texture2D: return eGL_INT_SAMPLER_2D;
-      case TextureType::TextureRect: return eGL_INT_SAMPLER_2D_RECT;
-      case TextureType::Texture2DArray: return eGL_INT_SAMPLER_2D_ARRAY;
-      case TextureType::Texture2DMS: return eGL_INT_SAMPLER_2D_MULTISAMPLE;
-      case TextureType::Texture2DMSArray: return eGL_INT_SAMPLER_2D_MULTISAMPLE_ARRAY;
-      case TextureType::Texture3D: return eGL_INT_SAMPLER_3D;
-      case TextureType::TextureCube: return eGL_INT_SAMPLER_CUBE;
-      case TextureType::TextureCubeArray: return eGL_INT_SAMPLER_CUBE_MAP_ARRAY;
-      default: break;
-    }
-  }
-  else
-  {
-    switch(res.resType)
-    {
-      case TextureType::Buffer: return eGL_SAMPLER_BUFFER;
-      case TextureType::Texture1D: return eGL_SAMPLER_1D;
-      case TextureType::Texture1DArray: return eGL_SAMPLER_1D_ARRAY;
-      case TextureType::Texture2D: return eGL_SAMPLER_2D;
-      case TextureType::TextureRect: return eGL_SAMPLER_2D_RECT;
-      case TextureType::Texture2DArray: return eGL_SAMPLER_2D_ARRAY;
-      case TextureType::Texture2DMS: return eGL_SAMPLER_2D_MULTISAMPLE;
-      case TextureType::Texture2DMSArray: return eGL_SAMPLER_2D_MULTISAMPLE_ARRAY;
-      case TextureType::Texture3D: return eGL_SAMPLER_3D;
-      case TextureType::TextureCube: return eGL_SAMPLER_CUBE;
-      case TextureType::TextureCubeArray: return eGL_SAMPLER_CUBE_MAP_ARRAY;
-      default: break;
-    }
-  }
-
-  RDCERR("Unhandled GL type");
-
-  return eGL_SAMPLER_2D;
 }
 
 static void UnrollConstant(rdcarray<UnrolledSPIRVConstant> &unrolled, const ShaderConstant &var,
@@ -311,7 +249,7 @@ static void UnrollConstant(rdcarray<UnrolledSPIRVConstant> &unrolled, const Shad
     name = var.name;
   }
 
-  const uint32_t arraySize = RDCMAX(1U, var.type.descriptor.elements);
+  const uint32_t arraySize = RDCMAX(1U, var.type.elements);
 
   if(var.type.members.empty())
   {
@@ -353,7 +291,7 @@ static void UnrollConstant(rdcarray<UnrolledSPIRVConstant> &unrolled, const Shad
 static void UnrollConstants(const PerStageReflections &stages,
                             rdcarray<UnrolledSPIRVConstant> &globals)
 {
-  for(size_t s = 0; s < 6; s++)
+  for(size_t s = 0; s < NumShaderStages; s++)
   {
     if(!stages.refls[s])
       continue;
@@ -382,36 +320,6 @@ static void UnrollConstants(const PerStageReflections &stages,
 
           if(!already)
             UnrollConstant(globals, shaderConst);
-        }
-      }
-    }
-
-    // now include the samplers which can be bound
-    for(const ShaderResource &res : stages.refls[s]->readOnlyResources)
-    {
-      if(res.isTexture && res.bindPoint < stages.mappings[s]->readOnlyResources.count())
-      {
-        int32_t location = -stages.mappings[s]->readOnlyResources[res.bindPoint].bind;
-
-        bool already = false;
-
-        for(const UnrolledSPIRVConstant &existing : globals)
-        {
-          if(existing.location == location)
-          {
-            already = true;
-            break;
-          }
-        }
-
-        if(!already)
-        {
-          UnrolledSPIRVConstant u;
-          u.glType = MakeGLType(res);
-          memcpy(u.name, res.name.c_str(), RDCMIN(res.name.size(), ARRAY_COUNT(u.name)));
-          u.arraySize = 1;
-          u.location = location;
-          globals.push_back(u);
         }
       }
     }
@@ -661,12 +569,14 @@ static void ForAllProgramUniforms(SerialiserType *ser, CaptureState state,
   // we only need to process uniform values - for compatibility we still serialise the same, but we
   // skip fetching or applying UBO bindings etc.
   bool IsSrcProgramSPIRV = false;
-  for(size_t i = 0; i < 6; i++)
-    IsSrcProgramSPIRV |= srcStages.refls[i] && srcStages.refls[i]->encoding == ShaderEncoding::SPIRV;
+  for(size_t i = 0; i < NumShaderStages; i++)
+    IsSrcProgramSPIRV |=
+        srcStages.refls[i] && srcStages.refls[i]->encoding == ShaderEncoding::OpenGLSPIRV;
 
   bool IsDstProgramSPIRV = false;
-  for(size_t i = 0; i < 6; i++)
-    IsDstProgramSPIRV |= dstStages.refls[i] && dstStages.refls[i]->encoding == ShaderEncoding::SPIRV;
+  for(size_t i = 0; i < NumShaderStages; i++)
+    IsDstProgramSPIRV |=
+        dstStages.refls[i] && dstStages.refls[i]->encoding == ShaderEncoding::OpenGLSPIRV;
 
   RDCASSERTMSG("Expect both programs to be SPIR-V in ForAllProgramUniforms",
                IsSrcProgramSPIRV == IsDstProgramSPIRV, IsSrcProgramSPIRV, IsDstProgramSPIRV);
@@ -712,7 +622,7 @@ static void ForAllProgramUniforms(SerialiserType *ser, CaptureState state,
       GLenum type = eGL_NONE;
       int32_t arraySize = 0;
       int32_t srcLocation = 0;
-      std::string basename;
+      rdcstr basename;
       bool isArray = false;
 
       if(IsSrcProgramSPIRV)
@@ -789,7 +699,7 @@ static void ForAllProgramUniforms(SerialiserType *ser, CaptureState state,
         uniformVal.Type = type;
         uniformVal.Location = srcLocation;
 
-        std::string name = basename;
+        rdcstr name = basename;
 
         // atomic counters cannot be changed, don't fetch their value
         if(type == eGL_UNSIGNED_INT_ATOMIC_COUNTER)
@@ -811,6 +721,9 @@ static void ForAllProgramUniforms(SerialiserType *ser, CaptureState state,
           if(srcLocation == -1)
             RDCWARN("Couldn't get srcLocation for %s", name.c_str());
         }
+
+        if(srcLocation == -1)
+          continue;
 
         // fetch the data into the ProgramUniformValue, with the appropriate method for its type
         double *dv = uniformVal.data.dval;
@@ -845,9 +758,7 @@ static void ForAllProgramUniforms(SerialiserType *ser, CaptureState state,
           case eGL_DOUBLE:
           case eGL_DOUBLE_VEC2:
           case eGL_DOUBLE_VEC3:
-          case eGL_DOUBLE_VEC4:
-            GL.glGetUniformdv(progSrc, srcLocation, dv);
-            break;
+          case eGL_DOUBLE_VEC4: GL.glGetUniformdv(progSrc, srcLocation, dv); break;
 
           // treat all samplers as just an int (since they just store their binding value)
           case eGL_SAMPLER_1D:
@@ -925,9 +836,7 @@ static void ForAllProgramUniforms(SerialiserType *ser, CaptureState state,
           case eGL_INT:
           case eGL_INT_VEC2:
           case eGL_INT_VEC3:
-          case eGL_INT_VEC4:
-            GL.glGetUniformiv(progSrc, srcLocation, iv);
-            break;
+          case eGL_INT_VEC4: GL.glGetUniformiv(progSrc, srcLocation, iv); break;
           // bools are unsigned integers
           case eGL_UNSIGNED_INT:
           case eGL_BOOL:
@@ -1009,7 +918,7 @@ static void ForAllProgramUniforms(SerialiserType *ser, CaptureState state,
       {
         const ProgramUniformValue &val = uniform.Values[arr];
 
-        std::string name = uniform.Basename;
+        rdcstr name = uniform.Basename;
 
         if(uniform.IsArray)
           name += StringFormat::Fmt("[%u]", (uint32_t)arr);
@@ -1118,6 +1027,7 @@ static void ForAllProgramUniforms(SerialiserType *ser, CaptureState state,
           case eGL_DOUBLE_VEC2: GL.glProgramUniform2dv(progDst, dstLocation, 1, dv); break;
           case eGL_DOUBLE_VEC3: GL.glProgramUniform3dv(progDst, dstLocation, 1, dv); break;
           case eGL_DOUBLE_VEC4: GL.glProgramUniform4dv(progDst, dstLocation, 1, dv); break;
+          case eGL_INT: GL.glProgramUniform1iv(progDst, dstLocation, 1, iv); break;
           case eGL_INT_VEC2: GL.glProgramUniform2iv(progDst, dstLocation, 1, iv); break;
           case eGL_INT_VEC3: GL.glProgramUniform3iv(progDst, dstLocation, 1, iv); break;
           case eGL_INT_VEC4: GL.glProgramUniform4iv(progDst, dstLocation, 1, iv); break;
@@ -1166,7 +1076,7 @@ static void ForAllProgramUniforms(SerialiserType *ser, CaptureState state,
             if(IsGLES || IsDstProgramSPIRV)
               // Image uniforms cannot be re-assigned in GLES or with SPIR-V programs.
               break;
-          // deliberate fall-through
+            DELIBERATE_FALLTHROUGH();
           // treat all samplers as just an int (since they just store their binding value)
           case eGL_SAMPLER_1D:
           case eGL_SAMPLER_2D:
@@ -1208,7 +1118,6 @@ static void ForAllProgramUniforms(SerialiserType *ser, CaptureState state,
           case eGL_UNSIGNED_INT_SAMPLER_2D_MULTISAMPLE_ARRAY:
           case eGL_UNSIGNED_INT_SAMPLER_BUFFER:
           case eGL_UNSIGNED_INT_SAMPLER_2D_RECT:
-          case eGL_INT:
             if(!IsDstProgramSPIRV)    // SPIR-V shaders treat samplers as immutable
               GL.glProgramUniform1iv(progDst, dstLocation, 1, iv);
             break;
@@ -1254,12 +1163,13 @@ static void ForAllProgramUniforms(SerialiserType *ser, CaptureState state,
 }
 
 void CopyProgramUniforms(const PerStageReflections &srcStages, GLuint progSrc,
-                         const PerStageReflections &dstStages, GLuint progDst)
+                         const PerStageReflections &dstStages, GLuint progDst,
+                         std::map<GLint, GLint> *locTranslate)
 {
   const bool CopyUniforms = true;
   const bool SerialiseUniforms = false;
   ForAllProgramUniforms<CopyUniforms, SerialiseUniforms, ReadSerialiser>(
-      NULL, CaptureState::ActiveReplaying, srcStages, progSrc, dstStages, progDst, NULL);
+      NULL, CaptureState::ActiveReplaying, srcStages, progSrc, dstStages, progDst, locTranslate);
 }
 
 template <typename SerialiserType>
@@ -1284,7 +1194,7 @@ bool CopyProgramAttribBindings(GLuint progsrc, GLuint progdst, ShaderReflection 
 {
   // don't try to copy bindings for SPIR-V shaders. The queries by name may fail, and the bindings
   // are immutable anyway
-  if(refl->encoding == ShaderEncoding::SPIRV)
+  if(refl->encoding == ShaderEncoding::OpenGLSPIRV)
     return false;
 
   // copy over attrib bindings
@@ -1306,7 +1216,7 @@ bool CopyProgramFragDataBindings(GLuint progsrc, GLuint progdst, ShaderReflectio
 {
   // don't try to copy bindings for SPIR-V shaders. The queries by name may fail, and the bindings
   // are immutable anyway
-  if(refl->encoding == ShaderEncoding::SPIRV)
+  if(refl->encoding == ShaderEncoding::OpenGLSPIRV)
     return false;
 
   uint64_t used = 0;
@@ -1335,15 +1245,11 @@ bool CopyProgramFragDataBindings(GLuint progsrc, GLuint progdst, ShaderReflectio
 
       used |= mask;
 
-      if(GL.glBindFragDataLocation)
+      // glBindFragDataLocation is not core GLES. However when it's not available that means the
+      // user must have explicitly specified locations so we don't need to set them.
+      if(!IsGLES && GL.glBindFragDataLocation)
       {
         GL.glBindFragDataLocation(progdst, (GLuint)idx, refl->outputSignature[i].varName.c_str());
-      }
-      else
-      {
-        // glBindFragDataLocation is not core GLES, but it is in GL_EXT_blend_func_extended
-        // TODO what to do if that extension is not supported
-        RDCWARN("glBindFragDataLocation is not supported!");
       }
     }
   }
@@ -1355,15 +1261,18 @@ template <typename SerialiserType>
 bool SerialiseProgramBindings(SerialiserType &ser, CaptureState state,
                               const PerStageReflections &stages, GLuint prog)
 {
-  std::vector<ProgramBinding> InputBindings;
-  std::vector<ProgramBinding> OutputBindings;
+  rdcarray<ProgramBinding> InputBindings;
+  rdcarray<ProgramBinding> OutputBindings;
 
   // technically we can completely skip this if the shaders are SPIR-V, but for compatibility we
   // instead just skip the fetch & apply steps, so that we can still serialise in a backwards
   // compatible way.
   bool IsProgramSPIRV = false;
-  for(size_t i = 0; i < 6; i++)
-    IsProgramSPIRV |= stages.refls[i] && stages.refls[i]->encoding == ShaderEncoding::SPIRV;
+  for(size_t i = 0; i < NumShaderStages; i++)
+    IsProgramSPIRV |= stages.refls[i] && stages.refls[i]->encoding == ShaderEncoding::OpenGLSPIRV;
+
+  const bool hasVert = stages.refls[0] != NULL;
+  const bool hasFrag = stages.refls[5] != NULL;
 
   if(ser.IsWriting() && !IsProgramSPIRV)
   {
@@ -1372,7 +1281,7 @@ bool SerialiseProgramBindings(SerialiserType &ser, CaptureState state,
     for(int sigType = 0; sigType < 2; sigType++)
     {
       GLenum sigEnum = (sigType == 0 ? eGL_PROGRAM_INPUT : eGL_PROGRAM_OUTPUT);
-      std::vector<ProgramBinding> &bindings = (sigType == 0 ? InputBindings : OutputBindings);
+      rdcarray<ProgramBinding> &bindings = (sigType == 0 ? InputBindings : OutputBindings);
 
       int32_t NumAttributes = 0;
       GL.glGetProgramInterfaceiv(prog, sigEnum, eGL_ACTIVE_RESOURCES, (GLint *)&NumAttributes);
@@ -1385,10 +1294,19 @@ bool SerialiseProgramBindings(SerialiserType &ser, CaptureState state,
         ProgramBinding bind;
         bind.Name = buf;
 
-        if(sigType == 0)
-          bind.Binding = GL.glGetAttribLocation(prog, buf);
+        // don't query for gl_ bindings. Serialise it anyway to preserve legacy compatibility, but
+        // on replay below we won't try to set this binding either
+        if(bind.Name.beginsWith("gl_"))
+        {
+          bind.Binding = -1;
+        }
         else
-          bind.Binding = GL.glGetFragDataLocation(prog, buf);
+        {
+          if(sigType == 0)
+            bind.Binding = GL.glGetAttribLocation(prog, buf);
+          else
+            bind.Binding = GL.glGetFragDataLocation(prog, buf);
+        }
 
         bindings.push_back(bind);
       }
@@ -1402,7 +1320,7 @@ bool SerialiseProgramBindings(SerialiserType &ser, CaptureState state,
   {
     for(int sigType = 0; sigType < 2; sigType++)
     {
-      const std::vector<ProgramBinding> &bindings = (sigType == 0 ? InputBindings : OutputBindings);
+      const rdcarray<ProgramBinding> &bindings = (sigType == 0 ? InputBindings : OutputBindings);
 
       uint64_t used = 0;
 
@@ -1421,25 +1339,22 @@ bool SerialiseProgramBindings(SerialiserType &ser, CaptureState state,
 
           used |= mask;
 
-          if(!strncmp("gl_", bind.Name.c_str(), 3))
-            continue;    // GL_INVALID_OPERATION if name starts with reserved gl_ prefix (for both
-                         // glBindAttribLocation and glBindFragDataLocation)
+          // GL_INVALID_OPERATION if name starts with reserved gl_ prefix (for both
+          // glBindAttribLocation and glBindFragDataLocation)
+          if(bind.Name.beginsWith("gl_"))
+            continue;
 
-          if(sigType == 0)
+          if(sigType == 0 && hasVert)
           {
             GL.glBindAttribLocation(prog, (GLuint)bind.Binding, bind.Name.c_str());
           }
-          else
+          else if(sigType == 1 && hasFrag)
           {
-            if(GL.glBindFragDataLocation)
+            // glBindFragDataLocation is not core GLES. However when it's not available that means
+            // the user must have explicitly specified locations so we don't need to set them.
+            if(!IsGLES && GL.glBindFragDataLocation)
             {
               GL.glBindFragDataLocation(prog, (GLuint)bind.Binding, bind.Name.c_str());
-            }
-            else
-            {
-              // glBindFragDataLocation is not core GLES, but it is in GL_EXT_blend_func_extended
-              // TODO what to do if that extension is not supported
-              RDCWARN("glBindFragDataLocation is not supported!");
             }
           }
         }

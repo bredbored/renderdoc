@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2018-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -27,7 +27,10 @@
 #include "gl_common.h"
 
 typedef EGLBoolean(EGLAPIENTRY *PFN_eglBindAPI)(EGLenum api);
+typedef EGLenum(EGLAPIENTRY *PFN_eglQueryAPI)();
 typedef EGLDisplay(EGLAPIENTRY *PFN_eglGetDisplay)(EGLNativeDisplayType display_id);
+typedef EGLDisplay(EGLAPIENTRY *PFN_eglGetPlatformDisplay)(EGLenum platform, void *native_display,
+                                                           const EGLAttrib *attrib_list);
 typedef EGLContext(EGLAPIENTRY *PFN_eglCreateContext)(EGLDisplay dpy, EGLConfig config,
                                                       EGLContext share_context,
                                                       const EGLint *attrib_list);
@@ -43,6 +46,9 @@ typedef EGLSurface(EGLAPIENTRY *PFN_eglCreatePbufferSurface)(EGLDisplay dpy, EGL
 typedef EGLSurface(EGLAPIENTRY *PFN_eglCreateWindowSurface)(EGLDisplay dpy, EGLConfig config,
                                                             EGLNativeWindowType win,
                                                             const EGLint *attrib_list);
+typedef EGLSurface(EGLAPIENTRY *PFN_eglCreatePlatformWindowSurface)(EGLDisplay dpy, EGLConfig config,
+                                                                    void *native_window,
+                                                                    const EGLAttrib *attrib_list);
 typedef EGLBoolean(EGLAPIENTRY *PFN_eglChooseConfig)(EGLDisplay dpy, const EGLint *attrib_list,
                                                      EGLConfig *configs, EGLint config_size,
                                                      EGLint *num_config);
@@ -56,35 +62,41 @@ typedef EGLint(EGLAPIENTRY *PFN_eglGetError)(void);
 typedef EGLBoolean(EGLAPIENTRY *PFN_eglGetConfigAttrib)(EGLDisplay dpy, EGLConfig config,
                                                         EGLint attribute, EGLint *value);
 typedef const char *(EGLAPIENTRY *PFN_eglQueryString)(EGLDisplay dpy, EGLint name);
+typedef EGLBoolean(EGLAPIENTRY *PFN_eglQueryContext)(EGLDisplay dpy, EGLContext ctx,
+                                                     EGLint attribute, EGLint *value);
 typedef PFNEGLPOSTSUBBUFFERNVPROC PFN_eglPostSubBufferNV;
 typedef PFNEGLSWAPBUFFERSWITHDAMAGEEXTPROC PFN_eglSwapBuffersWithDamageEXT;
 typedef PFNEGLSWAPBUFFERSWITHDAMAGEKHRPROC PFN_eglSwapBuffersWithDamageKHR;
 
-#define EGL_HOOKED_SYMBOLS(FUNC)        \
-  FUNC(BindAPI, false);                 \
-  FUNC(GetProcAddress, false);          \
-  FUNC(GetDisplay, false);              \
-  FUNC(CreateContext, false);           \
-  FUNC(DestroyContext, false);          \
-  FUNC(CreateWindowSurface, false);     \
-  FUNC(MakeCurrent, false);             \
-  FUNC(SwapBuffers, false);             \
-  FUNC(PostSubBufferNV, true);          \
-  FUNC(SwapBuffersWithDamageEXT, true); \
-  FUNC(SwapBuffersWithDamageKHR, true);
+#define EGL_HOOKED_SYMBOLS(FUNC)                   \
+  FUNC(BindAPI, false, true);                      \
+  FUNC(GetProcAddress, false, true);               \
+  FUNC(GetDisplay, false, true);                   \
+  FUNC(GetPlatformDisplay, false, false);          \
+  FUNC(CreateContext, false, true);                \
+  FUNC(DestroyContext, false, true);               \
+  FUNC(CreateWindowSurface, false, true);          \
+  FUNC(CreatePlatformWindowSurface, false, false); \
+  FUNC(MakeCurrent, false, true);                  \
+  FUNC(SwapBuffers, false, true);                  \
+  FUNC(QueryString, false, true);                  \
+  FUNC(PostSubBufferNV, true, false);              \
+  FUNC(SwapBuffersWithDamageEXT, true, false);     \
+  FUNC(SwapBuffersWithDamageKHR, true, false);
 
-#define EGL_NONHOOKED_SYMBOLS(FUNC)  \
-  FUNC(ChooseConfig, false);         \
-  FUNC(CreatePbufferSurface, false); \
-  FUNC(DestroySurface, false);       \
-  FUNC(GetConfigAttrib, false);      \
-  FUNC(GetCurrentContext, false);    \
-  FUNC(GetCurrentDisplay, false);    \
-  FUNC(GetCurrentSurface, false);    \
-  FUNC(GetError, false);             \
-  FUNC(Initialize, false);           \
-  FUNC(QueryString, false);          \
-  FUNC(QuerySurface, false);
+#define EGL_NONHOOKED_SYMBOLS(FUNC)        \
+  FUNC(ChooseConfig, false, true);         \
+  FUNC(CreatePbufferSurface, false, true); \
+  FUNC(DestroySurface, false, true);       \
+  FUNC(GetConfigAttrib, false, false);     \
+  FUNC(GetCurrentContext, false, true);    \
+  FUNC(GetCurrentDisplay, false, true);    \
+  FUNC(GetCurrentSurface, false, true);    \
+  FUNC(GetError, false, true);             \
+  FUNC(Initialize, false, true);           \
+  FUNC(QueryAPI, false, true);             \
+  FUNC(QuerySurface, false, true);         \
+  FUNC(QueryContext, false, true);
 
 struct EGLDispatchTable
 {
@@ -102,7 +114,7 @@ struct EGLDispatchTable
 // Generate the EGL function pointers. We need to consider hooked and non-hooked symbols separately
 // - non-hooked symbols don't have a function hook to register, or if they do it's a dummy
 // pass-through hook that will risk calling itself via trampoline.
-#define EGL_PTR_GEN(func, isext) CONCAT(PFN_egl, func) func;
+#define EGL_PTR_GEN(func, isext, replayrequired) CONCAT(PFN_egl, func) func;
   EGL_HOOKED_SYMBOLS(EGL_PTR_GEN)
   EGL_NONHOOKED_SYMBOLS(EGL_PTR_GEN)
 #undef EGL_PTR_GEN

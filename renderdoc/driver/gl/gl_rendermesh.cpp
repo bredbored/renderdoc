@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2018-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -33,7 +33,17 @@
 #define OPENGL 1
 #include "data/glsl/glsl_ubos_cpp.h"
 
-void GLReplay::RenderMesh(uint32_t eventId, const std::vector<MeshFormat> &secondaryDraws,
+static int VisModeToMeshDisplayFormat(const MeshDisplay &cfg)
+{
+  switch(cfg.visualisationMode)
+  {
+    default: return (int)cfg.visualisationMode;
+    case Visualisation::Secondary:
+      return cfg.second.showAlpha ? MESHDISPLAY_SECONDARY_ALPHA : MESHDISPLAY_SECONDARY;
+  }
+}
+
+void GLReplay::RenderMesh(uint32_t eventId, const rdcarray<MeshFormat> &secondaryDraws,
                           const MeshDisplay &cfg)
 {
   WrappedOpenGL &drv = *m_pDriver;
@@ -51,7 +61,9 @@ void GLReplay::RenderMesh(uint32_t eventId, const std::vector<MeshFormat> &secon
 
   Matrix4f camMat = cfg.cam ? ((Camera *)cfg.cam)->GetMatrix() : Matrix4f::Identity();
 
-  Matrix4f ModelViewProj = projMat.Mul(camMat);
+  Matrix4f axisMapMat = Matrix4f(cfg.axisMapping);
+
+  Matrix4f ModelViewProj = projMat.Mul(camMat.Mul(axisMapMat));
   Matrix4f guessProjInv;
 
   drv.glBindVertexArray(DebugData.meshVAO);
@@ -67,6 +79,20 @@ void GLReplay::RenderMesh(uint32_t eventId, const std::vector<MeshFormat> &secon
 
   if(HasExt[EXT_framebuffer_sRGB])
     drv.glEnable(eGL_FRAMEBUFFER_SRGB);
+
+  if(cfg.position.allowRestart)
+  {
+    if(IsGLES)
+    {
+      drv.glEnable(eGL_PRIMITIVE_RESTART_FIXED_INDEX);
+    }
+    else
+    {
+      drv.glEnable(eGL_PRIMITIVE_RESTART);
+      drv.glPrimitiveRestartIndex(cfg.position.restartIndex &
+                                  (0xFFFFFFFFU >> ((4 - cfg.position.indexByteStride) * 8)));
+    }
+  }
 
   drv.glDisable(eGL_CULL_FACE);
 
@@ -84,6 +110,11 @@ void GLReplay::RenderMesh(uint32_t eventId, const std::vector<MeshFormat> &secon
       guessProj = Matrix4f::Orthographic(cfg.position.nearPlane, cfg.position.farPlane);
     }
 
+    if(cfg.position.flipY)
+    {
+      guessProj[5] *= -1.0f;
+    }
+
     guessProjInv = guessProj.Inverse();
 
     ModelViewProj = projMat.Mul(camMat.Mul(guessProjInv));
@@ -92,6 +123,12 @@ void GLReplay::RenderMesh(uint32_t eventId, const std::vector<MeshFormat> &secon
   uboParams.mvp = ModelViewProj;
   uboParams.homogenousInput = cfg.position.unproject;
   uboParams.pointSpriteSize = Vec2f(0.0f, 0.0f);
+  uboParams.vtxExploderSNorm = cfg.vtxExploderSliderSNorm;
+  uboParams.exploderScale =
+      (cfg.visualisationMode == Visualisation::Explode) ? cfg.exploderScale : 0.0f;
+  uboParams.exploderCentre =
+      Vec3f((cfg.minBounds.x + cfg.maxBounds.x) * 0.5f, (cfg.minBounds.y + cfg.maxBounds.y) * 0.5f,
+            (cfg.minBounds.z + cfg.maxBounds.z) * 0.5f);
 
   if(!secondaryDraws.empty())
   {
@@ -118,6 +155,13 @@ void GLReplay::RenderMesh(uint32_t eventId, const std::vector<MeshFormat> &secon
 
         uboptr = (MeshUBOData *)drv.glMapBufferRange(eGL_UNIFORM_BUFFER, 0, sizeof(MeshUBOData),
                                                      GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
+
+        if(!uboptr)
+        {
+          RDCERR("Map buffer failed %d", drv.glGetError());
+          return;
+        }
+
         *uboptr = uboParams;
         drv.glUnmapBuffer(eGL_UNIFORM_BUFFER);
 
@@ -125,8 +169,8 @@ void GLReplay::RenderMesh(uint32_t eventId, const std::vector<MeshFormat> &secon
         drv.glBindVertexBuffer(0, vb, (GLintptr)fmt.vertexByteOffset, fmt.vertexByteStride);
 
         {
-          GLint bytesize = 0;
-          drv.glGetNamedBufferParameterivEXT(vb, eGL_BUFFER_SIZE, &bytesize);
+          GLuint bytesize = 0;
+          drv.glGetNamedBufferParameterivEXT(vb, eGL_BUFFER_SIZE, (GLint *)&bytesize);
 
           // skip empty source buffers
           if(bytesize == 0)
@@ -188,36 +232,45 @@ void GLReplay::RenderMesh(uint32_t eventId, const std::vector<MeshFormat> &secon
             meshData[i]->format.compType == CompType::UNorm ||
             meshData[i]->format.compType == CompType::SNorm)
     {
-      GLenum fmttype = eGL_UNSIGNED_INT;
+      if(meshData[i]->format.compByteWidth == 8)
+      {
+        drv.glVertexAttribLFormat(i, meshData[i]->format.compCount, eGL_DOUBLE, 0);
 
-      if(meshData[i]->format.compByteWidth == 4)
-      {
-        if(meshData[i]->format.compType == CompType::Float)
-          fmttype = eGL_FLOAT;
-        else if(meshData[i]->format.compType == CompType::UNorm)
-          fmttype = eGL_UNSIGNED_INT;
-        else if(meshData[i]->format.compType == CompType::SNorm)
-          fmttype = eGL_INT;
+        progidx |= (1 << i);
       }
-      else if(meshData[i]->format.compByteWidth == 2)
+      else
       {
-        if(meshData[i]->format.compType == CompType::Float)
-          fmttype = eGL_HALF_FLOAT;
-        else if(meshData[i]->format.compType == CompType::UNorm)
-          fmttype = eGL_UNSIGNED_SHORT;
-        else if(meshData[i]->format.compType == CompType::SNorm)
-          fmttype = eGL_SHORT;
-      }
-      else if(meshData[i]->format.compByteWidth == 1)
-      {
-        if(meshData[i]->format.compType == CompType::UNorm)
-          fmttype = eGL_UNSIGNED_BYTE;
-        else if(meshData[i]->format.compType == CompType::SNorm)
-          fmttype = eGL_BYTE;
-      }
+        GLenum fmttype = eGL_UNSIGNED_INT;
 
-      drv.glVertexAttribFormat(i, meshData[i]->format.compCount, fmttype,
-                               meshData[i]->format.compType != CompType::Float, 0);
+        if(meshData[i]->format.compByteWidth == 4)
+        {
+          if(meshData[i]->format.compType == CompType::Float)
+            fmttype = eGL_FLOAT;
+          else if(meshData[i]->format.compType == CompType::UNorm)
+            fmttype = eGL_UNSIGNED_INT;
+          else if(meshData[i]->format.compType == CompType::SNorm)
+            fmttype = eGL_INT;
+        }
+        else if(meshData[i]->format.compByteWidth == 2)
+        {
+          if(meshData[i]->format.compType == CompType::Float)
+            fmttype = eGL_HALF_FLOAT;
+          else if(meshData[i]->format.compType == CompType::UNorm)
+            fmttype = eGL_UNSIGNED_SHORT;
+          else if(meshData[i]->format.compType == CompType::SNorm)
+            fmttype = eGL_SHORT;
+        }
+        else if(meshData[i]->format.compByteWidth == 1)
+        {
+          if(meshData[i]->format.compType == CompType::UNorm)
+            fmttype = eGL_UNSIGNED_BYTE;
+          else if(meshData[i]->format.compType == CompType::SNorm)
+            fmttype = eGL_BYTE;
+        }
+
+        drv.glVertexAttribFormat(i, meshData[i]->format.compCount, fmttype,
+                                 meshData[i]->format.compType != CompType::Float, 0);
+      }
     }
     else if(meshData[i]->format.compType == CompType::UInt ||
             meshData[i]->format.compType == CompType::SInt)
@@ -248,12 +301,6 @@ void GLReplay::RenderMesh(uint32_t eventId, const std::vector<MeshFormat> &secon
 
       drv.glVertexAttribIFormat(i, meshData[i]->format.compCount, fmttype, 0);
     }
-    else if(meshData[i]->format.compType == CompType::Double)
-    {
-      drv.glVertexAttribLFormat(i, meshData[i]->format.compCount, eGL_DOUBLE, 0);
-
-      progidx |= (1 << i);
-    }
 
     GLintptr offs = (GLintptr)meshData[i]->vertexByteOffset;
 
@@ -264,8 +311,8 @@ void GLReplay::RenderMesh(uint32_t eventId, const std::vector<MeshFormat> &secon
         m_pDriver->GetResourceManager()->GetCurrentResource(meshData[i]->vertexResourceId).name;
 
     {
-      GLint bytesize = 0;
-      drv.glGetNamedBufferParameterivEXT(vb, eGL_BUFFER_SIZE, &bytesize);
+      GLuint bytesize = 0;
+      drv.glGetNamedBufferParameterivEXT(vb, eGL_BUFFER_SIZE, (GLint *)&bytesize);
 
       // skip empty source buffers
       if(bytesize == 0)
@@ -302,13 +349,15 @@ void GLReplay::RenderMesh(uint32_t eventId, const std::vector<MeshFormat> &secon
   drv.glEnable(eGL_DEPTH_TEST);
 
   // solid render
-  if(cfg.solidShadeMode != SolidShade::NoSolid && topo != eGL_PATCHES)
+  if(cfg.visualisationMode != Visualisation::NoSolid && topo != eGL_PATCHES)
   {
     drv.glDepthFunc(eGL_LESS);
 
     GLuint solidProg = prog;
 
-    if(cfg.solidShadeMode == SolidShade::Lit && DebugData.meshgsProg[0])
+    if((cfg.visualisationMode == Visualisation::Lit ||
+        cfg.visualisationMode == Visualisation::Explode) &&
+       DebugData.meshgsProg[0])
     {
       // pick program with GS for per-face lighting
       solidProg = DebugData.meshgsProg[progidx];
@@ -321,26 +370,22 @@ void GLReplay::RenderMesh(uint32_t eventId, const std::vector<MeshFormat> &secon
 
       ClearGLErrors();
       drv.glUseProgram(solidProg);
-      GLenum err = drv.glGetError();
-
-      err = eGL_NONE;
     }
 
     MeshUBOData *soliddata = (MeshUBOData *)drv.glMapBufferRange(
         eGL_UNIFORM_BUFFER, 0, sizeof(MeshUBOData), GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
 
-    soliddata->mvp = ModelViewProj;
-    soliddata->pointSpriteSize = Vec2f(0.0f, 0.0f);
-    soliddata->homogenousInput = cfg.position.unproject;
+    if(!soliddata)
+    {
+      RDCERR("Map buffer failed %d", drv.glGetError());
+      return;
+    }
 
-    soliddata->color = Vec4f(0.8f, 0.8f, 0.0f, 1.0f);
+    uboParams.color = Vec4f(0.8f, 0.8f, 0.0f, 1.0f);
+    uboParams.displayFormat = VisModeToMeshDisplayFormat(cfg);
+    *soliddata = uboParams;
 
-    uint32_t OutputDisplayFormat = (uint32_t)cfg.solidShadeMode;
-    if(cfg.solidShadeMode == SolidShade::Secondary && cfg.second.showAlpha)
-      OutputDisplayFormat = MESHDISPLAY_SECONDARY_ALPHA;
-    soliddata->displayFormat = OutputDisplayFormat;
-
-    if(cfg.solidShadeMode == SolidShade::Lit)
+    if(cfg.visualisationMode == Visualisation::Lit || cfg.visualisationMode == Visualisation::Explode)
       soliddata->invProj = projMat.Inverse();
 
     drv.glUnmapBuffer(eGL_UNIFORM_BUFFER);
@@ -383,19 +428,26 @@ void GLReplay::RenderMesh(uint32_t eventId, const std::vector<MeshFormat> &secon
 
   drv.glDepthFunc(eGL_ALWAYS);
 
+  uboParams.displayFormat = MESHDISPLAY_SOLID;
+
   // wireframe render
-  if(cfg.solidShadeMode == SolidShade::NoSolid || cfg.wireframeDraw || topo == eGL_PATCHES)
+  if(cfg.visualisationMode == Visualisation::NoSolid || cfg.wireframeDraw || topo == eGL_PATCHES)
   {
     uboParams.color = Vec4f(cfg.position.meshColor.x, cfg.position.meshColor.y,
                             cfg.position.meshColor.z, cfg.position.meshColor.w);
-
-    uboParams.displayFormat = MESHDISPLAY_SOLID;
 
     if(!IsGLES)
       drv.glPolygonMode(eGL_FRONT_AND_BACK, eGL_LINE);
 
     uboptr = (MeshUBOData *)drv.glMapBufferRange(eGL_UNIFORM_BUFFER, 0, sizeof(MeshUBOData),
                                                  GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
+
+    if(!uboptr)
+    {
+      RDCERR("Map buffer failed %d", drv.glGetError());
+      return;
+    }
+
     *uboptr = uboParams;
     drv.glUnmapBuffer(eGL_UNIFORM_BUFFER);
 
@@ -427,6 +479,10 @@ void GLReplay::RenderMesh(uint32_t eventId, const std::vector<MeshFormat> &secon
 
   // helpers always use basic float-input program
   drv.glUseProgram(DebugData.meshProg[0]);
+
+  uboParams.vtxExploderSNorm = 0.0f;
+  uboParams.exploderScale = 0.0f;
+  uboParams.exploderCentre = Vec3f();
 
   if(cfg.showBBox)
   {
@@ -460,11 +516,20 @@ void GLReplay::RenderMesh(uint32_t eventId, const std::vector<MeshFormat> &secon
     uboParams.color = Vec4f(0.2f, 0.2f, 1.0f, 1.0f);
 
     Matrix4f mvpMat = projMat.Mul(camMat);
+    if(!cfg.position.unproject)
+      mvpMat = mvpMat.Mul(axisMapMat);
 
     uboParams.mvp = mvpMat;
 
     uboptr = (MeshUBOData *)drv.glMapBufferRange(eGL_UNIFORM_BUFFER, 0, sizeof(MeshUBOData),
                                                  GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
+
+    if(!uboptr)
+    {
+      RDCERR("Map buffer failed %d", drv.glGetError());
+      return;
+    }
+
     *uboptr = uboParams;
     drv.glUnmapBuffer(eGL_UNIFORM_BUFFER);
 
@@ -484,6 +549,13 @@ void GLReplay::RenderMesh(uint32_t eventId, const std::vector<MeshFormat> &secon
     uboParams.color = Vec4f(1.0f, 0.0f, 0.0f, 1.0f);
     uboptr = (MeshUBOData *)drv.glMapBufferRange(eGL_UNIFORM_BUFFER, 0, sizeof(MeshUBOData),
                                                  GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
+
+    if(!uboptr)
+    {
+      RDCERR("Map buffer failed %d", drv.glGetError());
+      return;
+    }
+
     *uboptr = uboParams;
     drv.glUnmapBuffer(eGL_UNIFORM_BUFFER);
 
@@ -492,6 +564,13 @@ void GLReplay::RenderMesh(uint32_t eventId, const std::vector<MeshFormat> &secon
     uboParams.color = Vec4f(0.0f, 1.0f, 0.0f, 1.0f);
     uboptr = (MeshUBOData *)drv.glMapBufferRange(eGL_UNIFORM_BUFFER, 0, sizeof(MeshUBOData),
                                                  GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
+
+    if(!uboptr)
+    {
+      RDCERR("Map buffer failed %d", drv.glGetError());
+      return;
+    }
+
     *uboptr = uboParams;
     drv.glUnmapBuffer(eGL_UNIFORM_BUFFER);
     drv.glDrawArrays(eGL_LINES, 2, 2);
@@ -499,6 +578,13 @@ void GLReplay::RenderMesh(uint32_t eventId, const std::vector<MeshFormat> &secon
     uboParams.color = Vec4f(0.0f, 0.0f, 1.0f, 1.0f);
     uboptr = (MeshUBOData *)drv.glMapBufferRange(eGL_UNIFORM_BUFFER, 0, sizeof(MeshUBOData),
                                                  GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
+
+    if(!uboptr)
+    {
+      RDCERR("Map buffer failed %d", drv.glGetError());
+      return;
+    }
+
     *uboptr = uboParams;
     drv.glUnmapBuffer(eGL_UNIFORM_BUFFER);
     drv.glDrawArrays(eGL_LINES, 4, 2);
@@ -514,6 +600,13 @@ void GLReplay::RenderMesh(uint32_t eventId, const std::vector<MeshFormat> &secon
 
     uboptr = (MeshUBOData *)drv.glMapBufferRange(eGL_UNIFORM_BUFFER, 0, sizeof(MeshUBOData),
                                                  GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
+
+    if(!uboptr)
+    {
+      RDCERR("Map buffer failed %d", drv.glGetError());
+      return;
+    }
+
     *uboptr = uboParams;
     drv.glUnmapBuffer(eGL_UNIFORM_BUFFER);
 
@@ -537,16 +630,16 @@ void GLReplay::RenderMesh(uint32_t eventId, const std::vector<MeshFormat> &secon
     FloatVector activeVertex;
 
     // primitive this vert is a part of (red prim, optional)
-    std::vector<FloatVector> activePrim;
+    rdcarray<FloatVector> activePrim;
 
     // for patch lists, to show other verts in patch (green dots, optional)
     // for non-patch lists, we use the activePrim and adjacentPrimVertices
     // to show what other verts are related
-    std::vector<FloatVector> inactiveVertices;
+    rdcarray<FloatVector> inactiveVertices;
 
     // adjacency (line or tri, strips or lists) (green prims, optional)
     // will be N*M long, N adjacent prims of M verts each. M = primSize below
-    std::vector<FloatVector> adjacentPrimVertices;
+    rdcarray<FloatVector> adjacentPrimVertices;
 
     GLenum primTopo = eGL_TRIANGLES;
     uint32_t primSize = 3;    // number of verts per primitive
@@ -570,7 +663,7 @@ void GLReplay::RenderMesh(uint32_t eventId, const std::vector<MeshFormat> &secon
       if(cfg.position.unproject)
         ModelViewProj = projMat.Mul(camMat.Mul(guessProjInv));
       else
-        ModelViewProj = projMat.Mul(camMat);
+        ModelViewProj = projMat.Mul(camMat.Mul(axisMapMat));
 
       uboParams.homogenousInput = cfg.position.unproject;
 
@@ -588,6 +681,13 @@ void GLReplay::RenderMesh(uint32_t eventId, const std::vector<MeshFormat> &secon
       {
         uboptr = (MeshUBOData *)drv.glMapBufferRange(eGL_UNIFORM_BUFFER, 0, sizeof(MeshUBOData),
                                                      GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
+
+        if(!uboptr)
+        {
+          RDCERR("Map buffer failed %d", drv.glGetError());
+          return;
+        }
+
         *uboptr = uboParams;
         drv.glUnmapBuffer(eGL_UNIFORM_BUFFER);
 
@@ -604,6 +704,13 @@ void GLReplay::RenderMesh(uint32_t eventId, const std::vector<MeshFormat> &secon
       {
         uboptr = (MeshUBOData *)drv.glMapBufferRange(eGL_UNIFORM_BUFFER, 0, sizeof(MeshUBOData),
                                                      GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
+
+        if(!uboptr)
+        {
+          RDCERR("Map buffer failed %d", drv.glGetError());
+          return;
+        }
+
         *uboptr = uboParams;
         drv.glUnmapBuffer(eGL_UNIFORM_BUFFER);
 
@@ -626,11 +733,21 @@ void GLReplay::RenderMesh(uint32_t eventId, const std::vector<MeshFormat> &secon
 
       uboptr = (MeshUBOData *)drv.glMapBufferRange(eGL_UNIFORM_BUFFER, 0, sizeof(MeshUBOData),
                                                    GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
+
+      if(!uboptr)
+      {
+        RDCERR("Map buffer failed %d", drv.glGetError());
+        return;
+      }
+
       *uboptr = uboParams;
       drv.glUnmapBuffer(eGL_UNIFORM_BUFFER);
 
       FloatVector vertSprite[4] = {
-          activeVertex, activeVertex, activeVertex, activeVertex,
+          activeVertex,
+          activeVertex,
+          activeVertex,
+          activeVertex,
       };
 
       drv.glBindBuffer(eGL_ARRAY_BUFFER, DebugData.triHighlightBuffer);
@@ -643,6 +760,13 @@ void GLReplay::RenderMesh(uint32_t eventId, const std::vector<MeshFormat> &secon
 
       uboptr = (MeshUBOData *)drv.glMapBufferRange(eGL_UNIFORM_BUFFER, 0, sizeof(MeshUBOData),
                                                    GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
+
+      if(!uboptr)
+      {
+        RDCERR("Map buffer failed %d", drv.glGetError());
+        return;
+      }
+
       *uboptr = uboParams;
       drv.glUnmapBuffer(eGL_UNIFORM_BUFFER);
 

@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2018-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -24,6 +24,7 @@
 
 #include "d3d11_context.h"
 #include "d3d11_debug.h"
+#include "d3d11_renderstate.h"
 #include "d3d11_resources.h"
 
 struct Tex2DMSToArrayStateTracker
@@ -202,7 +203,8 @@ void D3D11DebugManager::CopyArrayToTex2DMS(ID3D11Texture2D *destMS, ID3D11Textur
   }
 
   bool depthFormat = IsDepthFormat(descMS.Format);
-  bool intFormat = IsUIntFormat(descMS.Format) || IsIntFormat(descMS.Format);
+  bool intFormat =
+      IsUIntFormat(descMS.Format) || IsIntFormat(descMS.Format) || IsTypelessFormat(descMS.Format);
 
   ID3D11Texture2D *rtvResource = NULL;
   ID3D11Texture2D *srvResource = NULL;
@@ -363,7 +365,9 @@ void D3D11DebugManager::CopyArrayToTex2DMS(ID3D11Texture2D *destMS, ID3D11Textur
         break;
 
       case DXGI_FORMAT_D16_UNORM:
-      case DXGI_FORMAT_R16_TYPELESS: srvDesc.Format = DXGI_FORMAT_R16_FLOAT; break;
+      case DXGI_FORMAT_R16_TYPELESS: srvDesc.Format = DXGI_FORMAT_R16_UNORM; break;
+
+      default: break;
     }
   }
 
@@ -547,7 +551,8 @@ void D3D11DebugManager::CopyTex2DMSToArray(ID3D11Texture2D *destArray, ID3D11Tex
   D3D11_TEXTURE2D_DESC srvResDesc = descMS;
 
   bool depthFormat = IsDepthFormat(descMS.Format);
-  bool intFormat = IsUIntFormat(descMS.Format) || IsIntFormat(descMS.Format);
+  bool intFormat =
+      IsUIntFormat(descMS.Format) || IsIntFormat(descMS.Format) || IsTypelessFormat(descMS.Format);
 
   rtvResDesc.BindFlags = depthFormat ? D3D11_BIND_DEPTH_STENCIL : D3D11_BIND_RENDER_TARGET;
   srvResDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
@@ -691,7 +696,9 @@ void D3D11DebugManager::CopyTex2DMSToArray(ID3D11Texture2D *destArray, ID3D11Tex
         break;
 
       case DXGI_FORMAT_D16_UNORM:
-      case DXGI_FORMAT_R16_TYPELESS: srvDesc.Format = DXGI_FORMAT_R16_FLOAT; break;
+      case DXGI_FORMAT_R16_TYPELESS: srvDesc.Format = DXGI_FORMAT_R16_UNORM; break;
+
+      default: break;
     }
   }
 

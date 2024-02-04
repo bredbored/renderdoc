@@ -7,11 +7,13 @@ import platform
 import subprocess
 import threading
 import queue
+import datetime
 import time
 import renderdoc as rd
 from . import util
 from . import testcase
 from .logging import log
+from pathlib import Path
 
 
 def get_tests():
@@ -20,7 +22,7 @@ def get_tests():
     for m in sys.modules.values():
         for name in m.__dict__:
             obj = m.__dict__[name]
-            if isinstance(obj, type) and issubclass(obj, testcase.TestCase) and obj != testcase.TestCase:
+            if isinstance(obj, type) and issubclass(obj, testcase.TestCase) and obj != testcase.TestCase and not obj.internal:
                 testcases.append(obj)
 
     testcases.sort(key=lambda t: (t.slow_test,t.__name__))
@@ -28,7 +30,7 @@ def get_tests():
     return testcases
 
 
-RUNNER_TIMEOUT = 30    # Require output every 30 seconds
+RUNNER_TIMEOUT = 90    # Require output every X seconds
 RUNNER_DEBUG = False   # Debug test runner running by printing messages to track it
 
 
@@ -76,6 +78,9 @@ def _run_test(testclass, failedcases: list):
     if RUNNER_DEBUG:
         print("Waiting for test runner to complete...")
 
+    out_pending = ""
+    err_pending = ""
+
     while test_run.poll() is None:
         out = err = ""
 
@@ -93,7 +98,10 @@ def _run_test(testclass, failedcases: list):
             out = None  # No output
 
         try:
+            err = None
             while not test_stderr.empty():
+                if err is None:
+                    err = ''
                 err += test_stderr.get_nowait()
 
                 if test_run.poll() is not None:
@@ -101,11 +109,39 @@ def _run_test(testclass, failedcases: list):
         except queue.Empty:
             err = None  # No output
 
-        if RUNNER_DEBUG and out is not None:
-            print("Test stdout: {}".format(out))
+        if RUNNER_DEBUG:
+            if out is not None:
+                print("Test stdout: {}".format(out))
 
-        if RUNNER_DEBUG and err is not None:
-            print("Test stderr: {}".format(err))
+            if err is not None:
+                print("Test stderr: {}".format(err))
+        else:
+            if out is not None:
+                out_pending += out
+            if err is not None:
+                err_pending += err
+
+        while True:
+            try:
+                nl = out_pending.index('\n')
+                line = out_pending[0:nl]
+                out_pending = out_pending[nl+1:]
+                line = line.replace('\r', '')
+                sys.stdout.write(line + '\n')
+                sys.stdout.flush()
+            except:
+                break
+
+        while True:
+            try:
+                nl = err_pending.index('\n')
+                line = err_pending[0:nl]
+                err_pending = err_pending[nl+1:]
+                line = line.replace('\r', '')
+                sys.stderr.write(line + '\n')
+                sys.stderr.flush()
+            except:
+                break
 
         if out is None and err is None and test_run.poll() is None:
             log.error('Timed out, no output within {}s elapsed'.format(RUNNER_TIMEOUT))
@@ -154,9 +190,9 @@ def fetch_tests():
 
 
 def run_tests(test_include: str, test_exclude: str, in_process: bool, slow_tests: bool, debugger: bool):
-    start_time = time.time()
+    start_time = datetime.datetime.now(datetime.timezone.utc)
 
-    rd.InitGlobalEnv(rd.GlobalEnvironment(), [])
+    rd.InitialiseReplay(rd.GlobalEnvironment(), [])
 
     # On windows, disable error reporting
     if 'windll' in dir(ctypes):
@@ -225,6 +261,13 @@ def run_tests(test_include: str, test_exclude: str, in_process: bool, slow_tests
                 args = sys.argv.copy()
                 args.append("--internal_vulkan_register")
 
+                for i in range(len(args)):
+                    if os.path.exists(args[i]):
+                        args[i] = str(Path(args[i]).resolve())
+
+                if 'renderdoccmd' in sys.executable:
+                    args = ['vulkanlayer', '--register', '--system']
+
                 ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, ' '.join(args), None, 1)
 
                 time.sleep(10)
@@ -254,6 +297,7 @@ def run_tests(test_include: str, test_exclude: str, in_process: bool, slow_tests
 
     failedcases = []
     skippedcases = []
+    runcases = []
 
     ver = 0
 
@@ -270,7 +314,7 @@ def run_tests(test_include: str, test_exclude: str, in_process: bool, slow_tests
 
         instance = testclass()
 
-        supported,unsupported_reason = instance.check_support()
+        supported, unsupported_reason = instance.check_support()
 
         if not supported:
             log.print("Skipping {} as {}".format(name, unsupported_reason))
@@ -292,37 +336,41 @@ def run_tests(test_include: str, test_exclude: str, in_process: bool, slow_tests
             skippedcases.append(testclass)
             continue
 
+        runcases.append((testclass, name, instance))
+
+    for testclass, name, instance in runcases:
         # Print header (and footer) outside the exec so we know they will always be printed successfully
         log.begin_test(name)
 
         util.set_current_test(name)
 
-        def do():
+        def do(debugMode):
             if in_process:
-                instance.invoketest()
+                instance.invoketest(debugMode)
             else:
                 _run_test(testclass, failedcases)
 
         if debugger:
-            do()
+            do(True)
         else:
             try:
-                do()
+                do(False)
             except Exception as ex:
                 log.failure(ex)
                 failedcases.append(testclass)
 
         log.end_test(name)
 
-    duration = time.time() - start_time
+    duration = datetime.datetime.now(datetime.timezone.utc) - start_time
 
-    hours = int(duration / 3600)
-    minutes = int(duration / 60) % 60
-    seconds = round(duration % 60)
+    if len(failedcases) > 0:
+        logfile = rd.GetLogFile()
+        if os.path.exists(logfile):
+            log.inline_file('RenderDoc log', logfile)
 
-    log.comment("total={} fail={} skip={} time={}".format(len(testcases), len(failedcases), len(skippedcases), duration))
-    log.header("Tests complete summary: {} passed out of {} run from {} total in {}:{:02}:{:02}"
-               .format(len(testcases)-len(skippedcases)-len(failedcases), len(testcases)-len(skippedcases), len(testcases), hours, minutes, seconds))
+    log.comment("total={} fail={} skip={} time={}".format(len(testcases), len(failedcases), len(skippedcases), int(duration.total_seconds())))
+    log.header("Tests complete summary: {} passed out of {} run from {} total in {}"
+               .format(len(runcases)-len(failedcases), len(runcases), len(testcases), duration))
     if len(failedcases) > 0:
         log.print("Failed tests:")
     for testclass in failedcases:
@@ -330,6 +378,8 @@ def run_tests(test_include: str, test_exclude: str, in_process: bool, slow_tests
 
     # Print a proper footer if we got here
     log.rawprint('\n\n\n</script>', with_stdout=False)
+
+    rd.ShutdownReplay()
 
     if len(failedcases) > 0:
         sys.exit(1)
@@ -341,28 +391,64 @@ def vulkan_register():
     rd.UpdateVulkanLayerRegistration(True)
 
 
+def launch_remote_server():
+    # Fork the interpreter to run the test, in case it crashes we can catch it.
+    # We can re-run with the same parameters
+    args = sys.argv.copy()
+    args.insert(0, sys.executable)
+
+    # Add parameter to run the remote server itself
+    args.append('--internal_remote_server')
+
+    # if we're running from renderdoccmd, invoke it properly
+    if 'renderdoccmd' in sys.executable:
+        # run_tests.py
+        # --renderdoc
+        # <renderdoc_path>
+        # --pyrenderdoc
+        # <pyrenderdoc_path>
+        del args[1:6]
+        args.insert(1, 'test')
+        args.insert(2, 'functional')
+
+    subprocess.Popen(args)
+    return
+
+
+def become_remote_server():
+    rd.BecomeRemoteServer('localhost', 0, None, None)
+
+
 def internal_run_test(test_name):
     testcases = get_tests()
-
-    rd.InitGlobalEnv(rd.GlobalEnvironment(), [])
 
     log.add_output(util.get_artifact_path("output.log.html"))
 
     for testclass in testcases:
         if testclass.__name__ == test_name:
+            globalenv = rd.GlobalEnvironment()
+            globalenv.enumerateGPUs = False
+            rd.InitialiseReplay(globalenv, [])
+
             log.begin_test(test_name, print_header=False)
 
             util.set_current_test(test_name)
 
             try:
                 instance = testclass()
-                instance.invoketest()
+                instance.invoketest(False)
                 suceeded = True
             except Exception as ex:
                 log.failure(ex)
                 suceeded = False
+                
+            logfile = rd.GetLogFile()
+            if os.path.exists(logfile):
+                log.inline_file('RenderDoc log', logfile)
 
             log.end_test(test_name, print_footer=False)
+
+            rd.ShutdownReplay()
 
             if suceeded:
                 sys.exit(0)

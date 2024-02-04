@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2017-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -40,7 +40,6 @@
 // warning C4522: 'Shiboken::AutoDecRef': multiple assignment operators specified
 #pragma warning(disable : 4522)
 #include <pyside.h>
-#include <pyside2_qtwidgets_python.h>
 #include <shiboken.h>
 
 PyTypeObject **SbkPySide2_QtCoreTypes = NULL;
@@ -56,6 +55,11 @@ PyTypeObject **SbkPySide2_QtWidgetsTypes = NULL;
 
 #endif
 
+#ifdef _MSC_VER
+// for the LoadLibrary call on 32-bit windows
+#include <windows.h>
+#endif
+
 #include <QApplication>
 #include <QDebug>
 #include <QDir>
@@ -68,9 +72,46 @@ PyTypeObject **SbkPySide2_QtWidgetsTypes = NULL;
 #include "PythonContext.h"
 #include "version.h"
 
+// helpers for new PyFrameObject accessors in newer python versions, that are required starting from
+// python 3.11
+#if PY_VERSION_HEX < 0x030B0000
+
+// Get the frame's f_globals attribute.
+// Return a strong reference
+PyObject *PyFrame_GetGlobals(PyFrameObject *frame)
+{
+  PyObject *ret = frame->f_globals;
+  Py_XINCREF(ret);
+  return ret;
+}
+
+#endif
+
+#if PY_VERSION_HEX < 0x03090000
+
+// Get the frame next outer frame.
+// Return a strong reference
+PyFrameObject *PyFrame_GetBack(PyFrameObject *frame)
+{
+  PyFrameObject *ret = frame->f_back;
+  Py_XINCREF(ret);
+  return ret;
+}
+
+// Get the frame code.
+// Return a strong reference
+PyCodeObject *PyFrame_GetCode(PyFrameObject *frame)
+{
+  PyCodeObject *ret = frame->f_code;
+  Py_XINCREF(ret);
+  return ret;
+}
+
+#endif
+
 // exported by generated files, used to check interface compliance
-bool CheckCoreInterface();
-bool CheckQtInterface();
+bool CheckCoreInterface(rdcstr &log);
+bool CheckQtInterface(rdcstr &log);
 
 // defined in SWIG-generated renderdoc_python.cpp
 extern "C" PyObject *PyInit_renderdoc(void);
@@ -118,6 +159,7 @@ struct OutputRedirector
     PythonContext *context;
   };
   int isStdError;
+  bool block;
 };
 
 static PyTypeObject OutputRedirectorType = {PyVarObject_HEAD_INIT(NULL, 0)};
@@ -131,6 +173,10 @@ PyObject *PythonContext::main_dict = NULL;
 QMap<rdcstr, PyObject *> PythonContext::extensions;
 
 static PyObject *current_global_handle = NULL;
+
+static QMutex decrefQueueMutex;
+static QList<PyObject *> decrefQueue;
+extern "C" void ProcessDecRefQueue();
 
 void FetchException(QString &typeStr, QString &valueStr, int &finalLine, QList<QString> &frames)
 {
@@ -164,7 +210,7 @@ void FetchException(QString &typeStr, QString &valueStr, int &finalLine, QList<Q
 
       if(func && PyCallable_Check(func))
       {
-        PyObject *args = Py_BuildValue("(N)", tracebackObj);
+        PyObject *args = Py_BuildValue("(O)", tracebackObj);
         PyObject *formattedTB = PyObject_CallObject(func, args);
 
         PyTracebackObject *tb = (PyTracebackObject *)tracebackObj;
@@ -286,6 +332,7 @@ void PythonContext::GlobalInit()
     OutputRedirector *output = (OutputRedirector *)redirector;
     output->isStdError = 0;
     output->context = NULL;
+    output->block = false;
 
     redirector = PyObject_CallFunction((PyObject *)&OutputRedirectorType, noparams);
     PyObject_SetAttrString(sysobj, "stderr", redirector);
@@ -293,6 +340,7 @@ void PythonContext::GlobalInit()
     output = (OutputRedirector *)redirector;
     output->isStdError = 1;
     output->context = NULL;
+    output->block = false;
   }
 
 // if we need to append to sys.path to locate PySide2, do that now
@@ -314,9 +362,39 @@ void PythonContext::GlobalInit()
   }
 #endif
 
+#if RENDERDOC_STABLE_BUILD == 0
+  // if we're running in the git checkout and we can find the test scripts, add that location to the
+  // path
+  {
+    QDir bin = QFileInfo(QCoreApplication::applicationFilePath()).absoluteDir();
+
+    QString testpath = QDir::cleanPath(bin.absoluteFilePath(lit("../../util/test")));
+
+    if(QDir(testpath).exists(lit("run_tests.py")))
+    {
+      PyObject *syspath = PyObject_GetAttrString(sysobj, "path");
+
+      PyObject *str = PyUnicode_FromString(testpath.toUtf8().data());
+
+      PyList_Append(syspath, str);
+
+      Py_DecRef(str);
+      Py_DecRef(syspath);
+    }
+  }
+#endif
+
 // set up PySide
 #if PYSIDE2_ENABLED
   {
+// hack for win32 builds, where our pyside2 accidentally depends on Qt5Qml.dll for no good
+// reason and we ship a stub to allow the dll to load instead of rebuilding the whole of pyside2
+// :S
+#if defined(_MSC_VER) && !defined(_M_X64)
+    QString Qt5QmlStub = QApplication::applicationDirPath() + lit("/PySide2/Qt5Qml.dll");
+    LoadLibraryA(Qt5QmlStub.toUtf8().data());
+#endif
+
     Shiboken::AutoDecRef core(Shiboken::Module::import("PySide2.QtCore"));
     if(!core.isNull())
       SbkPySide2_QtCoreTypes = Shiboken::Module::getTypes(core);
@@ -371,6 +449,7 @@ PythonContext::PythonContext(QObject *parent) : QObject(parent)
 
     OutputRedirector *output = (OutputRedirector *)redirector;
     output->context = this;
+    output->block = false;
     Py_DECREF(redirector);
   }
 
@@ -431,15 +510,43 @@ PythonContext::~PythonContext()
   outputTick();
 }
 
-bool PythonContext::CheckInterfaces()
+bool PythonContext::CheckInterfaces(rdcstr &log)
 {
   bool errors = false;
 
   PyGILState_STATE gil = PyGILState_Ensure();
-  errors |= CheckCoreInterface();
-  errors |= CheckQtInterface();
+  errors |= CheckCoreInterface(log);
+  errors |= CheckQtInterface(log);
+
+  for(rdcstr module_name : {"renderdoc", "qrenderdoc"})
+  {
+    PyObject *mod = PyImport_ImportModule(module_name.c_str());
+    PyObject *dict = PyModule_GetDict(mod);
+
+    PyObject *key, *value;
+    Py_ssize_t pos = 0;
+
+    while(PyDict_Next(dict, &pos, &key, &value))
+    {
+      rdcstr name = ToQStr(key);
+
+      if(name.beginsWith("__"))
+        continue;
+
+      if(!PyCallable_Check(value))
+      {
+        log += "Non-callable object found: " + module_name + "." + name +
+               ". Expected only classes and functions.\n";
+        errors = true;
+      }
+    }
+
+    Py_DECREF(mod);
+  }
+
   PyGILState_Release(gil);
 
+  log.trim();
   return errors;
 }
 
@@ -451,6 +558,17 @@ void PythonContext::Finish()
   Py_XDECREF(context_namespace);
 
   PyGILState_Release(gil);
+}
+
+void PythonContext::PausePythonThreading()
+{
+  m_SavedThread = PyEval_SaveThread();
+}
+
+void PythonContext::ResumePythonThreading()
+{
+  PyEval_RestoreThread((PyThreadState *)m_SavedThread);
+  m_SavedThread = NULL;
 }
 
 void PythonContext::GlobalShutdown()
@@ -471,6 +589,22 @@ void PythonContext::GlobalShutdown()
   Py_Finalize();
 }
 
+QStringList PythonContext::GetApplicationExtensionsPaths()
+{
+  QStringList ret;
+
+  for(QString d : QStandardPaths::standardLocations(QStandardPaths::AppDataLocation))
+  {
+    QDir dir(d);
+    dir.cd(lit("extensions"));
+
+    if(dir.exists())
+      ret.append(dir.absolutePath());
+  }
+
+  return ret;
+}
+
 void PythonContext::ProcessExtensionWork(std::function<void()> callback)
 {
   PyGILState_STATE gil = PyGILState_Ensure();
@@ -480,24 +614,28 @@ void PythonContext::ProcessExtensionWork(std::function<void()> callback)
   PyGILState_Release(gil);
 }
 
-bool PythonContext::LoadExtension(ICaptureContext &ctx, const rdcstr &extension)
+QString PythonContext::LoadExtension(ICaptureContext &ctx, const rdcstr &extension)
 {
+  QString ret;
+
   PyObject *sysobj = PyDict_GetItemString(main_dict, "sys");
 
   PyObject *syspath = PyObject_GetAttrString(sysobj, "path");
 
-  QString configPath = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
-  QDir dir(configPath);
+  // add extensions directories in
+  for(QString p : PythonContext::GetApplicationExtensionsPaths())
+  {
+    QDir dir(p);
 
-  dir.cd(lit("extensions"));
+    rdcstr path = dir.absolutePath();
 
-  rdcstr path = dir.absolutePath();
-
-  PyObject *str = PyUnicode_FromString(path.c_str());
-
-  PyList_Append(syspath, str);
-
-  Py_DecRef(str);
+    if(dir.exists())
+    {
+      PyObject *str = PyUnicode_FromString(path.c_str());
+      PyList_Append(syspath, str);
+      Py_DecRef(str);
+    }
+  }
 
   PyObject *ext = NULL;
 
@@ -550,6 +688,7 @@ bool PythonContext::LoadExtension(ICaptureContext &ctx, const rdcstr &extension)
           if(mod == NULL)
           {
             qCritical() << "Failed to reload " << keystr;
+            ret += tr("Failed to reload submodule '%1'\n").arg(keystr);
             reloadSuccess = false;
             break;
           }
@@ -576,7 +715,11 @@ bool PythonContext::LoadExtension(ICaptureContext &ctx, const rdcstr &extension)
   // failed a reimport in which case the original module is still there and valid, so don't
   // overwrite the value.
   if(ext)
+  {
     extensions[extension] = ext;
+
+    PyModule_AddObject(ext, "_renderdoc_internal", current_global_handle);
+  }
 
   QString typeStr;
   QString valueStr;
@@ -601,19 +744,28 @@ bool PythonContext::LoadExtension(ICaptureContext &ctx, const rdcstr &extension)
       else
       {
         qCritical() << "Internal error passing pyrenderdoc to extension register()";
+        ret += tr("Internal error passing pyrenderdoc to extension register()\n");
       }
 
       if(retval == NULL)
+      {
+        qCritical() << "register() function failed";
+        ret += tr("register() function failed\n");
         ext = NULL;
+      }
 
       Py_XDECREF(retval);
 
       if(ext)
       {
-        int ret = PyModule_AddObject(ext, "pyrenderdoc", pyctx);
+        int pyret = PyModule_AddObject(ext, "pyrenderdoc", pyctx);
 
-        if(ret != 0)
+        if(pyret != 0)
+        {
+          qCritical() << "Couldn't set pyrenderdoc global in loaded module";
+          ret += tr("Couldn't set pyrenderdoc global in loaded module\n");
           ext = NULL;
+        }
       }
 
       Py_XDECREF(pyctx);
@@ -632,17 +784,26 @@ bool PythonContext::LoadExtension(ICaptureContext &ctx, const rdcstr &extension)
   {
     FetchException(typeStr, valueStr, finalLine, frames);
 
+    ret += lit("\n");
+
+    ret = ret.trimmed();
+
     qCritical("Error importing extension module. %s: %s", typeStr.toUtf8().data(),
               valueStr.toUtf8().data());
+    ret += tr("Error importing extension module. %1: %2\n\n").arg(typeStr).arg(valueStr);
 
     if(!frames.isEmpty())
     {
       qCritical() << "Traceback (most recent call last):";
+      ret += tr("Traceback (most recent call last):\n");
       for(const QString &f : frames)
       {
         QStringList lines = f.split(QLatin1Char('\n'));
         for(const QString &line : lines)
-          qCritical("%s", line.toUtf8().data());
+        {
+          qCritical("  %s", line.toUtf8().data());
+          ret += line + lit("\n");
+        }
       }
     }
   }
@@ -654,7 +815,7 @@ bool PythonContext::LoadExtension(ICaptureContext &ctx, const rdcstr &extension)
 
   current_global_handle = NULL;
 
-  return ext != NULL;
+  return ret;
 }
 
 void PythonContext::ConvertPyArgs(const ExtensionCallbackData &data,
@@ -730,10 +891,7 @@ void PythonContext::executeString(const QString &filename, const QString &source
 {
   if(!initialised())
   {
-    emit exception(
-        lit("SystemError"),
-        tr("Python integration failed to initialise, see diagnostic log for more information."), -1,
-        {});
+    emit exception(lit("SystemError"), tr("Python integration failed to initialise."), -1, {});
     return;
   }
 
@@ -752,7 +910,7 @@ void PythonContext::executeString(const QString &filename, const QString &source
   {
     PyObject *traceContext = PyDict_New();
 
-    uintptr_t thisint = (uintptr_t) this;
+    uintptr_t thisint = (uintptr_t)this;
     uint64_t thisuint64 = (uint64_t)thisint;
     PyObject *thisobj = PyLong_FromUnsignedLongLong(thisuint64);
 
@@ -773,6 +931,8 @@ void PythonContext::executeString(const QString &filename, const QString &source
     outputTick();
 
     PyEval_SetTrace(NULL, NULL);
+
+    ProcessDecRefQueue();
 
     Py_XDECREF(thisobj);
     Py_XDECREF(traceContext);
@@ -829,10 +989,7 @@ void PythonContext::setGlobal(const char *varName, const char *typeName, void *o
 {
   if(!initialised())
   {
-    emit exception(
-        lit("SystemError"),
-        tr("Python integration failed to initialise, see diagnostic log for more information."), -1,
-        {});
+    emit exception(lit("SystemError"), tr("Python integration failed to initialise."), -1, {});
     return;
   }
 
@@ -850,9 +1007,10 @@ void PythonContext::setGlobal(const char *varName, const char *typeName, void *o
 
   if(ret != 0)
   {
-    emit exception(lit("RuntimeError"), tr("Failed to set variable '%1' of type '%2'")
-                                            .arg(QString::fromUtf8(varName))
-                                            .arg(QString::fromUtf8(typeName)),
+    emit exception(lit("RuntimeError"),
+                   tr("Failed to set variable '%1' of type '%2'")
+                       .arg(QString::fromUtf8(varName))
+                       .arg(QString::fromUtf8(typeName)),
                    -1, {});
     return;
   }
@@ -882,6 +1040,9 @@ QWidget *PythonContext::QWidgetFromPy(PyObject *widget)
 {
 #if PYSIDE2_ENABLED
   if(!initialised())
+    return NULL;
+
+  if(widget == Py_None || widget == NULL)
     return NULL;
 
   if(!SbkPySide2_QtCoreTypes || !SbkPySide2_QtGuiTypes || !SbkPySide2_QtWidgetsTypes)
@@ -982,6 +1143,11 @@ PyObject *PythonContext::QtObjectToPython(const char *typeName, QObject *object)
     Py_RETURN_NONE;
   }
 
+  if(object == NULL)
+  {
+    Py_RETURN_NONE;
+  }
+
   PyObject *obj =
       Shiboken::Object::newObject(reinterpret_cast<SbkObjectType *>(Shiboken::SbkType<QObject>()),
                                   object, false, false, typeName);
@@ -1029,10 +1195,7 @@ void PythonContext::setPyGlobal(const char *varName, PyObject *obj)
 {
   if(!initialised())
   {
-    emit exception(
-        lit("SystemError"),
-        tr("Python integration failed to initialise, see diagnostic log for more information."), -1,
-        {});
+    emit exception(lit("SystemError"), tr("Python integration failed to initialise."), -1, {});
     return;
   }
 
@@ -1084,11 +1247,14 @@ PyObject *PythonContext::outstream_write(PyObject *self, PyObject *args)
     // contexts. So look up the global variable that stores the context
     if(context == NULL)
     {
-      _frame *frame = PyEval_GetFrame();
+      PyFrameObject *frame = PyEval_GetFrame();
+      // inc reference count here so all frames can be decref'd whether they come from here or
+      // PyFrame_GetBack
+      Py_XINCREF(frame);
 
       while(frame)
       {
-        PyObject *globals = frame->f_globals;
+        PyObject *globals = PyFrame_GetGlobals(frame);
         if(globals)
         {
           OutputRedirector *global =
@@ -1097,10 +1263,22 @@ PyObject *PythonContext::outstream_write(PyObject *self, PyObject *args)
             context = global->context;
         }
 
-        if(context)
-          break;
+        Py_XDECREF(globals);
 
-        frame = frame->f_back;
+        // first get the next frame without decrefing the current
+        PyFrameObject *back = PyFrame_GetBack(frame);
+        // now decref the old frame
+        Py_XDECREF(frame);
+        // and iterate on the next one, if we got one
+        frame = back;
+
+        if(context)
+        {
+          // release the last trailing ref, which we know is either NULL or a strong reference from
+          // PyFrame_GetBack
+          Py_XDECREF(frame);
+          break;
+        }
       }
     }
 
@@ -1113,23 +1291,25 @@ PyObject *PythonContext::outstream_write(PyObject *self, PyObject *args)
       // if context is still NULL we're running in the extension context
       rdcstr message = text;
 
-      _frame *frame = PyEval_GetFrame();
+      PyFrameObject *frame = PyEval_GetFrame();
 
       while(message.back() == '\n' || message.back() == '\r')
-        message.erase(message.size() - 1);
+        message.pop_back();
 
       QString filename = lit("unknown");
       int line = 0;
 
       if(frame)
       {
-        filename = ToQStr(frame->f_code->co_filename);
+        PyCodeObject *code = PyFrame_GetCode(frame);
+        filename = ToQStr(code->co_filename);
+        Py_XDECREF(code);
         line = PyFrame_GetLineNumber(frame);
       }
 
       if(!message.empty())
         RENDERDOC_LogMessage(redirector->isStdError ? LogType::Error : LogType::Comment, "EXTN",
-                             filename.toUtf8().data(), line, message.c_str());
+                             filename, line, message);
     }
   }
 
@@ -1152,13 +1332,17 @@ int PythonContext::traceEvent(PyObject *obj, PyFrameObject *frame, int what, PyO
   uintptr_t thisint = (uintptr_t)thisuint64;
   PythonContext *context = (PythonContext *)thisint;
 
+  PyCodeObject *code = PyFrame_GetCode(frame);
+
   PyObject *compiled = PyDict_GetItemString(obj, "compiled");
-  if(compiled == (PyObject *)frame->f_code && what == PyTrace_LINE)
+  if(compiled == (PyObject *)code && what == PyTrace_LINE)
   {
     context->location.line = PyFrame_GetLineNumber(frame);
 
     emit context->traceLine(context->location.file, context->location.line);
   }
+
+  Py_XDECREF(code);
 
   if(context->shouldAbort())
   {
@@ -1180,7 +1364,54 @@ extern "C" PyThreadState *GetExecutingThreadState(PyObject *global_handle)
 
 extern "C" PyObject *GetCurrentGlobalHandle()
 {
-  return current_global_handle;
+  PyObject *frame_global_handle = NULL;
+
+  // walk the frames until we find one with _renderdoc_internal. If we call a function in another
+  // module the globals may not have the entry, but the root level is expected to.
+  {
+    PyFrameObject *frame = PyEval_GetFrame();
+    // inc reference count here so all frames can be decref'd whether they come from here or
+    // PyFrame_GetBack
+    Py_XINCREF(frame);
+
+    while(frame)
+    {
+      PyObject *globals = PyFrame_GetGlobals(frame);
+      frame_global_handle = PyDict_GetItemString(globals, "_renderdoc_internal");
+      Py_XDECREF(globals);
+
+      // first get the next frame without decrefing the current
+      PyFrameObject *back = PyFrame_GetBack(frame);
+      // now decref the old frame
+      Py_XDECREF(frame);
+      // and iterate on the next one, if we got one
+      frame = back;
+
+      if(frame_global_handle)
+      {
+        // release the last trailing ref, which we know is either NULL or a strong reference from
+        // PyFrame_GetBack
+        Py_XDECREF(frame);
+        break;
+      }
+    }
+  }
+
+  if(frame_global_handle)
+    return frame_global_handle;
+
+  if(current_global_handle)
+    return current_global_handle;
+
+  PyObject *sys = PyImport_ImportModule("sys");
+  if(sys)
+  {
+    PyObject *ret = PyObject_GetAttrString(sys, "stdout");
+    Py_XDECREF(sys);
+    return ret;
+  }
+
+  return NULL;
 }
 
 extern "C" void HandleException(PyObject *global_handle)
@@ -1200,45 +1431,74 @@ extern "C" void HandleException(PyObject *global_handle)
   else if(redirector && !redirector->context)
   {
     // if still NULL we're running in the extension context
-    std::string exString;
+    rdcstr exString;
 
     if(!frames.isEmpty())
     {
       exString += "Traceback (most recent call last):\n";
       for(const QString &f : frames)
-        exString += "  " + f.toUtf8().toStdString() + "\n";
+      {
+        exString += "  ";
+        exString += f;
+        exString += "\n";
+      }
     }
 
-    exString += typeStr.toUtf8().toStdString() + ": " + valueStr.toUtf8().toStdString() + "\n";
+    exString += typeStr;
+    exString += ": ";
+    exString += valueStr;
+    exString += "\n";
 
-    _frame *frame = PyEval_GetFrame();
+    PyFrameObject *frame = PyEval_GetFrame();
 
     QString filename = lit("unknown");
     int linenum = 0;
 
     if(frame)
     {
-      filename = ToQStr(frame->f_code->co_filename);
+      PyCodeObject *code = PyFrame_GetCode(frame);
+      filename = ToQStr(code->co_filename);
+      Py_XDECREF(code);
       linenum = PyFrame_GetLineNumber(frame);
     }
 
-    RENDERDOC_LogMessage(LogType::Error, "EXTN", filename.toUtf8().data(), linenum, exString.c_str());
+    RENDERDOC_LogMessage(LogType::Error, "EXTN", filename, linenum, exString);
   }
 }
 
 extern "C" bool IsThreadBlocking(PyObject *global_handle)
 {
   OutputRedirector *redirector = (OutputRedirector *)global_handle;
-  if(redirector && redirector->context)
-    return redirector->context->threadBlocking();
+  if(redirector)
+    return redirector->block;
   return false;
 }
 
 extern "C" void SetThreadBlocking(PyObject *global_handle, bool block)
 {
   OutputRedirector *redirector = (OutputRedirector *)global_handle;
-  if(redirector && redirector->context)
-    return redirector->context->setThreadBlocking(block);
+  if(redirector)
+    redirector->block = block;
+}
+
+extern "C" void QueueDecRef(PyObject *obj)
+{
+  QMutexLocker lock(&decrefQueueMutex);
+
+  decrefQueue.push_back(obj);
+}
+
+extern "C" void ProcessDecRefQueue()
+{
+  QMutexLocker lock(&decrefQueueMutex);
+
+  if(decrefQueue.isEmpty())
+    return;
+
+  for(PyObject *obj : decrefQueue)
+    Py_XDECREF(obj);
+
+  decrefQueue.clear();
 }
 
 extern "C" QWidget *QWidgetFromPy(PyObject *widget)

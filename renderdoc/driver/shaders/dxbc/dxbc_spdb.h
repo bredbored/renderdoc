@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  * Copyright (c) 2014 Crytek
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -27,10 +27,9 @@
 
 #include <guiddef.h>
 #include <map>
-#include <string>
-#include <utility>
-#include <vector>
-#include "dxbc_disassemble.h"
+#include "api/replay/rdcarray.h"
+#include "api/replay/rdcstr.h"
+#include "dxbc_bytecode.h"
 
 namespace DXBC
 {
@@ -64,7 +63,7 @@ public:
 
 private:
   const byte *direct;
-  std::vector<byte> contiguous;
+  bytebuf contiguous;
 };
 
 struct FileHeaderPage
@@ -172,8 +171,8 @@ struct DBIModule
   int32_t niCompiler;
 
   // invalid when this is read in-place!
-  std::string moduleName;
-  std::string objectName;
+  rdcstr moduleName;
+  rdcstr objectName;
 };
 
 struct CompilandDetails
@@ -189,7 +188,7 @@ struct CompilandDetails
   } FrontendVersion, BackendVersion;
 
   // invalid when this is read in-place!
-  std::string CompilerSig;
+  rdcstr CompilerSig;
 };
 
 struct FileChecksum
@@ -218,19 +217,19 @@ struct Inlinee
   uint64_t parentPtr;
   uint32_t fileOffs;
   uint32_t baseLineNum;
-  std::vector<InstructionLocation> locations;
+  rdcarray<InstructionLocation> locations;
 };
 
 struct Function
 {
   uint32_t type = 0;
-  std::string name;
+  rdcstr name;
 };
 
 struct PDBStream
 {
   uint32_t byteLength;
-  std::vector<uint32_t> pageIndices;
+  rdcarray<uint32_t> pageIndices;
 };
 
 struct LocalRange
@@ -248,43 +247,57 @@ struct LocalMapping
 {
   bool operator<(const LocalMapping &o) const { return range.startRange < o.range.startRange; }
   LocalRange range;
-  uint32_t regFirstComp;
+  uint8_t regFirstComp;
   uint32_t varFirstComp;
+  uint32_t varOffset;
   uint32_t numComps;
-  std::vector<LocalRange> gaps;
+  rdcarray<LocalRange> gaps;
 
-  LocalVariableMapping var;
+  ShaderConstantType var;
+
+  // stored here so that we don't need to have the register mapping at the time we parse the SPDB
+  // chunk
+  DXBCBytecode::OperandType regType;
+  uint32_t regIndex;
 };
 
-class SPDBChunk : public DXBCDebugChunk
+class SPDBChunk : public IDebugInfo
 {
 public:
-  SPDBChunk(DXBCFile *dxbc, void *data);
+  SPDBChunk(byte *data, uint32_t length);
   SPDBChunk(const SPDBChunk &) = delete;
   SPDBChunk &operator=(const SPDBChunk &o) = delete;
 
-  std::string GetCompilerSig() const { return m_CompilerSig; }
-  std::string GetEntryFunction() const { return m_Entry; }
-  std::string GetShaderProfile() const { return m_Profile; }
-  uint32_t GetShaderCompileFlags() const { return m_ShaderFlags; }
+  rdcstr GetCompilerSig() const { return m_CompilerSig; }
+  rdcstr GetEntryFunction() const { return m_Entry; }
+  rdcstr GetShaderProfile() const { return m_Profile; }
+  ShaderCompileFlags GetShaderCompileFlags() const { return EncodeFlags(m_ShaderFlags, m_Profile); }
   void GetLineInfo(size_t instruction, uintptr_t offset, LineColumnInfo &lineInfo) const;
+  void GetCallstack(size_t instruction, uintptr_t offset, rdcarray<rdcstr> &callstack) const;
 
-  bool HasLocals() const;
-  void GetLocals(size_t instruction, uintptr_t offset, rdcarray<LocalVariableMapping> &locals) const;
+  bool HasSourceMapping() const;
+  void GetLocals(const DXBC::DXBCContainer *dxbc, size_t instruction, uintptr_t offset,
+                 rdcarray<SourceVariableMapping> &locals) const;
 
 private:
   bool m_HasDebugInfo;
 
-  std::string m_CompilerSig;
+  rdcstr m_CompilerSig;
 
-  std::string m_Entry;
-  std::string m_Profile;
+  rdcstr m_Entry;
+  rdcstr m_Profile;
 
   uint32_t m_ShaderFlags;
 
-  std::vector<LocalMapping> m_Locals;
+  rdcarray<LocalMapping> m_Locals;
+
+  struct InstInfo
+  {
+    LineColumnInfo lineInfo;
+    rdcarray<rdcstr> callstack;
+  };
 
   std::map<uint32_t, Function> m_Functions;
-  std::map<uint32_t, LineColumnInfo> m_Lines;
+  std::map<uint32_t, InstInfo> m_InstructionInfo;
 };
 };

@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2018-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -24,55 +24,11 @@
 
 #include "vk_test.h"
 
-TEST(VK_Indirect, VulkanGraphicsTest)
+RD_TEST(VK_Indirect, VulkanGraphicsTest)
 {
   static constexpr const char *Description =
       "Tests different indirect drawing and dispatching functions, including parameters that are "
       "generated on the GPU and not known on the CPU at submit time";
-
-  std::string common = R"EOSHADER(
-
-#version 420 core
-
-struct v2f
-{
-	vec4 pos;
-	vec4 col;
-	vec4 uv;
-};
-
-)EOSHADER";
-
-  const std::string vertex = R"EOSHADER(
-
-layout(location = 0) in vec3 Position;
-layout(location = 1) in vec4 Color;
-layout(location = 2) in vec2 UV;
-
-layout(location = 0) out v2f vertOut;
-
-void main()
-{
-	vertOut.pos = vec4(Position.xyz*vec3(1,-1,1), 1);
-	gl_Position = vertOut.pos;
-	vertOut.col = Color;
-	vertOut.uv = vec4(UV.xy, 0, 1);
-}
-
-)EOSHADER";
-
-  const std::string pixel = R"EOSHADER(
-
-layout(location = 0) in v2f vertIn;
-
-layout(location = 0, index = 0) out vec4 Color;
-
-void main()
-{
-	Color = vertIn.col;
-}
-
-)EOSHADER";
 
   const std::string compute = R"EOSHADER(
 
@@ -145,15 +101,26 @@ void main()
 
   void Prepare(int argc, char **argv)
   {
+    optDevExts.push_back(VK_KHR_DRAW_INDIRECT_COUNT_EXTENSION_NAME);
+
     features.multiDrawIndirect = VK_TRUE;
 
     VulkanGraphicsTest::Prepare(argc, argv);
+
+    if(devVersion >= VK_MAKE_VERSION(1, 2, 0))
+    {
+      static VkPhysicalDeviceVulkan12Features feats = {
+          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
+      };
+
+      feats.drawIndirectCount = VK_TRUE;
+
+      devInfoNext = &feats;
+    }
   }
 
   int main()
   {
-    optDevExts.push_back(VK_KHR_DRAW_INDIRECT_COUNT_EXTENSION_NAME);
-
     // initialise, create window, create context, etc
     if(!Init())
       return 3;
@@ -178,13 +145,14 @@ void main()
 
     pipeCreateInfo.vertexInputState.vertexBindingDescriptions = {vkh::vertexBind(0, DefaultA2V)};
     pipeCreateInfo.vertexInputState.vertexAttributeDescriptions = {
-        vkh::vertexAttr(0, 0, DefaultA2V, pos), vkh::vertexAttr(1, 0, DefaultA2V, col),
+        vkh::vertexAttr(0, 0, DefaultA2V, pos),
+        vkh::vertexAttr(1, 0, DefaultA2V, col),
         vkh::vertexAttr(2, 0, DefaultA2V, uv),
     };
 
     pipeCreateInfo.stages = {
-        CompileShaderModule(common + vertex, ShaderLang::glsl, ShaderStage::vert, "main"),
-        CompileShaderModule(common + pixel, ShaderLang::glsl, ShaderStage::frag, "main"),
+        CompileShaderModule(VKDefaultVertex, ShaderLang::glsl, ShaderStage::vert, "main"),
+        CompileShaderModule(VKDefaultPixel, ShaderLang::glsl, ShaderStage::frag, "main"),
     };
 
     VkPipeline drawpipe = createGraphicsPipeline(pipeCreateInfo);
@@ -192,48 +160,63 @@ void main()
     VkPipeline comppipe = createComputePipeline(vkh::ComputePipelineCreateInfo(
         complayout, CompileShaderModule(compute, ShaderLang::glsl, ShaderStage::comp, "main")));
 
-    const DefaultA2V vbdata[24] = {
+    const DefaultA2V vbdata[33] = {
         // non-indexed indirect draw
         {Vec3f(-0.8f, 0.5f, 0.0f), Vec4f(1.0f, 0.0f, 0.0f, 1.0f), Vec2f(0.0f, 0.0f)},
-        {Vec3f(-0.7f, 0.8f, 0.0f), Vec4f(0.0f, 1.0f, 0.0f, 1.0f), Vec2f(0.0f, 1.0f)},
-        {Vec3f(-0.6f, 0.5f, 0.0f), Vec4f(0.0f, 0.0f, 1.0f, 1.0f), Vec2f(1.0f, 0.0f)},
+        {Vec3f(-0.7f, 0.8f, 0.0f), Vec4f(1.0f, 0.0f, 0.0f, 1.0f), Vec2f(0.0f, 1.0f)},
+        {Vec3f(-0.6f, 0.5f, 0.0f), Vec4f(1.0f, 0.0f, 0.0f, 1.0f), Vec2f(1.0f, 0.0f)},
 
         // non-indexed KHR_draw_indirect_count draw
-        {Vec3f(-0.8f, -0.5f, 0.0f), Vec4f(1.0f, 0.0f, 0.0f, 1.0f), Vec2f(0.0f, 0.0f)},
+        {Vec3f(-0.8f, -0.5f, 0.0f), Vec4f(0.0f, 1.0f, 0.0f, 1.0f), Vec2f(0.0f, 0.0f)},
         {Vec3f(-0.7f, -0.2f, 0.0f), Vec4f(0.0f, 1.0f, 0.0f, 1.0f), Vec2f(0.0f, 1.0f)},
-        {Vec3f(-0.6f, -0.5f, 0.0f), Vec4f(0.0f, 0.0f, 1.0f, 1.0f), Vec2f(1.0f, 0.0f)},
+        {Vec3f(-0.6f, -0.5f, 0.0f), Vec4f(0.0f, 1.0f, 0.0f, 1.0f), Vec2f(1.0f, 0.0f)},
 
         // indexed indirect draw 1
-        {Vec3f(-0.6f, 0.5f, 0.0f), Vec4f(1.0f, 0.0f, 0.0f, 1.0f), Vec2f(0.0f, 0.0f)},
-        {Vec3f(-0.5f, 0.8f, 0.0f), Vec4f(0.0f, 1.0f, 0.0f, 1.0f), Vec2f(0.0f, 1.0f)},
+        {Vec3f(-0.6f, 0.5f, 0.0f), Vec4f(0.0f, 0.0f, 1.0f, 1.0f), Vec2f(0.0f, 0.0f)},
+        {Vec3f(-0.5f, 0.8f, 0.0f), Vec4f(0.0f, 0.0f, 1.0f, 1.0f), Vec2f(0.0f, 1.0f)},
         {Vec3f(-0.4f, 0.5f, 0.0f), Vec4f(0.0f, 0.0f, 1.0f, 1.0f), Vec2f(1.0f, 0.0f)},
 
         // indexed indirect draw 2
-        {Vec3f(-0.4f, 0.5f, 0.0f), Vec4f(1.0f, 0.0f, 0.0f, 1.0f), Vec2f(0.0f, 0.0f)},
-        {Vec3f(-0.3f, 0.8f, 0.0f), Vec4f(0.0f, 1.0f, 0.0f, 1.0f), Vec2f(0.0f, 1.0f)},
-        {Vec3f(-0.2f, 0.8f, 0.0f), Vec4f(0.0f, 0.0f, 1.0f, 1.0f), Vec2f(1.0f, 0.0f)},
-        {Vec3f(-0.1f, 0.5f, 0.0f), Vec4f(1.0f, 0.0f, 0.0f, 1.0f), Vec2f(0.0f, 0.0f)},
-        {Vec3f(0.0f, 0.8f, 0.0f), Vec4f(0.0f, 1.0f, 0.0f, 1.0f), Vec2f(0.0f, 1.0f)},
-        {Vec3f(0.1f, 0.8f, 0.0f), Vec4f(0.0f, 0.0f, 1.0f, 1.0f), Vec2f(1.0f, 0.0f)},
+        {Vec3f(-0.4f, 0.5f, 0.0f), Vec4f(1.0f, 1.0f, 0.0f, 1.0f), Vec2f(0.0f, 0.0f)},
+        {Vec3f(-0.3f, 0.8f, 0.0f), Vec4f(1.0f, 1.0f, 0.0f, 1.0f), Vec2f(0.0f, 1.0f)},
+        {Vec3f(-0.2f, 0.8f, 0.0f), Vec4f(1.0f, 1.0f, 0.0f, 1.0f), Vec2f(1.0f, 0.0f)},
+        {Vec3f(-0.1f, 0.5f, 0.0f), Vec4f(0.0f, 1.0f, 1.0f, 1.0f), Vec2f(0.0f, 0.0f)},
+        {Vec3f(0.0f, 0.8f, 0.0f), Vec4f(0.0f, 1.0f, 1.0f, 1.0f), Vec2f(0.0f, 1.0f)},
+        {Vec3f(0.1f, 0.8f, 0.0f), Vec4f(0.0f, 1.0f, 1.0f, 1.0f), Vec2f(1.0f, 0.0f)},
 
         // indexed KHR_draw_indirect_count draw 1
-        {Vec3f(-0.6f, -0.5f, 0.0f), Vec4f(1.0f, 0.0f, 0.0f, 1.0f), Vec2f(0.0f, 0.0f)},
-        {Vec3f(-0.5f, -0.2f, 0.0f), Vec4f(0.0f, 1.0f, 0.0f, 1.0f), Vec2f(0.0f, 1.0f)},
-        {Vec3f(-0.4f, -0.5f, 0.0f), Vec4f(0.0f, 0.0f, 1.0f, 1.0f), Vec2f(1.0f, 0.0f)},
+        {Vec3f(-0.6f, -0.5f, 0.0f), Vec4f(1.0f, 0.0f, 1.0f, 1.0f), Vec2f(0.0f, 0.0f)},
+        {Vec3f(-0.5f, -0.2f, 0.0f), Vec4f(1.0f, 0.0f, 1.0f, 1.0f), Vec2f(0.0f, 1.0f)},
+        {Vec3f(-0.4f, -0.5f, 0.0f), Vec4f(1.0f, 0.0f, 1.0f, 1.0f), Vec2f(1.0f, 0.0f)},
 
         // indexed KHR_draw_indirect_count draw 2
         // empty
 
         // indexed indirect draw 3
-        {Vec3f(-0.4f, -0.5f, 0.0f), Vec4f(1.0f, 0.0f, 0.0f, 1.0f), Vec2f(0.0f, 0.0f)},
-        {Vec3f(-0.3f, -0.2f, 0.0f), Vec4f(0.0f, 1.0f, 0.0f, 1.0f), Vec2f(0.0f, 1.0f)},
-        {Vec3f(-0.2f, -0.2f, 0.0f), Vec4f(0.0f, 0.0f, 1.0f, 1.0f), Vec2f(1.0f, 0.0f)},
-        {Vec3f(-0.1f, -0.5f, 0.0f), Vec4f(1.0f, 0.0f, 0.0f, 1.0f), Vec2f(0.0f, 0.0f)},
-        {Vec3f(0.0f, -0.2f, 0.0f), Vec4f(0.0f, 1.0f, 0.0f, 1.0f), Vec2f(0.0f, 1.0f)},
-        {Vec3f(0.1f, -0.2f, 0.0f), Vec4f(0.0f, 0.0f, 1.0f, 1.0f), Vec2f(1.0f, 0.0f)},
+        {Vec3f(-0.4f, -0.5f, 0.0f), Vec4f(0.5f, 1.0f, 0.0f, 1.0f), Vec2f(0.0f, 0.0f)},
+        {Vec3f(-0.3f, -0.2f, 0.0f), Vec4f(0.5f, 1.0f, 0.0f, 1.0f), Vec2f(0.0f, 1.0f)},
+        {Vec3f(-0.2f, -0.2f, 0.0f), Vec4f(0.5f, 1.0f, 0.0f, 1.0f), Vec2f(1.0f, 0.0f)},
+        {Vec3f(-0.1f, -0.5f, 0.0f), Vec4f(0.5f, 0.0f, 1.0f, 1.0f), Vec2f(0.0f, 0.0f)},
+        {Vec3f(0.0f, -0.2f, 0.0f), Vec4f(0.5f, 0.0f, 1.0f, 1.0f), Vec2f(0.0f, 1.0f)},
+        {Vec3f(0.1f, -0.2f, 0.0f), Vec4f(0.5f, 0.0f, 1.0f, 1.0f), Vec2f(1.0f, 0.0f)},
+
+        // post-indirect count test draw 1
+        {Vec3f(0.6f, 0.5f, 0.0f), Vec4f(1.0f, 0.5f, 0.0f, 1.0f), Vec2f(0.0f, 0.0f)},
+        {Vec3f(0.7f, 0.8f, 0.0f), Vec4f(1.0f, 0.5f, 0.0f, 1.0f), Vec2f(0.0f, 1.0f)},
+        {Vec3f(0.8f, 0.5f, 0.0f), Vec4f(1.0f, 0.5f, 0.0f, 1.0f), Vec2f(1.0f, 0.0f)},
+
+        // post-indirect count test draw 2
+        {Vec3f(0.6f, -0.5f, 0.0f), Vec4f(1.0f, 0.0f, 0.5f, 1.0f), Vec2f(0.0f, 0.0f)},
+        {Vec3f(0.7f, -0.2f, 0.0f), Vec4f(1.0f, 0.0f, 0.5f, 1.0f), Vec2f(0.0f, 1.0f)},
+        {Vec3f(0.8f, -0.5f, 0.0f), Vec4f(1.0f, 0.0f, 0.5f, 1.0f), Vec2f(1.0f, 0.0f)},
+
+        // post-indirect count test draw 3
+        {Vec3f(0.6f, 0.0f, 0.0f), Vec4f(1.0f, 0.5f, 0.5f, 1.0f), Vec2f(0.0f, 0.0f)},
+        {Vec3f(0.7f, 0.3f, 0.0f), Vec4f(1.0f, 0.5f, 0.5f, 1.0f), Vec2f(0.0f, 1.0f)},
+        {Vec3f(0.8f, 0.0f, 0.0f), Vec4f(1.0f, 0.5f, 0.5f, 1.0f), Vec2f(1.0f, 0.0f)},
     };
 
-    AllocatedBuffer vb(allocator,
+    AllocatedBuffer vb(this,
                        vkh::BufferCreateInfo(sizeof(vbdata), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
                                                                  VK_BUFFER_USAGE_TRANSFER_DST_BIT),
                        VmaAllocationCreateInfo({0, VMA_MEMORY_USAGE_CPU_TO_GPU}));
@@ -241,7 +224,7 @@ void main()
     vb.upload(vbdata);
 
     uint32_t indices[18] = {6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23};
-    AllocatedBuffer ib(allocator,
+    AllocatedBuffer ib(this,
                        vkh::BufferCreateInfo(sizeof(indices), VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
                                                                   VK_BUFFER_USAGE_TRANSFER_DST_BIT),
                        VmaAllocationCreateInfo({0, VMA_MEMORY_USAGE_CPU_TO_GPU}));
@@ -250,14 +233,11 @@ void main()
 
     VkDeviceSize ssbo_size = 16 * 1024;
 
-    AllocatedBuffer ssbo(allocator,
+    AllocatedBuffer ssbo(this,
                          vkh::BufferCreateInfo(ssbo_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                                                               VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
                                                               VK_BUFFER_USAGE_TRANSFER_DST_BIT),
-                         VmaAllocationCreateInfo({0, VMA_MEMORY_USAGE_CPU_TO_GPU}));
-
-    memset(ssbo.map(), 0, (size_t)ssbo_size);
-    ssbo.unmap();
+                         VmaAllocationCreateInfo({0, VMA_MEMORY_USAGE_GPU_ONLY}));
 
     VkDescriptorSet descset = allocateDescriptorSet(setlayout);
 
@@ -280,9 +260,22 @@ void main()
 
       setMarker(primary, "Do Clear");
 
+      pushMarker(queue, "Primary tests");
+
       vkCmdClearColorImage(primary, swapimg, VK_IMAGE_LAYOUT_GENERAL,
-                           vkh::ClearColorValue(0.4f, 0.5f, 0.6f, 1.0f), 1,
+                           vkh::ClearColorValue(0.2f, 0.2f, 0.2f, 1.0f), 1,
                            vkh::ImageSubresourceRange());
+
+      vkh::cmdPipelineBarrier(primary, {},
+                              {vkh::BufferMemoryBarrier(VK_ACCESS_TRANSFER_WRITE_BIT,
+                                                        VK_ACCESS_TRANSFER_WRITE_BIT, ssbo.buffer)});
+
+      // clear the buffer so that we can't read any of the data back from outside the command buffer
+      vkCmdFillBuffer(primary, ssbo.buffer, 0, ssbo_size, 0);
+
+      vkh::cmdPipelineBarrier(primary, {},
+                              {vkh::BufferMemoryBarrier(VK_ACCESS_TRANSFER_WRITE_BIT,
+                                                        VK_ACCESS_TRANSFER_WRITE_BIT, ssbo.buffer)});
 
       {
         VkCommandBuffer cmd = primary;
@@ -290,8 +283,10 @@ void main()
         pushMarker(cmd, "Primary: Dispatches");
 
         vkh::cmdPipelineBarrier(
-            cmd, {}, {vkh::BufferMemoryBarrier(VK_ACCESS_TRANSFER_WRITE_BIT,
-                                               VK_ACCESS_INDIRECT_COMMAND_READ_BIT, ssbo.buffer)});
+            cmd, {},
+            {vkh::BufferMemoryBarrier(
+                VK_ACCESS_TRANSFER_WRITE_BIT,
+                VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT, ssbo.buffer)});
 
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, comppipe);
         vkh::cmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, complayout, 0, {descset}, {});
@@ -309,8 +304,10 @@ void main()
         vkCmdDispatch(cmd, 1, 1, 1);
 
         vkh::cmdPipelineBarrier(
-            cmd, {}, {vkh::BufferMemoryBarrier(VK_ACCESS_TRANSFER_WRITE_BIT,
-                                               VK_ACCESS_INDIRECT_COMMAND_READ_BIT, ssbo.buffer)});
+            cmd, {},
+            {vkh::BufferMemoryBarrier(
+                VK_ACCESS_SHADER_WRITE_BIT,
+                VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT, ssbo.buffer)});
 
         mode = 2;
         vkCmdPushConstants(cmd, complayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, 4, &mode);
@@ -321,13 +318,14 @@ void main()
         popMarker(cmd);
 
         vkh::cmdPipelineBarrier(
-            cmd, {}, {vkh::BufferMemoryBarrier(VK_ACCESS_SHADER_WRITE_BIT,
-                                               VK_ACCESS_INDIRECT_COMMAND_READ_BIT, ssbo.buffer)});
+            cmd, {},
+            {vkh::BufferMemoryBarrier(VK_ACCESS_SHADER_WRITE_BIT,
+                                      VK_ACCESS_INDIRECT_COMMAND_READ_BIT, ssbo.buffer)});
       }
 
-      vkCmdBeginRenderPass(primary, vkh::RenderPassBeginInfo(mainWindow->rp, mainWindow->GetFB(),
-                                                             mainWindow->scissor),
-                           VK_SUBPASS_CONTENTS_INLINE);
+      vkCmdBeginRenderPass(
+          primary, vkh::RenderPassBeginInfo(mainWindow->rp, mainWindow->GetFB(), mainWindow->scissor),
+          VK_SUBPASS_CONTENTS_INLINE);
 
       {
         VkCommandBuffer cmd = primary;
@@ -365,6 +363,9 @@ void main()
           vkCmdDrawIndexedIndirectCountKHR(cmd, ssbo.buffer, 12 * sizeof(uvec4), ssbo.buffer,
                                            10 * sizeof(uvec4) + sizeof(uint32_t), 0,
                                            sizeof(uvec4) * 2);
+          vkCmdDrawIndexedIndirectCountKHR(cmd, ssbo.buffer, 12 * sizeof(uvec4), ssbo.buffer,
+                                           10 * sizeof(uvec4) + sizeof(uint32_t) * 2, 10,
+                                           sizeof(uvec4) * 2);
           popMarker(cmd);
 
           pushMarker(cmd, "Primary: Indirect count draws");
@@ -373,6 +374,10 @@ void main()
           vkCmdDrawIndexedIndirectCountKHR(cmd, ssbo.buffer, 12 * sizeof(uvec4), ssbo.buffer,
                                            10 * sizeof(uvec4) + sizeof(uint32_t), 10,
                                            sizeof(uvec4) * 2);
+          popMarker(cmd);
+
+          pushMarker(cmd, "Primary: Post-count 1");
+          vkCmdDraw(cmd, 3, 1, 24, 0);
           popMarker(cmd);
 
           popMarker(cmd);
@@ -389,20 +394,63 @@ void main()
       // clear the buffer so that we can't read any of the data back from outside the command buffer
       vkCmdFillBuffer(primary, ssbo.buffer, 0, ssbo_size, 0);
 
+      std::vector<VkCommandBuffer> cmds = {primary};
+
+      if(KHR_draw_indirect_count)
+      {
+        VkCommandBuffer cmd = GetCommandBuffer();
+        cmds.push_back(cmd);
+
+        vkBeginCommandBuffer(cmd, vkh::CommandBufferBeginInfo());
+
+        vkCmdBeginRenderPass(
+            cmd, vkh::RenderPassBeginInfo(mainWindow->rp, mainWindow->GetFB(), mainWindow->scissor),
+            VK_SUBPASS_CONTENTS_INLINE);
+
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, drawpipe);
+        vkCmdSetViewport(cmd, 0, 1, &mainWindow->viewport);
+        vkCmdSetScissor(cmd, 0, 1, &mainWindow->scissor);
+        vkh::cmdBindVertexBuffers(cmd, 0, {vb.buffer}, {0});
+        vkCmdBindIndexBuffer(cmd, ib.buffer, 0, VK_INDEX_TYPE_UINT32);
+
+        pushMarker(cmd, "Primary: Post-count 2");
+        vkCmdDraw(cmd, 3, 1, 27, 0);
+        popMarker(cmd);
+
+        // redundant, but do it here so that primary and secondary match
+        pushMarker(cmd, "Primary: Post-count 3");
+        vkCmdDraw(cmd, 3, 1, 30, 0);
+        popMarker(cmd);
+
+        vkCmdEndRenderPass(cmd);
+
+        setMarker(cmd, "Primary: Final");
+
+        vkEndCommandBuffer(cmd);
+      }
+      else
+      {
+        setMarker(primary, "Primary: Final");
+      }
+
       vkEndCommandBuffer(primary);
 
-      Submit(0, 2, {primary});
+      Submit(0, 2, cmds);
 
       vkDeviceWaitIdle(device);
 
+      popMarker(queue);
+
       // now do the same in secondary command buffers
+
+      pushMarker(queue, "Secondary tests");
 
       primary = GetCommandBuffer();
 
       vkBeginCommandBuffer(primary, vkh::CommandBufferBeginInfo());
 
       vkCmdClearColorImage(primary, swapimg, VK_IMAGE_LAYOUT_GENERAL,
-                           vkh::ClearColorValue(0.4f, 0.5f, 0.6f, 1.0f), 1,
+                           vkh::ClearColorValue(0.2f, 0.2f, 0.2f, 1.0f), 1,
                            vkh::ImageSubresourceRange());
 
       VkCommandBuffer dispatch_secondary = GetCommandBuffer(VK_COMMAND_BUFFER_LEVEL_SECONDARY);
@@ -417,8 +465,9 @@ void main()
         pushMarker(cmd, "Secondary: Dispatches");
 
         vkh::cmdPipelineBarrier(
-            cmd, {}, {vkh::BufferMemoryBarrier(VK_ACCESS_TRANSFER_WRITE_BIT,
-                                               VK_ACCESS_INDIRECT_COMMAND_READ_BIT, ssbo.buffer)});
+            cmd, {},
+            {vkh::BufferMemoryBarrier(VK_ACCESS_TRANSFER_WRITE_BIT,
+                                      VK_ACCESS_INDIRECT_COMMAND_READ_BIT, ssbo.buffer)});
 
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, comppipe);
         vkh::cmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, complayout, 0, {descset}, {});
@@ -436,8 +485,9 @@ void main()
         vkCmdDispatch(cmd, 1, 1, 1);
 
         vkh::cmdPipelineBarrier(
-            cmd, {}, {vkh::BufferMemoryBarrier(VK_ACCESS_TRANSFER_WRITE_BIT,
-                                               VK_ACCESS_INDIRECT_COMMAND_READ_BIT, ssbo.buffer)});
+            cmd, {},
+            {vkh::BufferMemoryBarrier(VK_ACCESS_SHADER_WRITE_BIT,
+                                      VK_ACCESS_INDIRECT_COMMAND_READ_BIT, ssbo.buffer)});
 
         mode = 2;
         vkCmdPushConstants(cmd, complayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, 4, &mode);
@@ -448,17 +498,18 @@ void main()
         popMarker(cmd);
 
         vkh::cmdPipelineBarrier(
-            cmd, {}, {vkh::BufferMemoryBarrier(VK_ACCESS_SHADER_WRITE_BIT,
-                                               VK_ACCESS_INDIRECT_COMMAND_READ_BIT, ssbo.buffer)});
+            cmd, {},
+            {vkh::BufferMemoryBarrier(VK_ACCESS_SHADER_WRITE_BIT,
+                                      VK_ACCESS_INDIRECT_COMMAND_READ_BIT, ssbo.buffer)});
       }
 
       vkEndCommandBuffer(dispatch_secondary);
 
       vkCmdExecuteCommands(primary, 1, &dispatch_secondary);
 
-      vkCmdBeginRenderPass(primary, vkh::RenderPassBeginInfo(mainWindow->rp, mainWindow->GetFB(),
-                                                             mainWindow->scissor),
-                           VK_SUBPASS_CONTENTS_SECONDARY_COMMAND_BUFFERS);
+      vkCmdBeginRenderPass(
+          primary, vkh::RenderPassBeginInfo(mainWindow->rp, mainWindow->GetFB(), mainWindow->scissor),
+          VK_SUBPASS_CONTENTS_SECONDARY_COMMAND_BUFFERS);
 
       VkCommandBuffer draw_secondary = GetCommandBuffer(VK_COMMAND_BUFFER_LEVEL_SECONDARY);
 
@@ -502,6 +553,9 @@ void main()
           vkCmdDrawIndexedIndirectCountKHR(cmd, ssbo.buffer, 12 * sizeof(uvec4), ssbo.buffer,
                                            10 * sizeof(uvec4) + sizeof(uint32_t), 0,
                                            sizeof(uvec4) * 2);
+          vkCmdDrawIndexedIndirectCountKHR(cmd, ssbo.buffer, 12 * sizeof(uvec4), ssbo.buffer,
+                                           10 * sizeof(uvec4) + sizeof(uint32_t) * 2, 10,
+                                           sizeof(uvec4) * 2);
           popMarker(cmd);
 
           pushMarker(cmd, "Secondary: Indirect count draws");
@@ -512,6 +566,10 @@ void main()
                                            sizeof(uvec4) * 2);
           popMarker(cmd);
 
+          pushMarker(cmd, "Secondary: Post-count 1");
+          vkCmdDraw(cmd, 3, 1, 24, 0);
+          popMarker(cmd);
+
           popMarker(cmd);
         }
       }
@@ -519,6 +577,64 @@ void main()
       vkEndCommandBuffer(draw_secondary);
 
       vkCmdExecuteCommands(primary, 1, &draw_secondary);
+
+      cmds = {dispatch_secondary, draw_secondary};
+
+      if(KHR_draw_indirect_count)
+      {
+        VkCommandBuffer cmd = primary;
+
+        // end the secondary renderpass so we can do a primary draw
+        vkCmdEndRenderPass(primary);
+
+        vkCmdBeginRenderPass(
+            cmd, vkh::RenderPassBeginInfo(mainWindow->rp, mainWindow->GetFB(), mainWindow->scissor),
+            VK_SUBPASS_CONTENTS_INLINE);
+
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, drawpipe);
+        vkCmdSetViewport(cmd, 0, 1, &mainWindow->viewport);
+        vkCmdSetScissor(cmd, 0, 1, &mainWindow->scissor);
+        vkh::cmdBindVertexBuffers(cmd, 0, {vb.buffer}, {0});
+        vkCmdBindIndexBuffer(cmd, ib.buffer, 0, VK_INDEX_TYPE_UINT32);
+
+        pushMarker(cmd, "Secondary: Post-count 2");
+        vkCmdDraw(cmd, 3, 1, 27, 0);
+        popMarker(cmd);
+
+        vkCmdEndRenderPass(primary);
+
+        // restart the secondary renderpass
+        vkCmdBeginRenderPass(
+            primary,
+            vkh::RenderPassBeginInfo(mainWindow->rp, mainWindow->GetFB(), mainWindow->scissor),
+            VK_SUBPASS_CONTENTS_SECONDARY_COMMAND_BUFFERS);
+
+        VkCommandBuffer count_secondary = GetCommandBuffer(VK_COMMAND_BUFFER_LEVEL_SECONDARY);
+        cmds.push_back(count_secondary);
+
+        vkBeginCommandBuffer(
+            count_secondary,
+            vkh::CommandBufferBeginInfo(VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT,
+                                        vkh::CommandBufferInheritanceInfo(mainWindow->rp, 0)));
+
+        cmd = count_secondary;
+
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, drawpipe);
+        vkCmdSetViewport(cmd, 0, 1, &mainWindow->viewport);
+        vkCmdSetScissor(cmd, 0, 1, &mainWindow->scissor);
+        vkh::cmdBindVertexBuffers(cmd, 0, {vb.buffer}, {0});
+        vkCmdBindIndexBuffer(cmd, ib.buffer, 0, VK_INDEX_TYPE_UINT32);
+
+        pushMarker(cmd, "Secondary: Post-count 3");
+        vkCmdDraw(cmd, 3, 1, 30, 0);
+        popMarker(cmd);
+
+        vkEndCommandBuffer(count_secondary);
+
+        vkCmdExecuteCommands(primary, 1, &count_secondary);
+      }
+
+      setMarker(primary, "Secondary: Final");
 
       vkCmdEndRenderPass(primary);
 
@@ -534,9 +650,11 @@ void main()
 
       vkEndCommandBuffer(primary);
 
-      Submit(1, 2, {primary}, {dispatch_secondary, draw_secondary});
+      Submit(1, 2, {primary}, cmds);
 
       vkDeviceWaitIdle(device);
+
+      popMarker(queue);
 
       Present();
     }

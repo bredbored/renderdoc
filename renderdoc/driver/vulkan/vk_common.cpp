@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -24,105 +24,161 @@
 
 #include "vk_common.h"
 #include "vk_core.h"
+#include "vk_debug.h"
 #include "vk_manager.h"
 #include "vk_resources.h"
 
-// utility struct for firing one-shot command buffers to begin/end markers
-struct ScopedCommandBuffer
-{
-  ScopedCommandBuffer(VkCommandBuffer cmdbuf, WrappedVulkan *vk)
-  {
-    core = vk;
-    cmd = cmdbuf;
-    local = (cmd == VK_NULL_HANDLE);
-
-    if(local)
-    {
-      VkCommandBufferBeginInfo beginInfo = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL,
-                                            VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
-
-      cmd = vk->GetNextCmd();
-
-      VkResult vkr = ObjDisp(cmd)->BeginCommandBuffer(Unwrap(cmd), &beginInfo);
-      RDCASSERTEQUAL(vkr, VK_SUCCESS);
-    }
-  }
-  ~ScopedCommandBuffer()
-  {
-    if(local)
-    {
-      VkResult vkr = ObjDisp(cmd)->EndCommandBuffer(Unwrap(cmd));
-      RDCASSERTEQUAL(vkr, VK_SUCCESS);
-
-      core->SubmitCmds();
-    }
-  }
-
-  WrappedVulkan *core;
-  VkCommandBuffer cmd;
-  bool local;
-};
-
 WrappedVulkan *VkMarkerRegion::vk = NULL;
 
-VkMarkerRegion::VkMarkerRegion(const std::string &marker, VkCommandBuffer cmd)
+VkMarkerRegion::VkMarkerRegion(VkCommandBuffer cmd, const rdcstr &marker)
 {
   if(cmd == VK_NULL_HANDLE)
-  {
-    RDCERR("Cannot auto-allocate a command buffer for a scoped VkMarkerRegion");
     return;
-  }
 
   cmdbuf = cmd;
   Begin(marker, cmd);
 }
 
+VkMarkerRegion::VkMarkerRegion(VkQueue q, const rdcstr &marker)
+{
+  if(q == VK_NULL_HANDLE)
+  {
+    if(vk)
+      q = vk->GetQ();
+    else
+      return;
+  }
+
+  queue = q;
+  Begin(marker, q);
+}
+
 VkMarkerRegion::~VkMarkerRegion()
 {
-  if(cmdbuf)
+  if(queue)
+    End(queue);
+  else if(cmdbuf)
     End(cmdbuf);
 }
 
-void VkMarkerRegion::Begin(const std::string &marker, VkCommandBuffer cmd)
+void VkMarkerRegion::Begin(const rdcstr &marker, VkCommandBuffer cmd)
 {
-  if(!vk)
+  if(cmd == VK_NULL_HANDLE)
     return;
 
   // check for presence of the marker extension
-  if(!ObjDisp(vk->GetDev())->CmdDebugMarkerBeginEXT)
+  if(!ObjDisp(cmd)->CmdBeginDebugUtilsLabelEXT)
     return;
 
-  ScopedCommandBuffer scope(cmd, vk);
-
-  VkDebugMarkerMarkerInfoEXT markerInfo = {};
-  markerInfo.sType = VK_STRUCTURE_TYPE_DEBUG_MARKER_MARKER_INFO_EXT;
-  markerInfo.pMarkerName = marker.c_str();
-  ObjDisp(scope.cmd)->CmdDebugMarkerBeginEXT(Unwrap(scope.cmd), &markerInfo);
+  VkDebugUtilsLabelEXT label = {};
+  label.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT;
+  label.pLabelName = marker.c_str();
+  ObjDisp(cmd)->CmdBeginDebugUtilsLabelEXT(Unwrap(cmd), &label);
 }
 
-void VkMarkerRegion::Set(const std::string &marker, VkCommandBuffer cmd)
+void VkMarkerRegion::Set(const rdcstr &marker, VkCommandBuffer cmd)
 {
-  // check for presence of the marker extension
-  if(!ObjDisp(vk->GetDev())->CmdDebugMarkerBeginEXT)
+  if(cmd == VK_NULL_HANDLE)
     return;
 
-  ScopedCommandBuffer scope(cmd, vk);
+  // check for presence of the marker extension
+  if(!ObjDisp(cmd)->CmdInsertDebugUtilsLabelEXT)
+    return;
 
-  VkDebugMarkerMarkerInfoEXT markerInfo = {};
-  markerInfo.sType = VK_STRUCTURE_TYPE_DEBUG_MARKER_MARKER_INFO_EXT;
-  markerInfo.pMarkerName = marker.c_str();
-  ObjDisp(scope.cmd)->CmdDebugMarkerInsertEXT(Unwrap(scope.cmd), &markerInfo);
+  VkDebugUtilsLabelEXT label = {};
+  label.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT;
+  label.pLabelName = marker.c_str();
+  ObjDisp(cmd)->CmdInsertDebugUtilsLabelEXT(Unwrap(cmd), &label);
 }
 
 void VkMarkerRegion::End(VkCommandBuffer cmd)
 {
-  // check for presence of the marker extension
-  if(!ObjDisp(vk->GetDev())->CmdDebugMarkerBeginEXT)
+  if(cmd == VK_NULL_HANDLE)
     return;
 
-  ScopedCommandBuffer scope(cmd, vk);
+  // check for presence of the marker extension
+  if(!ObjDisp(cmd)->CmdEndDebugUtilsLabelEXT)
+    return;
 
-  ObjDisp(scope.cmd)->CmdDebugMarkerEndEXT(Unwrap(scope.cmd));
+  ObjDisp(cmd)->CmdEndDebugUtilsLabelEXT(Unwrap(cmd));
+}
+
+VkDevice VkMarkerRegion::GetDev()
+{
+  return vk->GetDev();
+}
+
+void VkMarkerRegion::Begin(const rdcstr &marker, VkQueue q)
+{
+  if(q == VK_NULL_HANDLE)
+  {
+    if(vk)
+      q = vk->GetQ();
+    else
+      return;
+  }
+
+  // check for presence of the marker extension
+  if(!ObjDisp(q)->QueueBeginDebugUtilsLabelEXT)
+    return;
+
+  VkDebugUtilsLabelEXT label = {};
+  label.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT;
+  label.pLabelName = marker.c_str();
+  ObjDisp(q)->QueueBeginDebugUtilsLabelEXT(Unwrap(q), &label);
+}
+
+void VkMarkerRegion::Set(const rdcstr &marker, VkQueue q)
+{
+  if(q == VK_NULL_HANDLE)
+  {
+    if(vk)
+      q = vk->GetQ();
+    else
+      return;
+  }
+
+  // check for presence of the marker extension
+  if(!ObjDisp(q)->QueueInsertDebugUtilsLabelEXT)
+    return;
+
+  VkDebugUtilsLabelEXT label = {};
+  label.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT;
+  label.pLabelName = marker.c_str();
+  ObjDisp(q)->QueueInsertDebugUtilsLabelEXT(Unwrap(q), &label);
+}
+
+void VkMarkerRegion::End(VkQueue q)
+{
+  if(q == VK_NULL_HANDLE)
+  {
+    if(vk)
+      q = vk->GetQ();
+    else
+      return;
+  }
+
+  // check for presence of the marker extension
+  if(!ObjDisp(q)->QueueEndDebugUtilsLabelEXT)
+    return;
+
+  ObjDisp(q)->QueueEndDebugUtilsLabelEXT(Unwrap(q));
+}
+
+template <>
+VkObjectType objType<VkImage>()
+{
+  return VK_OBJECT_TYPE_IMAGE;
+}
+template <>
+VkObjectType objType<VkImageView>()
+{
+  return VK_OBJECT_TYPE_IMAGE_VIEW;
+}
+template <>
+VkObjectType objType<VkFramebuffer>()
+{
+  return VK_OBJECT_TYPE_FRAMEBUFFER;
 }
 
 void GPUBuffer::Create(WrappedVulkan *driver, VkDevice dev, VkDeviceSize size, uint32_t ringSize,
@@ -149,9 +205,13 @@ void GPUBuffer::Create(WrappedVulkan *driver, VkDevice dev, VkDeviceSize size, u
       VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, totalsize, 0,
   };
 
-  bufInfo.usage |= VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
   bufInfo.usage |= VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-  bufInfo.usage |= VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
+
+  if((flags & eGPUBufferReadback) == 0)
+  {
+    bufInfo.usage |= VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    bufInfo.usage |= VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
+  }
 
   if(flags & eGPUBufferVBuffer)
     bufInfo.usage |= VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
@@ -166,10 +226,10 @@ void GPUBuffer::Create(WrappedVulkan *driver, VkDevice dev, VkDeviceSize size, u
     bufInfo.usage |= VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
 
   if(flags & eGPUBufferAddressable)
-    bufInfo.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT_EXT;
+    bufInfo.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
 
   VkResult vkr = driver->vkCreateBuffer(dev, &bufInfo, NULL, &buf);
-  RDCASSERTEQUAL(vkr, VK_SUCCESS);
+  driver->CheckVkResult(vkr);
 
   VkMemoryRequirements mrq = {};
   driver->vkGetBufferMemoryRequirements(dev, buf, &mrq);
@@ -183,11 +243,23 @@ void GPUBuffer::Create(WrappedVulkan *driver, VkDevice dev, VkDeviceSize size, u
   else
     allocInfo.memoryTypeIndex = driver->GetUploadMemoryIndex(mrq.memoryTypeBits);
 
+  bool useBufferAddressKHR = driver->GetExtensions(NULL).ext_KHR_buffer_device_address;
+
+  VkMemoryAllocateFlagsInfo memFlags = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
+  if(useBufferAddressKHR && (flags & eGPUBufferAddressable))
+  {
+    allocInfo.pNext = &memFlags;
+    memFlags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+  }
+
   vkr = driver->vkAllocateMemory(dev, &allocInfo, NULL, &mem);
-  RDCASSERTEQUAL(vkr, VK_SUCCESS);
+  driver->CheckVkResult(vkr);
+
+  if(vkr != VK_SUCCESS)
+    return;
 
   vkr = driver->vkBindBufferMemory(dev, buf, mem, 0);
-  RDCASSERTEQUAL(vkr, VK_SUCCESS);
+  driver->CheckVkResult(vkr);
 }
 
 void GPUBuffer::FillDescriptor(VkDescriptorBufferInfo &desc)
@@ -230,9 +302,21 @@ void *GPUBuffer::Map(uint32_t *bindoffset, VkDeviceSize usedsize)
 
   mapoffset = offset;
 
+  if(mem == VK_NULL_HANDLE)
+  {
+    RDCERR("Manually reporting failed memory map with no memory");
+    m_pDriver->CheckVkResult(VK_ERROR_MEMORY_MAP_FAILED);
+  }
+
   void *ptr = NULL;
   VkResult vkr = m_pDriver->vkMapMemory(device, mem, offset, size, 0, (void **)&ptr);
-  RDCASSERTEQUAL(vkr, VK_SUCCESS);
+  m_pDriver->CheckVkResult(vkr);
+
+  if(!ptr)
+  {
+    RDCERR("Manually reporting failed memory map");
+    m_pDriver->CheckVkResult(VK_ERROR_MEMORY_MAP_FAILED);
+  }
 
   if(createFlags & eGPUBufferReadback)
   {
@@ -241,7 +325,7 @@ void *GPUBuffer::Map(uint32_t *bindoffset, VkDeviceSize usedsize)
     };
 
     vkr = m_pDriver->vkInvalidateMappedMemoryRanges(device, 1, &range);
-    RDCASSERTEQUAL(vkr, VK_SUCCESS);
+    m_pDriver->CheckVkResult(vkr);
   }
 
   return ptr;
@@ -267,7 +351,7 @@ void GPUBuffer::Unmap()
     };
 
     VkResult vkr = m_pDriver->vkFlushMappedMemoryRanges(device, 1, &range);
-    RDCASSERTEQUAL(vkr, VK_SUCCESS);
+    m_pDriver->CheckVkResult(vkr);
   }
 
   m_pDriver->vkUnmapMemory(device, mem);
@@ -276,6 +360,26 @@ void GPUBuffer::Unmap()
 bool VkInitParams::IsSupportedVersion(uint64_t ver)
 {
   if(ver == CurrentVersion)
+    return true;
+
+  // 0x14 -> 0x15 - added support for mutable descriptors
+  if(ver == 0x14)
+    return true;
+
+  // 0x13 -> 0x14 - added missing VkCommandBufferInheritanceRenderingInfo::flags
+  if(ver == 0x13)
+    return true;
+
+  // 0x12 -> 0x13 - added full sparse resource support
+  if(ver == 0x12)
+    return true;
+
+  // 0x11 -> 0x12 - added inline uniform block support
+  if(ver == 0x11)
+    return true;
+
+  // 0x10 -> 0x11 - non-breaking changes to image state serialization
+  if(ver == 0x10)
     return true;
 
   // 0xF -> 0x10 - added serialisation of VkPhysicalDeviceDriverPropertiesKHR into enumerated
@@ -306,26 +410,12 @@ bool VkInitParams::IsSupportedVersion(uint64_t ver)
   return false;
 }
 
-VkAccessFlags MakeAccessMask(VkImageLayout layout)
+void SanitiseReplayImageLayout(VkImageLayout &layout)
 {
-  switch(layout)
-  {
-    case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL:
-      return VkAccessFlags(VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT);
-    case VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL:
-      return VkAccessFlags(VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
-                           VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT);
-    case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL: return VkAccessFlags(VK_ACCESS_TRANSFER_WRITE_BIT);
-    case VK_IMAGE_LAYOUT_PREINITIALIZED: return VkAccessFlags(VK_ACCESS_HOST_WRITE_BIT);
-    case VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL:
-      return VkAccessFlags(VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_SHADER_READ_BIT);
-    case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
-      return VkAccessFlags(VK_ACCESS_INPUT_ATTACHMENT_READ_BIT | VK_ACCESS_SHADER_READ_BIT);
-    case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL: return VkAccessFlags(VK_ACCESS_TRANSFER_READ_BIT);
-    default: break;
-  }
-
-  return VkAccessFlags(0);
+  // we don't replay with present layouts since we don't create actual swapchains. So change any
+  // present layouts to general layouts
+  if(layout == VK_IMAGE_LAYOUT_PRESENT_SRC_KHR || layout == VK_IMAGE_LAYOUT_SHARED_PRESENT_KHR)
+    layout = VK_IMAGE_LAYOUT_GENERAL;
 }
 
 void SanitiseOldImageLayout(VkImageLayout &layout)
@@ -355,6 +445,56 @@ void SanitiseNewImageLayout(VkImageLayout &layout)
   // UNDEFINED, which will work silently.
   if(layout == VK_IMAGE_LAYOUT_UNDEFINED)
     layout = VK_IMAGE_LAYOUT_GENERAL;
+}
+
+void CombineDepthStencilLayouts(rdcarray<VkImageMemoryBarrier> &barriers)
+{
+  for(size_t i = 0; i < barriers.size(); i++)
+  {
+    // only consider barriers on depth
+    // barriers not on D/S at all can be ignored
+    // barriers on both D/S already can be ignored
+    // barriers on stencil only can be ignored, because we expect to always find depth before
+    // stencil
+    if(barriers[i].subresourceRange.aspectMask != VK_IMAGE_ASPECT_DEPTH_BIT)
+      continue;
+
+    // search forward to see if we have an identical barrier on stencil for the same image. We
+    // expect a loose sort so all barriers for the same image are together.
+    // This means when we don't have separate depth-stencil layout support, the aspects should
+    // always be in the same layout so can be combined.
+    for(size_t j = i + 1; j < barriers.size(); j++)
+    {
+      // stop when we reach another image, no more possible matches expected after this
+      if(barriers[i].image != barriers[j].image)
+        break;
+
+      // only consider stencil aspect barriers
+      if(barriers[j].subresourceRange.aspectMask != VK_IMAGE_ASPECT_STENCIL_BIT)
+        continue;
+
+      // if the barriers are equal apart from the aspect mask, we can promote [i] to depth and
+      // stencil, and erase j
+      if(barriers[i].oldLayout == barriers[j].oldLayout &&
+         barriers[i].newLayout == barriers[j].newLayout &&
+         barriers[i].srcAccessMask == barriers[j].srcAccessMask &&
+         barriers[i].dstAccessMask == barriers[j].dstAccessMask &&
+         barriers[i].srcQueueFamilyIndex == barriers[j].srcQueueFamilyIndex &&
+         barriers[i].dstQueueFamilyIndex == barriers[j].dstQueueFamilyIndex &&
+         barriers[i].subresourceRange.baseArrayLayer == barriers[j].subresourceRange.baseArrayLayer &&
+         barriers[i].subresourceRange.baseMipLevel == barriers[j].subresourceRange.baseMipLevel &&
+         barriers[i].subresourceRange.layerCount == barriers[j].subresourceRange.layerCount &&
+         barriers[i].subresourceRange.levelCount == barriers[j].subresourceRange.levelCount)
+      {
+        barriers[i].subresourceRange.aspectMask |= VK_IMAGE_ASPECT_STENCIL_BIT;
+        barriers.erase(j);
+        break;
+      }
+    }
+
+    // either we merged the i'th element and we can skip it, or it's not mergeable and we can skip
+    // it. Either way we can continue the loop at i+1
+  }
 }
 
 int SampleCount(VkSampleCountFlagBits countFlag)
@@ -401,37 +541,60 @@ int StageIndex(VkShaderStageFlagBits stageFlag)
     case VK_SHADER_STAGE_GEOMETRY_BIT: return 3;
     case VK_SHADER_STAGE_FRAGMENT_BIT: return 4;
     case VK_SHADER_STAGE_COMPUTE_BIT: return 5;
+    case VK_SHADER_STAGE_TASK_BIT_EXT: return 6;
+    case VK_SHADER_STAGE_MESH_BIT_EXT: return 7;
     default: RDCERR("Unrecognised/not single flag %x", stageFlag); break;
   }
 
   return 0;
 }
 
-void DoPipelineBarrier(VkCommandBuffer cmd, uint32_t count, const VkImageMemoryBarrier *barriers)
+VkShaderStageFlags ShaderMaskFromIndex(size_t index)
+{
+  VkShaderStageFlagBits mask[] = {
+      VK_SHADER_STAGE_VERTEX_BIT,
+      VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT,
+      VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT,
+      VK_SHADER_STAGE_GEOMETRY_BIT,
+      VK_SHADER_STAGE_FRAGMENT_BIT,
+      VK_SHADER_STAGE_COMPUTE_BIT,
+      VK_SHADER_STAGE_TASK_BIT_EXT,
+      VK_SHADER_STAGE_MESH_BIT_EXT,
+  };
+
+  if(index < ARRAY_COUNT(mask))
+    return mask[index];
+
+  RDCERR("Unrecognised shader stage index %d", index);
+
+  return 0;
+}
+
+void DoPipelineBarrier(VkCommandBuffer cmd, size_t count, const VkImageMemoryBarrier *barriers)
 {
   RDCASSERT(cmd != VK_NULL_HANDLE);
   ObjDisp(cmd)->CmdPipelineBarrier(Unwrap(cmd), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                                    VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0,
-                                   NULL,                // global memory barriers
-                                   0, NULL,             // buffer memory barriers
-                                   count, barriers);    // image memory barriers
+                                   NULL,                          // global memory barriers
+                                   0, NULL,                       // buffer memory barriers
+                                   (uint32_t)count, barriers);    // image memory barriers
 }
 
-void DoPipelineBarrier(VkCommandBuffer cmd, uint32_t count, const VkBufferMemoryBarrier *barriers)
+void DoPipelineBarrier(VkCommandBuffer cmd, size_t count, const VkBufferMemoryBarrier *barriers)
 {
   RDCASSERT(cmd != VK_NULL_HANDLE);
   ObjDisp(cmd)->CmdPipelineBarrier(Unwrap(cmd), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                                    VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0,
-                                   NULL,               // global memory barriers
-                                   count, barriers,    // buffer memory barriers
-                                   0, NULL);           // image memory barriers
+                                   NULL,                         // global memory barriers
+                                   (uint32_t)count, barriers,    // buffer memory barriers
+                                   0, NULL);                     // image memory barriers
 }
 
-void DoPipelineBarrier(VkCommandBuffer cmd, uint32_t count, const VkMemoryBarrier *barriers)
+void DoPipelineBarrier(VkCommandBuffer cmd, size_t count, const VkMemoryBarrier *barriers)
 {
   RDCASSERT(cmd != VK_NULL_HANDLE);
   ObjDisp(cmd)->CmdPipelineBarrier(Unwrap(cmd), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                                   VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, count,
+                                   VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, (uint32_t)count,
                                    barriers,    // global memory barriers
                                    0, NULL,     // buffer memory barriers
                                    0, NULL);    // image memory barriers
@@ -442,21 +605,17 @@ Topology MakePrimitiveTopology(VkPrimitiveTopology Topo, uint32_t patchControlPo
   switch(Topo)
   {
     default: break;
-    case VK_PRIMITIVE_TOPOLOGY_POINT_LIST: return Topology::PointList; break;
-    case VK_PRIMITIVE_TOPOLOGY_LINE_LIST: return Topology::LineList; break;
-    case VK_PRIMITIVE_TOPOLOGY_LINE_STRIP: return Topology::LineStrip; break;
-    case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST: return Topology::TriangleList; break;
-    case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP: return Topology::TriangleStrip; break;
-    case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN: return Topology::TriangleFan; break;
-    case VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY: return Topology::LineList_Adj; break;
-    case VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY: return Topology::LineStrip_Adj; break;
-    case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST_WITH_ADJACENCY:
-      return Topology::TriangleList_Adj;
-      break;
-    case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY:
-      return Topology::TriangleStrip_Adj;
-      break;
-    case VK_PRIMITIVE_TOPOLOGY_PATCH_LIST: return PatchList_Topology(patchControlPoints); break;
+    case VK_PRIMITIVE_TOPOLOGY_POINT_LIST: return Topology::PointList;
+    case VK_PRIMITIVE_TOPOLOGY_LINE_LIST: return Topology::LineList;
+    case VK_PRIMITIVE_TOPOLOGY_LINE_STRIP: return Topology::LineStrip;
+    case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST: return Topology::TriangleList;
+    case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP: return Topology::TriangleStrip;
+    case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN: return Topology::TriangleFan;
+    case VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY: return Topology::LineList_Adj;
+    case VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY: return Topology::LineStrip_Adj;
+    case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST_WITH_ADJACENCY: return Topology::TriangleList_Adj;
+    case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY: return Topology::TriangleStrip_Adj;
+    case VK_PRIMITIVE_TOPOLOGY_PATCH_LIST: return PatchList_Topology(patchControlPoints);
   }
 
   return Topology::Unknown;
@@ -530,24 +689,18 @@ AddressMode MakeAddressMode(VkSamplerAddressMode addr)
   return AddressMode::Wrap;
 }
 
-void MakeBorderColor(VkBorderColor border, FloatVector *BorderColor)
+void MakeBorderColor(VkBorderColor border, rdcfixedarray<float, 4> &BorderColor)
 {
   // we don't distinguish float/int, assume it matches
   switch(border)
   {
     case VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK:
-    case VK_BORDER_COLOR_INT_TRANSPARENT_BLACK:
-      *BorderColor = FloatVector(0.0f, 0.0f, 0.0f, 0.0f);
-      break;
+    case VK_BORDER_COLOR_INT_TRANSPARENT_BLACK: BorderColor = {0.0f, 0.0f, 0.0f, 0.0f}; break;
     case VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK:
-    case VK_BORDER_COLOR_INT_OPAQUE_BLACK:
-      *BorderColor = FloatVector(0.0f, 0.0f, 0.0f, 1.0f);
-      break;
+    case VK_BORDER_COLOR_INT_OPAQUE_BLACK: BorderColor = {0.0f, 0.0f, 0.0f, 1.0f}; break;
     case VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE:
-    case VK_BORDER_COLOR_INT_OPAQUE_WHITE:
-      *BorderColor = FloatVector(1.0f, 1.0f, 1.0f, 1.0f);
-      break;
-    default: memset(BorderColor, 0, sizeof(FloatVector)); break;
+    case VK_BORDER_COLOR_INT_OPAQUE_WHITE: BorderColor = {1.0f, 1.0f, 1.0f, 1.0f}; break;
+    default: BorderColor = {0.0f, 0.0f, 0.0f, 0.0f}; break;
   }
 }
 
@@ -575,7 +728,7 @@ FilterMode MakeFilterMode(VkFilter f)
   {
     case VK_FILTER_NEAREST: return FilterMode::Point;
     case VK_FILTER_LINEAR: return FilterMode::Linear;
-    case VK_FILTER_CUBIC_IMG: return FilterMode::Cubic;
+    case VK_FILTER_CUBIC_EXT: return FilterMode::Cubic;
     default: break;
   }
 
@@ -595,7 +748,7 @@ static FilterMode MakeFilterMode(VkSamplerMipmapMode f)
 }
 
 TextureFilter MakeFilter(VkFilter minFilter, VkFilter magFilter, VkSamplerMipmapMode mipmapMode,
-                         bool anisoEnable, bool compareEnable, VkSamplerReductionModeEXT reduction)
+                         bool anisoEnable, bool compareEnable, VkSamplerReductionMode reduction)
 {
   TextureFilter ret;
 
@@ -620,11 +773,9 @@ TextureFilter MakeFilter(VkFilter minFilter, VkFilter magFilter, VkSamplerMipmap
     switch(reduction)
     {
       default:
-      case VK_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE_EXT:
-        ret.filter = FilterFunction::Normal;
-        break;
-      case VK_SAMPLER_REDUCTION_MODE_MIN_EXT: ret.filter = FilterFunction::Minimum; break;
-      case VK_SAMPLER_REDUCTION_MODE_MAX_EXT: ret.filter = FilterFunction::Maximum; break;
+      case VK_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE: ret.filter = FilterFunction::Normal; break;
+      case VK_SAMPLER_REDUCTION_MODE_MIN: ret.filter = FilterFunction::Minimum; break;
+      case VK_SAMPLER_REDUCTION_MODE_MAX: ret.filter = FilterFunction::Maximum; break;
     }
   }
 
@@ -720,6 +871,40 @@ StencilOperation MakeStencilOp(VkStencilOp op)
   return StencilOperation::Keep;
 }
 
+rdcstr HumanDriverName(VkDriverId driverId)
+{
+  switch(driverId)
+  {
+    case VK_DRIVER_ID_AMD_PROPRIETARY: return "AMD Proprietary";
+    case VK_DRIVER_ID_AMD_OPEN_SOURCE: return "AMD Open-source";
+    case VK_DRIVER_ID_MESA_RADV: return "AMD RADV";
+    case VK_DRIVER_ID_NVIDIA_PROPRIETARY: return "NVIDIA Proprietary";
+    case VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS: return "Intel Proprietary";
+    case VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA: return "Intel Open-source";
+    case VK_DRIVER_ID_IMAGINATION_PROPRIETARY: return "NVIDIA Proprietary";
+    case VK_DRIVER_ID_QUALCOMM_PROPRIETARY: return "NVIDIA Proprietary";
+    case VK_DRIVER_ID_ARM_PROPRIETARY: return "NVIDIA Proprietary";
+    case VK_DRIVER_ID_GOOGLE_SWIFTSHADER: return "Swiftshader";
+    case VK_DRIVER_ID_GGP_PROPRIETARY: return "GGP Proprietary";
+    case VK_DRIVER_ID_BROADCOM_PROPRIETARY: return "Broadcom Proprietary";
+    case VK_DRIVER_ID_MESA_LLVMPIPE: return "Mesa LLVMPipe";
+    case VK_DRIVER_ID_MOLTENVK: return "MoltenVK";
+    case VK_DRIVER_ID_COREAVI_PROPRIETARY: return "Coreavi Proprietary";
+    case VK_DRIVER_ID_JUICE_PROPRIETARY: return "Juice Proprietary";
+    case VK_DRIVER_ID_VERISILICON_PROPRIETARY: return "Verisilicon Proprietary";
+    case VK_DRIVER_ID_MESA_TURNIP: return "Mesa Turnip";
+    case VK_DRIVER_ID_MESA_V3DV: return "Mesa V3DV";
+    case VK_DRIVER_ID_MESA_PANVK: return "Mesa Panvk";
+    case VK_DRIVER_ID_SAMSUNG_PROPRIETARY: return "Samsung Proprietary";
+    case VK_DRIVER_ID_MESA_VENUS: return "Mesa Venus";
+    case VK_DRIVER_ID_MESA_DOZEN: return "Mesa Dozen";
+    case VK_DRIVER_ID_MESA_NVK: return "Mesa NVK";
+    default: break;
+  }
+
+  return "";
+}
+
 BASIC_TYPE_SERIALISE_STRINGIFY(VkPackedVersion, (uint32_t &)el, SDBasic::UnsignedInteger, 4);
 
 INSTANTIATE_SERIALISE_TYPE(VkPackedVersion);
@@ -733,13 +918,46 @@ void DoSerialise(SerialiserType &ser, VkInitParams &el)
   SERIALISE_MEMBER(EngineVersion);
   SERIALISE_MEMBER(APIVersion).TypedAs("uint32_t"_lit);
   SERIALISE_MEMBER(Layers);
-  SERIALISE_MEMBER(Extensions);
+  SERIALISE_MEMBER(Extensions).Important();
   SERIALISE_MEMBER(InstanceID).TypedAs("VkInstance"_lit);
 }
 
 INSTANTIATE_SERIALISE_TYPE(VkInitParams);
 
-VkDriverInfo::VkDriverInfo(const VkPhysicalDeviceProperties &physProps)
+void GetPhysicalDeviceDriverProperties(VkInstDispatchTable *instDispatchTable,
+                                       VkPhysicalDevice unwrappedPhysicalDevice,
+                                       VkPhysicalDeviceDriverProperties &driverProps)
+{
+  uint32_t count = 0;
+  instDispatchTable->EnumerateDeviceExtensionProperties(unwrappedPhysicalDevice, NULL, &count, NULL);
+
+  VkExtensionProperties *props = new VkExtensionProperties[count];
+  instDispatchTable->EnumerateDeviceExtensionProperties(unwrappedPhysicalDevice, NULL, &count, props);
+
+  RDCEraseEl(driverProps);
+  driverProps.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES;
+
+  for(uint32_t e = 0; e < count; e++)
+  {
+    // GPDP2 must be available if the driver properties extension is, and we always enable it if
+    // available, so we can unconditionally query here
+    if(!strcmp(props[e].extensionName, VK_KHR_DRIVER_PROPERTIES_EXTENSION_NAME))
+    {
+      VkPhysicalDeviceProperties2 physProps2 = {
+          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+      };
+
+      physProps2.pNext = &driverProps;
+      instDispatchTable->GetPhysicalDeviceProperties2(unwrappedPhysicalDevice, &physProps2);
+      break;
+    }
+  }
+
+  SAFE_DELETE_ARRAY(props);
+}
+
+VkDriverInfo::VkDriverInfo(const VkPhysicalDeviceProperties &physProps,
+                           const VkPhysicalDeviceDriverProperties &origDriverProps, bool active)
 {
   m_Vendor = GPUVendorFromPCIVendor(physProps.vendorID);
 
@@ -747,18 +965,71 @@ VkDriverInfo::VkDriverInfo(const VkPhysicalDeviceProperties &physProps)
   if(physProps.vendorID == VK_VENDOR_ID_VSI)
     m_Vendor = GPUVendor::Verisilicon;
 
-  m_Major = VK_VERSION_MAJOR(physProps.driverVersion);
-  m_Minor = VK_VERSION_MINOR(physProps.driverVersion);
-  m_Patch = VK_VERSION_PATCH(physProps.driverVersion);
+  // Swiftshader
+  if(physProps.vendorID == 0x1AE0 && physProps.deviceID == 0xC0DE)
+    m_Vendor = GPUVendor::Software;
 
+  // mesa software
+  if(physProps.vendorID == VK_VENDOR_ID_MESA)
+    m_Vendor = GPUVendor::Software;
+
+  // take a copy so we can patch the driverID
+  VkPhysicalDeviceDriverProperties driverProps = origDriverProps;
+
+  switch(driverProps.driverID)
+  {
+    case VK_DRIVER_ID_GOOGLE_SWIFTSHADER:
+    case VK_DRIVER_ID_MESA_LLVMPIPE: m_Vendor = GPUVendor::Software; break;
+    case VK_DRIVER_ID_MOLTENVK: metalBackend = true;
+    default: break;
+  }
+
+// true by definition
 #if ENABLED(RDOC_APPLE)
   metalBackend = true;
 #endif
 
-  // nvidia uses its own version packing:
+  // guess driver by OS & vendor, if we don't have a driver ID. This is mostly for cases where only
+  // the proprietary driver exists
+  if(driverProps.driverID == 0)
+  {
+    RDCWARN("Estimating driver based on OS & vendor ID - may be inaccurate");
+    switch(m_Vendor)
+    {
+#if ENABLED(RDOC_WIN32)
+      case GPUVendor::AMD:
+      case GPUVendor::Samsung: driverProps.driverID = VK_DRIVER_ID_AMD_PROPRIETARY; break;
+#elif ENABLED(RDOC_LINUX)
+      // this could be radv, but we expect radv to provide the driverID
+      case GPUVendor::AMD:
+      case GPUVendor::Samsung: driverProps.driverID = VK_DRIVER_ID_AMD_OPEN_SOURCE; break;
+#endif
+
+#if ENABLED(RDOC_WIN32)
+      case GPUVendor::Intel: driverProps.driverID = VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS; break;
+#elif ENABLED(RDOC_LINUX)
+      case GPUVendor::Intel: driverProps.driverID = VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA; break;
+#endif
+
+      case GPUVendor::nVidia: driverProps.driverID = VK_DRIVER_ID_NVIDIA_PROPRIETARY; break;
+      case GPUVendor::Qualcomm: driverProps.driverID = VK_DRIVER_ID_QUALCOMM_PROPRIETARY; break;
+      case GPUVendor::ARM: driverProps.driverID = VK_DRIVER_ID_ARM_PROPRIETARY; break;
+      case GPUVendor::Imagination:
+        driverProps.driverID = VK_DRIVER_ID_IMAGINATION_PROPRIETARY;
+        break;
+      case GPUVendor::Broadcom: driverProps.driverID = VK_DRIVER_ID_BROADCOM_PROPRIETARY; break;
+      default: break;
+    }
+  }
+
+  m_Major = VK_VERSION_MAJOR(physProps.driverVersion);
+  m_Minor = VK_VERSION_MINOR(physProps.driverVersion);
+  m_Patch = VK_VERSION_PATCH(physProps.driverVersion);
+
+  // nvidia proprietary uses its own version packing:
   //   10 |  8  |        8       |       6
   // major|minor|secondary_branch|tertiary_branch
-  if(m_Vendor == GPUVendor::nVidia)
+  if(driverProps.driverID == VK_DRIVER_ID_NVIDIA_PROPRIETARY)
   {
     m_Major = ((uint32_t)(physProps.driverVersion) >> (8 + 8 + 6)) & 0x3ff;
     m_Minor = ((uint32_t)(physProps.driverVersion) >> (8 + 6)) & 0x0ff;
@@ -769,196 +1040,527 @@ VkDriverInfo::VkDriverInfo(const VkPhysicalDeviceProperties &physProps)
     m_Patch = (secondary << 8) | tertiary;
   }
 
-  if(m_Vendor == GPUVendor::nVidia)
+  // Ditto for Intel proprietary
+  //  18  | 14
+  // major|minor
+  if(driverProps.driverID == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS)
+  {
+    m_Major = ((uint32_t)(physProps.driverVersion) >> 14) & 0x3fff;
+    m_Minor = (uint32_t)(physProps.driverVersion) & 0x3fff;
+    m_Patch = 0;
+  }
+
+  if(driverProps.driverID == VK_DRIVER_ID_NVIDIA_PROPRIETARY)
   {
     // drivers before 372.54 did not handle a glslang bugfix about separated samplers,
     // and disabling texelFetch works as a workaround.
 
     if(Major() < 372 || (Major() == 372 && Minor() < 54))
+    {
+      if(active)
+        RDCLOG("Enabling NV texel fetch workaround - update to a newer driver for fix");
       texelFetchBrokenDriver = true;
+    }
+
+    // this isn't exactly when the root problem started happening, but it is when it started
+    // happening in a way that was easy to notice. In this version NV applied a optimisation
+    // to not re-set static pipeline state when a renderpass was begun, which was previously
+    // hiding the issue by conservatively re-setting the state.
+    if(Major() > 532)
+    {
+      if(active)
+        RDCLOG("Enabling NV workaround for static pipeline force-bind to preserve state");
+      nvidiaStaticPipelineRebindStates = true;
+    }
   }
 
-// only check this on windows. This is a bit of a hack, as really we want to check if we're
-// using the AMD official driver, but there's not a great other way to distinguish it from
-// the RADV open source driver.
-#if ENABLED(RDOC_WIN32)
-  if(m_Vendor == GPUVendor::AMD)
+  if(driverProps.driverID == VK_DRIVER_ID_AMD_PROPRIETARY ||
+     driverProps.driverID == VK_DRIVER_ID_AMD_OPEN_SOURCE)
   {
     // for AMD the bugfix version isn't clear as version numbering wasn't strong for a while, but
     // any driver that reports a version of >= 1.0.0 is fine, as previous versions all reported
     // 0.9.0 as the version.
 
     if(Major() < 1)
+    {
+      if(active)
+        RDCLOG("Enabling AMD texel fetch workaround - update to a newer driver for fix");
       texelFetchBrokenDriver = true;
+    }
 
     // driver 18.5.2 which is vulkan version >= 2.0.33 contains the fix
     if(physProps.driverVersion < VK_MAKE_VERSION(2, 0, 33))
-      unreliableImgMemReqs = true;
-  }
-#endif
+    {
+      if(active)
+        RDCLOG(
+            "Enabling AMD image memory requirements workaround - update to a newer driver for fix");
+      amdUnreliableImgMemReqs = true;
+    }
 
-  if(texelFetchBrokenDriver)
-  {
-    RDCWARN("Detected an older driver, enabling workaround. Try updating to the latest drivers.");
-  }
-
-// same as above, only affects the AMD official driver
-#if ENABLED(RDOC_WIN32)
-  if(m_Vendor == GPUVendor::AMD)
-  {
     // driver 18.5.2 which is vulkan version >= 2.0.33 contains the fix
     if(physProps.driverVersion < VK_MAKE_VERSION(2, 0, 33))
+    {
+      if(active)
+        RDCLOG("Enabling AMD image MSAA storage workaround - update to a newer driver for fix");
       amdStorageMSAABrokenDriver = true;
-  }
-#endif
+    }
 
-  // not fixed yet
-  qualcommLeakingUBOOffsets = m_Vendor == GPUVendor::Qualcomm;
+    // driver 21.3.1 which is vulkan version >= 2.0.179 contains the fix
+    if(physProps.driverVersion < VK_MAKE_VERSION(2, 0, 179))
+    {
+      if(active)
+        RDCLOG("Disabling buffer_device_address on AMD - update to a newer driver for fix");
+      bdaBrokenDriver = true;
+    }
+  }
+
+  if(driverProps.driverID == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS)
+  {
+    // buffer device address doesn't work well on older drivers, even using it internally we get
+    // VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS thrown when creating multiple buffers, even though we
+    // don't provide opaque capture addresses at all...
+    // seems fixed in 100.9466. Intel's driver versioning is inconsistent and some drivers don't
+    // follow this scheme, but they also seem old?
+    if(m_Major <= 100 && m_Minor < 9466)
+    {
+      if(active)
+        RDCLOG("Disabling buffer_device_address on Intel - update to a newer driver for fix");
+      bdaBrokenDriver = true;
+    }
+
+    // Currently unfixed at the time of writing, Intel's drivers require manually inserted
+    // side-effects for occlusion queries to function properly if there are no other effects from a
+    // pixel shader.
+    // Only affects windows drivers, linux drivers are unaffected.
+    intelBrokenOcclusionQueries = true;
+  }
+
+  if(driverProps.driverID == VK_DRIVER_ID_QUALCOMM_PROPRIETARY)
+  {
+    if(active)
+      RDCLOG("Enabling Qualcomm driver workarounds");
+
+    // not fixed yet that I know of, or unknown driver with fixes
+    qualcommDrefNon2DCompileCrash = true;
+    qualcommLineWidthCrash = true;
+
+    // KHR_buffer_device_address has been tested on 622 (Quest2)
+    // UBO dynamic offset leak has been fixed in early 2020, 622 tested.
+    if(physProps.driverVersion < VK_MAKE_VERSION(512, 622, 0))
+    {
+      bdaBrokenDriver = true;
+      qualcommLeakingUBOOffsets = true;
+    }
+  }
 }
 
-FrameRefType GetRefType(VkDescriptorType descType)
+FrameRefType GetRefType(DescriptorSlotType descType)
 {
   switch(descType)
   {
-    case VK_DESCRIPTOR_TYPE_SAMPLER:
-    case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
-    case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
-    case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
-    case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
-    case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
-    case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT: return eFrameRef_Read; break;
-    case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
-    case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
-    case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
-    case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC: return eFrameRef_ReadBeforeWrite; break;
+    case DescriptorSlotType::Unwritten:
+    case DescriptorSlotType::Sampler:
+    case DescriptorSlotType::CombinedImageSampler:
+    case DescriptorSlotType::SampledImage:
+    case DescriptorSlotType::UniformTexelBuffer:
+    case DescriptorSlotType::UniformBuffer:
+    case DescriptorSlotType::UniformBufferDynamic:
+    case DescriptorSlotType::InputAttachment:
+    case DescriptorSlotType::InlineBlock: return eFrameRef_Read;
+    case DescriptorSlotType::StorageImage:
+    case DescriptorSlotType::StorageTexelBuffer:
+    case DescriptorSlotType::StorageBuffer:
+    case DescriptorSlotType::StorageBufferDynamic: return eFrameRef_ReadBeforeWrite;
     default: RDCERR("Unexpected descriptor type");
   }
 
   return eFrameRef_Read;
 }
 
-bool IsValid(const VkWriteDescriptorSet &write, uint32_t arrayElement)
+void DescriptorSetSlot::SetBuffer(VkDescriptorType writeType, const VkDescriptorBufferInfo &bufInfo)
 {
-  // this makes assumptions that only hold within the context of Serialise_InitialState below,
-  // specifically that if pTexelBufferView/pBufferInfo is set then we are using them. In the general
-  // case they can be garbage and we must ignore them based on the descriptorType
-
-  if(write.pTexelBufferView)
-    return write.pTexelBufferView[arrayElement] != VK_NULL_HANDLE;
-
-  if(write.pBufferInfo)
-    return write.pBufferInfo[arrayElement].buffer != VK_NULL_HANDLE;
-
-  if(write.pImageInfo)
-  {
-    // only these two types need samplers
-    bool needSampler = (write.descriptorType == VK_DESCRIPTOR_TYPE_SAMPLER ||
-                        write.descriptorType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
-
-    // but all types that aren't just a sampler need an image
-    bool needImage = (write.descriptorType != VK_DESCRIPTOR_TYPE_SAMPLER);
-
-    if(needSampler && write.pImageInfo[arrayElement].sampler == VK_NULL_HANDLE)
-      return false;
-
-    if(needImage && write.pImageInfo[arrayElement].imageView == VK_NULL_HANDLE)
-      return false;
-
-    return true;
-  }
-
-  RDCERR("Encountered VkWriteDescriptorSet with no data!");
-
-  return false;
+  type = convert(writeType);
+  resource = GetResID(bufInfo.buffer);
+  offset = bufInfo.offset;
+  range = bufInfo.range;
+  if(bufInfo.range > VK_WHOLE_SIZE)
+    RDCWARN("Unrepresentable buffer range size: %llx", bufInfo.range);
 }
 
-void DescriptorSetBindingElement::RemoveBindRefs(VkResourceRecord *record)
+void DescriptorSetSlot::SetImage(VkDescriptorType writeType, const VkDescriptorImageInfo &imInfo,
+                                 bool useSampler)
 {
-  SCOPED_LOCK(record->descInfo->refLock);
-
-  if(texelBufferView != VK_NULL_HANDLE)
-  {
-    record->RemoveBindFrameRef(GetResID(texelBufferView));
-
-    VkResourceRecord *viewRecord = GetRecord(texelBufferView);
-    if(viewRecord && viewRecord->baseResource != ResourceId())
-      record->RemoveBindFrameRef(viewRecord->baseResource);
-  }
-  if(imageInfo.imageView != VK_NULL_HANDLE)
-  {
-    record->RemoveBindFrameRef(GetResID(imageInfo.imageView));
-
-    VkResourceRecord *viewRecord = GetRecord(imageInfo.imageView);
-    if(viewRecord)
-    {
-      record->RemoveBindFrameRef(viewRecord->baseResource);
-      if(viewRecord->baseResourceMem != ResourceId())
-        record->RemoveBindFrameRef(viewRecord->baseResourceMem);
-    }
-  }
-  if(imageInfo.sampler != VK_NULL_HANDLE)
-  {
-    record->RemoveBindFrameRef(GetResID(imageInfo.sampler));
-  }
-  if(bufferInfo.buffer != VK_NULL_HANDLE)
-  {
-    record->RemoveBindFrameRef(GetResID(bufferInfo.buffer));
-
-    VkResourceRecord *bufRecord = GetRecord(bufferInfo.buffer);
-    if(bufRecord && bufRecord->baseResource != ResourceId())
-      record->RemoveBindFrameRef(bufRecord->baseResource);
-  }
-
-  // NULL everything out now so that we don't accidentally reference an object
-  // that was removed already
-  texelBufferView = VK_NULL_HANDLE;
-  bufferInfo.buffer = VK_NULL_HANDLE;
-  imageInfo.imageView = VK_NULL_HANDLE;
-  imageInfo.sampler = VK_NULL_HANDLE;
+  type = convert(writeType);
+  if(useSampler &&
+     (type == DescriptorSlotType::CombinedImageSampler || type == DescriptorSlotType::Sampler))
+    sampler = GetResID(imInfo.sampler);
+  if(type != DescriptorSlotType::Sampler)
+    resource = GetResID(imInfo.imageView);
+  imageLayout = convert(imInfo.imageLayout);
 }
 
-void DescriptorSetBindingElement::AddBindRefs(VkResourceRecord *record, FrameRefType ref)
+void DescriptorSetSlot::SetTexelBuffer(VkDescriptorType writeType, ResourceId id)
 {
-  SCOPED_LOCK(record->descInfo->refLock);
+  type = convert(writeType);
+  resource = id;
+}
 
-  if(texelBufferView != VK_NULL_HANDLE)
+void AddBindFrameRef(DescriptorBindRefs &refs, ResourceId id, FrameRefType ref)
+{
+  if(id == ResourceId())
   {
-    VkResourceRecord *bufView = GetRecord(texelBufferView);
-    record->AddBindFrameRef(bufView->GetResourceID(), eFrameRef_Read,
-                            bufView->resInfo && bufView->resInfo->IsSparse());
+    RDCERR("Unexpected NULL resource ID being added as a bind frame ref");
+    return;
+  }
+  FrameRefType &p = refs.bindFrameRefs[id];
+  // be conservative - mark refs as read before write if we see a write and a read ref on it
+  p = ComposeFrameRefsUnordered(p, ref);
+}
+
+void AddImgFrameRef(DescriptorBindRefs &refs, VkResourceRecord *view, FrameRefType refType)
+{
+  AddBindFrameRef(refs, view->GetResourceID(), eFrameRef_Read);
+  if(view->resInfo && view->resInfo->IsSparse())
+    refs.sparseRefs.insert(view);
+  if(view->baseResourceMem != ResourceId())
+    AddBindFrameRef(refs, view->baseResourceMem, eFrameRef_Read);
+
+  FrameRefType &p = refs.bindFrameRefs[view->baseResource];
+
+  ImageRange imgRange = ImageRange((VkImageSubresourceRange)view->viewRange);
+  imgRange.viewType = view->viewRange.viewType();
+
+  FrameRefType maxRef =
+      MarkImageReferenced(refs.bindImageStates, view->baseResource, view->resInfo->imageInfo,
+                          ImageSubresourceRange(imgRange), VK_QUEUE_FAMILY_IGNORED, refType);
+
+  p = ComposeFrameRefsDisjoint(p, maxRef);
+}
+
+void AddMemFrameRef(DescriptorBindRefs &refs, ResourceId mem, VkDeviceSize offset,
+                    VkDeviceSize size, FrameRefType refType)
+{
+  if(mem == ResourceId())
+  {
+    RDCERR("Unexpected NULL resource ID being added as a bind frame ref");
+    return;
+  }
+  FrameRefType &p = refs.bindFrameRefs[mem];
+  FrameRefType maxRef =
+      MarkMemoryReferenced(refs.bindMemRefs, mem, offset, size, refType, ComposeFrameRefsUnordered);
+  p = ComposeFrameRefsDisjoint(p, maxRef);
+}
+
+void DescriptorSetSlot::AccumulateBindRefs(DescriptorBindRefs &refs, VulkanResourceManager *rm) const
+{
+  RDCCOMPILE_ASSERT(uint64_t(DescriptorSlotImageLayout::Count) <= 0xff,
+                    "DescriptorSlotImageLayout is no longer 8-bit");
+  RDCCOMPILE_ASSERT(uint64_t(DescriptorSlotType::Count) <= 0xff,
+                    "DescriptorSlotType is no longer 8-bit");
+  RDCCOMPILE_ASSERT(sizeof(DescriptorSetSlot) == 32, "DescriptorSetSlot is no longer 32 bytes");
+  RDCCOMPILE_ASSERT(offsetof(DescriptorSetSlot, offset) == 8,
+                    "DescriptorSetSlot first uint64_t bitpacking isn't working as expected");
+
+  VkResourceRecord *bufView = NULL, *imgView = NULL, *buffer = NULL;
+
+  switch(type)
+  {
+    case DescriptorSlotType::UniformTexelBuffer:
+    case DescriptorSlotType::StorageTexelBuffer: bufView = rm->GetResourceRecord(resource); break;
+    case DescriptorSlotType::StorageBuffer:
+    case DescriptorSlotType::StorageBufferDynamic:
+    case DescriptorSlotType::UniformBuffer:
+    case DescriptorSlotType::UniformBufferDynamic: buffer = rm->GetResourceRecord(resource); break;
+    case DescriptorSlotType::CombinedImageSampler:
+    case DescriptorSlotType::SampledImage:
+    case DescriptorSlotType::StorageImage:
+    case DescriptorSlotType::InputAttachment: imgView = rm->GetResourceRecord(resource); break;
+    default: break;
+  }
+
+  FrameRefType ref = GetRefType(type);
+
+  if(bufView)
+  {
+    AddBindFrameRef(refs, bufView->GetResourceID(), eFrameRef_Read);
+    if(bufView->resInfo && bufView->resInfo->IsSparse())
+      refs.sparseRefs.insert(bufView);
     if(bufView->baseResource != ResourceId())
-      record->AddBindFrameRef(bufView->baseResource, eFrameRef_Read);
+      AddBindFrameRef(refs, bufView->baseResource, eFrameRef_Read);
     if(bufView->baseResourceMem != ResourceId())
-      record->AddMemFrameRef(bufView->baseResourceMem, bufView->memOffset, bufView->memSize, ref);
+      AddMemFrameRef(refs, bufView->baseResourceMem, bufView->memOffset, bufView->memSize, ref);
+    if(bufView->storable)
+      refs.storableRefs.insert(rm->GetResourceRecord(bufView->baseResource));
   }
-  if(imageInfo.imageView != VK_NULL_HANDLE)
+  if(imgView)
   {
-    VkResourceRecord *view = GetRecord(imageInfo.imageView);
-    record->AddImgFrameRef(view, ref);
+    AddImgFrameRef(refs, imgView, ref);
   }
-  if(imageInfo.sampler != VK_NULL_HANDLE)
+  if(sampler != ResourceId())
   {
-    record->AddBindFrameRef(GetResID(imageInfo.sampler), eFrameRef_Read);
+    AddBindFrameRef(refs, sampler, eFrameRef_Read);
   }
-  if(bufferInfo.buffer != VK_NULL_HANDLE)
+  if(buffer)
   {
-    VkResourceRecord *buf = GetRecord(bufferInfo.buffer);
-    record->AddBindFrameRef(GetResID(bufferInfo.buffer), eFrameRef_Read,
-                            buf->resInfo && buf->resInfo->IsSparse());
-    if(buf->baseResource != ResourceId())
-      record->AddMemFrameRef(buf->baseResource, buf->memOffset, buf->memSize, ref);
+    AddBindFrameRef(refs, resource, eFrameRef_Read);
+    if(buffer->resInfo && buffer->resInfo->IsSparse())
+      refs.sparseRefs.insert(buffer);
+    if(buffer->baseResource != ResourceId())
+      AddMemFrameRef(refs, buffer->baseResource, buffer->memOffset, buffer->memSize, ref);
+    if(buffer->storable)
+      refs.storableRefs.insert(buffer);
   }
 }
 
-void DescriptorSetSlot::CreateFrom(const DescriptorSetBindingElement &slot)
+#if ENABLED(ENABLE_UNIT_TESTS)
+
+#undef None
+#undef Always
+
+#include "catch/catch.hpp"
+
+bool operator==(const VkImageMemoryBarrier &a, const VkImageMemoryBarrier &b)
 {
-  bufferInfo.buffer = GetResID(slot.bufferInfo.buffer);
-  bufferInfo.offset = slot.bufferInfo.offset;
-  bufferInfo.range = slot.bufferInfo.range;
-
-  imageInfo.sampler = GetResID(slot.imageInfo.sampler);
-  imageInfo.imageView = GetResID(slot.imageInfo.imageView);
-  imageInfo.imageLayout = slot.imageInfo.imageLayout;
-
-  texelBufferView = GetResID(slot.texelBufferView);
+  return memcmp(&a, &b, sizeof(VkImageMemoryBarrier)) == 0;
 }
+bool operator<(const VkImageMemoryBarrier &a, const VkImageMemoryBarrier &b)
+{
+  return memcmp(&a, &b, sizeof(VkImageMemoryBarrier)) < 0;
+}
+
+TEST_CASE("Validate CombineDepthStencilLayouts works", "[vulkan]")
+{
+  VkImage imga, imgb;
+
+  // give the fake handles values
+  {
+    uint64_t a = 1;
+    uint64_t b = 2;
+    memcpy(&imga, &a, sizeof(a));
+    memcpy(&imgb, &b, sizeof(b));
+  }
+
+  rdcarray<VkImageMemoryBarrier> barriers, ref;
+
+  VkImageMemoryBarrier b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+  b.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+  b.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+  SECTION("Ignored cases")
+  {
+    VkImageAspectFlags aspects[] = {VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_ASPECT_DEPTH_BIT,
+                                    VK_IMAGE_ASPECT_STENCIL_BIT,
+                                    VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT};
+    // only care about split depth and stencil for the same image
+    for(VkImageAspectFlags aspect : aspects)
+    {
+      barriers.clear();
+
+      // whole image
+      b.image = imga;
+      b.subresourceRange = {aspect, 0, 4, 0, 6};
+      barriers.push_back(b);
+
+      b.image = imgb;
+      b.subresourceRange = {aspect, 0, 4, 0, 6};
+      barriers.push_back(b);
+
+      ref = barriers;
+      CombineDepthStencilLayouts(barriers);
+
+      CHECK((ref == barriers));
+
+      barriers.clear();
+
+      // images split into different mips/arrays
+      b.image = imga;
+      b.subresourceRange = {aspect, 0, 1, 0, 3};
+      barriers.push_back(b);
+      b.subresourceRange = {aspect, 1, 2, 0, 3};
+      barriers.push_back(b);
+      b.subresourceRange = {aspect, 3, 1, 0, 3};
+      barriers.push_back(b);
+      b.subresourceRange = {aspect, 0, 4, 3, 3};
+      barriers.push_back(b);
+
+      b.image = imgb;
+      b.subresourceRange = {aspect, 0, 1, 0, 3};
+      barriers.push_back(b);
+      b.subresourceRange = {aspect, 1, 3, 0, 3};
+      barriers.push_back(b);
+      b.subresourceRange = {aspect, 0, 4, 3, 3};
+      barriers.push_back(b);
+
+      ref = barriers;
+      CombineDepthStencilLayouts(barriers);
+
+      CHECK((ref == barriers));
+    }
+  };
+
+  SECTION("Possible but unmergeable cases")
+  {
+    barriers.clear();
+
+    // could merge, but different images
+    b.image = imga;
+    b.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+    barriers.push_back(b);
+
+    b.image = imgb;
+    b.subresourceRange = {VK_IMAGE_ASPECT_STENCIL_BIT, 0, 1, 0, 1};
+    barriers.push_back(b);
+
+    ref = barriers;
+    CombineDepthStencilLayouts(barriers);
+
+    CHECK((ref == barriers));
+
+    barriers.clear();
+
+    // could merge, but different subresource ranges
+    b.image = imga;
+    b.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+    barriers.push_back(b);
+
+    b.image = imgb;
+    b.subresourceRange = {VK_IMAGE_ASPECT_STENCIL_BIT, 0, 2, 0, 1};
+    barriers.push_back(b);
+
+    ref = barriers;
+    CombineDepthStencilLayouts(barriers);
+
+    CHECK((ref == barriers));
+
+    barriers.clear();
+
+    b.image = imga;
+    b.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+    barriers.push_back(b);
+
+    b.image = imgb;
+    b.subresourceRange = {VK_IMAGE_ASPECT_STENCIL_BIT, 0, 1, 1, 1};
+    barriers.push_back(b);
+
+    ref = barriers;
+    CombineDepthStencilLayouts(barriers);
+
+    CHECK((ref == barriers));
+
+    barriers.clear();
+
+    // could merge, but different layouts
+    b.image = imga;
+    b.oldLayout = VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_OPTIMAL;
+    b.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 2, 0, 1};
+    barriers.push_back(b);
+
+    b.image = imgb;
+    b.oldLayout = VK_IMAGE_LAYOUT_STENCIL_READ_ONLY_OPTIMAL;
+    b.subresourceRange = {VK_IMAGE_ASPECT_STENCIL_BIT, 0, 2, 0, 1};
+    barriers.push_back(b);
+
+    ref = barriers;
+    CombineDepthStencilLayouts(barriers);
+
+    CHECK((ref == barriers));
+
+    barriers.clear();
+
+    b.image = imga;
+    b.newLayout = VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_OPTIMAL;
+    b.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 2, 0, 1};
+    barriers.push_back(b);
+
+    b.image = imgb;
+    b.newLayout = VK_IMAGE_LAYOUT_STENCIL_READ_ONLY_OPTIMAL;
+    b.subresourceRange = {VK_IMAGE_ASPECT_STENCIL_BIT, 0, 2, 0, 1};
+    barriers.push_back(b);
+
+    ref = barriers;
+    CombineDepthStencilLayouts(barriers);
+
+    CHECK((ref == barriers));
+  };
+
+  SECTION("Whole-image depth and separate stencil barriers are merged when possible")
+  {
+    barriers.clear();
+
+    CHECK((ref == barriers));
+    b.image = imga;
+    b.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+    barriers.push_back(b);
+
+    b.image = imga;
+    b.subresourceRange = {VK_IMAGE_ASPECT_STENCIL_BIT, 0, 1, 0, 1};
+    barriers.push_back(b);
+
+    b.image = imgb;
+    b.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+    barriers.push_back(b);
+
+    ref = barriers;
+    CombineDepthStencilLayouts(barriers);
+
+    REQUIRE(barriers.size() == 2);
+    // aspect mask is combined now
+    CHECK(barriers[0].subresourceRange.aspectMask ==
+          (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT));
+    // otherwise the barrier should be the same
+    CHECK(barriers[0].subresourceRange.baseMipLevel == 0);
+    CHECK(barriers[0].subresourceRange.levelCount == 1);
+    CHECK(barriers[0].subresourceRange.baseArrayLayer == 0);
+    CHECK(barriers[0].subresourceRange.layerCount == 1);
+    CHECK(barriers[0].oldLayout == ref[0].oldLayout);
+    CHECK(barriers[0].newLayout == ref[0].newLayout);
+    // the last barrier should be the same
+    CHECK((barriers[1] == ref[2]));
+  };
+
+  SECTION("Split depth and separate stencil barriers are merged when possible")
+  {
+    barriers.clear();
+
+    CHECK((ref == barriers));
+    b.image = imga;
+    b.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+    barriers.push_back(b);
+
+    b.image = imga;
+    b.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 1, 1, 0, 1};
+    barriers.push_back(b);
+
+    b.image = imga;
+    b.subresourceRange = {VK_IMAGE_ASPECT_STENCIL_BIT, 0, 1, 0, 1};
+    barriers.push_back(b);
+
+    b.image = imga;
+    b.subresourceRange = {VK_IMAGE_ASPECT_STENCIL_BIT, 1, 1, 0, 1};
+    barriers.push_back(b);
+
+    CombineDepthStencilLayouts(barriers);
+
+    REQUIRE(barriers.size() == 2);
+
+    // aspect mask is combined now
+    CHECK(barriers[0].subresourceRange.aspectMask ==
+          (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT));
+    // otherwise the barrier should be the same
+    CHECK(barriers[0].subresourceRange.baseMipLevel == 0);
+    CHECK(barriers[0].subresourceRange.levelCount == 1);
+    CHECK(barriers[0].subresourceRange.baseArrayLayer == 0);
+    CHECK(barriers[0].subresourceRange.layerCount == 1);
+
+    // aspect mask is combined now
+    CHECK(barriers[1].subresourceRange.aspectMask ==
+          (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT));
+    // otherwise the barrier should be the same
+    CHECK(barriers[1].subresourceRange.baseMipLevel == 1);
+    CHECK(barriers[1].subresourceRange.levelCount == 1);
+    CHECK(barriers[1].subresourceRange.baseArrayLayer == 0);
+    CHECK(barriers[1].subresourceRange.layerCount == 1);
+  };
+}
+
+#endif

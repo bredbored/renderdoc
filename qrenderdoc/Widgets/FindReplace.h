@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2017-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -61,7 +61,9 @@ public:
   bool matchWord();
   bool regexp();
 
+  void setFindText(QString text);
   QString findText();
+  void setReplaceText(QString text);
   QString replaceText();
 
 public slots:
@@ -75,9 +77,11 @@ signals:
   void performFindAll();
   void performReplace();
   void performReplaceAll();
+  void keyPress(QKeyEvent *e);
 
 private slots:
   // automatic slots
+  void on_findPrev_clicked();
   void on_find_clicked();
   void on_findAll_clicked();
   void on_replace_clicked();
@@ -89,6 +93,8 @@ private:
   void keyPressEvent(QKeyEvent *event) override;
 
   Ui::FindReplace *ui;
+
+  SearchDirection m_direction;
 
   void addHistory(QComboBox *combo);
 };

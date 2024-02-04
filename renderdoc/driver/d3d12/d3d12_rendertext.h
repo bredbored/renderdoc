@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2018-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -47,7 +47,7 @@ public:
   }
   int GetWidth() { return RDCMAX(1, m_width); }
   int GetHeight() { return RDCMAX(1, m_height); }
-  void RenderText(ID3D12GraphicsCommandList *list, float x, float y, const char *textfmt, ...);
+  void RenderText(ID3D12GraphicsCommandList *list, float x, float y, const rdcstr &text);
 
 private:
   int m_width = 1, m_height = 1;
@@ -59,7 +59,7 @@ private:
     FMTNUM_BACKBUFFER,
   } m_BBFmtIdx;
 
-  void RenderTextInternal(ID3D12GraphicsCommandList *list, float x, float y, const char *text);
+  void RenderTextInternal(ID3D12GraphicsCommandList *list, float x, float y, const rdcstr &text);
 
   static const int FONT_TEX_WIDTH = 256;
   static const int FONT_TEX_HEIGHT = 128;

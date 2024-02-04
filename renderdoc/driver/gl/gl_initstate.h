@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2018-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -117,6 +117,8 @@ struct PipelineInitialData
 {
   bool valid;
   GLResource programs[6];
+  // since this array is serialised (and because GL will never support other shader stages) we leave
+  // this at 6 instead of NumShaderStages
 };
 
 DECLARE_REFLECTION_STRUCT(PipelineInitialData);
@@ -146,6 +148,7 @@ struct TextureStateInitialData
   GLResource texBuffer;
   uint32_t texBufOffs;
   uint32_t texBufSize;
+  float maxAniso;
 };
 
 DECLARE_REFLECTION_STRUCT(TextureStateInitialData);

@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2016-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -25,6 +25,7 @@
 #pragma once
 
 #include <QFrame>
+#include "renderdoc_replay.h"
 
 namespace Ui
 {
@@ -33,6 +34,7 @@ class ResourcePreview;
 
 struct IReplayOutput;
 struct ICaptureContext;
+class RDLabel;
 
 class ResourcePreview : public QFrame
 {
@@ -40,11 +42,17 @@ class ResourcePreview : public QFrame
 
 public:
   explicit ResourcePreview(ICaptureContext &c, IReplayOutput *output, QWidget *parent = 0);
+  // create a manually rendered preview
+  explicit ResourcePreview(bool, QWidget *parent = 0);
+
+  void Initialise();
+
   ~ResourcePreview();
 
 signals:
   void clicked(QMouseEvent *e);
   void doubleClicked(QMouseEvent *e);
+  void resized(ResourcePreview *prev);
 
 public:
   void setSlotName(const QString &n);
@@ -53,26 +61,27 @@ public:
   void clickEvent(QMouseEvent *e);
   void doubleClickEvent(QMouseEvent *e);
 
-  QWidget *thumbWidget();
+  WindowingData GetWidgetWindowingData();
+  QSize GetThumbSize();
+  void UpdateThumb(QSize s, const bytebuf &imgData);
 
   void setActive(bool b)
   {
     m_Active = b;
-    if(b)
-      show();
-    else
-      hide();
+    // we unconditionally hide the preview, the thumbnail strip will show it
+    hide();
   }
   bool isActive() { return m_Active; }
   void setSize(QSize s);
 
   void setSelected(bool sel);
 
-protected:
-  void changeEvent(QEvent *event) override;
-
 private:
+  virtual void resizeEvent(QResizeEvent *event);
+
   Ui::ResourcePreview *ui;
+
+  RDLabel *m_ManualThumbnail = NULL;
 
   bool m_Active;
   bool m_Selected = false;

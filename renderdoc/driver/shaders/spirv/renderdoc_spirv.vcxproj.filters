@@ -10,6 +10,9 @@
     <Filter Include="PCH">
       <UniqueIdentifier>{88413a79-d32c-4386-9428-47a9ea0d52b5}</UniqueIdentifier>
     </Filter>
+    <Filter Include="JSON-Generated helpers">
+      <UniqueIdentifier>{1b2858fa-eefd-42e7-af56-bfad5e61e8e9}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="..\..\..\3rdparty\glslang\OGLCompilersDLL\InitializeDll.cpp">
@@ -134,8 +137,15 @@
     <ClCompile Include="..\..\..\3rdparty\glslang\SPIRV\SpvTools.cpp">
       <Filter>3rdparty\glslang</Filter>
     </ClCompile>
+    <ClCompile Include="spirv_gen.cpp">
+      <Filter>JSON-Generated helpers</Filter>
+    </ClCompile>
     <ClCompile Include="spirv_reflect.cpp" />
     <ClCompile Include="glslang_compile.cpp" />
+    <ClCompile Include="spirv_processor.cpp" />
+    <ClCompile Include="spirv_debug_setup.cpp" />
+    <ClCompile Include="spirv_debug.cpp" />
+    <ClCompile Include="spirv_debug_glsl450.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\..\..\3rdparty\glslang\OGLCompilersDLL\InitializeDll.h">
@@ -278,8 +288,17 @@
     <ClInclude Include="..\..\..\3rdparty\glslang\SPIRV\SpvTools.h">
       <Filter>3rdparty\glslang</Filter>
     </ClInclude>
+    <ClInclude Include="spirv_gen.h">
+      <Filter>JSON-Generated helpers</Filter>
+    </ClInclude>
     <ClInclude Include="spirv_compile.h" />
     <ClInclude Include="glslang_compile.h" />
     <ClInclude Include="spirv_reflect.h" />
+    <ClInclude Include="spirv_op_helpers.h">
+      <Filter>JSON-Generated helpers</Filter>
+    </ClInclude>
+    <ClInclude Include="spirv_processor.h" />
+    <ClInclude Include="spirv_debug.h" />
+    <ClInclude Include="var_dispatch_helpers.h" />
   </ItemGroup>
 </Project>

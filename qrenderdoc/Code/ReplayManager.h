@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2016-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -48,12 +48,16 @@ public:
   ReplayManager();
   ~ReplayManager();
 
-  void OpenCapture(const QString &capturefile, RENDERDOC_ProgressCallback progress);
+  void OpenCapture(const QString &capturefile, const ReplayOptions &opts,
+                   RENDERDOC_ProgressCallback progress);
   void DeleteCapture(const rdcstr &capturefile, bool local);
 
   bool IsRunning();
-  ReplayStatus GetCreateStatus() { return m_CreateStatus; }
+  ResultDetails GetCreateStatus() { return m_CreateResult; }
+  void SetFatalErrorCallback(std::function<void()> cb) { m_FatalErrorCallback = cb; }
+  ResultDetails GetFatalError() { return m_FatalError; }
   float GetCurrentProcessingTime();
+  QString GetCurrentProcessingTag();
   // this tagged version is for cases when we might send a request - e.g. to pick a vertex or pixel
   // - and want to pre-empt it with a new request before the first has returned. Either because some
   // other work is taking a while or because we're sending requests faster than they can be
@@ -68,7 +72,7 @@ public:
 
   void CloseThread();
 
-  ReplayStatus ConnectToRemoteServer(RemoteHost *host);
+  ResultDetails ConnectToRemoteServer(RemoteHost host);
   void DisconnectFromRemoteServer();
   void ShutdownServer();
   void PingRemote();
@@ -86,7 +90,7 @@ public:
   // work whether local or remote.
   ICaptureFile *GetCaptureFile() { return m_CaptureFile; }
   void ReopenCaptureFile(const QString &path);
-  RemoteHost *CurrentRemote() { return m_RemoteHost; }
+  RemoteHost CurrentRemote() { return m_RemoteHost; }
   ExecuteResult ExecuteAndInject(const rdcstr &exe, const rdcstr &workingDir, const rdcstr &cmdLine,
                                  const rdcarray<EnvironmentModification> &env,
                                  const rdcstr &capturefile, CaptureOptions opts);
@@ -113,10 +117,12 @@ private:
     bool selfdelete;
   };
 
-  void run(int proxyRenderer, const QString &capturefile, RENDERDOC_ProgressCallback progress);
+  void run(int proxyRenderer, const QString &capturefile, const ReplayOptions &opts,
+           RENDERDOC_ProgressCallback progress);
 
   QMutex m_TimerLock;
   QElapsedTimer m_CommandTimer;
+  QString m_CommandTag;
 
   QMutex m_RenderLock;
   QQueue<InvokeHandle *> m_RenderQueue;
@@ -128,10 +134,13 @@ private:
   void PushInvoke(InvokeHandle *cmd);
 
   QMutex m_RemoteLock;
-  RemoteHost *m_RemoteHost = NULL;
+  RemoteHost m_RemoteHost;
   IRemoteServer *m_Remote = NULL;
+  IRemoteServer *m_OrphanedRemote = NULL;
 
+  std::function<void()> m_FatalErrorCallback;
+  ResultDetails m_FatalError = {ResultCode::Succeeded};
   volatile bool m_Running;
   LambdaThread *m_Thread;
-  ReplayStatus m_CreateStatus = ReplayStatus::Succeeded;
+  ResultDetails m_CreateResult = {ResultCode::Succeeded};
 };

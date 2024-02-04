@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2018-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -24,7 +24,7 @@
 
 #include "d3d12_test.h"
 
-TEST(D3D12_Untyped_Backbuffer_Descriptor, D3D12GraphicsTest)
+RD_TEST(D3D12_Untyped_Backbuffer_Descriptor, D3D12GraphicsTest)
 {
   static constexpr const char *Description =
       "D3D12 inherits D3D11's ability to have a mutable format on a non-typeless backbuffer "
@@ -60,7 +60,7 @@ TEST(D3D12_Untyped_Backbuffer_Descriptor, D3D12GraphicsTest)
       // create a descriptor with an UNKNOWN format
       D3D12_CPU_DESCRIPTOR_HANDLE rtv = MakeRTV(bb).Format(DXGI_FORMAT_UNKNOWN).CreateCPU(0);
 
-      ClearRenderTargetView(cmd, rtv, {0.4f, 0.5f, 0.6f, 1.0f});
+      ClearRenderTargetView(cmd, rtv, {0.2f, 0.2f, 0.2f, 1.0f});
 
       cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 

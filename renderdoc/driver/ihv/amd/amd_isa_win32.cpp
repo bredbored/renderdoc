@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2017-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -24,6 +24,7 @@
 
 #include "amd_isa.h"
 #include "common/common.h"
+#include "common/formatting.h"
 #include "core/plugins.h"
 #include "official/RGA/Common/AmdDxGsaCompile.h"
 #include "official/RGA/elf/elf32.h"
@@ -35,17 +36,9 @@
 #define DLL_NAME "atidxx32.dll"
 #endif
 
-static const char *driverDllErrorMessage = R"(Error loading atidxx64.dll.
-
-Currently atidxx64.dll from AMD's driver package is required for GCN disassembly and it cannot be
-distributed with RenderDoc.
-
-To see instructions on how to download and configure it on your system, go to:
-https://github.com/baldurk/renderdoc/wiki/GCN-ISA)";
-
 namespace GCNISA
 {
-extern std::string pluginPath;
+extern rdcstr pluginPath;
 
 static HMODULE GetAMDModule()
 {
@@ -59,14 +52,31 @@ static HMODULE GetAMDModule()
   return module;
 }
 
-std::string DisassembleDXBC(const bytebuf &shaderBytes, const std::string &target)
+HRESULT SafelyCompile(PfnAmdDxGsaCompileShader compileShader, AmdDxGsaCompileShaderInput &in,
+                      AmdDxGsaCompileShaderOutput &out)
+{
+  HRESULT ret = E_FAIL;
+  __try
+  {
+    ret = compileShader(&in, &out);
+  }
+  __except(EXCEPTION_EXECUTE_HANDLER)
+  {
+    RDCLOG("Exception occurred while compiling shader for ISA");
+    out.pShaderBinary = NULL;
+    out.shaderBinarySize = 0;
+  }
+  return ret;
+}
+
+rdcstr DisassembleDXBC(const bytebuf &shaderBytes, const rdcstr &target)
 {
   HMODULE mod = GetAMDModule();
 
   if(mod == NULL)
     return "; Error loading " DLL_NAME R"(.
 
-; Currently atidxx64.dll from AMD's driver package is required for GCN disassembly and it cannot be
+; Currently )" DLL_NAME R"( from AMD's driver package is required for GCN disassembly and it cannot be
 ; distributed with RenderDoc.
 
 ; To see instructions on how to download and configure it on your system, go to:
@@ -105,8 +115,8 @@ std::string DisassembleDXBC(const bytebuf &shaderBytes, const std::string &targe
   bool amdil = false;
   if(target == "AMDIL")
   {
-    in.chipFamily = asicInfo[0].chipFamily;
-    in.chipRevision = asicInfo[0].chipRevision;
+    in.chipFamily = asicInfo[legacyAsicCount].chipFamily;
+    in.chipRevision = asicInfo[legacyAsicCount].chipRevision;
     amdil = true;
   }
 
@@ -116,7 +126,8 @@ std::string DisassembleDXBC(const bytebuf &shaderBytes, const std::string &targe
   // we do a little mini parse of the DXBC file, just enough to get the shader code out. This is
   // because we're getting called from outside the D3D backend where the shader bytes are opaque.
 
-  const char *dxbcParseError = "; Failed to fetch D3D shader code from DXBC";
+  const char *dxbcParseError =
+      "; Failed to fetch D3D shader code from shader module, invalid DXBC container";
 
   const byte *base = shaderBytes.data();
   const uint32_t *end = (const uint32_t *)(base + shaderBytes.size());
@@ -136,7 +147,7 @@ std::string DisassembleDXBC(const bytebuf &shaderBytes, const std::string &targe
   const uint32_t numChunks = *dxbc;
   dxbc++;
 
-  std::vector<uint32_t> chunkOffsets;
+  rdcarray<uint32_t> chunkOffsets;
   for(uint32_t i = 0; i < numChunks; i++)
   {
     if(dxbc >= end)
@@ -148,6 +159,8 @@ std::string DisassembleDXBC(const bytebuf &shaderBytes, const std::string &targe
 
   in.pShaderByteCode = NULL;
   in.byteCodeLength = 0;
+
+  bool dxil = false;
 
   for(uint32_t offs : chunkOffsets)
   {
@@ -168,23 +181,35 @@ std::string DisassembleDXBC(const bytebuf &shaderBytes, const std::string &targe
 
       break;
     }
+    else if(*dxbc == MAKE_FOURCC('D', 'X', 'I', 'L') || *dxbc == MAKE_FOURCC('I', 'L', 'D', 'B'))
+    {
+      dxil = true;
+    }
   }
 
   if(in.byteCodeLength == 0)
+  {
+    if(dxil)
+      return "; Shader disassembly for DXIL shaders is not supported.";
     return dxbcParseError;
+  }
 
   out.size = sizeof(out);
 
-  compileShader(&in, &out);
+  HRESULT hr = SafelyCompile(compileShader, in, out);
 
   if(out.pShaderBinary == NULL || out.shaderBinarySize < 16)
+  {
+    RDCLOG("Failed to disassemble shader: %p/%zu (%s)", out.pShaderBinary, out.shaderBinarySize,
+           ToStr(hr).c_str());
     return "; Failed to disassemble shader";
+  }
 
   const uint8_t *elf = (const uint8_t *)out.pShaderBinary;
 
   const Elf32_Ehdr *elfHeader = (const Elf32_Ehdr *)elf;
 
-  std::string ret;
+  rdcstr ret;
 
   // minimal code to extract data from ELF. We assume the ELF we got back is well-formed.
   if(IS_ELF(*elfHeader) && elfHeader->e_ident[EI_CLASS] == ELFCLASS32)
@@ -228,8 +253,8 @@ std::string DisassembleDXBC(const bytebuf &shaderBytes, const std::string &targe
 
     if(stats && !amdil)
     {
-      std::string statStr = StringFormat::Fmt(
-          R"(; -------- Statistics ---------------------
+      ret.insert(0, StringFormat::Fmt(
+                        R"(; -------- Statistics ---------------------
 ; SGPRs: %u out of %u used
 ; VGPRs: %u out of %u used
 ; LDS: %u out of %u bytes used
@@ -237,16 +262,13 @@ std::string DisassembleDXBC(const bytebuf &shaderBytes, const std::string &targe
 ; Instructions: %u ALU, %u Control Flow, %u TFETCH
 
 )",
-          stats->numSgprsUsed, stats->availableSgprs, stats->numVgprsUsed, stats->availableVgprs,
-          stats->usedLdsBytes, stats->availableLdsBytes, stats->usedScratchBytes, stats->numAluInst,
-          stats->numControlFlowInst, stats->numTfetchInst);
-
-      ret.insert(ret.begin(), statStr.begin(), statStr.end());
+                        stats->numSgprsUsed, stats->availableSgprs, stats->numVgprsUsed,
+                        stats->availableVgprs, stats->usedLdsBytes, stats->availableLdsBytes,
+                        stats->usedScratchBytes, stats->numAluInst, stats->numControlFlowInst,
+                        stats->numTfetchInst));
     }
 
-    std::string header = StringFormat::Fmt("; Disassembly for %s\n\n", target.c_str());
-
-    ret.insert(ret.begin(), header.begin(), header.end());
+    ret.insert(0, StringFormat::Fmt("; Disassembly for %s\n\n", target.c_str()));
   }
   else
   {

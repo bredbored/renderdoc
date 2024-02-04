@@ -19,7 +19,7 @@ How do I do some particular task?
 
 Many specific tasks or functions are detailed in the :doc:`"How Do I... ?" <../how/index>` sections. These sections each take a feature or element of a workflow and explain how it fits into the program as a whole as well as any details of how it works.
 
-If the task you have in mind isn't listed there you might find something similar, or you might find a related feature which can be used to do what you want. If the feature you want doesn't seem to exist at all you might want to check the :doc:`../behind_scenes/planned_features` to see if it's coming soon - if it's not on that list please feel free to `contact me <mailto:baldurk@baldurk.org?subject=RenderDoc%20request>`__ and request it! It has often been that simple features are very quick to implement and the prioritisation and scheduling of features is fairly fluid depending on user needs.
+If the task you have in mind isn't listed there you might find something similar, or you might find a related feature which can be used to do what you want. If you have a workflow which isn't supported at all, feel free to open an issue on github to request a new feature. Make sure to describe clearly what you are trying to do and what workflow you want to support, not just the specific feature you want. That way the problem can be better understood.
 
 Why did you make RenderDoc?
 ---------------------------
@@ -58,7 +58,7 @@ There is also a thumbnail handler available for ``.rdc`` so that while browsing 
 What APIs does RenderDoc support?
 ---------------------------------
 
-Currently RenderDoc supports Vulkan 1.1, D3D11 (up to D3D11.4), D3D12, OpenGL 3.2+, and OpenGL ES 2.0 - 3.2. Note that OpenGL (and similarly OpenGL ES) is a complex & sprawling API, so see the details of what is supported in :doc:`its own page <../behind_scenes/opengl_support>`. In particular on desktop only modern GL is supported - legacy GL that is only available via the compatibility profile in OpenGL 3.2 is not supported.
+Currently RenderDoc supports Vulkan 1.2, D3D11 (up to D3D11.4), D3D12, OpenGL 3.2+, and OpenGL ES 2.0 - 3.2. Note that OpenGL (and similarly OpenGL ES) is a complex & sprawling API, so see the details of what is supported in :doc:`its own page <../behind_scenes/opengl_support>`. In particular on desktop only modern GL is supported - legacy GL that is only available via the compatibility profile in OpenGL 3.2 is not supported.
 
 Vulkan support has :doc:`a few notes <../behind_scenes/vulkan_support>`, as does :doc:`D3D12 <../behind_scenes/d3d12_support>`.
 
@@ -92,7 +92,7 @@ RenderDoc is licensed under the MIT license and the source is available on `GitH
 What are the requirements for RenderDoc?
 ----------------------------------------
 
-Currently RenderDoc expects Feature Level 11.0 hardware and above for D3D11. Lower levels will capture successfully, but on replay RenderDoc will fall back to WARP software emulation which will run quite slowly.
+Currently RenderDoc expects Feature Level 11.0 hardware and above for D3D11 and D3D12. Lower levels will capture successfully, but on replay RenderDoc will fall back to WARP software emulation which will run quite slowly.
 
 For OpenGL RenderDoc will only capture core profile applications, in general, and expects at minimum to be able to create a core 3.2 context which includes a few key extensions. For more details see :doc:`../behind_scenes/opengl_support`.
 
@@ -171,9 +171,9 @@ Note this is only supported on D3D11 and OpenGL currently, since Vulkan and D3D1
 RenderDoc is complaining about my OpenGL app in the overlay - what gives?
 -------------------------------------------------------------------------
 
-The first thing to remember is that **RenderDoc only supports Core 3.2 and above OpenGL**. If your app is using features from before 3.2 it almost certainly won't work as most functionality is not supported. A couple of things like not creating a VAO (which is required in core profile) and using luminance textures (which don't exist in core profile) are allowed, but none of the fixed function pipeline will work, etc etc.
+The first thing to remember is that **RenderDoc only supports Core Profile 3.2 and above OpenGL**. If your app is using deprecated compatibility profile features from before 3.2 it almost certainly won't work as most functionality is not supported. A couple of things like not creating a VAO (which is required in core profile) and using luminance textures (which don't exist in core profile) are allowed, but none of the fixed function pipeline will work, etc.
 
-If your app is not using the ``CreateContextAttribs`` API then RenderDoc will completely refuse to capture, and will display overlay text to this effect using the simplest fixed-function pipeline code, so it will run on any OpenGL app, even on a 1.4 context or similar.
+If your app is not using the ``CreateContextAttribs`` API then RenderDoc will assume your program uses legacy functionality and it will completely refuse to capture. The overlay will display text to this effect using the simplest fixed-function pipeline code, so it will run on any OpenGL app, even on a 1.4 context or similar.
 
 If your app did use the ``CreateContextAttribs`` API, RenderDoc will allow you to capture, but compatibility profiles will have a warning displayed in the overlay - this is because you could easily use old functionality which is still available in the context.
 
@@ -182,9 +182,9 @@ Can I tell via the graphics APIs if RenderDoc is present at runtime?
 
 Yes indeed. Some APIs offer ways to do this already - ``D3DPERF_GetStatus()``, ``ID3DUserDefinedAnnotation::GetStatus()`` and ``ID3D11DeviceContext2::IsAnnotationEnabled()``.
 
-In addition to those:
+In addition to those the simplest way is to see if the RenderDoc module is loaded, using ``GetModuleHandleA("renderdoc.dll") != NULL`` or ``dlopen("librenderdoc.so, RTLD_NOW | RTLD_NOLOAD) != NULL``. There are also API specific ways to query:
 
-Querying an ``ID3D11Device`` for UUID ``{A7AA6116-9C8D-4BBA-9083-B4D816B71B78}`` will return an ``IUnknown*`` and ``S_OK`` when RenderDoc is present.
+Querying an ``ID3D11Device`` or ``ID3D12Device`` for UUID ``{A7AA6116-9C8D-4BBA-9083-B4D816B71B78}`` will return an ``IUnknown*`` and ``S_OK`` when RenderDoc is present.
 
 `GL_EXT_debug_tool <https://renderdoc.org/debug_tool.txt>`_ is implemented on RenderDoc, which is an extension I've proposed for this purpose (identifying when and which tool is injected in your program). It allows you to query for the presence name and type of a debug tool that's currently hooked. At the time of writing only RenderDoc implements this as I've only just proposed the extension publicly, but in future you can use the queries described in that spec.
 
@@ -199,22 +199,20 @@ Querying an ``ID3D11Device`` for UUID ``{A7AA6116-9C8D-4BBA-9083-B4D816B71B78}``
         #define GL_DEBUG_TOOL_NAME_EXT            0x678A
         #define GL_DEBUG_TOOL_PURPOSE_EXT         0x678B
 
-.. _unstripped-shader-info:
+On Vulkan `VK_EXT_tooling_info` will return an entry for RenderDoc. This extension will always be available when running under RenderDoc.
 
 My shaders have 'cbuffer0' and unnamed variables, how do I get proper debug info?
 ---------------------------------------------------------------------------------
 
 If you get textures that are just named ``texture0`` and ``texture1`` or constant/uniform buffers named ``cbuffer2`` then this indicates that you have stripped optional reflection/debug information out of your shaders.
 
-This optional information is generated by the compiler, but is not required for API correctness so some codebases will strip the information out after processing it offline, and so it will not be available for RenderDoc to fetch.
+This optional information is generated by the compiler, but is not required for API correctness so some codebases will strip the information out after processing it offline, and so it will not be available for RenderDoc to fetch. This also includes shader source for source-level shader debugging on APIs that support it.
 
-The simplest solution is just to avoid stripping the data when using RenderDoc, but that isn't always possible. Instead RenderDoc allows you to use API-specific methods to specify where the unstripped data can be found. This means you can save the unstripped shader to a debug location and then either store this location with the shader, or specify it at runtime. On replay RenderDoc will expect the data to be available at that location and it will load it up instead.
+The simplest solution is just to avoid stripping the data when using RenderDoc. If you can enable debugging information to be embedded when building your shaders that's all that is necessary. All APIs will allow this data in the shader blob, but the way it is generated varies by API and shader compiler.
 
-The path you specify (with the stripped shader, or at runtime) can be either absolute or relative. If it's relative, you must configure a shader search path in the :doc:`../window/settings_window`.
+It's not always simple to avoid that stripping, and in some cases it may not be desirable as debug information can be quite a storage and memory overhead, it may instead be better to separate out the debug information and store it in a disk cache, with only a path or identifier remaining in the stripped blob so that RenderDoc can identify the matching debug information later.
 
-The stripped shader file stored on disk can also be compressed with LZ4 to save space as often most of the size is made up for shader source text which compresses well. To do this, simply compress the contents of the file and prepend the pathname (either absolute or relative, specified in the shader blob or at runtime) with ``lz4#``.
-
-For example code using this method, check out :doc:`tips_tricks`.
+For more information on how to do this, see :doc:`../how/how_shader_debug_info`.
 
 I want to debug a child process that my program launches, how can I inject RenderDoc?
 -------------------------------------------------------------------------------------
@@ -244,3 +242,22 @@ API validation layers are controlled by RenderDoc when it's active. This means t
 .. note::
 
     On D3D11 if you know what you are doing you can access the underlying ``ID3D11InfoQueue`` using the separate UUID ``{3FC4E618-3F70-452A-8B8F-A73ACCB58E3D}``. Be aware that accessing this interface is done at your own risk and may break the RenderDoc capture. If you need to use the API validation directly it's recommended that you do so without RenderDoc active.
+
+If I have multiple GPUs available, which one is used by RenderDoc? Can I change that?
+-------------------------------------------------------------------------------------
+
+By default RenderDoc will try to use the closest matching GPU to the one used on capture, which is controlled by the application. For example if a system has both Nvidia and AMD GPUs, then if the capture was made on an AMD GPU then the AMD GPU will be used on replay.
+
+If a compatible GPU cannot be found - e.g. if the capture was made on an Intel GPU then the default - then the system default will be used.
+
+This selection process can be overridden using :ref:`the GPU selection replay option <gpu-selection-override>` on a per-capture or global basis.
+
+.. _what-is-an-action:
+.. _what-is-a-drawcall:
+
+What is an Action?
+------------------
+
+RenderDoc uses 'action' as an umbrella term to cover events like draws, dispatches, copies, clears, resolves, and other calls that cause the GPU to do work or can affect memory and resources like textures and buffers. This is sometimes referred to as a drawcall, but the term action is used to be less ambiguous compared to actual rasterization drawing.
+
+This means that when browsing in the event browser by default only actions will be shown, meaning you can only see the list of actions and user-defined markers.

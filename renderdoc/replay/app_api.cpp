@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -24,8 +24,9 @@
 
 #include <string.h>
 #include "api/app/renderdoc_app.h"
-#include "api/replay/renderdoc_replay.h"    // for RENDERDOC_API to export the RENDERDOC_GetAPI function
+#include "api/replay/apidefs.h"    // for RENDERDOC_API to export the RENDERDOC_GetAPI function
 #include "common/common.h"
+#include "common/formatting.h"
 #include "core/core.h"
 #include "hooks/hooks.h"
 #include "serialise/rdcfile.h"
@@ -50,9 +51,9 @@ static void MaskOverlayBits(uint32_t And, uint32_t Or)
   RenderDoc::Inst().MaskOverlayBits(And, Or);
 }
 
-static void Shutdown()
+static void RemoveHooks()
 {
-  RenderDoc::Inst().Shutdown();
+  RenderDoc::Inst().RemoveHooks();
   LibraryHooks::RemoveHooks();
 }
 
@@ -79,7 +80,7 @@ static uint32_t GetNumCaptures()
 
 static uint32_t GetCapture(uint32_t idx, char *filename, uint32_t *pathlength, uint64_t *timestamp)
 {
-  std::vector<CaptureData> caps = RenderDoc::Inst().GetCaptures();
+  rdcarray<CaptureData> caps = RenderDoc::Inst().GetCaptures();
 
   if(idx >= (uint32_t)caps.size())
   {
@@ -106,10 +107,10 @@ static uint32_t GetCapture(uint32_t idx, char *filename, uint32_t *pathlength, u
 
 static void SetCaptureFileComments(const char *filePath, const char *comments)
 {
-  std::string path;
+  rdcstr path;
   if(filePath == NULL || filePath[0] == 0)
   {
-    std::vector<CaptureData> caps = RenderDoc::Inst().GetCaptures();
+    rdcarray<CaptureData> caps = RenderDoc::Inst().GetCaptures();
     if(caps.empty())
     {
       RDCERR(
@@ -125,10 +126,10 @@ static void SetCaptureFileComments(const char *filePath, const char *comments)
   }
 
   RDCFile rdc;
-  rdc.Open(path.c_str());
-  if(rdc.ErrorCode() != ContainerError::NoError)
+  rdc.Open(path);
+  if(rdc.Error() != ResultCode::Succeeded)
   {
-    RDCERR("Error opening '%s' to add capture comments", path.c_str());
+    RDCERR("Error adding capture file comments: %s", ResultDetails(rdc.Error()).Message().c_str());
     return;
   }
 
@@ -140,7 +141,7 @@ static void SetCaptureFileComments(const char *filePath, const char *comments)
 
   if(comments)
   {
-    std::string commentsjson = "{\"comments\":\"";
+    rdcstr commentsjson = "{\"comments\":\"";
 
     commentsjson.reserve(strlen(comments));
 
@@ -194,33 +195,35 @@ static uint32_t IsTargetControlConnected()
 
 static uint32_t LaunchReplayUI(uint32_t connectTargetControl, const char *cmdline)
 {
-  std::string replayapp = FileIO::GetReplayAppFilename();
+  rdcstr replayapp = FileIO::GetReplayAppFilename();
 
   if(replayapp.empty())
     return 0;
 
-  std::string cmd = cmdline ? cmdline : "";
+  rdcstr cmd = cmdline ? cmdline : "";
   if(connectTargetControl)
     cmd += StringFormat::Fmt(" --targetcontrol localhost:%u",
                              RenderDoc::Inst().GetTargetControlIdent());
 
-  return Process::LaunchProcess(replayapp.c_str(), "", cmd.c_str(), false);
+  return Process::LaunchProcess(replayapp, "", cmd, false);
 }
 
 static void SetActiveWindow(void *device, void *wndHandle)
 {
-  RenderDoc::Inst().SetActiveWindow(device, wndHandle);
+  RenderDoc::Inst().SetActiveWindow(DeviceOwnedWindow(device, wndHandle));
 }
 
 static void StartFrameCapture(void *device, void *wndHandle)
 {
-  RenderDoc::Inst().StartFrameCapture(device, wndHandle);
+  DeviceOwnedWindow devWnd(device, wndHandle);
 
-  if(device == NULL || wndHandle == NULL)
-    RenderDoc::Inst().MatchClosestWindow(device, wndHandle);
+  RenderDoc::Inst().StartFrameCapture(devWnd);
 
-  if(device != NULL && wndHandle != NULL)
-    RenderDoc::Inst().SetActiveWindow(device, wndHandle);
+  if(devWnd.device == NULL || devWnd.windowHandle == NULL)
+    RenderDoc::Inst().MatchClosestWindow(devWnd);
+
+  if(devWnd.device != NULL && devWnd.windowHandle != NULL)
+    RenderDoc::Inst().SetActiveWindow(devWnd);
 }
 
 static uint32_t IsFrameCapturing()
@@ -230,12 +233,22 @@ static uint32_t IsFrameCapturing()
 
 static uint32_t EndFrameCapture(void *device, void *wndHandle)
 {
-  return RenderDoc::Inst().EndFrameCapture(device, wndHandle) ? 1 : 0;
+  return RenderDoc::Inst().EndFrameCapture(DeviceOwnedWindow(device, wndHandle)) ? 1 : 0;
+}
+
+static void SetCaptureTitle(const char *title)
+{
+  RenderDoc::Inst().SetCaptureTitle(title);
 }
 
 static uint32_t DiscardFrameCapture(void *device, void *wndHandle)
 {
-  return RenderDoc::Inst().DiscardFrameCapture(device, wndHandle) ? 1 : 0;
+  return RenderDoc::Inst().DiscardFrameCapture(DeviceOwnedWindow(device, wndHandle)) ? 1 : 0;
+}
+
+static uint32_t ShowReplayUI()
+{
+  return RenderDoc::Inst().ShowReplayUI() ? 1 : 0;
 }
 
 // defined in capture_options.cpp
@@ -244,22 +257,22 @@ int RENDERDOC_CC SetCaptureOptionF32(RENDERDOC_CaptureOption opt, float val);
 uint32_t RENDERDOC_CC GetCaptureOptionU32(RENDERDOC_CaptureOption opt);
 float RENDERDOC_CC GetCaptureOptionF32(RENDERDOC_CaptureOption opt);
 
-void RENDERDOC_CC GetAPIVersion_1_4_0(int *major, int *minor, int *patch)
+void RENDERDOC_CC GetAPIVersion_1_6_0(int *major, int *minor, int *patch)
 {
   if(major)
     *major = 1;
   if(minor)
-    *minor = 4;
+    *minor = 6;
   if(patch)
     *patch = 0;
 }
 
-RENDERDOC_API_1_4_0 api_1_4_0;
-void Init_1_4_0()
+RENDERDOC_API_1_6_0 api_1_6_0;
+void Init_1_6_0()
 {
-  RENDERDOC_API_1_4_0 &api = api_1_4_0;
+  RENDERDOC_API_1_6_0 &api = api_1_6_0;
 
-  api.GetAPIVersion = &GetAPIVersion_1_4_0;
+  api.GetAPIVersion = &GetAPIVersion_1_6_0;
 
   api.SetCaptureOptionU32 = &SetCaptureOptionU32;
   api.SetCaptureOptionF32 = &SetCaptureOptionF32;
@@ -273,7 +286,7 @@ void Init_1_4_0()
   api.GetOverlayBits = &GetOverlayBits;
   api.MaskOverlayBits = &MaskOverlayBits;
 
-  api.Shutdown = &Shutdown;
+  api.RemoveHooks = &RemoveHooks;
   api.UnloadCrashHandler = &UnloadCrashHandler;
 
   api.SetCaptureFilePathTemplate = &SetCaptureFilePathTemplate;
@@ -298,6 +311,10 @@ void Init_1_4_0()
   api.SetCaptureFileComments = &SetCaptureFileComments;
 
   api.DiscardFrameCapture = &DiscardFrameCapture;
+
+  api.ShowReplayUI = &ShowReplayUI;
+
+  api.SetCaptureTitle = &SetCaptureTitle;
 }
 
 extern "C" RENDERDOC_API int RENDERDOC_CC RENDERDOC_GetAPI(RENDERDOC_Version version,
@@ -312,7 +329,7 @@ extern "C" RENDERDOC_API int RENDERDOC_CC RENDERDOC_GetAPI(RENDERDOC_Version ver
   int ret = 0;
   int major = 0, minor = 0, patch = 0;
 
-  std::string supportedVersions = "";
+  rdcstr supportedVersions = "";
 
 #define API_VERSION_HANDLE(enumver, actualver)                     \
   supportedVersions += " " STRINGIZE(CONCAT(API_, enumver));       \
@@ -324,15 +341,19 @@ extern "C" RENDERDOC_API int RENDERDOC_CC RENDERDOC_GetAPI(RENDERDOC_Version ver
     ret = 1;                                                       \
   }
 
-  API_VERSION_HANDLE(1_0_0, 1_4_0);
-  API_VERSION_HANDLE(1_0_1, 1_4_0);
-  API_VERSION_HANDLE(1_0_2, 1_4_0);
-  API_VERSION_HANDLE(1_1_0, 1_4_0);
-  API_VERSION_HANDLE(1_1_1, 1_4_0);
-  API_VERSION_HANDLE(1_1_2, 1_4_0);
-  API_VERSION_HANDLE(1_2_0, 1_4_0);
-  API_VERSION_HANDLE(1_3_0, 1_4_0);
-  API_VERSION_HANDLE(1_4_0, 1_4_0);
+  API_VERSION_HANDLE(1_0_0, 1_6_0);
+  API_VERSION_HANDLE(1_0_1, 1_6_0);
+  API_VERSION_HANDLE(1_0_2, 1_6_0);
+  API_VERSION_HANDLE(1_1_0, 1_6_0);
+  API_VERSION_HANDLE(1_1_1, 1_6_0);
+  API_VERSION_HANDLE(1_1_2, 1_6_0);
+  API_VERSION_HANDLE(1_2_0, 1_6_0);
+  API_VERSION_HANDLE(1_3_0, 1_6_0);
+  API_VERSION_HANDLE(1_4_0, 1_6_0);
+  API_VERSION_HANDLE(1_4_1, 1_6_0);
+  API_VERSION_HANDLE(1_4_2, 1_6_0);
+  API_VERSION_HANDLE(1_5_0, 1_6_0);
+  API_VERSION_HANDLE(1_6_0, 1_6_0);
 
 #undef API_VERSION_HANDLE
 

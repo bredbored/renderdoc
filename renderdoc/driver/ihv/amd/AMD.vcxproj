@@ -22,6 +22,7 @@
     <ProjectGuid>{5DE5A561-548A-4DD7-90F0-06A2B39EAE9A}</ProjectGuid>
     <RootNamespace>AMD</RootNamespace>
   </PropertyGroup>
+  <Import Project="$(SolutionDir)\util\WindowsSDKTarget.props" />
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Label="Configuration">
     <ConfigurationType>StaticLibrary</ConfigurationType>
@@ -69,6 +70,7 @@
       <MinimalRebuild>false</MinimalRebuild>
       <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
       <DisableSpecificWarnings>4100</DisableSpecificWarnings>
+      <AdditionalOptions>/w44062 /w44840 %(AdditionalOptions)</AdditionalOptions>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
@@ -94,7 +96,9 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="ags_wrapper.cpp" />
     <ClCompile Include="amd_counters.cpp" />
+    <ClCompile Include="amd_hooks.cpp" />
     <ClCompile Include="amd_isa.cpp" />
     <ClCompile Include="amd_isa_devices.cpp" />
     <ClCompile Include="amd_isa_posix.cpp">
@@ -104,26 +108,27 @@
     <ClCompile Include="amd_rgp.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="ags_wrapper.h" />
     <ClInclude Include="amd_counters.h" />
     <ClInclude Include="amd_isa.h" />
     <ClInclude Include="amd_isa_devices.h" />
     <ClInclude Include="amd_rgp.h" />
+    <ClInclude Include="official\ags\amd_ags.h" />
     <ClInclude Include="official\DXExt\AmdDxExt.h" />
     <ClInclude Include="official\DXExt\AmdDxExtApi.h" />
     <ClInclude Include="official\DXExt\AmdDxExtIface.h" />
     <ClInclude Include="official\DXExt\AmdExtD3D.h" />
     <ClInclude Include="official\DXExt\AmdExtD3DCommandListMarkerApi.h" />
-    <ClInclude Include="official\GPUPerfAPI\Include\GPACounterGenerator.h" />
-    <ClInclude Include="official\GPUPerfAPI\Include\GPAFunctions.h" />
-    <ClInclude Include="official\GPUPerfAPI\Include\GPUPerfAPI-VK.h" />
-    <ClInclude Include="official\GPUPerfAPI\Include\GPUPerfAPI.h" />
-    <ClInclude Include="official\GPUPerfAPI\Include\GPUPerfAPICounters.h" />
-    <ClInclude Include="official\GPUPerfAPI\Include\GPUPerfAPIFunctionTypes.h" />
-    <ClInclude Include="official\GPUPerfAPI\Include\GPUPerfAPITypes.h" />
-    <ClInclude Include="official\GPUPerfAPI\Include\IGPACounterAccessor.h" />
-    <ClInclude Include="official\GPUPerfAPI\Include\IGPACounterScheduler.h" />
+    <ClInclude Include="official\GPUPerfAPI\Include\gpu_perf_api.h" />
+    <ClInclude Include="official\GPUPerfAPI\Include\gpu_perf_api_counters.h" />
+    <ClInclude Include="official\GPUPerfAPI\Include\gpu_perf_api_functions.h" />
+    <ClInclude Include="official\GPUPerfAPI\Include\gpu_perf_api_function_types.h" />
+    <ClInclude Include="official\GPUPerfAPI\Include\gpu_perf_api_interface_loader.h" />
+    <ClInclude Include="official\GPUPerfAPI\Include\gpu_perf_api_stub.h" />
+    <ClInclude Include="official\GPUPerfAPI\Include\gpu_perf_api_types.h" />
+    <ClInclude Include="official\GPUPerfAPI\Include\gpu_perf_api_vk.h" />
     <ClInclude Include="official\RGA\Common\AmdDxGsaCompile.h" />
-    <ClInclude Include="official\RGA\Common\asic_reg\devices.h" />
+    <ClInclude Include="official\RGA\Common\AsicReg\devices.h" />
     <ClInclude Include="official\RGA\elf\elf32.h" />
     <ClInclude Include="official\RGA\elf\elf_common.h" />
   </ItemGroup>

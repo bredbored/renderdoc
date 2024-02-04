@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -24,7 +24,7 @@
 
 #include "d3d11_test.h"
 
-TEST(D3D11_CBuffer_Zoo, D3D11GraphicsTest)
+RD_TEST(D3D11_CBuffer_Zoo, D3D11GraphicsTest)
 {
   static constexpr const char *Description =
       "Tests every kind of constant that can be in a cbuffer to make sure it's decoded "
@@ -35,6 +35,36 @@ TEST(D3D11_CBuffer_Zoo, D3D11GraphicsTest)
 struct float3_1 { float3 a; float b; };
 
 struct nested { float3_1 a; float4 b[4]; float3_1 c[4]; };
+
+struct float2_struct { float x; float y; };
+
+struct nested_with_padding
+{
+  float a;                              // 0, <1, 2, 3>
+  float4 b;                             // {4, 5, 6, 7}
+  float c;                              // 8, <9, 10, 11>
+  float3 d[4];                          // [0]: {12, 13, 14}, <15>
+                                        // [1]: {16, 17, 18}, <19>
+                                        // [2]: {20, 21, 22}, <23>
+                                        // [3]: {24, 25, 26}, <27>
+};
+
+struct empty_struct
+{
+};
+
+struct nested_with_empty
+{
+  float3 a;                              // 0, 1, 2, 3
+  empty_struct b;                        // <omitted>
+  float2 c;                              // 4, 5, <6, 7>
+};
+
+struct misaligned_struct
+{
+  float4 a;
+  float2 b;
+};
 
 cbuffer consts : register(b0)
 {
@@ -225,8 +255,35 @@ cbuffer consts : register(b0)
                                           //         <434, 438>
                                           //         <435, 439>
                                           // }
+                                          
+  nested_with_padding ak[2];              // 440 - 467, 468 - 495
 
-  float4 test;                            // {440, 441, 442, 443}
+  float4 dummy13;                         // forces no trailing overlap with ak
+
+  float al;                               // {500}, <501, 502, 503>
+
+  // struct is always float4 aligned, can't be packed with al
+  float2_struct am;                       // {504, 505}, <506, 507>
+
+  // struct allows trailing things into padding
+  float an;                               // {506}
+
+  float4 gldummy4;                        // account for an not overlapping in GL/VK
+
+  empty_struct empty;                     // completely omitted
+
+  nested_with_empty nested_empty;         // empty struct will take up a float4
+
+  misaligned_struct ao[2];                // [0] = {
+                                          //   .a = { 520, 521, 522, 523 }
+                                          //   .b = { 524, 525 } <526, 527>
+                                          // }
+                                          // [1] = {
+                                          //   .a = { 528, 529, 530, 531 }
+                                          //   .b = { 532, 533 } <534, 535>
+                                          // }
+
+  float4 test;                            // {536, 537, 538, 539}
 };
 
 float4 main() : SV_Target0
@@ -259,12 +316,12 @@ float4 main() : SV_Target0
     ID3D11BufferPtr cb = MakeBuffer().Constant().Data(cbufferdata);
 
     ID3D11Texture2DPtr fltTex =
-        MakeTexture(DXGI_FORMAT_R32G32B32A32_FLOAT, screenWidth, screenHeight).RTV();
+        MakeTexture(DXGI_FORMAT_R32G32B32A32_FLOAT, screenWidth, screenHeight).RTV().SRV();
     ID3D11RenderTargetViewPtr fltRT = MakeRTV(fltTex);
 
     while(Running())
     {
-      ClearRenderTargetView(bbRTV, {0.4f, 0.5f, 0.6f, 1.0f});
+      ClearRenderTargetView(bbRTV, {0.2f, 0.2f, 0.2f, 1.0f});
 
       IASetVertexBuffer(vb, sizeof(DefaultA2V), 0);
       ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -280,6 +337,8 @@ float4 main() : SV_Target0
       ctx->OMSetRenderTargets(1, &fltRT.GetInterfacePtr(), NULL);
 
       ctx->Draw(3, 0);
+
+      blitToSwap(fltTex);
 
       Present();
     }

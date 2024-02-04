@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2017-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -29,61 +29,165 @@ class RemoteHost;
 // do not include any headers here, they must all be in QRDInterface.h
 #include "QRDInterface.h"
 
+class PersistantConfig;
+class ReplayManager;
+
+struct RemoteHostData;
+
+// to enable easy copying around of these hosts as well as allowing graceful behaviour when hosts
+// are unexpectedly removed (such as disconnecting an auto-populated device) these structs are
+// copied around and they have a shared locked data pointer. All accessors then lock and look up the
+// data there to fetch or modify
 DOCUMENT("A handle for interacting with a remote server on a given host.");
 class RemoteHost
 {
 public:
+  DOCUMENT("");
   RemoteHost();
-
+  RemoteHost(const rdcstr &host);
+  RemoteHost(const RemoteHost &o);
+#if !defined(SWIG)
+  RemoteHost &operator=(const RemoteHost &o);
+#endif
+  ~RemoteHost();
   VARIANT_CAST(RemoteHost);
 
   DOCUMENT("");
-  bool operator==(const RemoteHost &o) const
-  {
-    return hostname == o.hostname && friendlyName == o.friendlyName && runCommand == o.runCommand &&
-           serverRunning == o.serverRunning && connected == o.connected && busy == o.busy &&
-           versionMismatch == o.versionMismatch;
-  }
+  bool operator==(const RemoteHost &o) const { return m_hostname == o.m_hostname; }
   bool operator!=(const RemoteHost &o) const { return !(*this == o); }
+  bool operator<(const RemoteHost &o) const { return m_hostname < o.m_hostname; }
   DOCUMENT(
       "Ping the host to check current status - if the server is running, connection status, etc.");
   void CheckStatus();
-  DOCUMENT(
-      "Runs the command specified in :data:`runCommand`. Returns :class:`ReplayStatus` which "
-      "indicates success or the type of failure.");
-  ReplayStatus Launch();
 
-  DOCUMENT("``True`` if a remote server is currently running on this host.");
-  bool serverRunning : 1;
-  DOCUMENT("``True`` if an active connection exists to this remote server.");
-  bool connected : 1;
-  DOCUMENT("``True`` if someone else is currently connected to this server.");
-  bool busy : 1;
-  DOCUMENT("``True`` if there is a code version mismatch with this server.");
-  bool versionMismatch : 1;
+  DOCUMENT(R"(Runs the command specified in :data:`runCommand`. Returns
+:class:`~renderdoc.ResultDetails` which indicates success or the type of failure.
 
-  DOCUMENT("The hostname of this host.");
-  rdcstr hostname;
-  DOCUMENT("The friendly name for this host, if available (if empty, the Hostname is used).");
-  rdcstr friendlyName;
-  DOCUMENT("The command to run locally to try to launch the server remotely.");
-  rdcstr runCommand;
-
-  DOCUMENT("The last folder browser to on this host, to provide a reasonable default path.");
-  rdcstr lastCapturePath;
+:return: The result from launching the remote server.
+:rtype: renderdoc.ResultDetails
+)");
+  ResultDetails Launch();
 
   DOCUMENT(R"(
-Returns the name to display for this host in the UI, either :data:`friendlyName` or :data:`hostname`
+:return: ``True`` if a remote server is currently running on this host.
+:rtype: bool
 )");
-  const rdcstr &Name() const { return !friendlyName.isEmpty() ? friendlyName : hostname; }
-  DOCUMENT("Returns ``True`` if this host represents a connected ADB (Android) device.");
-  bool IsADB() const
+  bool IsServerRunning() const;
+
+  DOCUMENT(R"(
+:return: ``True`` if an active connection exists to this remote server.
+:rtype: bool
+)");
+  bool IsConnected() const;
+
+  DOCUMENT(R"(
+:return: ``True`` if someone else is currently connected to this server.
+:rtype: bool
+)");
+  bool IsBusy() const;
+
+  DOCUMENT(R"(
+:return: ``True`` if there is a code version mismatch with this server.
+:rtype: bool
+)");
+  bool IsVersionMismatch() const;
+
+  DOCUMENT(R"(
+:return: The version mismatch error.
+:rtype: str
+)");
+  rdcstr VersionMismatchError() const;
+
+  DOCUMENT(R"(
+:return: The hostname of this host.
+:rtype: str
+)");
+  rdcstr Hostname() const { return m_hostname; }
+  DOCUMENT(R"(
+:return: The friendly name for this host, if available (if empty, the Hostname is used).
+:rtype: str
+)");
+  rdcstr FriendlyName() const;
+
+  DOCUMENT(R"(
+:return: The command to run locally to try to launch the server remotely.
+:rtype: str
+)");
+  rdcstr RunCommand() const;
+
+  DOCUMENT(R"(Sets the run command. See :meth:`RunCommand`.
+
+:param str cmd: The new command to set.
+)");
+  void SetRunCommand(const rdcstr &cmd);
+
+  DOCUMENT(R"(
+:return: The last folder browsed to on this host, to provide a reasonable default path.
+:rtype: str
+)");
+  rdcstr LastCapturePath() const;
+
+  DOCUMENT(R"(Sets the last folder browsed to. See :meth:`LastCapturePath`.
+
+:param str path: The new path to set.
+)");
+  void SetLastCapturePath(const rdcstr &path);
+
+  DOCUMENT(R"(Create a connection to the remote server.
+
+:return: The status of opening the capture, whether success or failure, and a :class:`RemoteServer`
+  instance if it were successful
+:rtype: Tuple[renderdoc.ResultDetails, renderdoc.RemoteServer]
+)");
+  ResultDetails Connect(IRemoteServer **server);
+
+  DOCUMENT(R"(
+:return: The :class:`~renderdoc.DeviceProtocolController` for this host, or ``None`` if no protocol
+  is in use
+:rtype: renderdoc.DeviceProtocolController
+)");
+  IDeviceProtocolController *Protocol() const { return m_protocol; }
+  DOCUMENT(R"(
+:return: The name to display for this host in the UI, either :meth:`FriendlyName` if it is valid, or
+  :meth:`Hostname` if not.
+:rtype: str
+)");
+  rdcstr Name() const
   {
-    return hostname.count() > 4 && hostname[0] == 'a' && hostname[1] == 'd' && hostname[2] == 'b' &&
-           hostname[3] == ':';
+    rdcstr friendlyName = FriendlyName();
+    return !friendlyName.isEmpty() ? friendlyName : m_hostname;
   }
-  DOCUMENT("Returns ``True`` if this host represents the special localhost device.");
-  bool IsLocalhost() const { return hostname == "localhost"; }
+
+  DOCUMENT(R"(
+:return: Returns ``True`` if this host represents the special localhost device.
+:rtype: bool
+)");
+  bool IsLocalhost() const { return m_hostname == "localhost"; }
+  DOCUMENT(R"(Returns ``True`` if this host represents a valid remote host.
+:rtype: bool
+)");
+  bool IsValid() const { return m_data && !m_hostname.isEmpty(); }
+private:
+  // this is immutable and is used as a key to look up data, it's always valid as RemoteHost objects
+  // are created with it
+  rdcstr m_hostname;
+
+  IDeviceProtocolController *m_protocol = NULL;
+
+  // self-deleting shared and locked data store
+  RemoteHostData *m_data = NULL;
+
+  // allow config to set our data
+  friend class PersistantConfig;
+  void SetFriendlyName(const rdcstr &name);
+
+  // allow ReplayManager to call these functions to change the status. Otherwise they are read-only
+  // except by calling CheckStatus()
+  friend class ReplayManager;
+  void SetConnected(bool connected);
+  void SetShutdown();
+
+  void UpdateStatus(ResultDetails result);
 };
 
 DECLARE_REFLECTION_STRUCT(RemoteHost);

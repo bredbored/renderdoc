@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  * Copyright (c) 2014 Crytek
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -28,8 +28,7 @@
 #include <mutex>
 #include <thread>
 #include "data/resource.h"
-#include "driver/d3d11/d3d11_renderstate.h"
-#include "driver/d3d11/d3d11_resources.h"
+#include "driver/shaders/dxbc/dxbc_bytecode.h"
 #include "driver/shaders/dxbc/dxbc_debug.h"
 #include "maths/formatpacking.h"
 #include "maths/vec.h"
@@ -37,28 +36,12 @@
 #include "d3d11_context.h"
 #include "d3d11_debug.h"
 #include "d3d11_manager.h"
+#include "d3d11_renderstate.h"
+#include "d3d11_replay.h"
+#include "d3d11_resources.h"
 #include "d3d11_shader_cache.h"
-// struct that saves pointers as we iterate through to where we ultimately
-// want to copy the data to
-struct DataOutput
-{
-  DataOutput(int regster, int element, int numWords, ShaderBuiltin attr, bool inc)
-  {
-    reg = regster;
-    elem = element;
-    numwords = numWords;
-    sysattribute = attr;
-    included = inc;
-  }
 
-  int reg;
-  int elem;
-  ShaderBuiltin sysattribute;
-
-  int numwords;
-
-  bool included;
-};
+#include "data/hlsl/hlsl_cbuffers.h"
 
 struct DebugHit
 {
@@ -73,686 +56,1389 @@ struct DebugHit
   uint32_t rawdata;    // arbitrary, depending on shader
 };
 
-// over this number of cycles and things get problematic
-#define SHADER_DEBUG_WARN_THRESHOLD 100000
-
-bool PromptDebugTimeout(DXBC::ProgramType prog, uint32_t cycleCounter)
+class D3D11DebugAPIWrapper : public DXBCDebug::DebugAPIWrapper
 {
-  std::string msg = StringFormat::Fmt(
-      "RenderDoc's shader debugging has been running for over %u cycles, which indicates either a "
-      "very long-running loop, or possibly an infinite loop. Continuing could lead to extreme "
-      "memory allocations, slow UI or even crashes. Would you like to abort debugging to see what "
-      "has run so far?\n\n"
-      "Hit yes to abort debugging. Note that loading the resulting trace could take several "
-      "minutes.",
-      cycleCounter);
+public:
+  D3D11DebugAPIWrapper(WrappedID3D11Device *device, const DXBC::DXBCContainer *dxbc,
+                       DXBCDebug::GlobalState &globalState, uint32_t eid);
+  ~D3D11DebugAPIWrapper();
 
-  int ret = MessageBoxA(NULL, msg.c_str(), "Shader debugging timeout", MB_YESNO | MB_ICONWARNING);
+  void SetCurrentInstruction(uint32_t instruction) { m_instruction = instruction; }
+  void AddDebugMessage(MessageCategory c, MessageSeverity sv, MessageSource src, rdcstr d);
 
-  if(ret == IDYES)
-    return true;
+  void FetchSRV(const DXBCDebug::BindingSlot &slot);
+  void FetchUAV(const DXBCDebug::BindingSlot &slot);
 
-  return false;
+  bool CalculateMathIntrinsic(DXBCBytecode::OpcodeType opcode, const ShaderVariable &input,
+                              ShaderVariable &output1, ShaderVariable &output2);
+
+  ShaderVariable GetSampleInfo(DXBCBytecode::OperandType type, bool isAbsoluteResource,
+                               const DXBCDebug::BindingSlot &slot, const char *opString);
+  ShaderVariable GetBufferInfo(DXBCBytecode::OperandType type, const DXBCDebug::BindingSlot &slot,
+                               const char *opString);
+  ShaderVariable GetResourceInfo(DXBCBytecode::OperandType type, const DXBCDebug::BindingSlot &slot,
+                                 uint32_t mipLevel, int &dim);
+
+  bool CalculateSampleGather(DXBCBytecode::OpcodeType opcode,
+                             DXBCDebug::SampleGatherResourceData resourceData,
+                             DXBCDebug::SampleGatherSamplerData samplerData, ShaderVariable uv,
+                             ShaderVariable ddxCalc, ShaderVariable ddyCalc,
+                             const int8_t texelOffsets[3], int multisampleIndex,
+                             float lodOrCompareValue, const uint8_t swizzle[4],
+                             DXBCDebug::GatherChannel gatherChannel, const char *opString,
+                             ShaderVariable &output);
+
+private:
+  DXBC::ShaderType GetShaderType() { return m_dxbc ? m_dxbc->m_Type : DXBC::ShaderType::Pixel; }
+  WrappedID3D11Device *m_pDevice;
+  const DXBC::DXBCContainer *m_dxbc;
+  DXBCDebug::GlobalState &m_globalState;
+  uint32_t m_instruction;
+  uint32_t m_EventID;
+  bool m_DidReplay = false;
+};
+
+D3D11DebugAPIWrapper::D3D11DebugAPIWrapper(WrappedID3D11Device *device,
+                                           const DXBC::DXBCContainer *dxbc,
+                                           DXBCDebug::GlobalState &globalState, uint32_t eid)
+    : m_pDevice(device), m_dxbc(dxbc), m_globalState(globalState), m_instruction(0), m_EventID(eid)
+{
 }
 
-// apply coarse/fine derivatives to select threads within a quad to ensure all values are correct
-static void ApplyDerivatives(ShaderDebug::GlobalState &global, ShaderDebugTrace traces[4],
-                             const DataOutput &initialValue, float *data, float signmul,
-                             int32_t quadIdxA, int32_t quadIdxB = -1)
+D3D11DebugAPIWrapper::~D3D11DebugAPIWrapper()
 {
-  for(int w = 0; w < initialValue.numwords; w++)
+  // if we replayed to before the action for fetching some UAVs, replay back to after the action to
+  // keep
+  // the state consistent.
+  if(m_DidReplay)
   {
-    traces[quadIdxA].inputs[initialValue.reg].value.fv[initialValue.elem + w] += signmul * data[w];
-    if(quadIdxB >= 0)
-      traces[quadIdxB].inputs[initialValue.reg].value.fv[initialValue.elem + w] += signmul * data[w];
-  }
-
-  // quick check to see if this register was evaluated
-  if(global.sampleEvalRegisterMask & (1ULL << initialValue.reg))
-  {
-    // apply derivative to any cached sample evaluations on these quad indices
-    for(auto it = global.sampleEvalCache.begin(); it != global.sampleEvalCache.end(); ++it)
-    {
-      if((it->first.quadIndex == quadIdxA || it->first.quadIndex == quadIdxB) &&
-         initialValue.reg == it->first.inputRegisterIndex)
-      {
-        for(int w = 0; w < initialValue.numwords; w++)
-          it->second.value.fv[initialValue.elem + w] += data[w];
-      }
-    }
+    D3D11MarkerRegion region("ResetReplay");
+    // replay the action to get back to 'normal' state for this event, and mark that we need to
+    // replay back to pristine state next time we need to fetch data.
+    m_pDevice->ReplayLog(0, m_EventID, eReplay_OnlyDraw);
   }
 }
 
-static void FlattenSingleVariable(uint32_t byteOffset, const std::string &basename,
-                                  const ShaderVariable &v, rdcarray<ShaderVariable> &outvars)
+void D3D11DebugAPIWrapper::AddDebugMessage(MessageCategory c, MessageSeverity sv, MessageSource src,
+                                           rdcstr d)
 {
-  size_t outIdx = byteOffset / 16;
-  size_t outComp = (byteOffset % 16) / 4;
+  m_pDevice->AddDebugMessage(c, sv, src, d);
+}
 
-  if(v.rowMajor)
-    outvars.resize(RDCMAX(outIdx + v.rows, outvars.size()));
-  else
-    outvars.resize(RDCMAX(outIdx + v.columns, outvars.size()));
+void D3D11DebugAPIWrapper::FetchSRV(const DXBCDebug::BindingSlot &slot)
+{
+  RDCASSERT(slot.registerSpace == 0);
+  RDCASSERT(slot.shaderRegister < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT);
 
-  if(!outvars[outIdx].name.empty())
+  D3D11RenderState *rs = m_pDevice->GetImmediateContext()->GetCurrentPipelineState();
+  ID3D11ShaderResourceView *pSRV = NULL;
+  if(GetShaderType() == DXBC::ShaderType::Vertex)
+    pSRV = rs->VS.SRVs[slot.shaderRegister];
+  else if(GetShaderType() == DXBC::ShaderType::Pixel)
+    pSRV = rs->PS.SRVs[slot.shaderRegister];
+  else if(GetShaderType() == DXBC::ShaderType::Compute)
+    pSRV = rs->CS.SRVs[slot.shaderRegister];
+
+  DXBCDebug::GlobalState::SRVData &srvData = m_globalState.srvs[slot];
+
+  if(!pSRV)
+    return;
+
+  ID3D11Resource *res = NULL;
+  pSRV->GetResource(&res);
+
+  if(!res)
+    return;    // @NoCoverage
+
+  D3D11_SHADER_RESOURCE_VIEW_DESC sdesc;
+  pSRV->GetDesc(&sdesc);
+
+  if(sdesc.Format != DXGI_FORMAT_UNKNOWN)
   {
-    // if we already have a variable in this slot, just append this variable to it. We should not
-    // overlap into the next register as that's not allowed.
-    outvars[outIdx].name = std::string(outvars[outIdx].name) + ", " + basename;
-    outvars[outIdx].rows = 1;
-    outvars[outIdx].isStruct = false;
-    outvars[outIdx].columns += v.columns;
-
-    RDCASSERT(outvars[outIdx].columns <= 4, outvars[outIdx].columns);
-
-    memcpy(&outvars[outIdx].value.uv[outComp], &v.value.uv[0], sizeof(uint32_t) * v.columns);
+    DXBCDebug::FillViewFmt(sdesc.Format, srvData.format);
   }
   else
   {
-    const uint32_t numRegisters = v.rowMajor ? v.rows : v.columns;
-    const char *regName = v.rowMajor ? "row" : "col";
-    for(uint32_t reg = 0; reg < numRegisters; reg++)
-    {
-      if(numRegisters > 1)
-        outvars[outIdx + reg].name = StringFormat::Fmt("%s.%s%u", basename.c_str(), regName, reg);
-      else
-        outvars[outIdx + reg].name = basename;
-      outvars[outIdx + reg].rows = 1;
-      outvars[outIdx + reg].type = v.type;
-      outvars[outIdx + reg].isStruct = false;
-      outvars[outIdx + reg].columns = v.columns;
-      outvars[outIdx + reg].rowMajor = v.rowMajor;
-    }
+    D3D11_RESOURCE_DIMENSION dim;
+    res->GetType(&dim);
 
-    if(v.rowMajor)
+    if(dim == D3D11_RESOURCE_DIMENSION_BUFFER)
     {
-      for(size_t ri = 0; ri < v.rows; ri++)
-        memcpy(&outvars[outIdx + ri].value.uv[0], &v.value.uv[ri * v.columns],
-               sizeof(uint32_t) * v.columns);
+      ID3D11Buffer *buf = (ID3D11Buffer *)res;
+      D3D11_BUFFER_DESC bufdesc;
+      buf->GetDesc(&bufdesc);
+
+      srvData.format.stride = bufdesc.StructureByteStride;
+
+      // if we didn't get a type from the SRV description, try to pull it from the declaration
+      DXBCDebug::LookupSRVFormatFromShaderReflection(*m_dxbc->GetReflection(), slot, srvData.format);
+    }
+  }
+
+  if(sdesc.ViewDimension == D3D11_SRV_DIMENSION_BUFFER)
+  {
+    // I know this isn't what the docs say, but as best as I can tell
+    // this is how it's used.
+    srvData.firstElement = sdesc.Buffer.FirstElement;
+    srvData.numElements = sdesc.Buffer.NumElements;
+  }
+  else if(sdesc.ViewDimension == D3D11_SRV_DIMENSION_BUFFEREX)
+  {
+    srvData.firstElement = sdesc.BufferEx.FirstElement;
+    srvData.numElements = sdesc.BufferEx.NumElements;
+  }
+
+  if(res)
+  {
+    if(WrappedID3D11Buffer::IsAlloc(res))
+    {
+      m_pDevice->GetDebugManager()->GetBufferData((ID3D11Buffer *)res, 0, 0, srvData.data);
+    }
+  }
+
+  SAFE_RELEASE(res);
+}
+
+void D3D11DebugAPIWrapper::FetchUAV(const DXBCDebug::BindingSlot &slot)
+{
+  // if the UAV might be dirty from side-effects from the action, replay back to right
+  // before it.
+  if(!m_DidReplay)
+  {
+    D3D11MarkerRegion region("un-dirtying resources");
+    m_pDevice->ReplayLog(0, m_EventID, eReplay_WithoutDraw);
+    m_DidReplay = true;
+  }
+
+  RDCASSERT(slot.registerSpace == 0);
+  RDCASSERT(slot.shaderRegister < D3D11_1_UAV_SLOT_COUNT);
+
+  WrappedID3D11DeviceContext *pContext = m_pDevice->GetImmediateContext();
+  D3D11RenderState *rs = pContext->GetCurrentPipelineState();
+  ID3D11UnorderedAccessView *pUAV = NULL;
+  if(GetShaderType() == DXBC::ShaderType::Pixel)
+    pUAV = rs->OM.UAVs[slot.shaderRegister - rs->OM.UAVStartSlot];
+  else if(GetShaderType() == DXBC::ShaderType::Compute)
+    pUAV = rs->CSUAVs[slot.shaderRegister];
+
+  DXBCDebug::GlobalState::UAVData &uavData = m_globalState.uavs[slot];
+
+  if(!pUAV)
+    return;
+
+  ID3D11Resource *res = NULL;
+  pUAV->GetResource(&res);
+
+  uavData.hiddenCounter = m_pDevice->GetDebugManager()->GetStructCount(pUAV);
+
+  D3D11_UNORDERED_ACCESS_VIEW_DESC udesc;
+  pUAV->GetDesc(&udesc);
+
+  DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+
+  if(udesc.Format != DXGI_FORMAT_UNKNOWN)
+    format = udesc.Format;
+
+  if(format == DXGI_FORMAT_UNKNOWN)
+  {
+    if(WrappedID3D11Texture1D::IsAlloc(res))
+    {
+      D3D11_TEXTURE1D_DESC desc;
+      ((WrappedID3D11Texture1D *)res)->GetDesc(&desc);
+      format = desc.Format;
+    }
+    else if(WrappedID3D11Texture2D1::IsAlloc(res))
+    {
+      D3D11_TEXTURE2D_DESC desc;
+      ((WrappedID3D11Texture2D1 *)res)->GetDesc(&desc);
+      format = desc.Format;
+    }
+    else if(WrappedID3D11Texture3D1::IsAlloc(res))
+    {
+      D3D11_TEXTURE3D_DESC desc;
+      ((WrappedID3D11Texture3D1 *)res)->GetDesc(&desc);
+      format = desc.Format;
+    }
+  }
+
+  if(format != DXGI_FORMAT_UNKNOWN)
+  {
+    ResourceFormat fmt = MakeResourceFormat(GetTypedFormat(udesc.Format));
+
+    uavData.format.byteWidth = fmt.compByteWidth;
+    uavData.format.numComps = fmt.compCount;
+    uavData.format.fmt = fmt.compType;
+
+    if(udesc.Format == DXGI_FORMAT_R11G11B10_FLOAT)
+      uavData.format.byteWidth = 11;
+    if(udesc.Format == DXGI_FORMAT_R10G10B10A2_UINT || udesc.Format == DXGI_FORMAT_R10G10B10A2_UNORM)
+      uavData.format.byteWidth = 10;
+  }
+
+  if(udesc.ViewDimension == D3D11_UAV_DIMENSION_BUFFER)
+  {
+    uavData.firstElement = udesc.Buffer.FirstElement;
+    uavData.numElements = udesc.Buffer.NumElements;
+  }
+
+  if(res)
+  {
+    if(WrappedID3D11Buffer::IsAlloc(res))
+    {
+      m_pDevice->GetDebugManager()->GetBufferData((ID3D11Buffer *)res, 0, 0, uavData.data);
     }
     else
     {
-      // if we have a matrix stored in column major order, we need to transpose it back so we can
-      // unroll it into vectors.
-      for(size_t ci = 0; ci < v.columns; ci++)
-        for(size_t ri = 0; ri < v.rows; ri++)
-          outvars[outIdx + ci].value.uv[ri] = v.value.uv[ri * v.columns + ci];
-    }
-  }
-}
+      uavData.tex = true;
 
-static void FlattenVariables(const rdcarray<ShaderConstant> &constants,
-                             const rdcarray<ShaderVariable> &invars,
-                             rdcarray<ShaderVariable> &outvars, const std::string &prefix,
-                             uint32_t baseOffset)
-{
-  RDCASSERTEQUAL(constants.size(), invars.size());
+      uint32_t &rowPitch = uavData.rowPitch;
+      uint32_t &depthPitch = uavData.depthPitch;
 
-  for(size_t i = 0; i < constants.size(); i++)
-  {
-    const ShaderConstant &c = constants[i];
-    const ShaderVariable &v = invars[i];
+      bytebuf &data = uavData.data;
 
-    uint32_t byteOffset = baseOffset + c.byteOffset;
-
-    std::string basename = prefix + std::string(v.name);
-
-    if(!v.members.empty())
-    {
-      if(v.isStruct)
+      if(udesc.ViewDimension == D3D11_UAV_DIMENSION_TEXTURE1D ||
+         udesc.ViewDimension == D3D11_UAV_DIMENSION_TEXTURE1DARRAY)
       {
-        FlattenVariables(c.type.members, v.members, outvars, basename + ".", byteOffset);
+        D3D11_TEXTURE1D_DESC desc;
+        ((WrappedID3D11Texture1D *)res)->GetDesc(&desc);
+
+        desc.MiscFlags = 0;
+        desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ | D3D11_CPU_ACCESS_WRITE;
+        desc.BindFlags = 0;
+        desc.Usage = D3D11_USAGE_STAGING;
+
+        ID3D11Texture1D *stagingTex = NULL;
+        m_pDevice->CreateTexture1D(&desc, NULL, &stagingTex);
+
+        pContext->CopyResource(stagingTex, res);
+
+        D3D11_MAPPED_SUBRESOURCE mapped;
+        pContext->Map(stagingTex, udesc.Texture1D.MipSlice, D3D11_MAP_READ, 0, &mapped);
+
+        rowPitch = 0;
+        depthPitch = 0;
+        size_t datasize = GetByteSize(desc.Width, 1, 1, desc.Format, udesc.Texture1D.MipSlice);
+
+        uint32_t numSlices = 1;
+
+        byte *srcdata = (byte *)mapped.pData;
+        if(udesc.ViewDimension == D3D11_UAV_DIMENSION_TEXTURE1DARRAY)
+        {
+          rowPitch = mapped.RowPitch;
+          srcdata += udesc.Texture1DArray.FirstArraySlice * rowPitch;
+          numSlices = udesc.Texture1DArray.ArraySize;
+          datasize = numSlices * rowPitch;
+        }
+
+        data.resize(datasize);
+
+        // copy with all padding etc intact
+        memcpy(&data[0], srcdata, datasize);
+
+        pContext->Unmap(stagingTex, udesc.Texture1D.MipSlice);
+
+        SAFE_RELEASE(stagingTex);
       }
-      else
+      else if(udesc.ViewDimension == D3D11_UAV_DIMENSION_TEXTURE2D ||
+              udesc.ViewDimension == D3D11_UAV_DIMENSION_TEXTURE2DARRAY)
       {
-        if(c.type.members.empty())
-        {
-          // if there are no members in this type, it means it's a basic array - unroll directly
+        D3D11_TEXTURE2D_DESC desc;
+        ((WrappedID3D11Texture2D1 *)res)->GetDesc(&desc);
 
-          for(int m = 0; m < v.members.count(); m++)
-          {
-            FlattenSingleVariable(byteOffset + m * c.type.descriptor.arrayByteStride,
-                                  StringFormat::Fmt("%s[%zu]", basename.c_str(), m), v.members[m],
-                                  outvars);
-          }
-        }
-        else
-        {
-          // otherwise we recurse into each member and flatten
+        desc.MiscFlags = 0;
+        desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ | D3D11_CPU_ACCESS_WRITE;
+        desc.BindFlags = 0;
+        desc.Usage = D3D11_USAGE_STAGING;
 
-          for(int m = 0; m < v.members.count(); m++)
-          {
-            FlattenVariables(c.type.members, v.members[m].members, outvars,
-                             StringFormat::Fmt("%s[%zu].", basename.c_str(), m),
-                             byteOffset + m * c.type.descriptor.arrayByteStride);
-          }
+        ID3D11Texture2D *stagingTex = NULL;
+        m_pDevice->CreateTexture2D(&desc, NULL, &stagingTex);
+
+        pContext->CopyResource(stagingTex, res);
+
+        // MipSlice in union is shared between Texture2D and Texture2DArray unions, so safe to
+        // use either
+        D3D11_MAPPED_SUBRESOURCE mapped;
+        pContext->Map(stagingTex, udesc.Texture2D.MipSlice, D3D11_MAP_READ, 0, &mapped);
+
+        rowPitch = mapped.RowPitch;
+        depthPitch = 0;
+        size_t datasize = rowPitch * RDCMAX(1U, desc.Height >> udesc.Texture2D.MipSlice);
+
+        uint32_t numSlices = 1;
+
+        byte *srcdata = (byte *)mapped.pData;
+        if(udesc.ViewDimension == D3D11_UAV_DIMENSION_TEXTURE2DARRAY)
+        {
+          depthPitch = mapped.DepthPitch;
+          srcdata += udesc.Texture2DArray.FirstArraySlice * depthPitch;
+          numSlices = udesc.Texture2DArray.ArraySize;
+          datasize = numSlices * depthPitch;
         }
+
+        // copy with all padding etc intact
+        data.resize(datasize);
+
+        memcpy(&data[0], srcdata, datasize);
+
+        pContext->Unmap(stagingTex, udesc.Texture2D.MipSlice);
+
+        SAFE_RELEASE(stagingTex);
       }
+      else if(udesc.ViewDimension == D3D11_UAV_DIMENSION_TEXTURE3D)
+      {
+        D3D11_TEXTURE3D_DESC desc;
+        ((WrappedID3D11Texture3D1 *)res)->GetDesc(&desc);
 
-      continue;
+        desc.MiscFlags = 0;
+        desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ | D3D11_CPU_ACCESS_WRITE;
+        desc.BindFlags = 0;
+        desc.Usage = D3D11_USAGE_STAGING;
+
+        ID3D11Texture3D *stagingTex = NULL;
+        m_pDevice->CreateTexture3D(&desc, NULL, &stagingTex);
+
+        pContext->CopyResource(stagingTex, res);
+
+        // MipSlice in union is shared between Texture2D and Texture2DArray unions, so safe to
+        // use either
+        D3D11_MAPPED_SUBRESOURCE mapped;
+        pContext->Map(stagingTex, udesc.Texture3D.MipSlice, D3D11_MAP_READ, 0, &mapped);
+
+        rowPitch = mapped.RowPitch;
+        depthPitch = mapped.DepthPitch;
+
+        byte *srcdata = (byte *)mapped.pData;
+        srcdata += udesc.Texture3D.FirstWSlice * mapped.DepthPitch;
+        uint32_t numSlices = udesc.Texture3D.WSize;
+        size_t datasize = depthPitch * numSlices;
+
+        data.resize(datasize);
+
+        // copy with all padding etc intact
+        memcpy(&data[0], srcdata, datasize);
+
+        pContext->Unmap(stagingTex, udesc.Texture3D.MipSlice);
+
+        SAFE_RELEASE(stagingTex);
+      }
     }
-
-    FlattenSingleVariable(byteOffset, basename, v, outvars);
   }
+
+  SAFE_RELEASE(res);
 }
 
-static void FlattenVariables(const rdcarray<ShaderConstant> &constants,
-                             const rdcarray<ShaderVariable> &invars,
-                             rdcarray<ShaderVariable> &outvars)
+ShaderVariable D3D11DebugAPIWrapper::GetSampleInfo(DXBCBytecode::OperandType type,
+                                                   bool isAbsoluteResource,
+                                                   const DXBCDebug::BindingSlot &slot,
+                                                   const char *opString)
 {
-  FlattenVariables(constants, invars, outvars, "", 0);
-}
+  ID3D11DeviceContext *context = NULL;
+  m_pDevice->GetImmediateContext(&context);
 
-ShaderDebug::State D3D11DebugManager::CreateShaderDebugState(ShaderDebugTrace &trace, int quadIdx,
-                                                             DXBC::DXBCFile *dxbc,
-                                                             const ShaderReflection &refl,
-                                                             bytebuf *cbufData)
-{
-  using namespace DXBC;
-  using namespace ShaderDebug;
+  ShaderVariable result("", 0U, 0U, 0U, 0U);
 
-  State initialState = State(quadIdx, &trace, dxbc, m_pDevice);
+  ID3D11Resource *res = NULL;
 
-  // use pixel shader here to get inputs
-
-  int32_t maxReg = -1;
-  for(size_t i = 0; i < dxbc->m_InputSig.size(); i++)
-    maxReg = RDCMAX(maxReg, (int32_t)dxbc->m_InputSig[i].regIndex);
-
-  bool inputCoverage = false;
-
-  for(size_t i = 0; i < dxbc->GetNumDeclarations(); i++)
+  if(type == DXBCBytecode::TYPE_RASTERIZER)
   {
-    const DXBC::ASMDecl &decl = dxbc->GetDeclaration(i);
+    ID3D11RenderTargetView *rtv[8] = {};
+    ID3D11DepthStencilView *dsv = NULL;
 
-    if(decl.declaration == OPCODE_DCL_INPUT && decl.operand.type == TYPE_INPUT_COVERAGE_MASK)
+    context->OMGetRenderTargets(8, rtv, &dsv);
+
+    // try depth first - both should match sample count though to be valid
+    if(dsv)
     {
-      inputCoverage = true;
-      break;
+      dsv->GetResource(&res);
     }
-  }
-
-  if(maxReg >= 0 || inputCoverage)
-  {
-    trace.inputs.resize(maxReg + 1 + (inputCoverage ? 1 : 0));
-    for(size_t i = 0; i < dxbc->m_InputSig.size(); i++)
-    {
-      SigParameter &sig = dxbc->m_InputSig[i];
-
-      ShaderVariable v;
-
-      v.name = StringFormat::Fmt("v%d (%s)", sig.regIndex, sig.semanticIdxName.c_str());
-      v.rows = 1;
-      v.columns = sig.regChannelMask & 0x8 ? 4 : sig.regChannelMask & 0x4
-                                                     ? 3
-                                                     : sig.regChannelMask & 0x2
-                                                           ? 2
-                                                           : sig.regChannelMask & 0x1 ? 1 : 0;
-
-      if(sig.compType == CompType::UInt)
-        v.type = VarType::UInt;
-      else if(sig.compType == CompType::SInt)
-        v.type = VarType::SInt;
-
-      if(trace.inputs[sig.regIndex].columns == 0)
-        trace.inputs[sig.regIndex] = v;
-      else
-        trace.inputs[sig.regIndex].columns = RDCMAX(trace.inputs[sig.regIndex].columns, v.columns);
-    }
-
-    if(inputCoverage)
-    {
-      trace.inputs[maxReg + 1] = ShaderVariable("vCoverage", 0U, 0U, 0U, 0U);
-      trace.inputs[maxReg + 1].columns = 1;
-    }
-  }
-
-  uint32_t specialOutputs = 0;
-  maxReg = -1;
-  for(size_t i = 0; i < dxbc->m_OutputSig.size(); i++)
-  {
-    if(dxbc->m_OutputSig[i].regIndex == ~0U)
-      specialOutputs++;
     else
-      maxReg = RDCMAX(maxReg, (int32_t)dxbc->m_OutputSig[i].regIndex);
-  }
-
-  if(maxReg >= 0 || specialOutputs > 0)
-  {
-    initialState.outputs.resize(maxReg + 1 + specialOutputs);
-    for(size_t i = 0; i < dxbc->m_OutputSig.size(); i++)
     {
-      SigParameter &sig = dxbc->m_OutputSig[i];
-
-      if(sig.regIndex == ~0U)
-        continue;
-
-      ShaderVariable v;
-
-      v.name = StringFormat::Fmt("o%d (%s)", sig.regIndex, sig.semanticIdxName.c_str());
-      v.rows = 1;
-      v.columns = sig.regChannelMask & 0x8 ? 4 : sig.regChannelMask & 0x4
-                                                     ? 3
-                                                     : sig.regChannelMask & 0x2
-                                                           ? 2
-                                                           : sig.regChannelMask & 0x1 ? 1 : 0;
-
-      if(initialState.outputs[sig.regIndex].columns == 0)
-        initialState.outputs[sig.regIndex] = v;
-      else
-        initialState.outputs[sig.regIndex].columns =
-            RDCMAX(initialState.outputs[sig.regIndex].columns, v.columns);
+      for(size_t i = 0; i < ARRAY_COUNT(rtv); i++)
+      {
+        if(rtv[i])
+        {
+          rtv[i]->GetResource(&res);
+          break;
+        }
+      }
     }
 
-    int32_t outIdx = maxReg + 1;
-
-    for(size_t i = 0; i < dxbc->m_OutputSig.size(); i++)
+    if(!res)
     {
-      SigParameter &sig = dxbc->m_OutputSig[i];
+      RDCWARN("No targets bound for output when calling sampleinfo on rasterizer");
 
-      if(sig.regIndex != ~0U)
-        continue;
+      m_pDevice->AddDebugMessage(
+          MessageCategory::Shaders, MessageSeverity::Medium, MessageSource::RuntimeWarning,
+          StringFormat::Fmt("Shader debugging %d: %s\n"
+                            "No targets bound for output when calling sampleinfo on rasterizer",
+                            m_instruction, opString));
+    }
 
-      ShaderVariable v;
+    for(size_t i = 0; i < ARRAY_COUNT(rtv); i++)
+      SAFE_RELEASE(rtv[i]);
+    SAFE_RELEASE(dsv);
+  }
+  else if(type == DXBCBytecode::TYPE_RESOURCE && isAbsoluteResource)
+  {
+    ID3D11ShaderResourceView *srv = NULL;
+    switch(GetShaderType())
+    {
+      case DXBC::ShaderType::Vertex:
+        context->VSGetShaderResources(slot.shaderRegister, 1, &srv);
+        break;
+      case DXBC::ShaderType::Hull:
+        context->HSGetShaderResources(slot.shaderRegister, 1, &srv);
+        break;
+      case DXBC::ShaderType::Domain:
+        context->DSGetShaderResources(slot.shaderRegister, 1, &srv);
+        break;
+      case DXBC::ShaderType::Geometry:
+        context->GSGetShaderResources(slot.shaderRegister, 1, &srv);
+        break;
+      case DXBC::ShaderType::Pixel:
+        context->PSGetShaderResources(slot.shaderRegister, 1, &srv);
+        break;
+      case DXBC::ShaderType::Compute:
+        context->CSGetShaderResources(slot.shaderRegister, 1, &srv);
+        break;
+      default: RDCERR("Unhandled shader type %d", GetShaderType()); break;
+    }
 
-      if(sig.systemValue == ShaderBuiltin::OutputControlPointIndex)
-        v.name = "vOutputControlPointID";
-      else if(sig.systemValue == ShaderBuiltin::DepthOutput)
-        v.name = "oDepth";
-      else if(sig.systemValue == ShaderBuiltin::DepthOutputLessEqual)
-        v.name = "oDepthLessEqual";
-      else if(sig.systemValue == ShaderBuiltin::DepthOutputGreaterEqual)
-        v.name = "oDepthGreaterEqual";
-      else if(sig.systemValue == ShaderBuiltin::MSAACoverage)
-        v.name = "oMask";
-      else if(sig.systemValue == ShaderBuiltin::StencilReference)
-        v.name = "oStencilRef";
-      // if(sig.systemValue == TYPE_OUTPUT_CONTROL_POINT)							str = "oOutputControlPoint";
+    if(srv)
+    {
+      srv->GetResource(&res);
+    }
+    else
+    {
+      RDCWARN("SRV is NULL being queried by sampleinfo");
+
+      m_pDevice->AddDebugMessage(
+          MessageCategory::Shaders, MessageSeverity::Medium, MessageSource::RuntimeWarning,
+          StringFormat::Fmt("Shader debugging %d: %s\nSRV is NULL being queried by sampleinfo",
+                            m_instruction, opString));
+    }
+
+    SAFE_RELEASE(srv);
+  }
+  else
+  {
+    RDCWARN("unexpected operand type to sample_info");
+  }
+
+  if(res)
+  {
+    D3D11_RESOURCE_DIMENSION dim = D3D11_RESOURCE_DIMENSION_UNKNOWN;
+    res->GetType(&dim);
+
+    if(dim == D3D11_RESOURCE_DIMENSION_TEXTURE2D)
+    {
+      D3D11_TEXTURE2D_DESC desc;
+      ((ID3D11Texture2D *)res)->GetDesc(&desc);
+
+      // returns 1 for non-multisampled resources
+      result.value.u32v[0] = RDCMAX(1U, desc.SampleDesc.Count);
+    }
+    else
+    {
+      if(type == DXBCBytecode::TYPE_RASTERIZER)
+      {
+        // special behaviour for non-2D (i.e. by definition non-multisampled) textures when
+        // querying the rasterizer, just return 1.
+        result.value.u32v[0] = 1;
+      }
       else
       {
-        RDCERR("Unhandled output: %s (%d)", sig.semanticName.c_str(), sig.systemValue);
-        continue;
+        m_pDevice->AddDebugMessage(
+            MessageCategory::Shaders, MessageSeverity::Medium, MessageSource::RuntimeWarning,
+            StringFormat::Fmt("Shader debugging %d: %s\nResource specified is not a 2D texture",
+                              m_instruction, opString));
+
+        result.value.u32v[0] = 0;
       }
-
-      v.rows = 1;
-      v.columns = sig.regChannelMask & 0x8 ? 4 : sig.regChannelMask & 0x4
-                                                     ? 3
-                                                     : sig.regChannelMask & 0x2
-                                                           ? 2
-                                                           : sig.regChannelMask & 0x1 ? 1 : 0;
-
-      initialState.outputs[outIdx++] = v;
     }
+
+    SAFE_RELEASE(res);
   }
-
-  trace.constantBlocks.resize(dxbc->m_CBuffers.size());
-  for(size_t i = 0; i < dxbc->m_CBuffers.size(); i++)
-  {
-    rdcarray<ShaderVariable> vars;
-
-    // fetch the cbuffer data into vars, which will be 'natural' - structs with members, non merged
-    // vectors
-    StandardFillCBufferVariables(refl.constantBlocks[i].variables, vars,
-                                 cbufData[dxbc->m_CBuffers[i].reg]);
-
-    FlattenVariables(refl.constantBlocks[i].variables, vars, trace.constantBlocks[i].members);
-
-    for(size_t c = 0; c < trace.constantBlocks[i].members.size(); c++)
-      trace.constantBlocks[i].members[c].name =
-          StringFormat::Fmt("cb%u[%u] (%s)", dxbc->m_CBuffers[i].reg, (uint32_t)c,
-                            trace.constantBlocks[i].members[c].name.c_str());
-  }
-
-  initialState.Init();
-
-  return initialState;
+  SAFE_RELEASE(context);
+  return result;
 }
 
-void D3D11DebugManager::CreateShaderGlobalState(ShaderDebug::GlobalState &global,
-                                                DXBC::DXBCFile *dxbc, uint32_t UAVStartSlot,
-                                                ID3D11UnorderedAccessView **UAVs,
-                                                ID3D11ShaderResourceView **SRVs)
+ShaderVariable D3D11DebugAPIWrapper::GetBufferInfo(DXBCBytecode::OperandType type,
+                                                   const DXBCDebug::BindingSlot &slot,
+                                                   const char *opString)
 {
-  for(int i = 0; UAVs != NULL && i + UAVStartSlot < D3D11_1_UAV_SLOT_COUNT; i++)
+  ID3D11DeviceContext *context = NULL;
+  m_pDevice->GetImmediateContext(&context);
+
+  ShaderVariable result("", 0U, 0U, 0U, 0U);
+
+  if(type == DXBCBytecode::TYPE_UNORDERED_ACCESS_VIEW)
   {
-    int dsti = i + UAVStartSlot;
-    if(UAVs[i])
+    ID3D11UnorderedAccessView *uav = NULL;
+    if(GetShaderType() == DXBC::ShaderType::Compute)
+      context->CSGetUnorderedAccessViews(slot.shaderRegister, 1, &uav);
+    else
+      context->OMGetRenderTargetsAndUnorderedAccessViews(0, NULL, NULL, slot.shaderRegister, 1, &uav);
+
+    if(uav)
     {
-      ID3D11Resource *res = NULL;
-      UAVs[i]->GetResource(&res);
+      D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc;
+      uav->GetDesc(&uavDesc);
 
-      global.uavs[dsti].hiddenCounter = GetStructCount(UAVs[i]);
-
-      D3D11_UNORDERED_ACCESS_VIEW_DESC udesc;
-      UAVs[i]->GetDesc(&udesc);
-
-      DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
-
-      if(udesc.Format != DXGI_FORMAT_UNKNOWN)
-        format = udesc.Format;
-
-      if(format == DXGI_FORMAT_UNKNOWN)
+      if(uavDesc.ViewDimension == D3D11_UAV_DIMENSION_BUFFER)
       {
-        if(WrappedID3D11Texture1D::IsAlloc(res))
-        {
-          D3D11_TEXTURE1D_DESC desc;
-          ((WrappedID3D11Texture1D *)res)->GetDesc(&desc);
-          format = desc.Format;
-        }
-        else if(WrappedID3D11Texture2D1::IsAlloc(res))
-        {
-          D3D11_TEXTURE2D_DESC desc;
-          ((WrappedID3D11Texture2D1 *)res)->GetDesc(&desc);
-          format = desc.Format;
-        }
-        else if(WrappedID3D11Texture3D1::IsAlloc(res))
-        {
-          D3D11_TEXTURE3D_DESC desc;
-          ((WrappedID3D11Texture3D1 *)res)->GetDesc(&desc);
-          format = desc.Format;
-        }
+        result.value.u32v[0] = result.value.u32v[1] = result.value.u32v[2] = result.value.u32v[3] =
+            uavDesc.Buffer.NumElements;
       }
-
-      if(format != DXGI_FORMAT_UNKNOWN)
+      else
       {
-        ResourceFormat fmt = MakeResourceFormat(GetTypedFormat(udesc.Format));
+        RDCWARN("Unexpected UAV dimension %d passed to bufinfo", uavDesc.ViewDimension);
 
-        global.uavs[dsti].format.byteWidth = fmt.compByteWidth;
-        global.uavs[dsti].format.numComps = fmt.compCount;
-        global.uavs[dsti].format.fmt = fmt.compType;
-
-        if(udesc.Format == DXGI_FORMAT_R11G11B10_FLOAT)
-          global.uavs[dsti].format.byteWidth = 11;
-        if(udesc.Format == DXGI_FORMAT_R10G10B10A2_UINT ||
-           udesc.Format == DXGI_FORMAT_R10G10B10A2_UNORM)
-          global.uavs[dsti].format.byteWidth = 10;
+        m_pDevice->AddDebugMessage(
+            MessageCategory::Shaders, MessageSeverity::High, MessageSource::RuntimeWarning,
+            StringFormat::Fmt(
+                "Shader debugging %d: %s\nUAV being queried by bufinfo is not a buffer",
+                m_instruction, opString));
       }
+    }
+    else
+    {
+      RDCWARN("UAV is NULL being queried by bufinfo");
 
-      if(udesc.ViewDimension == D3D11_UAV_DIMENSION_BUFFER)
+      m_pDevice->AddDebugMessage(
+          MessageCategory::Shaders, MessageSeverity::Medium, MessageSource::RuntimeWarning,
+          StringFormat::Fmt("Shader debugging %d: %s\nUAV being queried by bufinfo is NULL",
+                            m_instruction, opString));
+    }
+
+    SAFE_RELEASE(uav);
+  }
+  else
+  {
+    ID3D11ShaderResourceView *srv = NULL;
+    switch(GetShaderType())
+    {
+      case DXBC::ShaderType::Vertex:
+        context->VSGetShaderResources(slot.shaderRegister, 1, &srv);
+        break;
+      case DXBC::ShaderType::Hull:
+        context->HSGetShaderResources(slot.shaderRegister, 1, &srv);
+        break;
+      case DXBC::ShaderType::Domain:
+        context->DSGetShaderResources(slot.shaderRegister, 1, &srv);
+        break;
+      case DXBC::ShaderType::Geometry:
+        context->GSGetShaderResources(slot.shaderRegister, 1, &srv);
+        break;
+      case DXBC::ShaderType::Pixel:
+        context->PSGetShaderResources(slot.shaderRegister, 1, &srv);
+        break;
+      case DXBC::ShaderType::Compute:
+        context->CSGetShaderResources(slot.shaderRegister, 1, &srv);
+        break;
+      default: RDCERR("Unhandled shader type %d", GetShaderType()); break;
+    }
+
+    if(srv)
+    {
+      D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc;
+      srv->GetDesc(&srvDesc);
+
+      if(srvDesc.ViewDimension == D3D11_SRV_DIMENSION_BUFFER)
       {
-        global.uavs[dsti].firstElement = udesc.Buffer.FirstElement;
-        global.uavs[dsti].numElements = udesc.Buffer.NumElements;
+        result.value.u32v[0] = result.value.u32v[1] = result.value.u32v[2] = result.value.u32v[3] =
+            srvDesc.Buffer.NumElements;
       }
-
-      if(res)
+      else if(srvDesc.ViewDimension == D3D11_SRV_DIMENSION_BUFFEREX)
       {
-        if(WrappedID3D11Buffer::IsAlloc(res))
+        result.value.u32v[0] = result.value.u32v[1] = result.value.u32v[2] = result.value.u32v[3] =
+            srvDesc.BufferEx.NumElements;
+      }
+      else
+      {
+        RDCWARN("Unexpected SRV dimension %d passed to bufinfo", srvDesc.ViewDimension);
+
+        m_pDevice->AddDebugMessage(
+            MessageCategory::Shaders, MessageSeverity::High, MessageSource::RuntimeWarning,
+            StringFormat::Fmt(
+                "Shader debugging %d: %s\nSRV being queried by bufinfo is not a buffer",
+                m_instruction, opString));
+      }
+    }
+    else
+    {
+      RDCWARN("SRV is NULL being queried by bufinfo");
+
+      m_pDevice->AddDebugMessage(
+          MessageCategory::Shaders, MessageSeverity::Medium, MessageSource::RuntimeWarning,
+          StringFormat::Fmt("Shader debugging %d: %s\nSRV being queried by bufinfo is NULL",
+                            m_instruction, opString));
+    }
+
+    SAFE_RELEASE(srv);
+  }
+
+  SAFE_RELEASE(context);
+  return result;
+}
+
+ShaderVariable D3D11DebugAPIWrapper::GetResourceInfo(DXBCBytecode::OperandType type,
+                                                     const DXBCDebug::BindingSlot &slot,
+                                                     uint32_t mipLevel, int &dim)
+{
+  ID3D11DeviceContext *context = NULL;
+  m_pDevice->GetImmediateContext(&context);
+
+  ShaderVariable result("", 0.0f, 0.0f, 0.0f, 0.0f);
+
+  if(type != DXBCBytecode::TYPE_UNORDERED_ACCESS_VIEW)
+  {
+    ID3D11ShaderResourceView *srv = NULL;
+    switch(GetShaderType())
+    {
+      case DXBC::ShaderType::Vertex:
+        context->VSGetShaderResources(slot.shaderRegister, 1, &srv);
+        break;
+      case DXBC::ShaderType::Hull:
+        context->HSGetShaderResources(slot.shaderRegister, 1, &srv);
+        break;
+      case DXBC::ShaderType::Domain:
+        context->DSGetShaderResources(slot.shaderRegister, 1, &srv);
+        break;
+      case DXBC::ShaderType::Geometry:
+        context->GSGetShaderResources(slot.shaderRegister, 1, &srv);
+        break;
+      case DXBC::ShaderType::Pixel:
+        context->PSGetShaderResources(slot.shaderRegister, 1, &srv);
+        break;
+      case DXBC::ShaderType::Compute:
+        context->CSGetShaderResources(slot.shaderRegister, 1, &srv);
+        break;
+      default: RDCERR("Unhandled shader type %d", GetShaderType()); break;
+    }
+
+    if(srv)
+    {
+      D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc;
+      srv->GetDesc(&srvDesc);
+
+      switch(srvDesc.ViewDimension)
+      {
+        case D3D11_SRV_DIMENSION_UNKNOWN:
+        case D3D11_SRV_DIMENSION_BUFFER:
         {
-          GetBufferData((ID3D11Buffer *)res, 0, 0, global.uavs[dsti].data);
+          RDCWARN("Invalid view dimension for GetResourceInfo");
+          break;
         }
-        else
+        case D3D11_SRV_DIMENSION_BUFFEREX:
         {
-          global.uavs[dsti].tex = true;
+          dim = 1;
 
-          uint32_t &rowPitch = global.uavs[dsti].rowPitch;
-          uint32_t &depthPitch = global.uavs[dsti].depthPitch;
+          result.value.u32v[0] = srvDesc.BufferEx.NumElements;
+          result.value.u32v[1] = 0;
+          result.value.u32v[2] = 0;
+          result.value.u32v[3] = 0;
+          break;
+        }
+        case D3D11_SRV_DIMENSION_TEXTURE1D:
+        case D3D11_SRV_DIMENSION_TEXTURE1DARRAY:
+        {
+          ID3D11Texture1D *tex = NULL;
+          srv->GetResource((ID3D11Resource **)&tex);
 
-          bytebuf &data = global.uavs[dsti].data;
+          dim = 1;
 
-          if(udesc.ViewDimension == D3D11_UAV_DIMENSION_TEXTURE1D ||
-             udesc.ViewDimension == D3D11_UAV_DIMENSION_TEXTURE1DARRAY)
+          if(tex)
           {
+            bool isarray = srvDesc.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE1DARRAY;
+
             D3D11_TEXTURE1D_DESC desc;
-            ((WrappedID3D11Texture1D *)res)->GetDesc(&desc);
+            tex->GetDesc(&desc);
+            result.value.u32v[0] = RDCMAX(1U, desc.Width >> mipLevel);
+            result.value.u32v[1] = isarray ? srvDesc.Texture1DArray.ArraySize : 0;
+            result.value.u32v[2] = 0;
+            result.value.u32v[3] =
+                isarray ? srvDesc.Texture1DArray.MipLevels : srvDesc.Texture1D.MipLevels;
 
-            desc.MiscFlags = 0;
-            desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ | D3D11_CPU_ACCESS_WRITE;
-            desc.BindFlags = 0;
-            desc.Usage = D3D11_USAGE_STAGING;
+            if(isarray && (result.value.u32v[2] == 0 || result.value.u32v[2] == ~0U))
+              result.value.u32v[2] = desc.ArraySize;
 
-            ID3D11Texture1D *stagingTex = NULL;
-            m_pDevice->CreateTexture1D(&desc, NULL, &stagingTex);
+            if(result.value.u32v[3] == 0 || result.value.u32v[3] == ~0U)
+              result.value.u32v[3] = desc.MipLevels;
+            if(result.value.u32v[3] == 0 || result.value.u32v[3] == ~0U)
+              result.value.u32v[3] = CalcNumMips(desc.Width, 1, 1);
 
-            m_pImmediateContext->CopyResource(stagingTex, res);
+            if(mipLevel >= result.value.u32v[3])
+              result.value.u32v[0] = result.value.u32v[1] = 0;
 
-            D3D11_MAPPED_SUBRESOURCE mapped;
-            m_pImmediateContext->Map(stagingTex, udesc.Texture1D.MipSlice, D3D11_MAP_READ, 0,
-                                     &mapped);
-
-            rowPitch = 0;
-            depthPitch = 0;
-            size_t datasize = GetByteSize(desc.Width, 1, 1, desc.Format, udesc.Texture1D.MipSlice);
-
-            uint32_t numSlices = 1;
-
-            byte *srcdata = (byte *)mapped.pData;
-            if(udesc.ViewDimension == D3D11_UAV_DIMENSION_TEXTURE1DARRAY)
-            {
-              rowPitch = mapped.RowPitch;
-              srcdata += udesc.Texture1DArray.FirstArraySlice * rowPitch;
-              numSlices = udesc.Texture1DArray.ArraySize;
-              datasize = numSlices * rowPitch;
-            }
-
-            data.resize(datasize);
-
-            // copy with all padding etc intact
-            memcpy(&data[0], srcdata, datasize);
-
-            m_pImmediateContext->Unmap(stagingTex, udesc.Texture1D.MipSlice);
-
-            SAFE_RELEASE(stagingTex);
+            SAFE_RELEASE(tex);
           }
-          else if(udesc.ViewDimension == D3D11_UAV_DIMENSION_TEXTURE2D ||
-                  udesc.ViewDimension == D3D11_UAV_DIMENSION_TEXTURE2DARRAY)
+          break;
+        }
+        case D3D11_SRV_DIMENSION_TEXTURE2D:
+        case D3D11_SRV_DIMENSION_TEXTURE2DARRAY:
+        case D3D11_SRV_DIMENSION_TEXTURE2DMS:
+        case D3D11_SRV_DIMENSION_TEXTURE2DMSARRAY:
+        {
+          ID3D11Texture2D *tex = NULL;
+          srv->GetResource((ID3D11Resource **)&tex);
+
+          dim = 2;
+
+          if(tex)
           {
             D3D11_TEXTURE2D_DESC desc;
-            ((WrappedID3D11Texture2D1 *)res)->GetDesc(&desc);
+            tex->GetDesc(&desc);
+            result.value.u32v[0] = RDCMAX(1U, desc.Width >> mipLevel);
+            result.value.u32v[1] = RDCMAX(1U, desc.Height >> mipLevel);
 
-            desc.MiscFlags = 0;
-            desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ | D3D11_CPU_ACCESS_WRITE;
-            desc.BindFlags = 0;
-            desc.Usage = D3D11_USAGE_STAGING;
-
-            ID3D11Texture2D *stagingTex = NULL;
-            m_pDevice->CreateTexture2D(&desc, NULL, &stagingTex);
-
-            m_pImmediateContext->CopyResource(stagingTex, res);
-
-            // MipSlice in union is shared between Texture2D and Texture2DArray unions, so safe to
-            // use either
-            D3D11_MAPPED_SUBRESOURCE mapped;
-            m_pImmediateContext->Map(stagingTex, udesc.Texture2D.MipSlice, D3D11_MAP_READ, 0,
-                                     &mapped);
-
-            rowPitch = mapped.RowPitch;
-            depthPitch = 0;
-            size_t datasize = rowPitch * RDCMAX(1U, desc.Height >> udesc.Texture2D.MipSlice);
-
-            uint32_t numSlices = 1;
-
-            byte *srcdata = (byte *)mapped.pData;
-            if(udesc.ViewDimension == D3D11_UAV_DIMENSION_TEXTURE2DARRAY)
+            if(srvDesc.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2D)
             {
-              depthPitch = mapped.DepthPitch;
-              srcdata += udesc.Texture2DArray.FirstArraySlice * depthPitch;
-              numSlices = udesc.Texture2DArray.ArraySize;
-              datasize = numSlices * depthPitch;
+              result.value.u32v[2] = 0;
+              result.value.u32v[3] = srvDesc.Texture2D.MipLevels;
+            }
+            else if(srvDesc.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2DARRAY)
+            {
+              result.value.u32v[2] = srvDesc.Texture2DArray.ArraySize;
+              result.value.u32v[3] = srvDesc.Texture2DArray.MipLevels;
+
+              if(result.value.u32v[2] == 0 || result.value.u32v[2] == ~0U)
+                result.value.u32v[2] = desc.ArraySize;
+            }
+            else if(srvDesc.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2DMS)
+            {
+              result.value.u32v[2] = 0;
+              result.value.u32v[3] = 1;
+            }
+            else if(srvDesc.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2DMSARRAY)
+            {
+              result.value.u32v[2] = srvDesc.Texture2DMSArray.ArraySize;
+              result.value.u32v[3] = 1;
+
+              if(result.value.u32v[2] == 0 || result.value.u32v[2] == ~0U)
+                result.value.u32v[2] = desc.ArraySize;
             }
 
-            // copy with all padding etc intact
-            data.resize(datasize);
+            if(result.value.u32v[3] == 0 || result.value.u32v[3] == ~0U)
+              result.value.u32v[3] = desc.MipLevels;
+            if(result.value.u32v[3] == 0 || result.value.u32v[3] == ~0U)
+              result.value.u32v[3] = CalcNumMips(desc.Width, desc.Height, 1);
 
-            memcpy(&data[0], srcdata, datasize);
+            if(mipLevel >= result.value.u32v[3])
+              result.value.u32v[0] = result.value.u32v[1] = result.value.u32v[2] = 0;
 
-            m_pImmediateContext->Unmap(stagingTex, udesc.Texture2D.MipSlice);
-
-            SAFE_RELEASE(stagingTex);
+            SAFE_RELEASE(tex);
           }
-          else if(udesc.ViewDimension == D3D11_UAV_DIMENSION_TEXTURE3D)
+          break;
+        }
+        case D3D11_SRV_DIMENSION_TEXTURE3D:
+        {
+          ID3D11Texture3D *tex = NULL;
+          srv->GetResource((ID3D11Resource **)&tex);
+
+          dim = 3;
+
+          if(tex)
           {
             D3D11_TEXTURE3D_DESC desc;
-            ((WrappedID3D11Texture3D1 *)res)->GetDesc(&desc);
+            tex->GetDesc(&desc);
+            result.value.u32v[0] = RDCMAX(1U, desc.Width >> mipLevel);
+            result.value.u32v[1] = RDCMAX(1U, desc.Height >> mipLevel);
+            result.value.u32v[2] = RDCMAX(1U, desc.Depth >> mipLevel);
+            result.value.u32v[3] = srvDesc.Texture3D.MipLevels;
 
-            desc.MiscFlags = 0;
-            desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ | D3D11_CPU_ACCESS_WRITE;
-            desc.BindFlags = 0;
-            desc.Usage = D3D11_USAGE_STAGING;
+            if(result.value.u32v[3] == 0 || result.value.u32v[3] == ~0U)
+              result.value.u32v[3] = desc.MipLevels;
+            if(result.value.u32v[3] == 0 || result.value.u32v[3] == ~0U)
+              result.value.u32v[3] = CalcNumMips(desc.Width, desc.Height, desc.Depth);
 
-            ID3D11Texture3D *stagingTex = NULL;
-            m_pDevice->CreateTexture3D(&desc, NULL, &stagingTex);
+            if(mipLevel >= result.value.u32v[3])
+              result.value.u32v[0] = result.value.u32v[1] = result.value.u32v[2] = 0;
 
-            m_pImmediateContext->CopyResource(stagingTex, res);
-
-            // MipSlice in union is shared between Texture2D and Texture2DArray unions, so safe to
-            // use either
-            D3D11_MAPPED_SUBRESOURCE mapped;
-            m_pImmediateContext->Map(stagingTex, udesc.Texture3D.MipSlice, D3D11_MAP_READ, 0,
-                                     &mapped);
-
-            rowPitch = mapped.RowPitch;
-            depthPitch = mapped.DepthPitch;
-
-            byte *srcdata = (byte *)mapped.pData;
-            srcdata += udesc.Texture3D.FirstWSlice * mapped.DepthPitch;
-            uint32_t numSlices = udesc.Texture3D.WSize;
-            size_t datasize = depthPitch * numSlices;
-
-            data.resize(datasize);
-
-            // copy with all padding etc intact
-            memcpy(&data[0], srcdata, datasize);
-
-            m_pImmediateContext->Unmap(stagingTex, udesc.Texture3D.MipSlice);
-
-            SAFE_RELEASE(stagingTex);
+            SAFE_RELEASE(tex);
           }
+          break;
         }
-      }
-
-      SAFE_RELEASE(res);
-    }
-  }
-
-  for(int i = 0; SRVs != NULL && i < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT; i++)
-  {
-    if(SRVs[i])
-    {
-      ID3D11Resource *res = NULL;
-      SRVs[i]->GetResource(&res);
-
-      D3D11_SHADER_RESOURCE_VIEW_DESC sdesc;
-      SRVs[i]->GetDesc(&sdesc);
-
-      if(sdesc.Format != DXGI_FORMAT_UNKNOWN)
-      {
-        ResourceFormat fmt = MakeResourceFormat(sdesc.Format);
-
-        global.srvs[i].format.byteWidth = fmt.compByteWidth;
-        global.srvs[i].format.numComps = fmt.compCount;
-        global.srvs[i].format.fmt = fmt.compType;
-
-        if(sdesc.Format == DXGI_FORMAT_R11G11B10_FLOAT)
-          global.srvs[i].format.byteWidth = 11;
-        if(sdesc.Format == DXGI_FORMAT_R10G10B10A2_UINT ||
-           sdesc.Format == DXGI_FORMAT_R10G10B10A2_UNORM)
-          global.srvs[i].format.byteWidth = 10;
-      }
-      else
-      {
-        D3D11_RESOURCE_DIMENSION dim;
-        res->GetType(&dim);
-
-        if(dim == D3D11_RESOURCE_DIMENSION_BUFFER)
+        case D3D11_SRV_DIMENSION_TEXTURECUBE:
+        case D3D11_SRV_DIMENSION_TEXTURECUBEARRAY:
         {
-          ID3D11Buffer *buf = (ID3D11Buffer *)res;
-          D3D11_BUFFER_DESC bufdesc;
-          buf->GetDesc(&bufdesc);
+          ID3D11Texture2D *tex = NULL;
+          srv->GetResource((ID3D11Resource **)&tex);
 
-          global.srvs[i].format.stride = bufdesc.StructureByteStride;
+          dim = 2;
 
-          // if we didn't get a type from the SRV description, try to pull it from the declaration
-          for(const DXBC::ShaderInputBind &bind : dxbc->m_SRVs)
+          if(tex)
           {
-            if(bind.reg == (uint32_t)i && bind.dimension == DXBC::ShaderInputBind::DIM_BUFFER &&
-               bind.retType < DXBC::RETURN_TYPE_MIXED && bind.retType != DXBC::RETURN_TYPE_UNKNOWN)
-            {
-              global.srvs[i].format.byteWidth = 4;
-              global.srvs[i].format.numComps = bind.numSamples;
+            bool isarray = srvDesc.ViewDimension == D3D11_SRV_DIMENSION_TEXTURECUBEARRAY;
 
-              if(bind.retType == DXBC::RETURN_TYPE_UNORM)
-                global.srvs[i].format.fmt = CompType::UNorm;
-              else if(bind.retType == DXBC::RETURN_TYPE_SNORM)
-                global.srvs[i].format.fmt = CompType::SNorm;
-              else if(bind.retType == DXBC::RETURN_TYPE_UINT)
-                global.srvs[i].format.fmt = CompType::UInt;
-              else if(bind.retType == DXBC::RETURN_TYPE_SINT)
-                global.srvs[i].format.fmt = CompType::SInt;
-              else
-                global.srvs[i].format.fmt = CompType::Float;
+            D3D11_TEXTURE2D_DESC desc;
+            tex->GetDesc(&desc);
+            result.value.u32v[0] = RDCMAX(1U, desc.Width >> mipLevel);
+            result.value.u32v[1] = RDCMAX(1U, desc.Height >> mipLevel);
 
-              break;
-            }
+            // the spec says "If srcResource is a TextureCubeArray, [...]. dest.z is set to an
+            // undefined value."
+            // but that's stupid, and implementations seem to return the number of cubes
+            result.value.u32v[2] = isarray ? srvDesc.TextureCubeArray.NumCubes : 0;
+            result.value.u32v[3] =
+                isarray ? srvDesc.TextureCubeArray.MipLevels : srvDesc.TextureCube.MipLevels;
+
+            if(isarray && (result.value.u32v[2] == 0 || result.value.u32v[2] == ~0U))
+              result.value.u32v[2] = desc.ArraySize;
+
+            if(result.value.u32v[3] == 0 || result.value.u32v[3] == ~0U)
+              result.value.u32v[3] = desc.MipLevels;
+            if(result.value.u32v[3] == 0 || result.value.u32v[3] == ~0U)
+              result.value.u32v[3] = CalcNumMips(desc.Width, desc.Height, 1);
+
+            if(mipLevel >= result.value.u32v[3])
+              result.value.u32v[0] = result.value.u32v[1] = result.value.u32v[2] = 0;
+
+            SAFE_RELEASE(tex);
           }
+          break;
         }
       }
 
-      if(sdesc.ViewDimension == D3D11_SRV_DIMENSION_BUFFER)
-      {
-        // I know this isn't what the docs say, but as best as I can tell
-        // this is how it's used.
-        global.srvs[i].firstElement = sdesc.Buffer.FirstElement;
-        global.srvs[i].numElements = sdesc.Buffer.NumElements;
-      }
-      else if(sdesc.ViewDimension == D3D11_SRV_DIMENSION_BUFFEREX)
-      {
-        global.srvs[i].firstElement = sdesc.BufferEx.FirstElement;
-        global.srvs[i].numElements = sdesc.BufferEx.NumElements;
-      }
+      SAFE_RELEASE(srv);
+    }
+  }
+  else
+  {
+    ID3D11UnorderedAccessView *uav = NULL;
+    if(GetShaderType() == DXBC::ShaderType::Compute)
+    {
+      context->CSGetUnorderedAccessViews(slot.shaderRegister, 1, &uav);
+    }
+    else
+    {
+      ID3D11RenderTargetView *rtvs[8] = {0};
+      ID3D11DepthStencilView *dsv = NULL;
+      context->OMGetRenderTargetsAndUnorderedAccessViews(0, rtvs, &dsv, slot.shaderRegister, 1, &uav);
 
-      if(res)
+      for(int i = 0; i < 8; i++)
+        SAFE_RELEASE(rtvs[i]);
+      SAFE_RELEASE(dsv);
+    }
+
+    if(uav)
+    {
+      D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc;
+      uav->GetDesc(&uavDesc);
+
+      switch(uavDesc.ViewDimension)
       {
-        if(WrappedID3D11Buffer::IsAlloc(res))
+        case D3D11_UAV_DIMENSION_UNKNOWN:
+        case D3D11_UAV_DIMENSION_BUFFER:
         {
-          GetBufferData((ID3D11Buffer *)res, 0, 0, global.srvs[i].data);
+          RDCWARN("Invalid view dimension for GetResourceInfo");
+          break;
+        }
+        case D3D11_UAV_DIMENSION_TEXTURE1D:
+        case D3D11_UAV_DIMENSION_TEXTURE1DARRAY:
+        {
+          ID3D11Texture1D *tex = NULL;
+          uav->GetResource((ID3D11Resource **)&tex);
+
+          dim = 1;
+
+          if(tex)
+          {
+            bool isarray = uavDesc.ViewDimension == D3D11_UAV_DIMENSION_TEXTURE1DARRAY;
+
+            D3D11_TEXTURE1D_DESC desc;
+            tex->GetDesc(&desc);
+            result.value.u32v[0] = RDCMAX(1U, desc.Width >> mipLevel);
+            result.value.u32v[1] = isarray ? uavDesc.Texture1DArray.ArraySize : 0;
+            result.value.u32v[2] = 0;
+
+            if(isarray && (result.value.u32v[2] == 0 || result.value.u32v[2] == ~0U))
+              result.value.u32v[2] = desc.ArraySize;
+
+            // spec says "For UAVs (u#), the number of mip levels is always 1."
+            result.value.u32v[3] = 1;
+
+            if(mipLevel >= result.value.u32v[3])
+              result.value.u32v[0] = result.value.u32v[1] = 0;
+
+            SAFE_RELEASE(tex);
+          }
+          break;
+        }
+        case D3D11_UAV_DIMENSION_TEXTURE2D:
+        case D3D11_UAV_DIMENSION_TEXTURE2DARRAY:
+        {
+          ID3D11Texture2D *tex = NULL;
+          uav->GetResource((ID3D11Resource **)&tex);
+
+          dim = 2;
+
+          if(tex)
+          {
+            D3D11_TEXTURE2D_DESC desc;
+            tex->GetDesc(&desc);
+            result.value.u32v[0] = RDCMAX(1U, desc.Width >> mipLevel);
+            result.value.u32v[1] = RDCMAX(1U, desc.Height >> mipLevel);
+
+            if(uavDesc.ViewDimension == D3D11_UAV_DIMENSION_TEXTURE2D)
+            {
+              result.value.u32v[2] = 0;
+            }
+            else if(uavDesc.ViewDimension == D3D11_UAV_DIMENSION_TEXTURE2DARRAY)
+            {
+              result.value.u32v[2] = uavDesc.Texture2DArray.ArraySize;
+
+              if(result.value.u32v[2] == 0 || result.value.u32v[2] == ~0U)
+                result.value.u32v[2] = desc.ArraySize;
+            }
+
+            // spec says "For UAVs (u#), the number of mip levels is always 1."
+            result.value.u32v[3] = 1;
+
+            if(mipLevel >= result.value.u32v[3])
+              result.value.u32v[0] = result.value.u32v[1] = result.value.u32v[2] = 0;
+
+            SAFE_RELEASE(tex);
+          }
+          break;
+        }
+        case D3D11_UAV_DIMENSION_TEXTURE3D:
+        {
+          ID3D11Texture3D *tex = NULL;
+          uav->GetResource((ID3D11Resource **)&tex);
+
+          dim = 3;
+
+          if(tex)
+          {
+            D3D11_TEXTURE3D_DESC desc;
+            tex->GetDesc(&desc);
+            result.value.u32v[0] = RDCMAX(1U, desc.Width >> mipLevel);
+            result.value.u32v[1] = RDCMAX(1U, desc.Height >> mipLevel);
+            result.value.u32v[2] = RDCMAX(1U, desc.Depth >> mipLevel);
+
+            // spec says "For UAVs (u#), the number of mip levels is always 1."
+            result.value.u32v[3] = 1;
+
+            if(mipLevel >= result.value.u32v[3])
+              result.value.u32v[0] = result.value.u32v[1] = result.value.u32v[2] = 0;
+
+            SAFE_RELEASE(tex);
+          }
+          break;
         }
       }
 
-      SAFE_RELEASE(res);
+      SAFE_RELEASE(uav);
     }
   }
 
-  for(size_t i = 0; i < dxbc->GetNumDeclarations(); i++)
+  SAFE_RELEASE(context);
+  return result;
+}
+
+bool D3D11DebugAPIWrapper::CalculateSampleGather(
+    DXBCBytecode::OpcodeType opcode, DXBCDebug::SampleGatherResourceData resourceData,
+    DXBCDebug::SampleGatherSamplerData samplerData, ShaderVariable uv, ShaderVariable ddxCalc,
+    ShaderVariable ddyCalc, const int8_t texelOffsets[3], int multisampleIndex,
+    float lodOrCompareValue, const uint8_t swizzle[4], DXBCDebug::GatherChannel gatherChannel,
+    const char *opString, ShaderVariable &output)
+{
+  using namespace DXBCBytecode;
+
+  RDCCOMPILE_ASSERT((int)DXBCBytecode::OPCODE_SAMPLE == DEBUG_SAMPLE_TEX_SAMPLE,
+                    "Opcode enum doesn't match shader define");
+  RDCCOMPILE_ASSERT((int)DXBCBytecode::OPCODE_SAMPLE_L == DEBUG_SAMPLE_TEX_SAMPLE_L,
+                    "Opcode enum doesn't match shader define");
+  RDCCOMPILE_ASSERT((int)DXBCBytecode::OPCODE_SAMPLE_B == DEBUG_SAMPLE_TEX_SAMPLE_B,
+                    "Opcode enum doesn't match shader define");
+  RDCCOMPILE_ASSERT((int)DXBCBytecode::OPCODE_SAMPLE_C == DEBUG_SAMPLE_TEX_SAMPLE_C,
+                    "Opcode enum doesn't match shader define");
+  RDCCOMPILE_ASSERT((int)DXBCBytecode::OPCODE_SAMPLE_D == DEBUG_SAMPLE_TEX_SAMPLE_D,
+                    "Opcode enum doesn't match shader define");
+  RDCCOMPILE_ASSERT((int)DXBCBytecode::OPCODE_SAMPLE_C_LZ == DEBUG_SAMPLE_TEX_SAMPLE_C_LZ,
+                    "Opcode enum doesn't match shader define");
+  RDCCOMPILE_ASSERT((int)DXBCBytecode::OPCODE_GATHER4 == DEBUG_SAMPLE_TEX_GATHER4,
+                    "Opcode enum doesn't match shader define");
+  RDCCOMPILE_ASSERT((int)DXBCBytecode::OPCODE_GATHER4_C == DEBUG_SAMPLE_TEX_GATHER4_C,
+                    "Opcode enum doesn't match shader define");
+  RDCCOMPILE_ASSERT((int)DXBCBytecode::OPCODE_GATHER4_PO == DEBUG_SAMPLE_TEX_GATHER4_PO,
+                    "Opcode enum doesn't match shader define");
+  RDCCOMPILE_ASSERT((int)DXBCBytecode::OPCODE_GATHER4_PO_C == DEBUG_SAMPLE_TEX_GATHER4_PO_C,
+                    "Opcode enum doesn't match shader define");
+  RDCCOMPILE_ASSERT((int)DXBCBytecode::OPCODE_LOD == DEBUG_SAMPLE_TEX_LOD,
+                    "Opcode enum doesn't match shader define");
+  RDCCOMPILE_ASSERT((int)DXBCBytecode::OPCODE_LD == DEBUG_SAMPLE_TEX_LD,
+                    "Opcode enum doesn't match shader define");
+  RDCCOMPILE_ASSERT((int)DXBCBytecode::OPCODE_LD_MS == DEBUG_SAMPLE_TEX_LD_MS,
+                    "Opcode enum doesn't match shader define");
+
+  ShaderDebugging &debugData = m_pDevice->GetReplay()->GetShaderDebuggingData();
+
+  for(uint32_t i = 0; i < ddxCalc.columns; i++)
   {
-    const DXBC::ASMDecl &decl = dxbc->GetDeclaration(i);
-
-    if(decl.declaration == DXBC::OPCODE_DCL_THREAD_GROUP_SHARED_MEMORY_RAW ||
-       decl.declaration == DXBC::OPCODE_DCL_THREAD_GROUP_SHARED_MEMORY_STRUCTURED)
+    if(!RDCISFINITE(ddxCalc.value.f32v[i]))
     {
-      uint32_t slot = (uint32_t)decl.operand.indices[0].index;
+      RDCWARN("NaN or Inf in texlookup");
+      ddxCalc.value.f32v[i] = 0.0f;
 
-      if(global.groupshared.size() <= slot)
-      {
-        global.groupshared.resize(slot + 1);
+      m_pDevice->AddDebugMessage(MessageCategory::Shaders, MessageSeverity::High,
+                                 MessageSource::RuntimeWarning,
+                                 StringFormat::Fmt("Shader debugging %d: %s\nNaN or Inf found in "
+                                                   "texture lookup ddx - using 0.0 instead",
+                                                   m_instruction, opString));
+    }
+    if(!RDCISFINITE(ddyCalc.value.f32v[i]))
+    {
+      RDCWARN("NaN or Inf in texlookup");
+      ddyCalc.value.f32v[i] = 0.0f;
 
-        ShaderDebug::GlobalState::groupsharedMem &mem = global.groupshared[slot];
+      m_pDevice->AddDebugMessage(MessageCategory::Shaders, MessageSeverity::High,
+                                 MessageSource::RuntimeWarning,
+                                 StringFormat::Fmt("Shader debugging %d: %s\nNaN or Inf found in "
+                                                   "texture lookup ddy - using 0.0 instead",
+                                                   m_instruction, opString));
+    }
+  }
 
-        mem.structured = (decl.declaration == DXBC::OPCODE_DCL_THREAD_GROUP_SHARED_MEMORY_STRUCTURED);
+  for(uint32_t i = 0; i < uv.columns; i++)
+  {
+    if(opcode != OPCODE_LD && opcode != OPCODE_LD_MS && !RDCISFINITE(uv.value.f32v[i]))
+    {
+      RDCWARN("NaN or Inf in texlookup");
+      uv.value.f32v[i] = 0.0f;
 
-        mem.count = decl.count;
-        if(mem.structured)
-          mem.bytestride = decl.stride;
-        else
-          mem.bytestride = 4;    // raw groupshared is implicitly uint32s
+      m_pDevice->AddDebugMessage(MessageCategory::Shaders, MessageSeverity::High,
+                                 MessageSource::RuntimeWarning,
+                                 StringFormat::Fmt("Shader debugging %d: %s\nNaN or Inf found in "
+                                                   "texture lookup uv - using 0.0 instead",
+                                                   m_instruction, opString));
+    }
+  }
 
-        mem.data.resize(mem.bytestride * mem.count);
-      }
+  // set array slice selection to 0 if the resource is declared non-arrayed
+
+  if(resourceData.dim == RESOURCE_DIMENSION_TEXTURE1D)
+    uv.value.f32v[1] = 0.0f;
+  else if(resourceData.dim == RESOURCE_DIMENSION_TEXTURE2D ||
+          resourceData.dim == RESOURCE_DIMENSION_TEXTURE2DMS ||
+          resourceData.dim == RESOURCE_DIMENSION_TEXTURECUBE)
+    uv.value.f32v[2] = 0.0f;
+
+  DebugSampleOperation cbufferData = {};
+
+  memcpy(&cbufferData.debugSampleUV, uv.value.u32v.data(), sizeof(Vec4f));
+  memcpy(&cbufferData.debugSampleDDX, ddxCalc.value.u32v.data(), sizeof(Vec4f));
+  memcpy(&cbufferData.debugSampleDDY, ddyCalc.value.u32v.data(), sizeof(Vec4f));
+  memcpy(&cbufferData.debugSampleUVInt, uv.value.u32v.data(), sizeof(Vec4f));
+
+  if(resourceData.dim == RESOURCE_DIMENSION_TEXTURE1D ||
+     resourceData.dim == RESOURCE_DIMENSION_TEXTURE1DARRAY)
+  {
+    cbufferData.debugSampleTexDim = DEBUG_SAMPLE_TEX1D;
+  }
+  else if(resourceData.dim == RESOURCE_DIMENSION_TEXTURE2D ||
+          resourceData.dim == RESOURCE_DIMENSION_TEXTURE2DARRAY)
+  {
+    cbufferData.debugSampleTexDim = DEBUG_SAMPLE_TEX2D;
+  }
+  else if(resourceData.dim == RESOURCE_DIMENSION_TEXTURE3D)
+  {
+    cbufferData.debugSampleTexDim = DEBUG_SAMPLE_TEX3D;
+  }
+  else if(resourceData.dim == RESOURCE_DIMENSION_TEXTURE2DMS ||
+          resourceData.dim == RESOURCE_DIMENSION_TEXTURE2DMSARRAY)
+  {
+    cbufferData.debugSampleTexDim = DEBUG_SAMPLE_TEXMS;
+  }
+  else if(resourceData.dim == RESOURCE_DIMENSION_TEXTURECUBE ||
+          resourceData.dim == RESOURCE_DIMENSION_TEXTURECUBEARRAY)
+  {
+    cbufferData.debugSampleTexDim = DEBUG_SAMPLE_TEXCUBE;
+  }
+  else
+  {
+    RDCERR("Unsupported resource type %d in sample operation", resourceData.dim);
+  }
+
+  int retTypes[DXBC::NUM_RETURN_TYPES] = {
+      0,                     // RETURN_TYPE_UNKNOWN
+      DEBUG_SAMPLE_UNORM,    // RETURN_TYPE_UNORM
+      DEBUG_SAMPLE_SNORM,    // RETURN_TYPE_UNORM
+      DEBUG_SAMPLE_INT,      // RETURN_TYPE_SINT
+      DEBUG_SAMPLE_UINT,     // RETURN_TYPE_UINT
+      DEBUG_SAMPLE_FLOAT,    // RETURN_TYPE_FLOAT
+      0,                     // RETURN_TYPE_MIXED
+      DEBUG_SAMPLE_FLOAT,    // RETURN_TYPE_DOUBLE (treat as floats)
+      0,                     // RETURN_TYPE_CONTINUED
+      0,                     // RETURN_TYPE_UNUSED
+  };
+
+  cbufferData.debugSampleRetType = retTypes[resourceData.retType];
+
+  cbufferData.debugSampleGatherChannel = (int)gatherChannel;
+  cbufferData.debugSampleSampleIndex = multisampleIndex;
+  cbufferData.debugSampleOperation = (int)opcode;
+  cbufferData.debugSampleLodCompare = lodOrCompareValue;
+
+  D3D11RenderStateTracker tracker(m_pDevice->GetImmediateContext());
+
+  ID3D11DeviceContext *context = NULL;
+
+  m_pDevice->GetImmediateContext(&context);
+
+  // back up SRV/sampler on PS slot 0
+
+  ID3D11ShaderResourceView *usedSRV = NULL;
+  ID3D11SamplerState *usedSamp = NULL;
+
+  // fetch SRV and sampler from the shader stage we're debugging that this opcode wants to load from
+  UINT texSlot = resourceData.binding.shaderRegister;
+  UINT samplerSlot = samplerData.binding.shaderRegister;
+  switch(GetShaderType())
+  {
+    case DXBC::ShaderType::Vertex:
+      context->VSGetShaderResources(texSlot, 1, &usedSRV);
+      context->VSGetSamplers(samplerSlot, 1, &usedSamp);
+      break;
+    case DXBC::ShaderType::Hull:
+      context->HSGetShaderResources(texSlot, 1, &usedSRV);
+      context->HSGetSamplers(samplerSlot, 1, &usedSamp);
+      break;
+    case DXBC::ShaderType::Domain:
+      context->DSGetShaderResources(texSlot, 1, &usedSRV);
+      context->DSGetSamplers(samplerSlot, 1, &usedSamp);
+      break;
+    case DXBC::ShaderType::Geometry:
+      context->GSGetShaderResources(texSlot, 1, &usedSRV);
+      context->GSGetSamplers(samplerSlot, 1, &usedSamp);
+      break;
+    case DXBC::ShaderType::Pixel:
+      context->PSGetShaderResources(texSlot, 1, &usedSRV);
+      context->PSGetSamplers(samplerSlot, 1, &usedSamp);
+      break;
+    case DXBC::ShaderType::Compute:
+      context->CSGetShaderResources(texSlot, 1, &usedSRV);
+      context->CSGetSamplers(samplerSlot, 1, &usedSamp);
+      break;
+    default: RDCERR("Unhandled shader type %d", GetShaderType()); break;
+  }
+
+  texSlot = (cbufferData.debugSampleTexDim - 1) + 5 * (cbufferData.debugSampleRetType - 1);
+
+  // set onto PS while we perform the sample
+  context->PSSetShaderResources(texSlot, 1, &usedSRV);
+  if(opcode == OPCODE_SAMPLE_B && samplerData.bias != 0.0f)
+  {
+    RDCASSERT(usedSamp);
+
+    D3D11_SAMPLER_DESC desc;
+    usedSamp->GetDesc(&desc);
+
+    desc.MipLODBias = RDCCLAMP(desc.MipLODBias + samplerData.bias, -15.99f, 15.99f);
+
+    ID3D11SamplerState *replacementSamp = NULL;
+    HRESULT hr = m_pDevice->CreateSamplerState(&desc, &replacementSamp);
+    if(FAILED(hr))
+    {
+      RDCERR("Failed to create new sampler state in debugging HRESULT: %s",
+             ToStr(hr).c_str());    // @NoCoverage
+    }
+    else
+    {
+      context->PSSetSamplers(0, 1, &replacementSamp);
+      SAFE_RELEASE(replacementSamp);
+    }
+  }
+  else
+  {
+    if(opcode == OPCODE_SAMPLE_C || opcode == OPCODE_SAMPLE_C_LZ || opcode == OPCODE_GATHER4_C ||
+       opcode == OPCODE_GATHER4_PO_C)
+      context->PSSetSamplers(1, 1, &usedSamp);
+    else
+      context->PSSetSamplers(0, 1, &usedSamp);
+  }
+
+  context->IASetInputLayout(NULL);
+  context->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+
+  context->VSSetShader(debugData.SampleVS, NULL, 0);
+  context->PSSetShader(debugData.GetSamplePS(texelOffsets), NULL, 0);
+
+  D3D11_MAPPED_SUBRESOURCE mapped;
+  HRESULT hr = context->Map(debugData.ParamBuf, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+  if(FAILED(hr))
+  {
+    RDCERR("Failed to map parameters HRESULT: %s", ToStr(hr).c_str());    // @NoCoverage
+    return false;                                                         // @NoCoverage
+  }
+
+  memcpy(mapped.pData, &cbufferData, sizeof(cbufferData));
+
+  context->Unmap(debugData.ParamBuf, 0);
+
+  context->VSSetConstantBuffers(0, 1, &debugData.ParamBuf);
+  context->PSSetConstantBuffers(0, 1, &debugData.ParamBuf);
+
+  D3D11_VIEWPORT view = {0.0f, 0.0f, 1.0f, 1.0f, 0.0f, 1.0f};
+  context->RSSetViewports(1, &view);
+
+  context->GSSetShader(NULL, NULL, 0);
+  context->DSSetShader(NULL, NULL, 0);
+  context->HSSetShader(NULL, NULL, 0);
+  context->CSSetShader(NULL, NULL, 0);
+
+  context->SOSetTargets(0, NULL, NULL);
+
+  context->RSSetState(NULL);
+  context->OMSetBlendState(NULL, NULL, (UINT)~0);
+  context->OMSetDepthStencilState(NULL, 0);
+
+  UINT uavCount = ~0U;
+  context->OMSetRenderTargetsAndUnorderedAccessViews(1, &debugData.DummyRTV, NULL, 1, 1,
+                                                     &debugData.OutUAV, &uavCount);
+  context->Draw(3, 0);
+
+  context->CopyResource(debugData.OutStageBuf, debugData.OutBuf);
+
+  hr = context->Map(debugData.OutStageBuf, 0, D3D11_MAP_READ, 0, &mapped);
+
+  if(FAILED(hr))
+  {
+    RDCERR("Failed to map results HRESULT: %s", ToStr(hr).c_str());    // @NoCoverage
+    return false;                                                      // @NoCoverage
+  }
+
+  ShaderVariable lookupResult("tex", 0.0f, 0.0f, 0.0f, 0.0f);
+
+  float *retFloats = (float *)mapped.pData;
+  uint32_t *retUInts = (uint32_t *)(retFloats + 8);
+  int32_t *retSInts = (int32_t *)(retUInts + 8);
+
+  if(cbufferData.debugSampleRetType == DEBUG_SAMPLE_UINT)
+  {
+    for(int i = 0; i < 4; i++)
+      lookupResult.value.u32v[i] = retUInts[swizzle[i]];
+  }
+  else if(cbufferData.debugSampleRetType == DEBUG_SAMPLE_INT)
+  {
+    for(int i = 0; i < 4; i++)
+      lookupResult.value.s32v[i] = retSInts[swizzle[i]];
+  }
+  else
+  {
+    for(int i = 0; i < 4; i++)
+      lookupResult.value.f32v[i] = retFloats[swizzle[i]];
+  }
+
+  context->Unmap(debugData.OutStageBuf, 0);
+
+  SAFE_RELEASE(context);
+
+  SAFE_RELEASE(usedSRV);
+  SAFE_RELEASE(usedSamp);
+
+  output = lookupResult;
+  return true;
+}
+
+bool D3D11DebugAPIWrapper::CalculateMathIntrinsic(DXBCBytecode::OpcodeType opcode,
+                                                  const ShaderVariable &input,
+                                                  ShaderVariable &output1, ShaderVariable &output2)
+{
+  D3D11RenderStateTracker tracker(m_pDevice->GetImmediateContext());
+
+  RDCCOMPILE_ASSERT((int)DXBCBytecode::OPCODE_RCP == DEBUG_SAMPLE_MATH_RCP,
+                    "Opcode enum doesn't match shader define");
+  RDCCOMPILE_ASSERT((int)DXBCBytecode::OPCODE_RSQ == DEBUG_SAMPLE_MATH_RSQ,
+                    "Opcode enum doesn't match shader define");
+  RDCCOMPILE_ASSERT((int)DXBCBytecode::OPCODE_EXP == DEBUG_SAMPLE_MATH_EXP,
+                    "Opcode enum doesn't match shader define");
+  RDCCOMPILE_ASSERT((int)DXBCBytecode::OPCODE_LOG == DEBUG_SAMPLE_MATH_LOG,
+                    "Opcode enum doesn't match shader define");
+  RDCCOMPILE_ASSERT((int)DXBCBytecode::OPCODE_SINCOS == DEBUG_SAMPLE_MATH_SINCOS,
+                    "Opcode enum doesn't match shader define");
+
+  ID3D11DeviceContext *context = NULL;
+  m_pDevice->GetImmediateContext(&context);
+
+  const ShaderDebugging &debugData = m_pDevice->GetReplay()->GetShaderDebuggingData();
+
+  D3D11_MAPPED_SUBRESOURCE mapped;
+  HRESULT hr = context->Map(debugData.ParamBuf, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+  if(FAILED(hr))
+  {
+    RDCERR("Failed to map parameters HRESULT: %s", ToStr(hr).c_str());    // @NoCoverage
+    return false;                                                         // @NoCoverage
+  }
+
+  DebugMathOperation data;
+  data.mathOp = (int)opcode;
+  memcpy(&data.mathInVal, &input.value.u32v[0], sizeof(Vec4f));
+
+  memcpy(mapped.pData, &data, sizeof(data));
+
+  context->Unmap(debugData.ParamBuf, 0);
+
+  context->CSSetConstantBuffers(0, 1, &debugData.ParamBuf);
+  context->CSSetShader(debugData.MathCS, NULL, 0);
+  context->CSSetUnorderedAccessViews(1, 1, &debugData.OutUAV, NULL);
+  context->Dispatch(1, 1, 1);
+
+  context->CopyResource(debugData.OutStageBuf, debugData.OutBuf);
+
+  hr = context->Map(debugData.OutStageBuf, 0, D3D11_MAP_READ, 0, &mapped);
+
+  if(FAILED(hr))
+  {
+    RDCERR("Failed to map results HRESULT: %s", ToStr(hr).c_str());    // @NoCoverage
+    return false;                                                      // @NoCoverage
+  }
+
+  uint32_t *resA = (uint32_t *)mapped.pData;
+  uint32_t *resB = resA + 4;
+
+  memcpy(output1.value.u32v.data(), resA, sizeof(uint32_t) * 4);
+  memcpy(output2.value.u32v.data(), resB, sizeof(uint32_t) * 4);
+
+  context->Unmap(debugData.OutStageBuf, 0);
+
+  SAFE_RELEASE(context);
+
+  return true;
+}
+
+void AddCBuffersToGlobalState(const DXBCBytecode::Program &program, D3D11DebugManager &debugManager,
+                              DXBCDebug::GlobalState &global,
+                              rdcarray<SourceVariableMapping> &sourceVars,
+                              const D3D11RenderState::Shader &shader, const ShaderReflection &refl,
+                              const ShaderBindpointMapping &mapping)
+{
+  bytebuf cbufData;
+  for(int i = 0; i < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT; i++)
+  {
+    if(shader.ConstantBuffers[i])
+    {
+      DXBCDebug::BindingSlot slot(i, 0);
+      cbufData.clear();
+      debugManager.GetBufferData(shader.ConstantBuffers[i], shader.CBOffsets[i] * sizeof(Vec4f),
+                                 shader.CBCounts[i] * sizeof(Vec4f), cbufData);
+
+      AddCBufferToGlobalState(program, global, sourceVars, refl, mapping, slot, cbufData);
     }
   }
 }
 
-ShaderDebugTrace D3D11Replay::DebugVertex(uint32_t eventId, uint32_t vertid, uint32_t instid,
-                                          uint32_t idx, uint32_t instOffset, uint32_t vertOffset)
+ShaderDebugTrace *D3D11Replay::DebugVertex(uint32_t eventId, uint32_t vertid, uint32_t instid,
+                                           uint32_t idx, uint32_t view)
 {
-  using namespace DXBC;
-  using namespace ShaderDebug;
+  using namespace DXBCBytecode;
+  using namespace DXBCDebug;
 
-  D3D11MarkerRegion debugpixRegion(
+  D3D11MarkerRegion region(
       StringFormat::Fmt("DebugVertex @ %u of (%u,%u,%u)", eventId, vertid, instid, idx));
 
-  ShaderDebugTrace empty;
-
-  const DrawcallDescription *draw = m_pDevice->GetDrawcall(eventId);
+  const ActionDescription *action = m_pDevice->GetAction(eventId);
 
   D3D11RenderStateTracker tracker(m_pImmediateContext);
 
@@ -764,19 +1450,19 @@ ShaderDebugTrace D3D11Replay::DebugVertex(uint32_t eventId, uint32_t vertid, uin
   SAFE_RELEASE(stateVS);
 
   if(!vs)
-    return empty;
+    return new ShaderDebugTrace;
 
-  DXBCFile *dxbc = vs->GetDXBC();
+  DXBC::DXBCContainer *dxbc = vs->GetDXBC();
   const ShaderReflection &refl = vs->GetDetails();
 
   if(!dxbc)
-    return empty;
+    return new ShaderDebugTrace;
 
   dxbc->GetDisassembly();
 
   D3D11RenderState *rs = m_pImmediateContext->GetCurrentPipelineState();
 
-  std::vector<D3D11_INPUT_ELEMENT_DESC> inputlayout = m_pDevice->GetLayoutDesc(rs->IA.Layout);
+  rdcarray<D3D11_INPUT_ELEMENT_DESC> inputlayout = m_pDevice->GetLayoutDesc(rs->IA.Layout);
 
   std::set<UINT> vertexbuffers;
   uint32_t trackingOffs[32] = {0};
@@ -787,7 +1473,7 @@ ShaderDebugTrace D3D11Replay::DebugVertex(uint32_t eventId, uint32_t vertid, uin
   for(size_t i = 0; i < inputlayout.size(); i++)
   {
     if(inputlayout[i].InputSlotClass == D3D11_INPUT_PER_INSTANCE_DATA &&
-       inputlayout[i].InstanceDataStepRate < draw->numInstances)
+       inputlayout[i].InstanceDataStepRate < action->numInstances)
       MaxStepRate = RDCMAX(inputlayout[i].InstanceDataStepRate, MaxStepRate);
 
     UINT slot =
@@ -818,53 +1504,51 @@ ShaderDebugTrace D3D11Replay::DebugVertex(uint32_t eventId, uint32_t vertid, uin
     UINT i = *it;
     if(rs->IA.VBs[i])
     {
-      GetDebugManager()->GetBufferData(rs->IA.VBs[i],
-                                       rs->IA.Offsets[i] + rs->IA.Strides[i] * (vertOffset + idx),
-                                       rs->IA.Strides[i], vertData[i]);
+      GetDebugManager()->GetBufferData(
+          rs->IA.VBs[i], rs->IA.Offsets[i] + rs->IA.Strides[i] * (action->vertexOffset + idx),
+          rs->IA.Strides[i], vertData[i]);
 
       for(UINT isr = 1; isr <= MaxStepRate; isr++)
       {
         GetDebugManager()->GetBufferData(
-            rs->IA.VBs[i], rs->IA.Offsets[i] + rs->IA.Strides[i] * (instOffset + (instid / isr)),
+            rs->IA.VBs[i],
+            rs->IA.Offsets[i] + rs->IA.Strides[i] * (action->instanceOffset + (instid / isr)),
             rs->IA.Strides[i], instData[i * MaxStepRate + isr - 1]);
       }
 
-      GetDebugManager()->GetBufferData(rs->IA.VBs[i],
-                                       rs->IA.Offsets[i] + rs->IA.Strides[i] * instOffset,
-                                       rs->IA.Strides[i], staticData[i]);
+      GetDebugManager()->GetBufferData(
+          rs->IA.VBs[i], rs->IA.Offsets[i] + rs->IA.Strides[i] * action->instanceOffset,
+          rs->IA.Strides[i], staticData[i]);
     }
   }
 
-  bytebuf cbufData[D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT];
+  InterpretDebugger *interpreter = new InterpretDebugger;
+  interpreter->eventId = eventId;
+  ShaderDebugTrace *ret = interpreter->BeginDebug(dxbc, refl, vs->GetMapping(), 0);
+  GlobalState &global = interpreter->global;
+  ThreadState &state = interpreter->activeLane();
 
-  for(int i = 0; i < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT; i++)
-    if(rs->VS.ConstantBuffers[i])
-      GetDebugManager()->GetBufferData(rs->VS.ConstantBuffers[i],
-                                       rs->VS.CBOffsets[i] * sizeof(Vec4f), 0, cbufData[i]);
+  AddCBuffersToGlobalState(*dxbc->GetDXBCByteCode(), *GetDebugManager(), global, ret->sourceVars,
+                           rs->VS, refl, vs->GetMapping());
 
-  ShaderDebugTrace ret;
-
-  GlobalState global;
-  GetDebugManager()->CreateShaderGlobalState(global, dxbc, 0, NULL, rs->VS.SRVs);
-  State initialState = GetDebugManager()->CreateShaderDebugState(ret, -1, dxbc, refl, cbufData);
-
-  for(size_t i = 0; i < ret.inputs.size(); i++)
+  for(size_t i = 0; i < state.inputs.size(); i++)
   {
-    if(dxbc->m_InputSig[i].systemValue == ShaderBuiltin::Undefined ||
-       dxbc->m_InputSig[i].systemValue ==
+    if(dxbc->GetReflection()->InputSig[i].systemValue == ShaderBuiltin::Undefined ||
+       dxbc->GetReflection()->InputSig[i].systemValue ==
            ShaderBuiltin::Position)    // SV_Position seems to get promoted
                                        // automatically, but it's invalid for
                                        // vertex input
     {
       const D3D11_INPUT_ELEMENT_DESC *el = NULL;
 
-      std::string signame = strlower(dxbc->m_InputSig[i].semanticName);
+      rdcstr signame = strlower(dxbc->GetReflection()->InputSig[i].semanticName);
 
       for(size_t l = 0; l < inputlayout.size(); l++)
       {
-        std::string layoutname = strlower(inputlayout[l].SemanticName);
+        rdcstr layoutname = strlower(inputlayout[l].SemanticName);
 
-        if(signame == layoutname && dxbc->m_InputSig[i].semanticIndex == inputlayout[l].SemanticIndex)
+        if(signame == layoutname &&
+           dxbc->GetReflection()->InputSig[i].semanticIndex == inputlayout[l].SemanticIndex)
         {
           el = &inputlayout[l];
           break;
@@ -894,10 +1578,13 @@ ShaderDebugTrace D3D11Replay::DebugVertex(uint32_t eventId, uint32_t vertid, uin
       }
       else
       {
-        if(el->InstanceDataStepRate == 0 || el->InstanceDataStepRate >= draw->numInstances)
+        if(el->InstanceDataStepRate == 0 || el->InstanceDataStepRate >= action->numInstances)
         {
-          srcData = &staticData[el->InputSlot][el->AlignedByteOffset];
-          dataSize = staticData[el->InputSlot].size() - el->AlignedByteOffset;
+          if(staticData[el->InputSlot].size() >= el->AlignedByteOffset)
+          {
+            srcData = &staticData[el->InputSlot][el->AlignedByteOffset];
+            dataSize = staticData[el->InputSlot].size() - el->AlignedByteOffset;
+          }
         }
         else
         {
@@ -913,19 +1600,19 @@ ShaderDebugTrace D3D11Replay::DebugVertex(uint32_t eventId, uint32_t vertid, uin
       ResourceFormat fmt = MakeResourceFormat(el->Format);
 
       // more data needed than is provided
-      if(dxbc->m_InputSig[i].compCount > fmt.compCount)
+      if(dxbc->GetReflection()->InputSig[i].compCount > fmt.compCount)
       {
-        ret.inputs[i].value.u.w = 1;
+        state.inputs[i].value.u32v[3] = 1;
 
         if(fmt.compType == CompType::Float)
-          ret.inputs[i].value.f.w = 1.0f;
+          state.inputs[i].value.f32v[3] = 1.0f;
       }
 
       // interpret resource format types
       if(fmt.Special())
       {
-        Vec3f *v3 = (Vec3f *)ret.inputs[i].value.fv;
-        Vec4f *v4 = (Vec4f *)ret.inputs[i].value.fv;
+        Vec3f *v3 = (Vec3f *)state.inputs[i].value.f32v.data();
+        Vec4f *v4 = (Vec4f *)state.inputs[i].value.f32v.data();
 
         // only pull in all or nothing from these,
         // if there's only e.g. 3 bytes remaining don't read and unpack some of
@@ -937,8 +1624,12 @@ ShaderDebugTrace D3D11Replay::DebugVertex(uint32_t eventId, uint32_t vertid, uin
 
         if(srcData == NULL || packedsize > dataSize)
         {
-          ret.inputs[i].value.u.x = ret.inputs[i].value.u.y = ret.inputs[i].value.u.z =
-              ret.inputs[i].value.u.w = 0;
+          state.inputs[i].value.u32v[0] = state.inputs[i].value.u32v[1] =
+              state.inputs[i].value.u32v[2] = 0;
+          if(fmt.compType == CompType::UInt || fmt.compType == CompType::SInt)
+            state.inputs[i].value.u32v[3] = 1;
+          else
+            state.inputs[i].value.f32v[3] = 1.0f;
         }
         else if(fmt.type == ResourceFormatType::R5G5B5A1)
         {
@@ -964,10 +1655,10 @@ ShaderDebugTrace D3D11Replay::DebugVertex(uint32_t eventId, uint32_t vertid, uin
 
           if(fmt.compType == CompType::UInt)
           {
-            ret.inputs[i].value.u.z = (packed >> 0) & 0x3ff;
-            ret.inputs[i].value.u.y = (packed >> 10) & 0x3ff;
-            ret.inputs[i].value.u.x = (packed >> 20) & 0x3ff;
-            ret.inputs[i].value.u.w = (packed >> 30) & 0x003;
+            state.inputs[i].value.u32v[2] = (packed >> 0) & 0x3ff;
+            state.inputs[i].value.u32v[1] = (packed >> 10) & 0x3ff;
+            state.inputs[i].value.u32v[0] = (packed >> 20) & 0x3ff;
+            state.inputs[i].value.u32v[3] = (packed >> 30) & 0x003;
           }
           else
           {
@@ -982,105 +1673,111 @@ ShaderDebugTrace D3D11Replay::DebugVertex(uint32_t eventId, uint32_t vertid, uin
       }
       else
       {
-        for(uint32_t c = 0; c < fmt.compCount; c++)
+        if(srcData == NULL || size_t(fmt.compByteWidth * fmt.compCount) > dataSize)
         {
-          if(srcData == NULL || fmt.compByteWidth > dataSize)
-          {
-            ret.inputs[i].value.uv[c] = 0;
-            continue;
-          }
-
-          dataSize -= fmt.compByteWidth;
-
-          if(fmt.compByteWidth == 1)
-          {
-            byte *src = srcData + c * fmt.compByteWidth;
-
-            if(fmt.compType == CompType::UInt)
-              ret.inputs[i].value.uv[c] = *src;
-            else if(fmt.compType == CompType::SInt)
-              ret.inputs[i].value.iv[c] = *((int8_t *)src);
-            else if(fmt.compType == CompType::UNorm || fmt.compType == CompType::UNormSRGB)
-              ret.inputs[i].value.fv[c] = float(*src) / 255.0f;
-            else if(fmt.compType == CompType::SNorm)
-            {
-              signed char *schar = (signed char *)src;
-
-              // -128 is mapped to -1, then -127 to -127 are mapped to -1 to 1
-              if(*schar == -128)
-                ret.inputs[i].value.fv[c] = -1.0f;
-              else
-                ret.inputs[i].value.fv[c] = float(*schar) / 127.0f;
-            }
-            else
-              RDCERR("Unexpected component type");
-          }
-          else if(fmt.compByteWidth == 2)
-          {
-            uint16_t *src = (uint16_t *)(srcData + c * fmt.compByteWidth);
-
-            if(fmt.compType == CompType::Float)
-              ret.inputs[i].value.fv[c] = ConvertFromHalf(*src);
-            else if(fmt.compType == CompType::UInt)
-              ret.inputs[i].value.uv[c] = *src;
-            else if(fmt.compType == CompType::SInt)
-              ret.inputs[i].value.iv[c] = *((int16_t *)src);
-            else if(fmt.compType == CompType::UNorm || fmt.compType == CompType::UNormSRGB)
-              ret.inputs[i].value.fv[c] = float(*src) / float(UINT16_MAX);
-            else if(fmt.compType == CompType::SNorm)
-            {
-              int16_t *sint = (int16_t *)src;
-
-              // -32768 is mapped to -1, then -32767 to -32767 are mapped to -1 to 1
-              if(*sint == -32768)
-                ret.inputs[i].value.fv[c] = -1.0f;
-              else
-                ret.inputs[i].value.fv[c] = float(*sint) / 32767.0f;
-            }
-            else
-              RDCERR("Unexpected component type");
-          }
-          else if(fmt.compByteWidth == 4)
-          {
-            uint32_t *src = (uint32_t *)(srcData + c * fmt.compByteWidth);
-
-            if(fmt.compType == CompType::Float || fmt.compType == CompType::UInt ||
-               fmt.compType == CompType::SInt)
-              memcpy(&ret.inputs[i].value.uv[c], src, 4);
-            else
-              RDCERR("Unexpected component type");
-          }
+          state.inputs[i].value.u32v[0] = state.inputs[i].value.u32v[1] =
+              state.inputs[i].value.u32v[2] = 0;
+          if(fmt.compType == CompType::UInt || fmt.compType == CompType::SInt)
+            state.inputs[i].value.u32v[3] = 1;
+          else
+            state.inputs[i].value.f32v[3] = 1.0f;
         }
-
-        if(fmt.BGRAOrder())
+        else
         {
-          RDCASSERT(fmt.compCount == 4);
-          std::swap(ret.inputs[i].value.fv[2], ret.inputs[i].value.fv[0]);
+          for(uint32_t c = 0; c < fmt.compCount; c++)
+          {
+            if(fmt.compByteWidth == 1)
+            {
+              byte *src = srcData + c * fmt.compByteWidth;
+
+              if(fmt.compType == CompType::UInt)
+                state.inputs[i].value.u32v[c] = *src;
+              else if(fmt.compType == CompType::SInt)
+                state.inputs[i].value.s32v[c] = *((int8_t *)src);
+              else if(fmt.compType == CompType::UNorm || fmt.compType == CompType::UNormSRGB)
+                state.inputs[i].value.f32v[c] = float(*src) / 255.0f;
+              else if(fmt.compType == CompType::SNorm)
+              {
+                signed char *schar = (signed char *)src;
+
+                // -128 is mapped to -1, then -127 to -127 are mapped to -1 to 1
+                if(*schar == -128)
+                  state.inputs[i].value.f32v[c] = -1.0f;
+                else
+                  state.inputs[i].value.f32v[c] = float(*schar) / 127.0f;
+              }
+              else
+                RDCERR("Unexpected component type");
+            }
+            else if(fmt.compByteWidth == 2)
+            {
+              uint16_t *src = (uint16_t *)(srcData + c * fmt.compByteWidth);
+
+              if(fmt.compType == CompType::Float)
+                state.inputs[i].value.f32v[c] = ConvertFromHalf(*src);
+              else if(fmt.compType == CompType::UInt)
+                state.inputs[i].value.u32v[c] = *src;
+              else if(fmt.compType == CompType::SInt)
+                state.inputs[i].value.s32v[c] = *((int16_t *)src);
+              else if(fmt.compType == CompType::UNorm || fmt.compType == CompType::UNormSRGB)
+                state.inputs[i].value.f32v[c] = float(*src) / float(UINT16_MAX);
+              else if(fmt.compType == CompType::SNorm)
+              {
+                int16_t *sint = (int16_t *)src;
+
+                // -32768 is mapped to -1, then -32767 to -32767 are mapped to -1 to 1
+                if(*sint == -32768)
+                  state.inputs[i].value.f32v[c] = -1.0f;
+                else
+                  state.inputs[i].value.f32v[c] = float(*sint) / 32767.0f;
+              }
+              else
+                RDCERR("Unexpected component type");
+            }
+            else if(fmt.compByteWidth == 4)
+            {
+              uint32_t *src = (uint32_t *)(srcData + c * fmt.compByteWidth);
+
+              if(fmt.compType == CompType::Float || fmt.compType == CompType::UInt ||
+                 fmt.compType == CompType::SInt)
+                memcpy(&state.inputs[i].value.u32v[c], src, 4);
+              else
+                RDCERR("Unexpected component type");
+            }
+          }
+
+          if(fmt.BGRAOrder())
+          {
+            RDCASSERT(fmt.compCount == 4);
+            std::swap(state.inputs[i].value.f32v[2], state.inputs[i].value.f32v[0]);
+          }
         }
       }
     }
-    else if(dxbc->m_InputSig[i].systemValue == ShaderBuiltin::VertexIndex)
+    else if(dxbc->GetReflection()->InputSig[i].systemValue == ShaderBuiltin::VertexIndex)
     {
       uint32_t sv_vertid = vertid;
 
-      if(draw->flags & DrawFlags::Indexed)
-        sv_vertid = idx;
+      if(action->flags & ActionFlags::Indexed)
+      {
+        sv_vertid = idx - action->baseVertex;
+      }
 
-      if(dxbc->m_InputSig[i].compType == CompType::Float)
-        ret.inputs[i].value.f.x = ret.inputs[i].value.f.y = ret.inputs[i].value.f.z =
-            ret.inputs[i].value.f.w = (float)sv_vertid;
+      if(dxbc->GetReflection()->InputSig[i].varType == VarType::Float)
+        state.inputs[i].value.f32v[0] = state.inputs[i].value.f32v[1] =
+            state.inputs[i].value.f32v[2] = state.inputs[i].value.f32v[3] = (float)sv_vertid;
       else
-        ret.inputs[i].value.u.x = ret.inputs[i].value.u.y = ret.inputs[i].value.u.z =
-            ret.inputs[i].value.u.w = sv_vertid;
+        state.inputs[i].value.u32v[0] = state.inputs[i].value.u32v[1] =
+            state.inputs[i].value.u32v[2] = state.inputs[i].value.u32v[3] = sv_vertid;
     }
-    else if(dxbc->m_InputSig[i].systemValue == ShaderBuiltin::InstanceIndex)
+    else if(dxbc->GetReflection()->InputSig[i].systemValue == ShaderBuiltin::InstanceIndex)
     {
-      if(dxbc->m_InputSig[i].compType == CompType::Float)
-        ret.inputs[i].value.f.x = ret.inputs[i].value.f.y = ret.inputs[i].value.f.z =
-            ret.inputs[i].value.f.w = (float)instid;
+      if(dxbc->GetReflection()->InputSig[i].varType == VarType::Float)
+        state.inputs[i].value.f32v[0] = state.inputs[i].value.f32v[1] =
+            state.inputs[i].value.f32v[2] = state.inputs[i].value.f32v[3] = (float)instid;
       else
-        ret.inputs[i].value.u.x = ret.inputs[i].value.u.y = ret.inputs[i].value.u.z =
-            ret.inputs[i].value.u.w = instid;
+        state.inputs[i].value.u32v[0] = state.inputs[i].value.u32v[1] =
+            state.inputs[i].value.u32v[2] = state.inputs[i].value.u32v[3] = instid;
     }
     else
     {
@@ -1088,65 +1785,24 @@ ShaderDebugTrace D3D11Replay::DebugVertex(uint32_t eventId, uint32_t vertid, uin
     }
   }
 
+  ret->constantBlocks = global.constantBlocks;
+  ret->inputs = state.inputs;
+
   delete[] instData;
 
-  State last;
-
-  std::vector<ShaderDebugState> states;
-
-  if(dxbc->m_DebugInfo)
-    dxbc->m_DebugInfo->GetLocals(0, dxbc->GetInstruction(0).offset, initialState.locals);
-
-  states.push_back((State)initialState);
-
-  D3D11MarkerRegion simloop("Simulation Loop");
-
-  for(int cycleCounter = 0;; cycleCounter++)
-  {
-    if(initialState.Finished())
-      break;
-
-    initialState = initialState.GetNext(global, NULL);
-
-    if(dxbc->m_DebugInfo)
-    {
-      const ASMOperation &op = dxbc->GetInstruction((size_t)initialState.nextInstruction);
-      dxbc->m_DebugInfo->GetLocals(initialState.nextInstruction, op.offset, initialState.locals);
-    }
-
-    states.push_back((State)initialState);
-
-    if(cycleCounter == SHADER_DEBUG_WARN_THRESHOLD)
-    {
-      if(PromptDebugTimeout(DXBC::TYPE_VERTEX, cycleCounter))
-        break;
-    }
-  }
-
-  ret.states = states;
-
-  ret.hasLocals = dxbc->m_DebugInfo && dxbc->m_DebugInfo->HasLocals();
-
-  ret.lineInfo.resize(dxbc->GetNumInstructions());
-  for(size_t i = 0; dxbc->m_DebugInfo && i < dxbc->GetNumInstructions(); i++)
-  {
-    const ASMOperation &op = dxbc->GetInstruction(i);
-    dxbc->m_DebugInfo->GetLineInfo(i, op.offset, ret.lineInfo[i]);
-  }
+  dxbc->FillTraceLineInfo(*ret);
 
   return ret;
 }
 
-ShaderDebugTrace D3D11Replay::DebugPixel(uint32_t eventId, uint32_t x, uint32_t y, uint32_t sample,
-                                         uint32_t primitive)
+ShaderDebugTrace *D3D11Replay::DebugPixel(uint32_t eventId, uint32_t x, uint32_t y, uint32_t sample,
+                                          uint32_t primitive)
 {
-  using namespace DXBC;
-  using namespace ShaderDebug;
+  using namespace DXBCBytecode;
+  using namespace DXBCDebug;
 
-  D3D11MarkerRegion debugpixRegion(
+  D3D11MarkerRegion region(
       StringFormat::Fmt("DebugPixel @ %u of (%u,%u) %u / %u", eventId, x, y, sample, primitive));
-
-  ShaderDebugTrace empty;
 
   D3D11RenderStateTracker tracker(m_pImmediateContext);
 
@@ -1180,19 +1836,19 @@ ShaderDebugTrace D3D11Replay::DebugPixel(uint32_t eventId, uint32_t x, uint32_t 
   SAFE_RELEASE(stateVS);
 
   if(!ps)
-    return empty;
+    return new ShaderDebugTrace;
 
   D3D11RenderState *rs = m_pImmediateContext->GetCurrentPipelineState();
 
-  DXBCFile *dxbc = ps->GetDXBC();
+  DXBC::DXBCContainer *dxbc = ps->GetDXBC();
   const ShaderReflection &refl = ps->GetDetails();
 
   if(!dxbc)
-    return empty;
+    return new ShaderDebugTrace;
 
   dxbc->GetDisassembly();
 
-  DXBCFile *prevdxbc = NULL;
+  DXBC::DXBCContainer *prevdxbc = NULL;
 
   if(prevdxbc == NULL && gs != NULL)
     prevdxbc = gs->GetDXBC();
@@ -1200,307 +1856,32 @@ ShaderDebugTrace D3D11Replay::DebugPixel(uint32_t eventId, uint32_t x, uint32_t 
     prevdxbc = ds->GetDXBC();
   if(prevdxbc == NULL && vs != NULL)
     prevdxbc = vs->GetDXBC();
+  RDCASSERT(prevdxbc);
 
-  std::vector<DataOutput> initialValues;
-
-  std::string extractHlsl = "struct PSInput\n{\n";
-
+  rdcarray<PSInputElement> initialValues;
+  rdcarray<rdcstr> floatInputs;
+  rdcarray<rdcstr> inputVarNames;
+  rdcstr extractHlsl;
   int structureStride = 0;
 
-  if(dxbc->m_InputSig.empty())
-  {
-    extractHlsl += "float4 input_dummy : SV_Position;\n";
-
-    initialValues.push_back(DataOutput(-1, 0, 4, ShaderBuiltin::Undefined, true));
-
-    structureStride += 4;
-  }
-
-  std::vector<std::string> floatInputs;
-  // name, pair<start semantic index, end semantic index>
-  std::vector<rdcpair<rdcstr, rdcpair<uint32_t, uint32_t>>> arrays;
-  std::vector<std::string> inputVarNames;
-
-  uint32_t nextreg = 0;
-
-  inputVarNames.resize(dxbc->m_InputSig.size());
-
-  for(size_t i = 0; i < dxbc->m_InputSig.size(); i++)
-  {
-    extractHlsl += "  ";
-
-    bool included = true;
-
-    // handled specially to account for SV_ ordering
-    if(dxbc->m_InputSig[i].systemValue == ShaderBuiltin::PrimitiveIndex ||
-       dxbc->m_InputSig[i].systemValue == ShaderBuiltin::MSAACoverage ||
-       dxbc->m_InputSig[i].systemValue == ShaderBuiltin::IsFrontFace ||
-       dxbc->m_InputSig[i].systemValue == ShaderBuiltin::MSAASampleIndex)
-    {
-      extractHlsl += "//";
-      included = false;
-    }
-
-    int arrayIndex = -1;
-
-    for(size_t a = 0; a < arrays.size(); a++)
-    {
-      if(dxbc->m_InputSig[i].semanticName == arrays[a].first &&
-         arrays[a].second.first <= dxbc->m_InputSig[i].semanticIndex &&
-         arrays[a].second.second >= dxbc->m_InputSig[i].semanticIndex)
-      {
-        extractHlsl += "//";
-        included = false;
-        arrayIndex = dxbc->m_InputSig[i].semanticIndex - arrays[a].second.first;
-      }
-    }
-
-    int missingreg = int(dxbc->m_InputSig[i].regIndex) - int(nextreg);
-
-    // fill in holes from output sig of previous shader if possible, to try and
-    // ensure the same register order
-    for(int dummy = 0; dummy < missingreg; dummy++)
-    {
-      bool filled = false;
-
-      if(prevdxbc)
-      {
-        for(size_t os = 0; os < prevdxbc->m_OutputSig.size(); os++)
-        {
-          if(prevdxbc->m_OutputSig[os].regIndex == nextreg + dummy)
-          {
-            filled = true;
-
-            if(prevdxbc->m_OutputSig[os].compType == CompType::Float)
-              extractHlsl += "float";
-            else if(prevdxbc->m_OutputSig[os].compType == CompType::SInt)
-              extractHlsl += "int";
-            else if(prevdxbc->m_OutputSig[os].compType == CompType::UInt)
-              extractHlsl += "uint";
-            else
-              RDCERR("Unexpected input signature type: %d", prevdxbc->m_OutputSig[os].compType);
-
-            int numCols = (prevdxbc->m_OutputSig[os].regChannelMask & 0x1 ? 1 : 0) +
-                          (prevdxbc->m_OutputSig[os].regChannelMask & 0x2 ? 1 : 0) +
-                          (prevdxbc->m_OutputSig[os].regChannelMask & 0x4 ? 1 : 0) +
-                          (prevdxbc->m_OutputSig[os].regChannelMask & 0x8 ? 1 : 0);
-
-            structureStride += 4 * numCols;
-
-            initialValues.push_back(DataOutput(-1, 0, numCols, ShaderBuiltin::Undefined, true));
-
-            std::string name = prevdxbc->m_OutputSig[os].semanticIdxName;
-
-            extractHlsl += ToStr((uint32_t)numCols) + " input_" + name + " : " + name + ";\n";
-          }
-        }
-      }
-
-      if(!filled)
-      {
-        std::string dummy_reg = "dummy_register";
-        dummy_reg += ToStr((uint32_t)nextreg + dummy);
-        extractHlsl += "float4 var_" + dummy_reg + " : semantic_" + dummy_reg + ";\n";
-
-        initialValues.push_back(DataOutput(-1, 0, 4, ShaderBuiltin::Undefined, true));
-
-        structureStride += 4 * sizeof(float);
-      }
-    }
-
-    nextreg = dxbc->m_InputSig[i].regIndex + 1;
-
-    if(dxbc->m_InputSig[i].compType == CompType::Float)
-    {
-      // if we're packed with ints on either side, we must be nointerpolation
-      bool nointerp = false;
-      for(size_t j = 0; j < dxbc->m_InputSig.size(); j++)
-      {
-        if(dxbc->m_InputSig[i].regIndex == dxbc->m_InputSig[j].regIndex &&
-           dxbc->m_InputSig[j].compType != CompType::Float)
-        {
-          nointerp = true;
-          break;
-        }
-      }
-
-      if(nointerp)
-        extractHlsl += "nointerpolation ";
-
-      extractHlsl += "float";
-    }
-    else if(dxbc->m_InputSig[i].compType == CompType::SInt)
-      extractHlsl += "nointerpolation int";
-    else if(dxbc->m_InputSig[i].compType == CompType::UInt)
-      extractHlsl += "nointerpolation uint";
-    else
-      RDCERR("Unexpected input signature type: %d", dxbc->m_InputSig[i].compType);
-
-    int numCols = (dxbc->m_InputSig[i].regChannelMask & 0x1 ? 1 : 0) +
-                  (dxbc->m_InputSig[i].regChannelMask & 0x2 ? 1 : 0) +
-                  (dxbc->m_InputSig[i].regChannelMask & 0x4 ? 1 : 0) +
-                  (dxbc->m_InputSig[i].regChannelMask & 0x8 ? 1 : 0);
-
-    std::string name = dxbc->m_InputSig[i].semanticIdxName;
-
-    // arrays of interpolators are handled really weirdly. They use cbuffer
-    // packing rules where each new value is in a new register (rather than
-    // e.g. 2 x float2 in a single register), but that's pointless because
-    // you can't dynamically index into input registers.
-    // If we declare those elements as a non-array, the float2s or floats
-    // will be packed into registers and won't match up to the previous
-    // shader.
-    // HOWEVER to add an extra bit of fun, fxc will happily pack other
-    // parameters not in the array into spare parts of the registers.
-    //
-    // So I think the upshot is that we can detect arrays reliably by
-    // whenever we encounter a float or float2 at the start of a register,
-    // search forward to see if the next register has an element that is the
-    // same semantic name and one higher semantic index. If so, there's an
-    // array, so keep searching to enumerate its length.
-    // I think this should be safe if the packing just happens to place those
-    // registers together.
-
-    int arrayLength = 0;
-
-    if(included && numCols <= 2 && dxbc->m_InputSig[i].regChannelMask <= 0x3)
-    {
-      uint32_t nextIdx = dxbc->m_InputSig[i].semanticIndex + 1;
-
-      for(size_t j = i + 1; j < dxbc->m_InputSig.size(); j++)
-      {
-        // if we've found the 'next' semantic
-        if(dxbc->m_InputSig[i].semanticName == dxbc->m_InputSig[j].semanticName &&
-           nextIdx == dxbc->m_InputSig[j].semanticIndex)
-        {
-          int jNumCols = (dxbc->m_InputSig[i].regChannelMask & 0x1 ? 1 : 0) +
-                         (dxbc->m_InputSig[i].regChannelMask & 0x2 ? 1 : 0) +
-                         (dxbc->m_InputSig[i].regChannelMask & 0x4 ? 1 : 0) +
-                         (dxbc->m_InputSig[i].regChannelMask & 0x8 ? 1 : 0);
-
-          // if it's the same size, and it's at the start of the next register
-          if(jNumCols == numCols && dxbc->m_InputSig[j].regChannelMask <= 0x3)
-          {
-            if(arrayLength == 0)
-              arrayLength = 2;
-            else
-              arrayLength++;
-
-            // continue searching now
-            nextIdx++;
-            j = i + 1;
-            continue;
-          }
-        }
-      }
-
-      if(arrayLength > 0)
-        arrays.push_back(make_rdcpair(dxbc->m_InputSig[i].semanticName,
-                                      make_rdcpair(dxbc->m_InputSig[i].semanticIndex, nextIdx - 1)));
-    }
-
-    if(included)
-    {
-      // in UAV structs, arrays are packed tightly, so just multiply by arrayLength
-      structureStride += 4 * numCols * RDCMAX(1, arrayLength);
-    }
-
-    // as another side effect of the above, an element declared as a 1-length array won't be
-    // detected but it WILL be put in its own register (not packed together), so detect this
-    // case too.
-    // Note we have to search *backwards* because we need to know if this register should have
-    // been packed into the previous register, but wasn't. float/float2 can be packed after an
-    // array just fine.
-    if(included && i > 0 && arrayLength == 0 && numCols <= 2 &&
-       dxbc->m_InputSig[i].regChannelMask <= 0x3)
-    {
-      const SigParameter &prev = dxbc->m_InputSig[i - 1];
-
-      if(prev.regIndex != dxbc->m_InputSig[i].regIndex && prev.compCount <= 2 &&
-         prev.regChannelMask <= 0x3)
-        arrayLength = 1;
-    }
-
-    // The compiler is also really annoying and will go to great lengths to rearrange elements
-    // and screw up our declaration, to pack things together. E.g.:
-    // float2 a : TEXCOORD1;
-    // float4 b : TEXCOORD2;
-    // float4 c : TEXCOORD3;
-    // float2 d : TEXCOORD4;
-    // the compiler will move d up and pack it into the last two components of a.
-    // To prevent this, we look forward and backward to check that we aren't expecting to pack
-    // with anything, and if not then we just make it a 1-length array to ensure no packing.
-    // Note the regChannelMask & 0x1 means it is using .x, so it's not the tail-end of a pack
-    if(included && arrayLength == 0 && numCols <= 2 && (dxbc->m_InputSig[i].regChannelMask & 0x1))
-    {
-      if(i == dxbc->m_InputSig.size() - 1)
-      {
-        // the last element is never packed
-        arrayLength = 1;
-      }
-      else
-      {
-        // if the next reg is using .x, it wasn't packed with us
-        if(dxbc->m_InputSig[i + 1].regChannelMask & 0x1)
-          arrayLength = 1;
-      }
-    }
-
-    extractHlsl += ToStr((uint32_t)numCols) + " input_" + name;
-    if(arrayLength > 0)
-      extractHlsl += "[" + ToStr(arrayLength) + "]";
-    extractHlsl += " : " + name;
-
-    inputVarNames[i] = "input_" + name;
-    if(arrayLength > 0)
-      inputVarNames[i] += StringFormat::Fmt("[%d]", RDCMAX(0, arrayIndex));
-
-    if(included && dxbc->m_InputSig[i].compType == CompType::Float)
-    {
-      if(arrayLength == 0)
-      {
-        floatInputs.push_back("input_" + name);
-      }
-      else
-      {
-        for(int a = 0; a < arrayLength; a++)
-          floatInputs.push_back("input_" + name + "[" + ToStr(a) + "]");
-      }
-    }
-
-    extractHlsl += ";\n";
-
-    int firstElem = dxbc->m_InputSig[i].regChannelMask & 0x1
-                        ? 0
-                        : dxbc->m_InputSig[i].regChannelMask & 0x2
-                              ? 1
-                              : dxbc->m_InputSig[i].regChannelMask & 0x4
-                                    ? 2
-                                    : dxbc->m_InputSig[i].regChannelMask & 0x8 ? 3 : -1;
-
-    // arrays get added all at once (because in the struct data, they are contiguous even if
-    // in the input signature they're not).
-    if(arrayIndex < 0)
-    {
-      if(arrayLength == 0)
-      {
-        initialValues.push_back(DataOutput(dxbc->m_InputSig[i].regIndex, firstElem, numCols,
-                                           dxbc->m_InputSig[i].systemValue, included));
-      }
-      else
-      {
-        for(int a = 0; a < arrayLength; a++)
-        {
-          initialValues.push_back(DataOutput(dxbc->m_InputSig[i].regIndex + a, firstElem, numCols,
-                                             dxbc->m_InputSig[i].systemValue, included));
-        }
-      }
-    }
-  }
-
-  extractHlsl += "};\n\n";
+  DXBCDebug::GatherPSInputDataForInitialValues(dxbc, *prevdxbc->GetReflection(), initialValues,
+                                               floatInputs, inputVarNames, extractHlsl,
+                                               structureStride);
 
   uint32_t overdrawLevels = 100;    // maximum number of overdraw levels
+
+  // If the pipe contains a geometry shader, then SV_PrimitiveID cannot be used in the pixel
+  // shader without being emitted from the geometry shader. For now, check if this semantic
+  // will succeed in a new pixel shader with the rest of the pipe unchanged
+  bool usePrimitiveID = (prevdxbc->m_Type != DXBC::ShaderType::Geometry);
+  for(const PSInputElement &e : initialValues)
+  {
+    if(e.sysattribute == ShaderBuiltin::PrimitiveIndex)
+    {
+      usePrimitiveID = true;
+      break;
+    }
+  }
 
   uint32_t uavslot = 0;
 
@@ -1549,9 +1930,9 @@ ShaderDebugTrace D3D11Replay::DebugPixel(uint32_t eventId, uint32_t x, uint32_t 
   if(outputSampleCount > 1)
   {
     // scan the instructions to see if it contains any evaluates.
-    for(size_t i = 0; i < dxbc->GetNumInstructions(); i++)
+    for(size_t i = 0; i < dxbc->GetDXBCByteCode()->GetNumInstructions(); i++)
     {
-      const ASMOperation &op = dxbc->GetInstruction(i);
+      const Operation &op = dxbc->GetDXBCByteCode()->GetInstruction(i);
 
       // skip any non-eval opcodes
       if(op.operation != OPCODE_EVAL_CENTROID && op.operation != OPCODE_EVAL_SAMPLE_INDEX &&
@@ -1658,19 +2039,37 @@ struct PSInitialData
     extractHlsl += "RWBuffer<float4> PSEvalBuffer : register(u" + ToStr(uavslot + 1) + ");\n\n";
   }
 
-  extractHlsl += R"(
+  if(usePrimitiveID)
+  {
+    extractHlsl += R"(
 void ExtractInputsPS(PSInput IN, float4 debug_pixelPos : SV_Position, uint prim : SV_PrimitiveID,
                      uint sample : SV_SampleIndex, uint covge : SV_Coverage,
                      bool fface : SV_IsFrontFace)
 {
 )";
+  }
+  else
+  {
+    extractHlsl += R"(
+void ExtractInputsPS(PSInput IN, float4 debug_pixelPos : SV_Position,
+                     uint sample : SV_SampleIndex, uint covge : SV_Coverage,
+                     bool fface : SV_IsFrontFace)
+{
+)";
+  }
+
   extractHlsl += "  uint idx = " + ToStr(overdrawLevels) + ";\n";
   extractHlsl += StringFormat::Fmt(
       "  if(abs(debug_pixelPos.x - %u.5) < 0.5f && abs(debug_pixelPos.y - %u.5) < 0.5f)\n", x, y);
   extractHlsl += "    InterlockedAdd(PSInitialBuffer[0].hit, 1, idx);\n\n";
   extractHlsl += "  idx = min(idx, " + ToStr(overdrawLevels) + ");\n\n";
   extractHlsl += "  PSInitialBuffer[idx].pos = debug_pixelPos.xyz;\n";
-  extractHlsl += "  PSInitialBuffer[idx].prim = prim;\n";
+
+  if(usePrimitiveID)
+    extractHlsl += "  PSInitialBuffer[idx].prim = prim;\n";
+  else
+    extractHlsl += "  PSInitialBuffer[idx].prim = 0;\n";
+
   extractHlsl += "  PSInitialBuffer[idx].fface = fface;\n";
   extractHlsl += "  PSInitialBuffer[idx].covge = covge;\n";
   extractHlsl += "  PSInitialBuffer[idx].sample = sample;\n";
@@ -1694,12 +2093,12 @@ void ExtractInputsPS(PSInput IN, float4 debug_pixelPos : SV_Position, uint prim 
         keyMask |= (1 << (key.firstComponent + i));
 
       // find the name of the variable matching the operand, in the case of merged input variables.
-      std::string name, swizzle = "xyzw";
-      for(size_t i = 0; i < dxbc->m_InputSig.size(); i++)
+      rdcstr name, swizzle = "xyzw";
+      for(size_t i = 0; i < dxbc->GetReflection()->InputSig.size(); i++)
       {
-        if(dxbc->m_InputSig[i].regIndex == (uint32_t)key.inputRegisterIndex &&
-           dxbc->m_InputSig[i].systemValue == ShaderBuiltin::Undefined &&
-           (dxbc->m_InputSig[i].regChannelMask & keyMask) == keyMask)
+        if(dxbc->GetReflection()->InputSig[i].regIndex == (uint32_t)key.inputRegisterIndex &&
+           dxbc->GetReflection()->InputSig[i].systemValue == ShaderBuiltin::Undefined &&
+           (dxbc->GetReflection()->InputSig[i].regChannelMask & keyMask) == keyMask)
         {
           name = inputVarNames[i];
 
@@ -1722,7 +2121,7 @@ void ExtractInputsPS(PSInput IN, float4 debug_pixelPos : SV_Position, uint prim 
       name = StringFormat::Fmt("IN.%s.%s", name.c_str(), swizzle.c_str());
 
       // we must write all components, so just swizzle the values - they'll be ignored later.
-      std::string expandSwizzle = swizzle;
+      rdcstr expandSwizzle = swizzle;
       while(expandSwizzle.size() < 4)
         expandSwizzle.push_back('x');
 
@@ -1746,7 +2145,7 @@ void ExtractInputsPS(PSInput IN, float4 debug_pixelPos : SV_Position, uint prim 
 
   for(size_t i = 0; i < floatInputs.size(); i++)
   {
-    const std::string &name = floatInputs[i];
+    const rdcstr &name = floatInputs[i];
     extractHlsl += "  PSInitialBuffer[idx].INddx." + name + " = ddx(IN." + name + ");\n";
     extractHlsl += "  PSInitialBuffer[idx].INddy." + name + " = ddy(IN." + name + ");\n";
     extractHlsl += "  PSInitialBuffer[idx].INddxfine." + name + " = ddx_fine(IN." + name + ");\n";
@@ -1782,8 +2181,8 @@ void ExtractInputsPS(PSInput IN, float4 debug_pixelPos : SV_Position, uint prim 
 
   if(FAILED(hr))
   {
-    RDCERR("Failed to create buffer HRESULT: %s", ToStr(hr).c_str());
-    return empty;
+    RDCERR("Failed to create buffer HRESULT: %s", ToStr(hr).c_str());    // @NoCoverage
+    return new ShaderDebugTrace;                                         // @NoCoverage
   }
 
   ID3D11Buffer *evalBuf = NULL;
@@ -1797,8 +2196,8 @@ void ExtractInputsPS(PSInput IN, float4 debug_pixelPos : SV_Position, uint prim 
 
     if(FAILED(hr))
     {
-      RDCERR("Failed to create buffer HRESULT: %s", ToStr(hr).c_str());
-      return empty;
+      RDCERR("Failed to create buffer HRESULT: %s", ToStr(hr).c_str());    // @NoCoverage
+      return new ShaderDebugTrace;                                         // @NoCoverage
     }
   }
 
@@ -1814,8 +2213,8 @@ void ExtractInputsPS(PSInput IN, float4 debug_pixelPos : SV_Position, uint prim 
 
   if(FAILED(hr))
   {
-    RDCERR("Failed to create buffer HRESULT: %s", ToStr(hr).c_str());
-    return empty;
+    RDCERR("Failed to create buffer HRESULT: %s", ToStr(hr).c_str());    // @NoCoverage
+    return new ShaderDebugTrace;                                         // @NoCoverage
   }
 
   uint32_t evalStructStride = uint32_t(evalSampleCacheData.size() * sizeof(Vec4f));
@@ -1829,8 +2228,8 @@ void ExtractInputsPS(PSInput IN, float4 debug_pixelPos : SV_Position, uint prim 
 
     if(FAILED(hr))
     {
-      RDCERR("Failed to create buffer HRESULT: %s", ToStr(hr).c_str());
-      return empty;
+      RDCERR("Failed to create buffer HRESULT: %s", ToStr(hr).c_str());    // @NoCoverage
+      return new ShaderDebugTrace;                                         // @NoCoverage
     }
   }
 
@@ -1846,8 +2245,8 @@ void ExtractInputsPS(PSInput IN, float4 debug_pixelPos : SV_Position, uint prim 
 
   if(FAILED(hr))
   {
-    RDCERR("Failed to create buffer HRESULT: %s", ToStr(hr).c_str());
-    return empty;
+    RDCERR("Failed to create buffer HRESULT: %s", ToStr(hr).c_str());    // @NoCoverage
+    return new ShaderDebugTrace;                                         // @NoCoverage
   }
 
   ID3D11UnorderedAccessView *evalUAV = NULL;
@@ -1859,8 +2258,8 @@ void ExtractInputsPS(PSInput IN, float4 debug_pixelPos : SV_Position, uint prim 
 
     if(FAILED(hr))
     {
-      RDCERR("Failed to create buffer HRESULT: %s", ToStr(hr).c_str());
-      return empty;
+      RDCERR("Failed to create buffer HRESULT: %s", ToStr(hr).c_str());    // @NoCoverage
+      return new ShaderDebugTrace;                                         // @NoCoverage
     }
   }
 
@@ -1894,8 +2293,8 @@ void ExtractInputsPS(PSInput IN, float4 debug_pixelPos : SV_Position, uint prim 
 
   if(FAILED(hr))
   {
-    RDCERR("Failed to map stage buff HRESULT: %s", ToStr(hr).c_str());
-    return empty;
+    RDCERR("Failed to map stage buff HRESULT: %s", ToStr(hr).c_str());    // @NoCoverage
+    return new ShaderDebugTrace;                                          // @NoCoverage
   }
 
   byte *initialData = new byte[structStride * (overdrawLevels + 1)];
@@ -1911,8 +2310,9 @@ void ExtractInputsPS(PSInput IN, float4 debug_pixelPos : SV_Position, uint prim 
 
     if(FAILED(hr))
     {
-      RDCERR("Failed to map stage buff HRESULT: %s", ToStr(hr).c_str());
-      return empty;
+      RDCERR("Failed to map stage buff HRESULT: %s", ToStr(hr).c_str());    // @NoCoverage
+      SAFE_DELETE_ARRAY(initialData);                                       // @NoCoverage
+      return new ShaderDebugTrace;                                          // @NoCoverage
     }
 
     evalData = new byte[evalStructStride * (overdrawLevels + 1)];
@@ -1940,7 +2340,7 @@ void ExtractInputsPS(PSInput IN, float4 debug_pixelPos : SV_Position, uint prim 
     RDCLOG("No hit for this event");
     SAFE_DELETE_ARRAY(initialData);
     SAFE_DELETE_ARRAY(evalData);
-    return empty;
+    return new ShaderDebugTrace;
   }
 
   // if we encounter multiple hits at our destination pixel co-ord (or any other) we
@@ -1949,9 +2349,6 @@ void ExtractInputsPS(PSInput IN, float4 debug_pixelPos : SV_Position, uint prim 
   // of which fragment was the last to successfully depth test and debug that, just by
   // checking if the depth test is ordered and picking the final fragment in the series
 
-  // our debugging quad. Order is TL, TR, BL, BR
-  State quad[4];
-
   // figure out the TL pixel's coords. Assume even top left (towards 0,0)
   // this isn't spec'd but is a reasonable assumption.
   int xTL = x & (~1);
@@ -1959,13 +2356,6 @@ void ExtractInputsPS(PSInput IN, float4 debug_pixelPos : SV_Position, uint prim 
 
   // get the index of our desired pixel
   int destIdx = (x - xTL) + 2 * (y - yTL);
-
-  bytebuf cbufData[D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT];
-
-  for(int i = 0; i < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT; i++)
-    if(rs->PS.ConstantBuffers[i])
-      GetDebugManager()->GetBufferData(rs->PS.ConstantBuffers[i],
-                                       rs->PS.CBOffsets[i] * sizeof(Vec4f), 0, cbufData[i]);
 
   D3D11_COMPARISON_FUNC depthFunc = D3D11_COMPARISON_LESS;
 
@@ -2002,22 +2392,34 @@ void ExtractInputsPS(PSInput IN, float4 debug_pixelPos : SV_Position, uint prim 
     {
       DebugHit *hit = (DebugHit *)(initialData + i * structStride);
 
-      if(winner == NULL || (winner->sample != sample && hit->sample == sample) ||
-         depthFunc == D3D11_COMPARISON_ALWAYS || depthFunc == D3D11_COMPARISON_NEVER ||
-         depthFunc == D3D11_COMPARISON_NOT_EQUAL || depthFunc == D3D11_COMPARISON_EQUAL)
+      if(winner == NULL)
       {
+        // If we haven't picked a winner at all yet, use the first one
         winner = hit;
         evalSampleCache = ((float *)evalData) + evalSampleCacheData.size() * 4 * i;
-        continue;
       }
-
-      if((depthFunc == D3D11_COMPARISON_LESS && hit->depth < winner->depth) ||
-         (depthFunc == D3D11_COMPARISON_LESS_EQUAL && hit->depth <= winner->depth) ||
-         (depthFunc == D3D11_COMPARISON_GREATER && hit->depth > winner->depth) ||
-         (depthFunc == D3D11_COMPARISON_GREATER_EQUAL && hit->depth >= winner->depth))
+      else if(hit->sample == sample)
       {
-        if(hit->sample == sample)
+        // If this hit is for the sample we want, check whether it's a better pick
+        if(winner->sample != sample)
         {
+          // The previously selected winner was for the wrong sample, use this one
+          winner = hit;
+          evalSampleCache = ((float *)evalData) + evalSampleCacheData.size() * 4 * i;
+        }
+        else if((depthFunc == D3D11_COMPARISON_ALWAYS || depthFunc == D3D11_COMPARISON_NEVER ||
+                 depthFunc == D3D11_COMPARISON_NOT_EQUAL || depthFunc == D3D11_COMPARISON_EQUAL))
+        {
+          // For depth functions without an inequality comparison, use the last sample encountered
+          winner = hit;
+          evalSampleCache = ((float *)evalData) + evalSampleCacheData.size() * 4 * i;
+        }
+        else if((depthFunc == D3D11_COMPARISON_LESS && hit->depth < winner->depth) ||
+                (depthFunc == D3D11_COMPARISON_LESS_EQUAL && hit->depth <= winner->depth) ||
+                (depthFunc == D3D11_COMPARISON_GREATER && hit->depth > winner->depth) ||
+                (depthFunc == D3D11_COMPARISON_GREATER_EQUAL && hit->depth >= winner->depth))
+        {
+          // For depth functions with an inequality, find the hit that "wins" the most
           winner = hit;
           evalSampleCache = ((float *)evalData) + evalSampleCacheData.size() * 4 * i;
         }
@@ -2030,32 +2432,33 @@ void ExtractInputsPS(PSInput IN, float4 debug_pixelPos : SV_Position, uint prim 
     RDCLOG("Couldn't find any pixels that passed depth test at target co-ordinates");
     SAFE_DELETE_ARRAY(initialData);
     SAFE_DELETE_ARRAY(evalData);
-    return empty;
+    return new ShaderDebugTrace;
   }
-
-  ShaderDebugTrace traces[4];
 
   tracker.State().ApplyState(m_pImmediateContext);
 
-  GlobalState global;
-  GetDebugManager()->CreateShaderGlobalState(global, dxbc, rs->OM.UAVStartSlot, rs->OM.UAVs,
-                                             rs->PS.SRVs);
+  InterpretDebugger *interpreter = new InterpretDebugger;
+  interpreter->eventId = eventId;
+  ShaderDebugTrace *ret = interpreter->BeginDebug(dxbc, refl, ps->GetMapping(), destIdx);
+  GlobalState &global = interpreter->global;
+  ThreadState &state = interpreter->activeLane();
+
+  AddCBuffersToGlobalState(*dxbc->GetDXBCByteCode(), *GetDebugManager(), global, ret->sourceVars,
+                           rs->PS, refl, ps->GetMapping());
 
   global.sampleEvalRegisterMask = sampleEvalRegisterMask;
 
   {
     DebugHit *hit = winner;
 
-    State initialState =
-        GetDebugManager()->CreateShaderDebugState(traces[destIdx], destIdx, dxbc, refl, cbufData);
+    rdcarray<ShaderVariable> &ins = state.inputs;
+    if(!ins.empty() && ins.back().name == dxbc->GetDXBCByteCode()->GetRegisterName(
+                                              DXBCBytecode::TYPE_INPUT_COVERAGE_MASK, 0))
+      ins.back().value.u32v[0] = hit->coverage;
 
-    rdcarray<ShaderVariable> &ins = traces[destIdx].inputs;
-    if(!ins.empty() && ins.back().name == "vCoverage")
-      ins.back().value.u.x = hit->coverage;
-
-    initialState.semantics.coverage = hit->coverage;
-    initialState.semantics.primID = hit->primitive;
-    initialState.semantics.isFrontFace = hit->isFrontFace;
+    state.semantics.coverage = hit->coverage;
+    state.semantics.primID = hit->primitive;
+    state.semantics.isFrontFace = hit->isFrontFace;
 
     uint32_t *data = &hit->rawdata;
 
@@ -2067,7 +2470,9 @@ void ExtractInputsPS(PSInput IN, float4 debug_pixelPos : SV_Position, uint prim 
       RDCERR("Derivatives invalid");
       SAFE_DELETE_ARRAY(initialData);
       SAFE_DELETE_ARRAY(evalData);
-      return empty;
+      delete interpreter;
+      delete ret;
+      return new ShaderDebugTrace;
     }
 
     data++;
@@ -2078,27 +2483,27 @@ void ExtractInputsPS(PSInput IN, float4 debug_pixelPos : SV_Position, uint prim 
 
       if(initialValues[i].reg >= 0)
       {
-        ShaderVariable &invar = traces[destIdx].inputs[initialValues[i].reg];
+        ShaderVariable &invar = ins[initialValues[i].reg];
 
         if(initialValues[i].sysattribute == ShaderBuiltin::PrimitiveIndex)
         {
-          invar.value.u.x = hit->primitive;
+          invar.value.u32v[0] = hit->primitive;
         }
         else if(initialValues[i].sysattribute == ShaderBuiltin::MSAASampleIndex)
         {
-          invar.value.u.x = hit->sample;
+          invar.value.u32v[0] = hit->sample;
         }
         else if(initialValues[i].sysattribute == ShaderBuiltin::MSAACoverage)
         {
-          invar.value.u.x = hit->coverage;
+          invar.value.u32v[0] = hit->coverage;
         }
         else if(initialValues[i].sysattribute == ShaderBuiltin::IsFrontFace)
         {
-          invar.value.u.x = hit->isFrontFace ? ~0U : 0;
+          invar.value.u32v[0] = hit->isFrontFace ? ~0U : 0;
         }
         else
         {
-          rawout = &invar.value.iv[initialValues[i].elem];
+          rawout = &invar.value.s32v[initialValues[i].elem];
 
           memcpy(rawout, data, initialValues[i].numwords * 4);
         }
@@ -2111,21 +2516,22 @@ void ExtractInputsPS(PSInput IN, float4 debug_pixelPos : SV_Position, uint prim 
     for(int i = 0; i < 4; i++)
     {
       if(i != destIdx)
-        traces[i] = traces[destIdx];
-      quad[i] = initialState;
-      quad[i].SetTrace(i, &traces[i]);
-      if(i != destIdx)
-        quad[i].SetHelper();
+      {
+        interpreter->workgroup[i].inputs = state.inputs;
+        interpreter->workgroup[i].semantics = state.semantics;
+        interpreter->workgroup[i].variables = state.variables;
+        interpreter->workgroup[i].SetHelper();
+      }
     }
 
     // fetch any inputs that were evaluated at sample granularity
     for(const GlobalState::SampleEvalCacheKey &key : evalSampleCacheData)
     {
       // start with the basic input value
-      ShaderVariable var = traces[destIdx].inputs[key.inputRegisterIndex];
+      ShaderVariable var = state.inputs[key.inputRegisterIndex];
 
       // copy over the value into the variable
-      memcpy(var.value.fv, evalSampleCache, var.columns * sizeof(float));
+      memcpy(var.value.f32v.data(), evalSampleCache, var.columns * sizeof(float));
 
       // store in the global cache for each quad. We'll apply derivatives below to adjust for each
       GlobalState::SampleEvalCacheKey k = key;
@@ -2135,305 +2541,35 @@ void ExtractInputsPS(PSInput IN, float4 debug_pixelPos : SV_Position, uint prim 
         global.sampleEvalCache[k] = var;
       }
 
-      // advance past this data - always by float4 as that's the buffer st ride
+      // advance past this data - always by float4 as that's the buffer stride
       evalSampleCache += 4;
     }
 
-    // We make the assumption that the coarse derivatives are generated from (0,0) in the quad, and
-    // fine derivatives are generated from the destination index and its neighbours in X and Y.
-    // This isn't spec'd but we must assume something and this will hopefully get us closest to
-    // reproducing actual results.
-    //
-    // For debugging, we need members of the quad to be able to generate coarse and fine
-    // derivatives.
-    //
-    // For (0,0) we only need the coarse derivatives to get our neighbours (1,0) and (0,1) which
-    // will give us coarse and fine derivatives being identical.
-    //
-    // For the others we will need to use a combination of coarse and fine derivatives to get the
-    // diagonal element in the quad. In the examples below, remember that the quad indices are:
-    //
-    // +---+---+
-    // | 0 | 1 |
-    // +---+---+
-    // | 2 | 3 |
-    // +---+---+
-    //
-    // And that we have definitions of the derivatives:
-    //
-    // ddx_coarse = (1,0) - (0,0)
-    // ddy_coarse = (0,1) - (0,0)
-    //
-    // i.e. the same for all members of the quad
-    //
-    // ddx_fine   = (x,y) - (1-x,y)
-    // ddy_fine   = (x,y) - (x,1-y)
-    //
-    // i.e. the difference to the neighbour of our desired invocation (the one we have the actual
-    // inputs for, from gathering above).
-    //
-    // So e.g. if our thread is at (1,1) destIdx = 3
-    //
-    // (1,0) = (1,1) - ddx_fine
-    // (0,1) = (1,1) - ddy_fine
-    // (0,0) = (1,1) - ddy_fine - ddx_coarse
-    //
-    // and ddy_coarse is unused. For (1,0) destIdx = 1:
-    //
-    // (1,1) = (1,0) + ddy_fine
-    // (0,1) = (1,0) - ddx_coarse + ddy_coarse
-    // (0,0) = (1,0) - ddx_coarse
-    //
-    // and ddx_fine is unused (it's identical to ddx_coarse anyway)
-
-    // this is the value of input[1] - input[0]
-    float *ddx_coarse = (float *)data;
-
-    for(size_t i = 0; i < initialValues.size(); i++)
-    {
-      if(!initialValues[i].included)
-        continue;
-
-      if(initialValues[i].reg >= 0)
-      {
-        if(destIdx == 0)
-          ApplyDerivatives(global, traces, initialValues[i], ddx_coarse, 1.0f, 1, 3);
-        else if(destIdx == 1)
-          ApplyDerivatives(global, traces, initialValues[i], ddx_coarse, -1.0f, 0, 2);
-        else if(destIdx == 2)
-          ApplyDerivatives(global, traces, initialValues[i], ddx_coarse, 1.0f, 1);
-        else if(destIdx == 3)
-          ApplyDerivatives(global, traces, initialValues[i], ddx_coarse, -1.0f, 0);
-      }
-
-      ddx_coarse += initialValues[i].numwords;
-    }
-
-    // this is the value of input[2] - input[0]
-    float *ddy_coarse = ddx_coarse;
-
-    for(size_t i = 0; i < initialValues.size(); i++)
-    {
-      if(!initialValues[i].included)
-        continue;
-
-      if(initialValues[i].reg >= 0)
-      {
-        if(destIdx == 0)
-          ApplyDerivatives(global, traces, initialValues[i], ddy_coarse, 1.0f, 2, 3);
-        else if(destIdx == 1)
-          ApplyDerivatives(global, traces, initialValues[i], ddy_coarse, 1.0f, 2);
-        else if(destIdx == 2)
-          ApplyDerivatives(global, traces, initialValues[i], ddy_coarse, -1.0f, 0, 1);
-      }
-
-      ddy_coarse += initialValues[i].numwords;
-    }
-
-    float *ddxfine = ddy_coarse;
-
-    for(size_t i = 0; i < initialValues.size(); i++)
-    {
-      if(!initialValues[i].included)
-        continue;
-
-      if(initialValues[i].reg >= 0)
-      {
-        if(destIdx == 2)
-          ApplyDerivatives(global, traces, initialValues[i], ddxfine, 1.0f, 3);
-        else if(destIdx == 3)
-          ApplyDerivatives(global, traces, initialValues[i], ddxfine, -1.0f, 2);
-      }
-
-      ddxfine += initialValues[i].numwords;
-    }
-
-    float *ddyfine = ddxfine;
-
-    for(size_t i = 0; i < initialValues.size(); i++)
-    {
-      if(!initialValues[i].included)
-        continue;
-
-      if(initialValues[i].reg >= 0)
-      {
-        if(destIdx == 1)
-          ApplyDerivatives(global, traces, initialValues[i], ddyfine, 1.0f, 3);
-        else if(destIdx == 3)
-          ApplyDerivatives(global, traces, initialValues[i], ddyfine, -1.0f, 0, 1);
-      }
-
-      ddyfine += initialValues[i].numwords;
-    }
+    ApplyAllDerivatives(global, interpreter->workgroup, destIdx, initialValues, (float *)data);
   }
+
+  ret->inputs = state.inputs;
+  ret->constantBlocks = global.constantBlocks;
 
   SAFE_DELETE_ARRAY(initialData);
   SAFE_DELETE_ARRAY(evalData);
 
-  std::vector<ShaderDebugState> states;
+  dxbc->FillTraceLineInfo(*ret);
 
-  if(dxbc->m_DebugInfo)
-    dxbc->m_DebugInfo->GetLocals(0, dxbc->GetInstruction(0).offset, quad[destIdx].locals);
-
-  states.push_back((State)quad[destIdx]);
-
-  // ping pong between so that we can have 'current' quad to update into new one
-  State quad2[4];
-
-  State *curquad = quad;
-  State *newquad = quad2;
-
-  // marks any threads stalled waiting for others to catch up
-  bool activeMask[4] = {true, true, true, true};
-
-  int cycleCounter = 0;
-
-  D3D11MarkerRegion simloop("Simulation Loop");
-
-  // simulate lockstep until all threads are finished
-  bool finished = true;
-  do
-  {
-    for(size_t i = 0; i < 4; i++)
-    {
-      if(activeMask[i])
-        newquad[i] = curquad[i].GetNext(global, curquad);
-      else
-        newquad[i] = curquad[i];
-    }
-
-    State *a = curquad;
-    curquad = newquad;
-    newquad = a;
-
-    // if our destination quad is paused don't record multiple identical states.
-    if(activeMask[destIdx])
-    {
-      State &s = curquad[destIdx];
-
-      if(dxbc->m_DebugInfo)
-      {
-        size_t inst = RDCMIN((size_t)s.nextInstruction, dxbc->GetNumInstructions() - 1);
-        const ASMOperation &op = dxbc->GetInstruction(inst);
-        dxbc->m_DebugInfo->GetLocals(s.nextInstruction, op.offset, s.locals);
-      }
-
-      states.push_back(s);
-    }
-
-    // we need to make sure that control flow which converges stays in lockstep so that
-    // derivatives are still valid. While diverged, we don't have to keep threads in lockstep
-    // since using derivatives is invalid.
-
-    // Threads diverge either in ifs, loops, or switches. Due to the nature of the bytecode,
-    // all threads *must* pass through the same exit instruction for each, there's no jumping
-    // around with gotos. Note also for the same reason, the only time threads are on earlier
-    // instructions is if they are still catching up to a thread that has exited the control
-    // flow.
-
-    // So the scheme is as follows:
-    // * If all threads have the same nextInstruction, just continue we are still in lockstep.
-    // * If threads are out of lockstep, find any thread which has nextInstruction pointing
-    //   immediately *after* an ENDIF, ENDLOOP or ENDSWITCH. Pointing directly at one is not
-    //   an indication the thread is done, as the next step for an ENDLOOP will jump back to
-    //   the matching LOOP and continue iterating.
-    // * Pause any thread matching the above until all threads are pointing to the same
-    //   instruction. By the assumption above, all threads will eventually pass through this
-    //   terminating instruction so we just pause any other threads and don't do anything
-    //   until the control flow has converged and we can continue stepping in lockstep.
-
-    // mark all threads as active again.
-    // if we've converged, or we were never diverged, this keeps everything ticking
-    activeMask[0] = activeMask[1] = activeMask[2] = activeMask[3] = true;
-
-    if(curquad[0].nextInstruction != curquad[1].nextInstruction ||
-       curquad[0].nextInstruction != curquad[2].nextInstruction ||
-       curquad[0].nextInstruction != curquad[3].nextInstruction)
-    {
-      // this isn't *perfect* but it will still eventually continue. We look for the most
-      // advanced thread, and check to see if it's just finished a control flow. If it has
-      // then we assume it's at the convergence point and wait for every other thread to
-      // catch up, pausing any threads that reach the convergence point before others.
-
-      // Note this might mean we don't have any threads paused even within divergent flow.
-      // This is fine and all we care about is pausing to make sure threads don't run ahead
-      // into code that should be lockstep. We don't care at all about what they do within
-      // the code that is divergent.
-
-      // The reason this isn't perfect is that the most advanced thread could be on an
-      // inner loop or inner if, not the convergence point, and we could be pausing it
-      // fruitlessly. Worse still - it could be on a branch none of the other threads will
-      // take so they will never reach that exact instruction.
-      // But we know that all threads will eventually go through the convergence point, so
-      // even in that worst case if we didn't pick the right waiting point, another thread
-      // will overtake and become the new most advanced thread and the previous waiting
-      // thread will resume. So in this case we caused a thread to wait more than it should
-      // have but that's not a big deal as it's within divergent flow so they don't have to
-      // stay in lockstep. Also if all threads will eventually pass that point we picked,
-      // we just waited to converge even in technically divergent code which is also
-      // harmless.
-
-      // Phew!
-
-      uint32_t convergencePoint = 0;
-
-      // find which thread is most advanced
-      for(size_t i = 0; i < 4; i++)
-        if(curquad[i].nextInstruction > convergencePoint)
-          convergencePoint = curquad[i].nextInstruction;
-
-      if(convergencePoint > 0)
-      {
-        OpcodeType op = dxbc->GetInstruction(convergencePoint - 1).operation;
-
-        // if the most advnaced thread hasn't just finished control flow, then all
-        // threads are still running, so don't converge
-        if(op != OPCODE_ENDIF && op != OPCODE_ENDLOOP && op != OPCODE_ENDSWITCH)
-          convergencePoint = 0;
-      }
-
-      // pause any threads at that instruction (could be none)
-      for(size_t i = 0; i < 4; i++)
-        if(curquad[i].nextInstruction == convergencePoint)
-          activeMask[i] = false;
-    }
-
-    finished = curquad[destIdx].Finished();
-
-    cycleCounter++;
-
-    if(cycleCounter == SHADER_DEBUG_WARN_THRESHOLD)
-    {
-      if(PromptDebugTimeout(DXBC::TYPE_VERTEX, cycleCounter))
-        break;
-    }
-  } while(!finished);
-
-  traces[destIdx].states = states;
-
-  traces[destIdx].hasLocals = dxbc->m_DebugInfo && dxbc->m_DebugInfo->HasLocals();
-
-  traces[destIdx].lineInfo.resize(dxbc->GetNumInstructions());
-  for(size_t i = 0; dxbc->m_DebugInfo && i < dxbc->GetNumInstructions(); i++)
-  {
-    const ASMOperation &op = dxbc->GetInstruction(i);
-    dxbc->m_DebugInfo->GetLineInfo(i, op.offset, traces[destIdx].lineInfo[i]);
-  }
-
-  return traces[destIdx];
+  return ret;
 }
 
-ShaderDebugTrace D3D11Replay::DebugThread(uint32_t eventId, const uint32_t groupid[3],
-                                          const uint32_t threadid[3], std::function<bool()> cancelled)
+ShaderDebugTrace *D3D11Replay::DebugThread(uint32_t eventId,
+                                           const rdcfixedarray<uint32_t, 3> &groupid,
+                                           const rdcfixedarray<uint32_t, 3> &threadid,
+                                           std::function<bool()> cancelled)
 {
-  using namespace DXBC;
-  using namespace ShaderDebug;
+  using namespace DXBCBytecode;
+  using namespace DXBCDebug;
 
-  D3D11MarkerRegion simloop(StringFormat::Fmt("DebugThread @ %u: [%u, %u, %u] (%u, %u, %u)",
-                                              eventId, groupid[0], groupid[1], groupid[2],
-                                              threadid[0], threadid[1], threadid[2]));
-
-  ShaderDebugTrace empty;
+  D3D11MarkerRegion region(StringFormat::Fmt("DebugThread @ %u: [%u, %u, %u] (%u, %u, %u)", eventId,
+                                             groupid[0], groupid[1], groupid[2], threadid[0],
+                                             threadid[1], threadid[2]));
 
   D3D11RenderStateTracker tracker(m_pImmediateContext);
 
@@ -2445,39 +2581,36 @@ ShaderDebugTrace D3D11Replay::DebugThread(uint32_t eventId, const uint32_t group
   SAFE_RELEASE(stateCS);
 
   if(!cs)
-    return empty;
+    return new ShaderDebugTrace;
 
-  DXBCFile *dxbc = cs->GetDXBC();
+  DXBC::DXBCContainer *dxbc = cs->GetDXBC();
   const ShaderReflection &refl = cs->GetDetails();
 
   if(!dxbc)
-    return empty;
+    return new ShaderDebugTrace;
 
   dxbc->GetDisassembly();
 
   D3D11RenderState *rs = m_pImmediateContext->GetCurrentPipelineState();
 
-  bytebuf cbufData[D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT];
+  InterpretDebugger *interpreter = new InterpretDebugger;
+  interpreter->eventId = eventId;
+  ShaderDebugTrace *ret = interpreter->BeginDebug(dxbc, refl, cs->GetMapping(), 0);
+  GlobalState &global = interpreter->global;
+  ThreadState &state = interpreter->activeLane();
 
-  for(int i = 0; i < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT; i++)
-    if(rs->CS.ConstantBuffers[i])
-      GetDebugManager()->GetBufferData(rs->CS.ConstantBuffers[i],
-                                       rs->CS.CBOffsets[i] * sizeof(Vec4f), 0, cbufData[i]);
-
-  ShaderDebugTrace ret;
-
-  GlobalState global;
-  GetDebugManager()->CreateShaderGlobalState(global, dxbc, 0, rs->CSUAVs, rs->CS.SRVs);
-  State initialState = GetDebugManager()->CreateShaderDebugState(ret, -1, dxbc, refl, cbufData);
+  AddCBuffersToGlobalState(*dxbc->GetDXBCByteCode(), *GetDebugManager(), global, ret->sourceVars,
+                           rs->CS, refl, cs->GetMapping());
 
   for(int i = 0; i < 3; i++)
   {
-    initialState.semantics.GroupID[i] = groupid[i];
-    initialState.semantics.ThreadID[i] = threadid[i];
+    state.semantics.GroupID[i] = groupid[i];
+    state.semantics.ThreadID[i] = threadid[i];
   }
 
-  if(dxbc->m_DebugInfo)
-    dxbc->m_DebugInfo->GetLocals(0, dxbc->GetInstruction(0).offset, initialState.locals);
+  ret->constantBlocks = global.constantBlocks;
+
+  dxbc->FillTraceLineInfo(*ret);
 
   std::vector<ShaderDebugState> states(1, initialState);
 
@@ -2673,9 +2806,10 @@ ShaderDebugTrace D3D11Replay::DebugThread(uint32_t eventId, const uint32_t group
     dxbc->m_DebugInfo->GetLineInfo(i, op.offset, ret.lineInfo[i]);
   }
 
-  for(size_t i = 0; i < dxbc->GetNumDeclarations(); i++)
+  // add fake inputs for semantics
+  for(size_t i = 0; i < dxbc->GetDXBCByteCode()->GetNumDeclarations(); i++)
   {
-    const DXBC::ASMDecl &decl = dxbc->GetDeclaration(i);
+    const DXBCBytecode::Declaration &decl = dxbc->GetDXBCByteCode()->GetDeclaration(i);
 
     if(decl.declaration == OPCODE_DCL_INPUT &&
        (decl.operand.type == TYPE_INPUT_THREAD_ID || decl.operand.type == TYPE_INPUT_THREAD_GROUP_ID ||
@@ -2684,42 +2818,66 @@ ShaderDebugTrace D3D11Replay::DebugThread(uint32_t eventId, const uint32_t group
     {
       ShaderVariable v;
 
-      v.name = decl.operand.toString(dxbc, ToString::IsDecl);
+      v.name = decl.operand.toString(dxbc->GetReflection(), ToString::IsDecl);
       v.rows = 1;
       v.type = VarType::UInt;
 
       switch(decl.operand.type)
       {
         case TYPE_INPUT_THREAD_GROUP_ID:
-          memcpy(v.value.uv, initialState.semantics.GroupID, sizeof(uint32_t) * 3);
+          memcpy(v.value.u32v.data(), state.semantics.GroupID, sizeof(uint32_t) * 3);
           v.columns = 3;
           break;
         case TYPE_INPUT_THREAD_ID_IN_GROUP:
-          memcpy(v.value.uv, initialState.semantics.ThreadID, sizeof(uint32_t) * 3);
+          memcpy(v.value.u32v.data(), state.semantics.ThreadID, sizeof(uint32_t) * 3);
           v.columns = 3;
           break;
         case TYPE_INPUT_THREAD_ID:
-          v.value.u.x = initialState.semantics.GroupID[0] * dxbc->DispatchThreadsDimension[0] +
-                        initialState.semantics.ThreadID[0];
-          v.value.u.y = initialState.semantics.GroupID[1] * dxbc->DispatchThreadsDimension[1] +
-                        initialState.semantics.ThreadID[1];
-          v.value.u.z = initialState.semantics.GroupID[2] * dxbc->DispatchThreadsDimension[2] +
-                        initialState.semantics.ThreadID[2];
+          v.value.u32v[0] =
+              state.semantics.GroupID[0] * dxbc->GetReflection()->DispatchThreadsDimension[0] +
+              state.semantics.ThreadID[0];
+          v.value.u32v[1] =
+              state.semantics.GroupID[1] * dxbc->GetReflection()->DispatchThreadsDimension[1] +
+              state.semantics.ThreadID[1];
+          v.value.u32v[2] =
+              state.semantics.GroupID[2] * dxbc->GetReflection()->DispatchThreadsDimension[2] +
+              state.semantics.ThreadID[2];
           v.columns = 3;
           break;
         case TYPE_INPUT_THREAD_ID_IN_GROUP_FLATTENED:
-          v.value.u.x = initialState.semantics.ThreadID[2] * dxbc->DispatchThreadsDimension[0] *
-                            dxbc->DispatchThreadsDimension[1] +
-                        initialState.semantics.ThreadID[1] * dxbc->DispatchThreadsDimension[0] +
-                        initialState.semantics.ThreadID[0];
+          v.value.u32v[0] =
+              state.semantics.ThreadID[2] * dxbc->GetReflection()->DispatchThreadsDimension[0] *
+                  dxbc->GetReflection()->DispatchThreadsDimension[1] +
+              state.semantics.ThreadID[1] * dxbc->GetReflection()->DispatchThreadsDimension[0] +
+              state.semantics.ThreadID[0];
           v.columns = 1;
           break;
         default: v.columns = 4; break;
       }
 
-      ret.inputs.push_back(v);
+      ret->inputs.push_back(v);
     }
   }
 
   return ret;
+}
+
+rdcarray<ShaderDebugState> D3D11Replay::ContinueDebug(ShaderDebugger *debugger)
+{
+  DXBCDebug::InterpretDebugger *interpreter = (DXBCDebug::InterpretDebugger *)debugger;
+
+  if(!interpreter)
+    return {};
+
+  D3D11DebugAPIWrapper apiWrapper(m_pDevice, interpreter->dxbc, interpreter->global,
+                                  interpreter->eventId);
+
+  D3D11MarkerRegion region("ContinueDebug Simulation Loop");
+
+  return interpreter->ContinueDebug(&apiWrapper);
+}
+
+void D3D11Replay::FreeDebugger(ShaderDebugger *debugger)
+{
+  delete debugger;
 }

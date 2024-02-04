@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  * Copyright (c) 2014 Crytek
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -34,7 +34,7 @@ struct FunctionHook
   FunctionHook() : orig(NULL), hook(NULL) {}
   FunctionHook(const char *f, void **o, void *d) : function(f), orig(o), hook(d) {}
   bool operator<(const FunctionHook &h) const { return function < h.function; }
-  std::string function;
+  rdcstr function;
   void **orig;
   void *hook;
 };
@@ -147,8 +147,13 @@ public:
   // generic, implemented in hooks.cpp to iterate over all registered libraries
   static void RegisterHooks();
   static void OptionsUpdated();
+  static void RemoveHookCallbacks();
 
   // platform specific implementations
+
+  // some platforms may unavoidably hook on replay, this gives them a chance to do any
+  // initialisation needed to ensure those hooks don't do anything
+  static void ReplayInitialise();
 
   // Removes hooks (where possible) and restores everything to an un-hooked state
   static void RemoveHooks();
@@ -183,10 +188,11 @@ struct LibraryHook
   LibraryHook();
   virtual void RegisterHooks() = 0;
   virtual void OptionsUpdated() {}
+  virtual void RemoveHooks() {}
 private:
   friend class LibraryHooks;
 
-  static std::vector<LibraryHook *> m_Libraries;
+  static rdcarray<LibraryHook *> m_Libraries;
 };
 
 template <typename FuncType>

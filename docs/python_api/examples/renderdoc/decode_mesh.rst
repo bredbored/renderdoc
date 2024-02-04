@@ -30,17 +30,17 @@ In the object we pass both the indices (which does not vary per attribute in our
 		meshInput = MeshData()
 		meshInput.indexResourceId = ib.resourceId
 		meshInput.indexByteOffset = ib.byteOffset
-		meshInput.indexByteStride = draw.indexByteWidth
+		meshInput.indexByteStride = ib.byteStride
 		meshInput.baseVertex = draw.baseVertex
 		meshInput.indexOffset = draw.indexOffset
 		meshInput.numIndices = draw.numIndices
 
 		# If the draw doesn't use an index buffer, don't use it even if bound
-		if not (draw.flags & rd.DrawFlags.Indexed):
+		if not (draw.flags & rd.ActionFlags.Indexed):
 			meshInput.indexResourceId = rd.ResourceId.Null()
 
 		# The total offset is the attribute offset from the base of the vertex
-		meshInput.vertexByteOffset = attr.byteOffset + vbs[attr.vertexBuffer].byteOffset
+		meshInput.vertexByteOffset = attr.byteOffset + vbs[attr.vertexBuffer].byteOffset + draw.vertexOffset * vbs[attr.vertexBuffer].byteStride
 		meshInput.format = attr.format
 		meshInput.vertexResourceId = vbs[attr.vertexBuffer].resourceId
 		meshInput.vertexByteStride = vbs[attr.vertexBuffer].byteStride
@@ -77,7 +77,7 @@ Next we fetch the index data using :py:meth:`~renderdoc.ReplayController.GetBuff
             return [i + mesh.baseVertex for i in indices]
         else:
             # With no index buffer, just generate a range
-            return tuple(range(vertexOffset, vertexOffset+mesh.numIndices))
+            return tuple(range(mesh.numIndices))
 
 To begin with, we define a helper that will read a given variable out of a ``bytes`` object, using a :py:class:`~renderdoc.ResourceFormat` do define the size and format of the data.
 
@@ -105,7 +105,6 @@ For normalised formats - :py:attr:`~renderdoc.CompType.UNorm` and :py:attr:`~ren
         formatChars[rd.CompType.UScaled] = formatChars[rd.CompType.UInt]
         formatChars[rd.CompType.SNorm] = formatChars[rd.CompType.SInt]
         formatChars[rd.CompType.SScaled] = formatChars[rd.CompType.SInt]
-        formatChars[rd.CompType.Double] = formatChars[rd.CompType.Float]
 
         # We need to fetch compCount components
         vertexFormat = str(fmt.compCount) + formatChars[fmt.compType][fmt.compByteWidth]
@@ -115,12 +114,12 @@ For normalised formats - :py:attr:`~renderdoc.CompType.UNorm` and :py:attr:`~ren
 
         # If the format needs post-processing such as normalisation, do that now
         if fmt.compType == rd.CompType.UNorm:
-            divisor = float((1 << fmt.compByteWidth) - 1)
-            value = tuple(float(value[i]) / divisor for i in value)
+            divisor = float((2 ** (fmt.compByteWidth * 8)) - 1)
+            value = tuple(float(i) / divisor for i in value)
         elif fmt.compType == rd.CompType.SNorm:
-            maxNeg = -(1 << (fmt.compByteWidth - 1))
+            maxNeg = -float(2 ** (fmt.compByteWidth * 8)) / 2
             divisor = float(-(maxNeg-1))
-            value = tuple((float(value[i]) if (value[i] == maxNeg) else (float(value[i]) / divisor)) for i in value)
+            value = tuple((float(i) if (i == maxNeg) else (float(i) / divisor)) for i in value)
 
         # If the format is BGRA, swap the two components
         if fmt.BGRAOrder():
@@ -193,9 +192,9 @@ The position output is also treated specially - it always appears first, regardl
 
 		# Construct a resource format for this element
 		meshOutput.format = rd.ResourceFormat()
-		meshOutput.format.compByteWidth = 8 if attr.compType == rd.CompType.Double else 4
+		meshOutput.format.compByteWidth = rd.VarTypeByteSize(attr.varType)
 		meshOutput.format.compCount = attr.compCount
-		meshOutput.format.compType = attr.compType
+		meshOutput.format.compType = rd.VarTypeCompType(attr.varType)
 		meshOutput.format.type = rd.ResourceFormatType.Regular
 
 		meshOutput.name = attr.semanticIdxName if attr.varName == '' else attr.varName
@@ -220,7 +219,7 @@ The position output is also treated specially - it always appears first, regardl
 		# while others will tightly pack
 		fmt = meshOutputs[i].format
 
-		accumOffset += (8 if fmt.compType == rd.CompType.Double else 4) * fmt.compCount
+		accumOffset += (8 if fmt.compByteWidth > 4 else 4) * fmt.compCount
 
 Example Source
 --------------

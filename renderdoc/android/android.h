@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2017-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -24,24 +24,21 @@
 
 #pragma once
 
-#include <string>
 #include "os/os_specific.h"
 
 // public interface, for other non-android parts of the code
 namespace Android
 {
 bool IsHostADB(const char *hostname);
-std::string GetPackageName(const std::string &packageAndActivity);
-std::string GetActivityName(const std::string &packageAndActivity);
-ExecuteResult StartAndroidPackageForCapture(const char *host, const char *packageAndActivity,
-                                            const char *intentArgs, const CaptureOptions &opts);
-void ResetCaptureSettings(const std::string &deviceID);
-void ExtractDeviceIDAndIndex(const std::string &hostname, int &index, std::string &deviceID);
-Process::ProcessResult adbExecCommand(const std::string &deviceID, const std::string &args,
-                                      const std::string &workDir = ".", bool silent = false);
+rdcstr GetPackageName(const rdcstr &packageAndActivity);
+rdcstr GetActivityName(const rdcstr &packageAndActivity);
+void ResetCaptureSettings(const rdcstr &deviceID);
+void ExtractDeviceIDAndIndex(const rdcstr &hostname, int &index, rdcstr &deviceID);
+Process::ProcessResult adbExecCommand(const rdcstr &deviceID, const rdcstr &args,
+                                      const rdcstr &workDir = ".", bool silent = false);
 void initAdb();
 void shutdownAdb();
-bool InjectWithJDWP(const std::string &deviceID, uint16_t jdwpport);
+bool InjectWithJDWP(const rdcstr &deviceID, uint16_t jdwpport);
 
 struct LogcatThread
 {
@@ -70,17 +67,17 @@ private:
 
   // the last log line we saw, so we start printing after that point. If we ever have a line here
   // and we don't see it in the backlog.
-  std::string lastLogcatLine;
+  rdcstr lastLogcatLine;
 
   // the device ID we're monitoring
-  std::string deviceID;
+  rdcstr deviceID;
 
   // the thread handle
   Threading::ThreadHandle thread = 0;
 
-  friend LogcatThread *ProcessLogcat(std::string deviceID);
+  friend LogcatThread *ProcessLogcat(rdcstr deviceID);
 };
 
 void TickDeviceLogcat();
-LogcatThread *ProcessLogcat(std::string deviceID);
+LogcatThread *ProcessLogcat(rdcstr deviceID);
 };

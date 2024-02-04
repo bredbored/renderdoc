@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2017-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -109,7 +109,7 @@ public:
           case 5:
           {
             QVariant desc = msg.description;
-            RichResourceTextInitialise(desc);
+            RichResourceTextInitialise(desc, &m_Ctx, true);
             return desc;
           }
           default: break;
@@ -216,6 +216,7 @@ DebugMessageView::DebugMessageView(ICaptureContext &ctx, QWidget *parent)
   ui->messages->setMouseTracking(true);
   ui->messages->setAutoScroll(false);
 
+  ui->messages->verticalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
   ui->messages->horizontalHeader()->setStretchLastSection(false);
 
   ui->messages->setContextMenuPolicy(Qt::CustomContextMenu);
@@ -319,14 +320,14 @@ void DebugMessageView::messages_toggled()
     else
       m_FilterModel->m_HiddenSeverities.push_back(m_ContextMessage.severity);
   }
-  else if(action == m_ToggleSeverity)
+  else if(action == m_ToggleCategory)
   {
     if(m_FilterModel->m_HiddenCategories.contains(m_ContextMessage.category))
       m_FilterModel->m_HiddenCategories.removeOne(m_ContextMessage.category);
     else
       m_FilterModel->m_HiddenCategories.push_back(m_ContextMessage.category);
   }
-  else if(action == m_ToggleSeverity)
+  else if(action == m_ToggleMessageType)
   {
     auto type = DebugMessageFilterModel::makeType(m_ContextMessage);
     if(m_FilterModel->m_HiddenTypes.contains(type))
@@ -349,6 +350,11 @@ void DebugMessageView::messages_contextMenu(const QPoint &pos)
   {
     index = m_FilterModel->mapToSource(index);
 
+    m_ToggleSource->setEnabled(true);
+    m_ToggleSeverity->setEnabled(true);
+    m_ToggleCategory->setEnabled(true);
+    m_ToggleMessageType->setEnabled(true);
+
     const DebugMessage &msg = m_Ctx.DebugMessages()[index.row()];
 
     QString hide = tr("Hide");
@@ -369,9 +375,20 @@ void DebugMessageView::messages_contextMenu(const QPoint &pos)
     m_ToggleMessageType->setText(tr("%1 Message Type").arg(hidden ? show : hide));
 
     m_ContextMessage = msg;
-
-    RDDialog::show(m_ContextMenu, ui->messages->viewport()->mapToGlobal(pos));
   }
+  else
+  {
+    m_ToggleSource->setEnabled(false);
+    m_ToggleSeverity->setEnabled(false);
+    m_ToggleCategory->setEnabled(false);
+    m_ToggleMessageType->setEnabled(false);
+    m_ToggleSource->setText(tr("Toggle by Source"));
+    m_ToggleSeverity->setText(tr("Toggle by Severity"));
+    m_ToggleCategory->setText(tr("Toggle by Category"));
+    m_ToggleMessageType->setText(tr("Toggle by Message Type"));
+  }
+
+  RDDialog::show(m_ContextMenu, ui->messages->viewport()->mapToGlobal(pos));
 }
 
 void DebugMessageView::paintEvent(QPaintEvent *e)

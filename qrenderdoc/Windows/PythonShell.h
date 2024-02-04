@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2017-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -47,8 +47,15 @@ public:
 
   ~PythonShell();
 
+  // for UI-forwarding helper classes
+  PythonContext *GetScriptContext();
+
   // IPythonShell
   QWidget *Widget() override { return this; }
+  void SetScriptText(rdcstr script) override;
+  bool LoadScriptFromFilename(rdcstr filename) override;
+  rdcstr GetScriptText() override;
+  void RunScript() override;
 private slots:
   // automatic slots
   void on_execute_clicked();

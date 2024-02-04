@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -25,6 +25,11 @@
 #pragma once
 
 #include <stdint.h>
+#include "apidefs.h"
+#include "rdcstr.h"
+#include "stringise.h"
+
+typedef uint8_t byte;
 
 // see renderdoc_app.h RENDERDOC_CaptureOption - make sure any changes here are reflected there, to
 // the options or to the documentation
@@ -42,13 +47,13 @@ struct CaptureOptions
   DOCUMENT(R"(Encode the current options to a string suitable for passing around between processes.
 
 :return: The encoded string, suitable for passing to :meth:`DecodeFromString`.
-:rtype: ``str``
+:rtype: str
 )");
   inline rdcstr EncodeAsString() const
   {
     rdcstr optstr;
     optstr.reserve(sizeof(CaptureOptions) * 2 + 1);
-    byte *b = (byte *)this;
+    const byte *b = (const byte *)this;
     for(size_t i = 0; i < sizeof(CaptureOptions); i++)
     {
       optstr.push_back(char('a' + ((b[i] >> 4) & 0xf)));
@@ -58,16 +63,21 @@ struct CaptureOptions
     return optstr;
   }
 
-  DOCUMENT("Decode the options from a string, as returned by :meth:`EncodeAsString`.");
-  inline void DecodeFromString(const rdcstr &str)
+  DOCUMENT(R"(Decode the options from a string, as returned by :meth:`EncodeAsString`. Updates this
+object in place.
+
+:param str encoded: The encoded string, as returned by :meth:`EncodeAsString`.
+)");
+  inline void DecodeFromString(const rdcstr &encoded)
   {
-    if(str.size() < sizeof(CaptureOptions))
+    if(encoded.size() < sizeof(CaptureOptions))
       return;
 
     // serialise from string with two chars per byte
     byte *b = (byte *)this;
     for(size_t i = 0; i < sizeof(CaptureOptions); i++)
-      *(b++) = (byte(str[i * 2 + 0] - 'a') << 4) | byte(str[i * 2 + 1] - 'a');
+      *(b++) = byte(((byte(encoded[i * 2 + 0] - 'a') & 0xf) << 4) |
+                    (byte(encoded[i * 2 + 1] - 'a') & 0xf));
   }
 
   DOCUMENT(R"(Allow the application to enable vsync.
@@ -111,16 +121,16 @@ Default - disabled
 )");
   bool captureCallstacks;
 
-  DOCUMENT(R"(When capturing CPU callstacks, only capture them from drawcalls.
+  DOCUMENT(R"(When capturing CPU callstacks, only capture them from actions.
 This option does nothing if :data:`captureCallstacks` is not enabled.
 
 Default - disabled
 
-``True`` - Only captures callstacks for drawcall type API events.
+``True`` - Only captures callstacks for actions.
 
 ``False`` - Callstacks, if enabled, are captured for every event.
 )");
-  bool captureCallstacksOnlyDraws;
+  bool captureCallstacksOnlyActions;
 
   DOCUMENT(R"(Specify a delay in seconds to wait for a debugger to attach, after
 creating or injecting into a process, before continuing to allow it to run.
@@ -199,6 +209,19 @@ Default - enabled
 ``False`` - API debugging is displayed as normal.
 )");
   bool debugOutputMute;
+
+  DOCUMENT(R"(Define a soft memory limit which some APIs may aim to keep overhead under where
+possible. Anything above this limit will where possible be saved directly to disk during capture.
+This will cause increased disk space use (which may cause a capture to fail if disk space is
+exhausted) as well as slower capture times.
+
+Not all memory allocations may be deferred like this so it is not a guarantee of a memory limit.
+
+Units are in MBs, suggested values would range from 200MB to 1000MB.
+
+Default - 0 Megabytes
+)");
+  uint32_t softMemoryLimit;
 };
 
 DECLARE_REFLECTION_STRUCT(CaptureOptions);

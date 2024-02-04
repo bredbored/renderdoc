@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2016-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -27,23 +27,25 @@
 #include <algorithm>
 #include <map>
 #include <set>
-#include <string>
+#include "api/replay/stringise.h"
+#include "common/common.h"
 #include "common/threading.h"
 #include "hooks/hooks.h"
 #include "strings/string_utils.h"
 
 Threading::CriticalSection libLock;
 
-static std::map<std::string, std::vector<FunctionLoadCallback>> libraryCallbacks;
-static std::set<std::string> libraryHooks;
-static std::vector<FunctionHook> functionHooks;
+static std::map<rdcstr, rdcarray<FunctionLoadCallback>> libraryCallbacks;
+static std::set<rdcstr> libraryHooks;
+static rdcarray<FunctionHook> functionHooks;
 static std::set<void *> libraryHandles;
+static std::map<rdcstr, void *> realSymbols;
 
 void *interposed_dlopen(const char *filename, int flag)
 {
   void *handle = dlopen(filename, flag);
 
-  std::string baseFilename = filename ? get_basename(std::string(filename)) : "";
+  rdcstr baseFilename = filename ? get_basename(rdcstr(filename)) : "";
 
   {
     SCOPED_LOCK(libLock);
@@ -98,13 +100,18 @@ void LibraryHooks::RemoveHooks()
   RDCERR("Removing hooks is not possible on this platform");
 }
 
+void LibraryHooks::ReplayInitialise()
+{
+  // nothing to do
+}
+
 void LibraryHooks::EndHookRegistration()
 {
   // process libraries with callbacks by loading them if necessary (though we should be linked to
   // them for the dyld interposing)
   for(auto it = libraryCallbacks.begin(); it != libraryCallbacks.end(); ++it)
   {
-    std::string libName = it->first;
+    rdcstr libName = it->first;
     void *handle = dlopen(libName.c_str(), RTLD_NOW | RTLD_GLOBAL);
 
     if(handle)
@@ -124,7 +131,16 @@ void LibraryHooks::EndHookRegistration()
   {
     if(hook.orig && *hook.orig == NULL)
     {
-      *hook.orig = dlsym(RTLD_NEXT, hook.function.c_str());
+      // Try to get direct compile time function pointer before using dlsym
+      auto it = realSymbols.find(hook.function);
+      if(it != realSymbols.end())
+      {
+        *hook.orig = it->second;
+      }
+      if(*hook.orig == NULL)
+      {
+        *hook.orig = dlsym(RTLD_NEXT, hook.function.c_str());
+      }
       RDCASSERT(*hook.orig != hook.hook, hook.function);
     }
   }
@@ -149,7 +165,7 @@ void LibraryHooks::RegisterLibraryHook(char const *name, FunctionLoadCallback cb
   SCOPED_LOCK(libLock);
 
   // we match by basename for library hooks
-  libraryHooks.insert(get_basename(std::string(name)));
+  libraryHooks.insert(get_basename(rdcstr(name)));
 
   if(cb)
     libraryCallbacks[name].push_back(cb);
@@ -166,4 +182,9 @@ ScopedSuppressHooking::ScopedSuppressHooking()
 
 ScopedSuppressHooking::~ScopedSuppressHooking()
 {
+}
+
+void AppleRegisterRealSymbol(const char *functionName, void *address)
+{
+  realSymbols[functionName] = address;
 }

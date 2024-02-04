@@ -1,29 +1,28 @@
 /******************************************************************************
-* The MIT License (MIT)
-*
-* Copyright (c) 2018-2019 Baldur Karlsson
-*
-* Permission is hereby granted, free of charge, to any person obtaining a copy
-* of this software and associated documentation files (the "Software"), to deal
-* in the Software without restriction, including without limitation the rights
-* to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-* copies of the Software, and to permit persons to whom the Software is
-* furnished to do so, subject to the following conditions:
-*
-* The above copyright notice and this permission notice shall be included in
-* all copies or substantial portions of the Software.
-*
-* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-* AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-* OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-* THE SOFTWARE.
-******************************************************************************/
+ * The MIT License (MIT)
+ *
+ * Copyright (c) 2019-2023 Baldur Karlsson
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ ******************************************************************************/
 
 #include "d3d_helpers.h"
-#include <vector>
 #include "../test_common.h"
 
 std::string D3DFullscreenQuadVertex = R"EOSHADER(
@@ -58,7 +57,7 @@ struct v2f
 	float2 uv : TEXCOORD0;
 };
 
-v2f main(vertin IN, uint vid : SV_VertexID)
+v2f main(vertin IN)
 {
 	v2f OUT = (v2f)0;
 
@@ -87,7 +86,8 @@ float4 main(v2f IN) : SV_Target0
 
 )EOSHADER";
 
-IDXGIAdapterPtr ChooseD3DAdapter(IDXGIFactoryPtr factory, int argc, char **argv, bool &warp)
+std::vector<IDXGIAdapterPtr> FindD3DAdapters(IDXGIFactoryPtr factory, int argc, char **argv,
+                                             bool &warp)
 {
   struct AdapterInfo
   {
@@ -98,31 +98,30 @@ IDXGIAdapterPtr ChooseD3DAdapter(IDXGIFactoryPtr factory, int argc, char **argv,
   std::vector<AdapterInfo> adapters;
 
   HRESULT hr = S_OK;
-
-  for(UINT i = 0; i < 10; i++)
   {
-    IDXGIAdapterPtr a;
-    hr = factory->EnumAdapters(i, &a);
-    if(hr == S_OK && a)
+    UINT i = 0;
+    while(true)
     {
+      IDXGIAdapterPtr a;
+      hr = factory->EnumAdapters(i, &a);
+      if(hr != S_OK || !a)
+        break;
+
       DXGI_ADAPTER_DESC desc;
       a->GetDesc(&desc);
       adapters.push_back({a, desc});
-    }
-    else
-    {
-      break;
+      i++;
     }
   }
 
-  IDXGIAdapterPtr adapter = NULL;
+  IDXGIAdapterPtr specifiedAdapter = NULL;
 
   for(int i = 0; i < argc; i++)
   {
     if(!strcmp(argv[i], "--warp"))
     {
       warp = true;
-      adapter = NULL;
+      specifiedAdapter = NULL;
       break;
     }
     if(!strcmp(argv[i], "--gpu") && i + 1 < argc)
@@ -131,7 +130,8 @@ IDXGIAdapterPtr ChooseD3DAdapter(IDXGIFactoryPtr factory, int argc, char **argv,
 
       if(needle == "warp")
       {
-        adapter = warp;
+        warp = true;
+        specifiedAdapter = NULL;
         break;
       }
 
@@ -143,11 +143,12 @@ IDXGIAdapterPtr ChooseD3DAdapter(IDXGIFactoryPtr factory, int argc, char **argv,
       {
         std::string haystack = strlower(Wide2UTF8(adapters[a].desc.Description));
 
-        if(haystack.find(needle) != std::string::npos || (nv && adapters[a].desc.VendorId == 0x10DE) ||
-           (amd && adapters[a].desc.VendorId == 0x1002) ||
-           (intel && adapters[a].desc.VendorId == 0x8086))
+        if(haystack.find(needle) != std::string::npos ||
+           (nv && adapters[a].desc.VendorId == PCI_VENDOR_NV) ||
+           (amd && adapters[a].desc.VendorId == PCI_VENDOR_AMD) ||
+           (intel && adapters[a].desc.VendorId == PCI_VENDOR_INTEL))
         {
-          adapter = adapters[a].adapter;
+          specifiedAdapter = adapters[a].adapter;
           break;
         }
       }
@@ -156,5 +157,19 @@ IDXGIAdapterPtr ChooseD3DAdapter(IDXGIFactoryPtr factory, int argc, char **argv,
     }
   }
 
-  return adapter;
+  // Return the adapters that we want to consider:
+  // With an adapter specified by command line, only return that one
+  // With warp specified, return an empty adapter list - fallback will occur
+  // Otherwise, return all adapters, to be attempted in order
+  if(specifiedAdapter)
+    return {specifiedAdapter};
+
+  if(warp)
+    return {};
+
+  std::vector<IDXGIAdapterPtr> returnedAdapters;
+  for(size_t i = 0; i < adapters.size(); ++i)
+    returnedAdapters.push_back(adapters[i].adapter);
+
+  return returnedAdapters;
 }

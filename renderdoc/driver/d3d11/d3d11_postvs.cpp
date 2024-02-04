@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2018-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -22,14 +22,27 @@
  * THE SOFTWARE.
  ******************************************************************************/
 
+#include <algorithm>
 #include "data/resource.h"
-#include "driver/d3d11/d3d11_resources.h"
-#include "driver/shaders/dxbc/dxbc_debug.h"
 #include "strings/string_utils.h"
 #include "d3d11_context.h"
 #include "d3d11_debug.h"
 #include "d3d11_manager.h"
 #include "d3d11_renderstate.h"
+#include "d3d11_replay.h"
+#include "d3d11_resources.h"
+
+struct ScopedOOMHandle11
+{
+  ScopedOOMHandle11(WrappedID3D11Device *dev)
+  {
+    m_pDevice = dev;
+    m_pDevice->HandleOOM(true);
+  }
+
+  ~ScopedOOMHandle11() { m_pDevice->HandleOOM(false); }
+  WrappedID3D11Device *m_pDevice;
+};
 
 void D3D11Replay::InitStreamOut()
 {
@@ -62,10 +75,16 @@ void D3D11Replay::CreateSOBuffers()
   SAFE_RELEASE(m_SOBuffer);
   SAFE_RELEASE(m_SOStagingBuffer);
 
-  if(m_SOBufferSize > 0xFFFFFFFFULL)
+  if(m_SOBufferSize > 0xFFFF0000ULL ||
+     // workaround nv driver bug, it crashes copying with an offset over 2GB (which we need for
+     // readback). Treat this as an OOM scenario
+     (m_DriverInfo.vendor == GPUVendor::nVidia && m_SOBufferSize > 0x80000000ULL))
   {
     RDCERR("Can't resize stream-out buffer to larger than 4GB, needed %llu bytes.", m_SOBufferSize);
-    m_SOBufferSize = 0xFFFFFFFFULL;
+    SAFE_RELEASE(m_SOBuffer);
+    SAFE_RELEASE(m_SOStagingBuffer);
+    m_SOBufferSize = 0;
+    return;
   }
 
   D3D11_BUFFER_DESC bufferDesc = {
@@ -82,6 +101,13 @@ void D3D11Replay::CreateSOBuffers()
   hr = m_pDevice->CreateBuffer(&bufferDesc, NULL, &m_SOStagingBuffer);
   if(FAILED(hr))
     RDCERR("Failed to create m_SOStagingBuffer HRESULT: %s", ToStr(hr).c_str());
+
+  if(!m_SOBuffer || !m_SOStagingBuffer)
+  {
+    SAFE_RELEASE(m_SOBuffer);
+    SAFE_RELEASE(m_SOStagingBuffer);
+    m_SOBufferSize = 0;
+  }
 }
 
 void D3D11Replay::ClearPostVSCache()
@@ -113,18 +139,30 @@ MeshFormat D3D11Replay::GetPostVSBuffers(uint32_t eventId, uint32_t instID, uint
 
   MeshFormat ret;
 
-  if(s.useIndices && s.idxBuf)
-    ret.indexResourceId = ((WrappedID3D11Buffer *)s.idxBuf)->GetResourceID();
-  else
-    ret.indexResourceId = ResourceId();
   ret.indexByteOffset = 0;
-  ret.indexByteStride = s.idxFmt == DXGI_FORMAT_R16_UINT ? 2 : 4;
   ret.baseVertex = 0;
 
-  if(s.buf)
-    ret.vertexResourceId = ((WrappedID3D11Buffer *)s.buf)->GetResourceID();
+  if(s.useIndices && s.idxBuf)
+  {
+    ret.indexResourceId = ((WrappedID3D11Buffer *)s.idxBuf)->GetResourceID();
+    ret.indexByteStride = s.idxFmt == DXGI_FORMAT_R16_UINT ? 2 : 4;
+    ret.indexByteSize = ~0ULL;
+  }
   else
+  {
+    ret.indexResourceId = ResourceId();
+    ret.indexByteStride = 0;
+  }
+
+  if(s.buf)
+  {
+    ret.vertexResourceId = ((WrappedID3D11Buffer *)s.buf)->GetResourceID();
+    ret.vertexByteSize = ~0ULL;
+  }
+  else
+  {
     ret.vertexResourceId = ResourceId();
+  }
 
   ret.vertexByteOffset = s.instStride * instID;
   ret.vertexByteStride = s.vertStride;
@@ -151,6 +189,8 @@ MeshFormat D3D11Replay::GetPostVSBuffers(uint32_t eventId, uint32_t instID, uint
     ret.numIndices = inst.numVerts;
   }
 
+  ret.status = s.status;
+
   return ret;
 }
 
@@ -158,6 +198,11 @@ void D3D11Replay::InitPostVSBuffers(uint32_t eventId)
 {
   if(m_PostVSData.find(eventId) != m_PostVSData.end())
     return;
+
+  D3D11PostVSData &ret = m_PostVSData[eventId];
+
+  // we handle out-of-memory errors while processing postvs, don't treat it as a fatal error
+  ScopedOOMHandle11 oom(m_pDevice);
 
   D3D11MarkerRegion postvs(StringFormat::Fmt("PostVS for %u", eventId));
 
@@ -185,66 +230,78 @@ void D3D11Replay::InitPostVSBuffers(uint32_t eventId)
     ds->Release();
 
   if(!vs)
+  {
+    ret.gsout.status = ret.vsout.status = "No vertex shader bound";
     return;
+  }
 
   D3D11_PRIMITIVE_TOPOLOGY topo;
   m_pImmediateContext->IAGetPrimitiveTopology(&topo);
 
   WrappedID3D11Shader<ID3D11VertexShader> *wrappedVS = (WrappedID3D11Shader<ID3D11VertexShader> *)vs;
 
-  if(!wrappedVS)
+  const ActionDescription *action = m_pDevice->GetAction(eventId);
+
+  if(action->numIndices == 0)
   {
-    RDCERR("Couldn't find wrapped vertex shader!");
+    ret.gsout.status = ret.vsout.status = "Empty drawcall (0 indices/vertices)";
     return;
   }
 
-  const DrawcallDescription *drawcall = m_pDevice->GetDrawcall(eventId);
-
-  if(drawcall->numIndices == 0 ||
-     ((drawcall->flags & DrawFlags::Instanced) && drawcall->numInstances == 0))
+  if((action->flags & ActionFlags::Instanced) && action->numInstances == 0)
+  {
+    ret.gsout.status = ret.vsout.status = "Empty drawcall (0 instances)";
     return;
+  }
 
-  DXBC::DXBCFile *dxbcVS = wrappedVS->GetDXBC();
+  DXBC::DXBCContainer *dxbcVS = wrappedVS->GetDXBC();
 
   RDCASSERT(dxbcVS);
 
-  DXBC::DXBCFile *dxbcGS = NULL;
+  DXBC::DXBCContainer *dxbcGS = NULL;
 
   if(gs)
   {
     WrappedID3D11Shader<ID3D11GeometryShader> *wrappedGS =
         (WrappedID3D11Shader<ID3D11GeometryShader> *)gs;
 
-    if(!wrappedGS)
-    {
-      RDCERR("Couldn't find wrapped geometry shader!");
-      return;
-    }
-
     dxbcGS = wrappedGS->GetDXBC();
 
     RDCASSERT(dxbcGS);
   }
 
-  DXBC::DXBCFile *dxbcDS = NULL;
+  DXBC::DXBCContainer *dxbcDS = NULL;
 
   if(ds)
   {
     WrappedID3D11Shader<ID3D11DomainShader> *wrappedDS =
         (WrappedID3D11Shader<ID3D11DomainShader> *)ds;
 
-    if(!wrappedDS)
-    {
-      RDCERR("Couldn't find wrapped domain shader!");
-      return;
-    }
-
     dxbcDS = wrappedDS->GetDXBC();
 
     RDCASSERT(dxbcDS);
   }
 
-  std::vector<D3D11_SO_DECLARATION_ENTRY> sodecls;
+  ResourceId lastShaderId = GetIDForDeviceChild(ds);
+  DXBC::DXBCContainer *lastShader = dxbcDS;
+  if(dxbcGS)
+  {
+    lastShaderId = GetIDForDeviceChild(gs);
+    lastShader = dxbcGS;
+  }
+
+  if(lastShader)
+  {
+    // put a general error in here in case anything goes wrong fetching VS outputs
+    ret.gsout.status =
+        "No geometry/tessellation output fetched due to error processing vertex stage.";
+  }
+  else
+  {
+    ret.gsout.status = "No geometry and no tessellation shader bound.";
+  }
+
+  rdcarray<D3D11_SO_DECLARATION_ENTRY> sodecls;
 
   UINT stride = 0;
   int posidx = -1;
@@ -252,11 +309,11 @@ void D3D11Replay::InitPostVSBuffers(uint32_t eventId)
 
   ID3D11GeometryShader *streamoutGS = NULL;
 
-  if(!dxbcVS->m_OutputSig.empty())
+  if(!dxbcVS->GetReflection()->OutputSig.empty())
   {
-    for(size_t i = 0; i < dxbcVS->m_OutputSig.size(); i++)
+    for(size_t i = 0; i < dxbcVS->GetReflection()->OutputSig.size(); i++)
     {
-      SigParameter &sign = dxbcVS->m_OutputSig[i];
+      const SigParameter &sign = dxbcVS->GetReflection()->OutputSig[i];
 
       D3D11_SO_DECLARATION_ENTRY decl;
 
@@ -283,17 +340,19 @@ void D3D11Replay::InitPostVSBuffers(uint32_t eventId)
     if(posidx > 0)
     {
       D3D11_SO_DECLARATION_ENTRY pos = sodecls[posidx];
-      sodecls.erase(sodecls.begin() + posidx);
-      sodecls.insert(sodecls.begin(), pos);
+      sodecls.erase(posidx);
+      sodecls.insert(0, pos);
     }
 
     HRESULT hr = m_pDevice->CreateGeometryShaderWithStreamOutput(
-        (void *)&dxbcVS->m_ShaderBlob[0], dxbcVS->m_ShaderBlob.size(), &sodecls[0],
+        (void *)dxbcVS->GetShaderBlob().data(), dxbcVS->GetShaderBlob().size(), &sodecls[0],
         (UINT)sodecls.size(), &stride, 1, D3D11_SO_NO_RASTERIZED_STREAM, NULL, &streamoutGS);
 
     if(FAILED(hr))
     {
-      RDCERR("Failed to create Geometry Shader + SO HRESULT: %s", ToStr(hr).c_str());
+      ret.vsout.status =
+          StringFormat::Fmt("Failed to fetch output via streamout, HRESULT: %s", ToStr(hr).c_str());
+      RDCERR("%s", ret.vsout.status.c_str());
       return;
     }
 
@@ -312,36 +371,41 @@ void D3D11Replay::InitPostVSBuffers(uint32_t eventId)
 
     ID3D11Buffer *origBuf = idxBuf;
 
-    if(!(drawcall->flags & DrawFlags::Indexed))
+    if(!(action->flags & ActionFlags::Indexed))
     {
       m_pImmediateContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_POINTLIST);
 
       SAFE_RELEASE(idxBuf);
 
-      uint64_t outputSize = stride * uint64_t(drawcall->numIndices);
-      if(drawcall->flags & DrawFlags::Instanced)
-        outputSize *= drawcall->numInstances;
+      uint64_t outputSize = stride * uint64_t(action->numIndices);
+      if(action->flags & ActionFlags::Instanced)
+        outputSize *= action->numInstances;
 
       if(m_SOBufferSize < outputSize)
       {
-        uint64_t oldSize = m_SOBufferSize;
-        m_SOBufferSize = CalcMeshOutputSize(m_SOBufferSize, outputSize);
-        RDCWARN("Resizing stream-out buffer from %llu to %llu", oldSize, m_SOBufferSize);
+        const uint64_t oldSize = m_SOBufferSize;
+        const uint64_t newSize = CalcMeshOutputSize(m_SOBufferSize, outputSize);
+        m_SOBufferSize = newSize;
+        RDCWARN("Resizing stream-out buffer from %llu to %llu", oldSize, newSize);
         CreateSOBuffers();
 
         if(!m_SOStagingBuffer)
+        {
+          ret.vsout.status = StringFormat::Fmt(
+              "Vertex output generated %llu bytes of data which ran out of memory", newSize);
           return;
+        }
       }
 
       m_pImmediateContext->SOSetTargets(1, &m_SOBuffer, &offset);
 
       m_pImmediateContext->Begin(m_SOStatsQueries[0]);
 
-      if(drawcall->flags & DrawFlags::Instanced)
-        m_pImmediateContext->DrawInstanced(drawcall->numIndices, drawcall->numInstances,
-                                           drawcall->vertexOffset, drawcall->instanceOffset);
+      if(action->flags & ActionFlags::Instanced)
+        m_pImmediateContext->DrawInstanced(action->numIndices, action->numInstances,
+                                           action->vertexOffset, action->instanceOffset);
       else
-        m_pImmediateContext->Draw(drawcall->numIndices, drawcall->vertexOffset);
+        m_pImmediateContext->Draw(action->numIndices, action->vertexOffset);
 
       m_pImmediateContext->End(m_SOStatsQueries[0]);
     }
@@ -351,49 +415,37 @@ void D3D11Replay::InitPostVSBuffers(uint32_t eventId)
       UINT bytesize = index16 ? 2 : 4;
 
       bytebuf idxdata;
-      GetDebugManager()->GetBufferData(idxBuf, idxOffs + drawcall->indexOffset * bytesize,
-                                       drawcall->numIndices * bytesize, idxdata);
+      GetDebugManager()->GetBufferData(idxBuf, idxOffs + action->indexOffset * bytesize,
+                                       action->numIndices * bytesize, idxdata);
 
       SAFE_RELEASE(idxBuf);
 
-      std::vector<uint32_t> indices;
+      rdcarray<uint32_t> indices;
 
       uint16_t *idx16 = (uint16_t *)&idxdata[0];
       uint32_t *idx32 = (uint32_t *)&idxdata[0];
 
       // only read as many indices as were available in the buffer
       uint32_t numIndices =
-          RDCMIN(uint32_t(index16 ? idxdata.size() / 2 : idxdata.size() / 4), drawcall->numIndices);
-
-      uint32_t idxclamp = 0;
-      if(drawcall->baseVertex < 0)
-        idxclamp = uint32_t(-drawcall->baseVertex);
+          RDCMIN(uint32_t(index16 ? idxdata.size() / 2 : idxdata.size() / 4), action->numIndices);
 
       // grab all unique vertex indices referenced
       for(uint32_t i = 0; i < numIndices; i++)
       {
         uint32_t i32 = index16 ? uint32_t(idx16[i]) : idx32[i];
 
-        // apply baseVertex but clamp to 0 (don't allow index to become negative)
-        if(i32 < idxclamp)
-          i32 = 0;
-        else if(drawcall->baseVertex < 0)
-          i32 -= idxclamp;
-        else if(drawcall->baseVertex > 0)
-          i32 += drawcall->baseVertex;
-
         auto it = std::lower_bound(indices.begin(), indices.end(), i32);
 
         if(it != indices.end() && *it == i32)
           continue;
 
-        indices.insert(it, i32);
+        indices.insert(it - indices.begin(), i32);
       }
 
       // if we read out of bounds, we'll also have a 0 index being referenced
       // (as 0 is read). Don't insert 0 if we already have 0 though
-      if(numIndices < drawcall->numIndices && (indices.empty() || indices[0] != 0))
-        indices.insert(indices.begin(), 0);
+      if(numIndices < action->numIndices && (indices.empty() || indices[0] != 0))
+        indices.insert(0, 0);
 
       // An index buffer could be something like: 500, 501, 502, 501, 503, 502
       // in which case we can't use the existing index buffer without filling 499 slots of vertex
@@ -433,28 +485,34 @@ void D3D11Replay::InitPostVSBuffers(uint32_t eventId)
       SAFE_RELEASE(idxBuf);
 
       uint64_t outputSize = stride * uint64_t(indices.size());
-      if(drawcall->flags & DrawFlags::Instanced)
-        outputSize *= drawcall->numInstances;
+      if(action->flags & ActionFlags::Instanced)
+        outputSize *= action->numInstances;
 
       if(m_SOBufferSize < outputSize)
       {
-        uint64_t oldSize = m_SOBufferSize;
-        m_SOBufferSize = CalcMeshOutputSize(m_SOBufferSize, outputSize);
-        RDCWARN("Resizing stream-out buffer from %llu to %llu", oldSize, m_SOBufferSize);
+        const uint64_t oldSize = m_SOBufferSize;
+        const uint64_t newSize = CalcMeshOutputSize(m_SOBufferSize, outputSize);
+        m_SOBufferSize = newSize;
+        RDCWARN("Resizing stream-out buffer from %llu to %llu", oldSize, newSize);
         CreateSOBuffers();
+
         if(!m_SOStagingBuffer)
+        {
+          ret.vsout.status = StringFormat::Fmt(
+              "Vertex output generated %llu bytes of data which ran out of memory", newSize);
           return;
+        }
       }
 
       m_pImmediateContext->SOSetTargets(1, &m_SOBuffer, &offset);
 
       m_pImmediateContext->Begin(m_SOStatsQueries[0]);
 
-      if(drawcall->flags & DrawFlags::Instanced)
-        m_pImmediateContext->DrawIndexedInstanced((UINT)indices.size(), drawcall->numInstances, 0,
-                                                  0, drawcall->instanceOffset);
+      if(action->flags & ActionFlags::Instanced)
+        m_pImmediateContext->DrawIndexedInstanced((UINT)indices.size(), action->numInstances, 0,
+                                                  action->baseVertex, action->instanceOffset);
       else
-        m_pImmediateContext->DrawIndexed((UINT)indices.size(), 0, 0);
+        m_pImmediateContext->DrawIndexed((UINT)indices.size(), 0, action->baseVertex);
 
       m_pImmediateContext->End(m_SOStatsQueries[0]);
 
@@ -467,14 +525,6 @@ void D3D11Replay::InitPostVSBuffers(uint32_t eventId)
         // preserve primitive restart indices
         if(i32 == (index16 ? 0xffff : 0xffffffff))
           continue;
-
-        // apply baseVertex but clamp to 0 (don't allow index to become negative)
-        if(i32 < idxclamp)
-          i32 = 0;
-        else if(drawcall->baseVertex < 0)
-          i32 -= idxclamp;
-        else if(drawcall->baseVertex > 0)
-          i32 += drawcall->baseVertex;
 
         if(index16)
           idx16[i] = uint16_t(indexRemap[i32]);
@@ -510,7 +560,7 @@ void D3D11Replay::InitPostVSBuffers(uint32_t eventId)
 
     if(numPrims.NumPrimitivesWritten == 0)
     {
-      m_PostVSData[eventId] = D3D11PostVSData();
+      ret.vsout.status = "Failed to generate vertex output data on GPU";
       SAFE_RELEASE(idxBuf);
       return;
     }
@@ -521,6 +571,7 @@ void D3D11Replay::InitPostVSBuffers(uint32_t eventId)
     if(FAILED(hr))
     {
       RDCERR("Failed to map sobuffer HRESULT: %s", ToStr(hr).c_str());
+      ret.vsout.status = "Couldn't read back vertex output data from GPU";
       SAFE_RELEASE(idxBuf);
       return;
     }
@@ -546,6 +597,7 @@ void D3D11Replay::InitPostVSBuffers(uint32_t eventId)
     if(FAILED(hr))
     {
       RDCERR("Failed to create postvs pos buffer HRESULT: %s", ToStr(hr).c_str());
+      ret.vsout.status = "Failed to create vertex output cache on GPU";
 
       m_pImmediateContext->Unmap(m_SOStagingBuffer, 0);
       SAFE_RELEASE(idxBuf);
@@ -591,7 +643,10 @@ void D3D11Replay::InitPostVSBuffers(uint32_t eventId)
         float m = (B.y - A.y) / (B.x - A.x);
         float c = B.y - B.x * m;
 
-        if(m == 1.0f)
+        if(m == 1.0f || c == 0.0f)
+          continue;
+
+        if(-c / m <= 0.000001f)
           continue;
 
         nearp = -c / m;
@@ -614,67 +669,74 @@ void D3D11Replay::InitPostVSBuffers(uint32_t eventId)
 
     m_pImmediateContext->Unmap(m_SOStagingBuffer, 0);
 
-    m_PostVSData[eventId].vsin.topo = topo;
-    m_PostVSData[eventId].vsout.buf = vsoutBuffer;
-    m_PostVSData[eventId].vsout.vertStride = stride;
-    m_PostVSData[eventId].vsout.nearPlane = nearp;
-    m_PostVSData[eventId].vsout.farPlane = farp;
+    ret.vsin.topo = topo;
+    ret.vsout.buf = vsoutBuffer;
+    ret.vsout.vertStride = stride;
+    ret.vsout.nearPlane = nearp;
+    ret.vsout.farPlane = farp;
 
-    m_PostVSData[eventId].vsout.useIndices = bool(drawcall->flags & DrawFlags::Indexed);
-    m_PostVSData[eventId].vsout.numVerts = drawcall->numIndices;
+    ret.vsout.useIndices = bool(action->flags & ActionFlags::Indexed);
+    ret.vsout.numVerts = action->numIndices;
 
-    m_PostVSData[eventId].vsout.instStride = 0;
-    if(drawcall->flags & DrawFlags::Instanced)
-      m_PostVSData[eventId].vsout.instStride =
-          bufferDesc.ByteWidth / RDCMAX(1U, drawcall->numInstances);
+    ret.vsout.instStride = 0;
+    if(action->flags & ActionFlags::Instanced)
+      ret.vsout.instStride = bufferDesc.ByteWidth / RDCMAX(1U, action->numInstances);
 
-    m_PostVSData[eventId].vsout.idxBuf = NULL;
-    if(m_PostVSData[eventId].vsout.useIndices && idxBuf)
+    ret.vsout.idxBuf = NULL;
+    if(ret.vsout.useIndices && idxBuf)
     {
-      m_PostVSData[eventId].vsout.idxBuf = idxBuf;
-      m_PostVSData[eventId].vsout.idxFmt = idxFmt;
+      ret.vsout.idxBuf = idxBuf;
+      ret.vsout.idxFmt = idxFmt;
     }
 
-    m_PostVSData[eventId].vsout.hasPosOut = posidx >= 0;
+    ret.vsout.hasPosOut = posidx >= 0;
 
-    m_PostVSData[eventId].vsout.topo = topo;
+    ret.vsout.topo = topo;
   }
   else
   {
     // empty vertex output signature
-    m_PostVSData[eventId].vsin.topo = topo;
-    m_PostVSData[eventId].vsout.buf = NULL;
-    m_PostVSData[eventId].vsout.instStride = 0;
-    m_PostVSData[eventId].vsout.vertStride = 0;
-    m_PostVSData[eventId].vsout.nearPlane = 0.0f;
-    m_PostVSData[eventId].vsout.farPlane = 0.0f;
-    m_PostVSData[eventId].vsout.useIndices = false;
-    m_PostVSData[eventId].vsout.hasPosOut = false;
-    m_PostVSData[eventId].vsout.idxBuf = NULL;
+    ret.vsin.topo = topo;
+    ret.vsout.buf = NULL;
+    ret.vsout.instStride = 0;
+    ret.vsout.vertStride = 0;
+    ret.vsout.nearPlane = 0.0f;
+    ret.vsout.farPlane = 0.0f;
+    ret.vsout.useIndices = false;
+    ret.vsout.hasPosOut = false;
+    ret.vsout.idxBuf = NULL;
 
-    m_PostVSData[eventId].vsout.topo = topo;
+    ret.vsout.topo = topo;
   }
 
-  if(dxbcGS || dxbcDS)
+  if(lastShader)
   {
+    ret.gsout.status.clear();
+
+    const SOShaderData &soshader = m_pDevice->GetSOShaderData(lastShaderId);
+
     stride = 0;
     posidx = -1;
     numPosComponents = 0;
 
-    DXBC::DXBCFile *lastShader = dxbcGS;
-    if(dxbcDS)
-      lastShader = dxbcDS;
-
     sodecls.clear();
-    for(size_t i = 0; i < lastShader->m_OutputSig.size(); i++)
+    for(size_t i = 0; i < lastShader->GetReflection()->OutputSig.size(); i++)
     {
-      SigParameter &sign = lastShader->m_OutputSig[i];
+      const SigParameter &sign = lastShader->GetReflection()->OutputSig[i];
 
       D3D11_SO_DECLARATION_ENTRY decl;
 
-      // for now, skip streams that aren't stream 0
-      if(sign.stream != 0)
-        continue;
+      // skip streams that aren't rasterized, or if none are rasterized skip non-zero
+      if(soshader.rastStream == ~0U)
+      {
+        if(sign.stream != 0)
+          continue;
+      }
+      else
+      {
+        if(sign.stream != soshader.rastStream)
+          continue;
+      }
 
       decl.Stream = 0;
       decl.OutputSlot = 0;
@@ -699,19 +761,21 @@ void D3D11Replay::InitPostVSBuffers(uint32_t eventId)
     if(posidx > 0)
     {
       D3D11_SO_DECLARATION_ENTRY pos = sodecls[posidx];
-      sodecls.erase(sodecls.begin() + posidx);
-      sodecls.insert(sodecls.begin(), pos);
+      sodecls.erase(posidx);
+      sodecls.insert(0, pos);
     }
 
     streamoutGS = NULL;
 
     HRESULT hr = m_pDevice->CreateGeometryShaderWithStreamOutput(
-        (void *)&lastShader->m_ShaderBlob[0], lastShader->m_ShaderBlob.size(), &sodecls[0],
+        (void *)lastShader->GetShaderBlob().data(), lastShader->GetShaderBlob().size(), &sodecls[0],
         (UINT)sodecls.size(), &stride, 1, D3D11_SO_NO_RASTERIZED_STREAM, NULL, &streamoutGS);
 
     if(FAILED(hr))
     {
-      RDCERR("Failed to create Geometry Shader + SO HRESULT: %s", ToStr(hr).c_str());
+      ret.gsout.status =
+          StringFormat::Fmt("Failed to fetch output via streamout, HRESULT: %s", ToStr(hr).c_str());
+      RDCERR("%s", ret.gsout.status.c_str());
       return;
     }
 
@@ -732,38 +796,38 @@ void D3D11Replay::InitPostVSBuffers(uint32_t eventId)
 
       m_pImmediateContext->SOSetTargets(1, &m_SOBuffer, &offset);
 
-      if(drawcall->flags & DrawFlags::Instanced)
+      if(action->flags & ActionFlags::Instanced)
       {
-        if(drawcall->flags & DrawFlags::Indexed)
+        if(action->flags & ActionFlags::Indexed)
         {
-          m_pImmediateContext->DrawIndexedInstanced(drawcall->numIndices, drawcall->numInstances,
-                                                    drawcall->indexOffset, drawcall->baseVertex,
-                                                    drawcall->instanceOffset);
+          m_pImmediateContext->DrawIndexedInstanced(action->numIndices, action->numInstances,
+                                                    action->indexOffset, action->baseVertex,
+                                                    action->instanceOffset);
         }
         else
         {
-          m_pImmediateContext->DrawInstanced(drawcall->numIndices, drawcall->numInstances,
-                                             drawcall->vertexOffset, drawcall->instanceOffset);
+          m_pImmediateContext->DrawInstanced(action->numIndices, action->numInstances,
+                                             action->vertexOffset, action->instanceOffset);
         }
       }
       else
       {
         // trying to stream out a stream-out-auto based drawcall would be bad!
         // instead just draw the number of verts we pre-calculated
-        if(drawcall->flags & DrawFlags::Auto)
+        if(action->flags & ActionFlags::Auto)
         {
-          m_pImmediateContext->Draw(drawcall->numIndices, 0);
+          m_pImmediateContext->Draw(action->numIndices, 0);
         }
         else
         {
-          if(drawcall->flags & DrawFlags::Indexed)
+          if(action->flags & ActionFlags::Indexed)
           {
-            m_pImmediateContext->DrawIndexed(drawcall->numIndices, drawcall->indexOffset,
-                                             drawcall->baseVertex);
+            m_pImmediateContext->DrawIndexed(action->numIndices, action->indexOffset,
+                                             action->baseVertex);
           }
           else
           {
-            m_pImmediateContext->Draw(drawcall->numIndices, drawcall->vertexOffset);
+            m_pImmediateContext->Draw(action->numIndices, action->vertexOffset);
           }
         }
       }
@@ -780,12 +844,20 @@ void D3D11Replay::InitPostVSBuffers(uint32_t eventId)
 
       if(m_SOBufferSize < outputSize)
       {
-        uint64_t oldSize = m_SOBufferSize;
-        m_SOBufferSize = CalcMeshOutputSize(m_SOBufferSize, outputSize);
-        RDCWARN("Resizing stream-out buffer from %llu to %llu", oldSize, m_SOBufferSize);
+        const uint64_t oldSize = m_SOBufferSize;
+        const uint64_t newSize = CalcMeshOutputSize(m_SOBufferSize, outputSize);
+        m_SOBufferSize = newSize;
+        RDCWARN("Resizing stream-out buffer from %llu to %llu", oldSize, newSize);
         CreateSOBuffers();
+
         if(!m_SOStagingBuffer)
+        {
+          ret.gsout.status = StringFormat::Fmt(
+              "Geometry/tessellation output generated %llu bytes of data which ran out of memory",
+              newSize);
           return;
+        }
+
         continue;
       }
 
@@ -793,11 +865,11 @@ void D3D11Replay::InitPostVSBuffers(uint32_t eventId)
     }
 
     // instanced draws must be replayed one at a time so we can record the number of primitives from
-    // each drawcall, as due to expansion this can vary per-instance.
-    if(drawcall->flags & DrawFlags::Instanced && drawcall->numInstances > 1)
+    // each action, as due to expansion this can vary per-instance.
+    if(action->flags & ActionFlags::Instanced && action->numInstances > 1)
     {
       // ensure we have enough queries
-      while(m_SOStatsQueries.size() < drawcall->numInstances)
+      while(m_SOStatsQueries.size() < action->numInstances)
       {
         D3D11_QUERY_DESC qdesc;
         qdesc.MiscFlags = 0;
@@ -815,22 +887,22 @@ void D3D11Replay::InitPostVSBuffers(uint32_t eventId)
       // there's no way to replay only a single instance. We have to replay 1, 2, 3, ... N
       // instances and count the total number of verts each time, then we can see from the
       // difference how much each instance wrote.
-      for(uint32_t inst = 1; inst <= drawcall->numInstances; inst++)
+      for(uint32_t inst = 1; inst <= action->numInstances; inst++)
       {
-        if(drawcall->flags & DrawFlags::Indexed)
+        if(action->flags & ActionFlags::Indexed)
         {
           m_pImmediateContext->SOSetTargets(1, &m_SOBuffer, &offset);
           m_pImmediateContext->Begin(m_SOStatsQueries[inst - 1]);
-          m_pImmediateContext->DrawIndexedInstanced(drawcall->numIndices, inst, drawcall->indexOffset,
-                                                    drawcall->baseVertex, drawcall->instanceOffset);
+          m_pImmediateContext->DrawIndexedInstanced(action->numIndices, inst, action->indexOffset,
+                                                    action->baseVertex, action->instanceOffset);
           m_pImmediateContext->End(m_SOStatsQueries[inst - 1]);
         }
         else
         {
           m_pImmediateContext->SOSetTargets(1, &m_SOBuffer, &offset);
           m_pImmediateContext->Begin(m_SOStatsQueries[inst - 1]);
-          m_pImmediateContext->DrawInstanced(drawcall->numIndices, inst, drawcall->vertexOffset,
-                                             drawcall->instanceOffset);
+          m_pImmediateContext->DrawInstanced(action->numIndices, inst, action->vertexOffset,
+                                             action->instanceOffset);
           m_pImmediateContext->End(m_SOStatsQueries[inst - 1]);
         }
 
@@ -844,13 +916,13 @@ void D3D11Replay::InitPostVSBuffers(uint32_t eventId)
 
     m_pImmediateContext->CopyResource(m_SOStagingBuffer, m_SOBuffer);
 
-    std::vector<D3D11PostVSData::InstData> instData;
+    rdcarray<D3D11PostVSData::InstData> instData;
 
-    if((drawcall->flags & DrawFlags::Instanced) && drawcall->numInstances > 1)
+    if((action->flags & ActionFlags::Instanced) && action->numInstances > 1)
     {
       uint64_t prevVertCount = 0;
 
-      for(uint32_t inst = 0; inst < drawcall->numInstances; inst++)
+      for(uint32_t inst = 0; inst < action->numInstances; inst++)
       {
         do
         {
@@ -879,6 +951,7 @@ void D3D11Replay::InitPostVSBuffers(uint32_t eventId)
 
     if(numPrims.NumPrimitivesWritten == 0)
     {
+      ret.gsout.status = "No detectable output generated by geometry/tessellation shaders";
       return;
     }
 
@@ -888,6 +961,7 @@ void D3D11Replay::InitPostVSBuffers(uint32_t eventId)
     if(FAILED(hr))
     {
       RDCERR("Failed to map sobuffer HRESULT: %s", ToStr(hr).c_str());
+      ret.gsout.status = "Couldn't read back geometry/tessellation output data from GPU";
       return;
     }
 
@@ -896,7 +970,10 @@ void D3D11Replay::InitPostVSBuffers(uint32_t eventId)
     if(bytesWritten > 0xFFFFFFFFULL)
     {
       RDCERR("More than 4GB of data generated, cannot create output buffer large enough.");
-      bytesWritten = 0xFFFFFFFFULL;
+      ret.gsout.status =
+          "More than 4GB of data generated by geometry/tessellation shaders, which caused an out "
+          "of memory error.";
+      return;
     }
 
     D3D11_BUFFER_DESC bufferDesc = {
@@ -905,7 +982,11 @@ void D3D11Replay::InitPostVSBuffers(uint32_t eventId)
 
     if(bytesWritten > m_SOBufferSize)
     {
-      RDCERR("Generated output data too large: %08x", bufferDesc.ByteWidth);
+      RDCERR("Generated output data too large: %08x %08x", bufferDesc.ByteWidth, m_SOBufferSize);
+
+      ret.gsout.status =
+          "More data generated during readback than initial sizing, output is potentially "
+          "non-deterministic";
 
       m_pImmediateContext->Unmap(m_SOStagingBuffer, 0);
       return;
@@ -925,6 +1006,7 @@ void D3D11Replay::InitPostVSBuffers(uint32_t eventId)
     if(FAILED(hr))
     {
       RDCERR("Failed to create postvs pos buffer HRESULT: %s", ToStr(hr).c_str());
+      ret.gsout.status = "Failed to create geometry/tessellation output cache on GPU";
 
       m_pImmediateContext->Unmap(m_SOStagingBuffer, 0);
       return;
@@ -969,7 +1051,10 @@ void D3D11Replay::InitPostVSBuffers(uint32_t eventId)
         float m = (B.y - A.y) / (B.x - A.x);
         float c = B.y - B.x * m;
 
-        if(m == 1.0f)
+        if(m == 1.0f || c == 0.0f)
+          continue;
+
+        if(-c / m <= 0.000001f)
           continue;
 
         nearp = -c / m;
@@ -992,86 +1077,55 @@ void D3D11Replay::InitPostVSBuffers(uint32_t eventId)
 
     m_pImmediateContext->Unmap(m_SOStagingBuffer, 0);
 
-    m_PostVSData[eventId].gsout.buf = gsoutBuffer;
-    m_PostVSData[eventId].gsout.instStride = 0;
-    if(drawcall->flags & DrawFlags::Instanced)
-      m_PostVSData[eventId].gsout.instStride =
-          bufferDesc.ByteWidth / RDCMAX(1U, drawcall->numInstances);
-    m_PostVSData[eventId].gsout.vertStride = stride;
-    m_PostVSData[eventId].gsout.nearPlane = nearp;
-    m_PostVSData[eventId].gsout.farPlane = farp;
-    m_PostVSData[eventId].gsout.useIndices = false;
-    m_PostVSData[eventId].gsout.hasPosOut = posidx >= 0;
-    m_PostVSData[eventId].gsout.idxBuf = NULL;
+    ret.gsout.buf = gsoutBuffer;
+    ret.gsout.instStride = 0;
+    if(action->flags & ActionFlags::Instanced)
+      ret.gsout.instStride = bufferDesc.ByteWidth / RDCMAX(1U, action->numInstances);
+    ret.gsout.vertStride = stride;
+    ret.gsout.nearPlane = nearp;
+    ret.gsout.farPlane = farp;
+    ret.gsout.useIndices = false;
+    ret.gsout.hasPosOut = posidx >= 0;
+    ret.gsout.idxBuf = NULL;
 
-    topo = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+    topo = lastShader->GetOutputTopology();
 
-    if(lastShader == dxbcGS)
-    {
-      for(size_t i = 0; i < dxbcGS->GetNumDeclarations(); i++)
-      {
-        const DXBC::ASMDecl &decl = dxbcGS->GetDeclaration(i);
-
-        if(decl.declaration == DXBC::OPCODE_DCL_GS_OUTPUT_PRIMITIVE_TOPOLOGY)
-        {
-          topo = decl.outTopology;
-          break;
-        }
-      }
-    }
-    else if(lastShader == dxbcDS)
-    {
-      for(size_t i = 0; i < dxbcDS->GetNumDeclarations(); i++)
-      {
-        const DXBC::ASMDecl &decl = dxbcDS->GetDeclaration(i);
-
-        if(decl.declaration == DXBC::OPCODE_DCL_TESS_DOMAIN)
-        {
-          if(decl.domain == DXBC::DOMAIN_ISOLINE)
-            topo = D3D11_PRIMITIVE_TOPOLOGY_LINELIST;
-          else
-            topo = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
-          break;
-        }
-      }
-    }
-
-    m_PostVSData[eventId].gsout.topo = topo;
+    ret.gsout.topo = topo;
 
     // streamout expands strips unfortunately
     if(topo == D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP)
-      m_PostVSData[eventId].gsout.topo = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+      ret.gsout.topo = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
     else if(topo == D3D11_PRIMITIVE_TOPOLOGY_LINESTRIP)
-      m_PostVSData[eventId].gsout.topo = D3D11_PRIMITIVE_TOPOLOGY_LINELIST;
+      ret.gsout.topo = D3D11_PRIMITIVE_TOPOLOGY_LINELIST;
     else if(topo == D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP_ADJ)
-      m_PostVSData[eventId].gsout.topo = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST_ADJ;
+      ret.gsout.topo = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST_ADJ;
     else if(topo == D3D11_PRIMITIVE_TOPOLOGY_LINESTRIP_ADJ)
-      m_PostVSData[eventId].gsout.topo = D3D11_PRIMITIVE_TOPOLOGY_LINELIST_ADJ;
+      ret.gsout.topo = D3D11_PRIMITIVE_TOPOLOGY_LINELIST_ADJ;
 
-    switch(m_PostVSData[eventId].gsout.topo)
+    switch(ret.gsout.topo)
     {
       case D3D11_PRIMITIVE_TOPOLOGY_POINTLIST:
-        m_PostVSData[eventId].gsout.numVerts = (uint32_t)numPrims.NumPrimitivesWritten;
+        ret.gsout.numVerts = (uint32_t)numPrims.NumPrimitivesWritten;
         break;
       case D3D11_PRIMITIVE_TOPOLOGY_LINELIST:
       case D3D11_PRIMITIVE_TOPOLOGY_LINELIST_ADJ:
-        m_PostVSData[eventId].gsout.numVerts = (uint32_t)numPrims.NumPrimitivesWritten * 2;
+        ret.gsout.numVerts = (uint32_t)numPrims.NumPrimitivesWritten * 2;
         break;
       default:
       case D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST:
       case D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST_ADJ:
-        m_PostVSData[eventId].gsout.numVerts = (uint32_t)numPrims.NumPrimitivesWritten * 3;
+        ret.gsout.numVerts = (uint32_t)numPrims.NumPrimitivesWritten * 3;
         break;
     }
 
-    if(drawcall->flags & DrawFlags::Instanced)
-      m_PostVSData[eventId].gsout.numVerts /= RDCMAX(1U, drawcall->numInstances);
+    if(action->flags & ActionFlags::Instanced)
+      ret.gsout.numVerts /= RDCMAX(1U, action->numInstances);
 
-    m_PostVSData[eventId].gsout.instData = instData;
+    ret.gsout.instData = instData;
   }
 }
 
-void D3D11Replay::InitPostVSBuffers(const std::vector<uint32_t> &passEvents)
+void D3D11Replay::InitPostVSBuffers(const rdcarray<uint32_t> &passEvents)
 {
   uint32_t prev = 0;
 
@@ -1086,7 +1140,7 @@ void D3D11Replay::InitPostVSBuffers(const std::vector<uint32_t> &passEvents)
       prev = passEvents[i];
     }
 
-    const DrawcallDescription *d = m_pDevice->GetDrawcall(passEvents[i]);
+    const ActionDescription *d = m_pDevice->GetAction(passEvents[i]);
 
     if(d)
       InitPostVSBuffers(passEvents[i]);

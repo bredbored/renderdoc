@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2017-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -56,9 +56,6 @@ public slots:
 private slots:
   // automatic slots
   void on_enabledCounters_activated(const QModelIndex &index);
-
-  // manual slots
-  void counterTree_contextMenu(const QPoint &pos);
 
 private:
   void SetCounters(const QVector<CounterDescription> &descriptions);

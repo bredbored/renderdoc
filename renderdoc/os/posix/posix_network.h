@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2017-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -28,5 +28,5 @@ namespace Network
 {
 uint32_t GetIPFromTCPSocket(int socket);
 Socket *CreateAbstractServerSocket(uint16_t port, int queuesize);
-Socket *CreateTCPServerSocket(const char *bindaddr, uint16_t port, int queuesize);
+Socket *CreateTCPServerSocket(const rdcstr &bindaddr, uint16_t port, int queuesize);
 }

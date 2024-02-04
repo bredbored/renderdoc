@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2014-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -25,6 +25,10 @@
 #include "dds_readwrite.h"
 #include <stdint.h>
 #include "common/common.h"
+#include "common/formatting.h"
+#include "common/result.h"
+#include "os/os_specific.h"
+#include "serialise/streamio.h"
 
 static const uint32_t dds_fourcc = MAKE_FOURCC('D', 'D', 'S', ' ');
 
@@ -225,6 +229,7 @@ struct DDS_HEADER_DXT10
 #define DDPF_RGB 0x40
 #define DDPF_YUV 0x200
 #define DDPF_LUMINANCE 0x20000
+#define DDPF_BUMPDUDV 0x80000
 #define DDPF_RGBA (DDPF_RGB | DDPF_ALPHAPIXELS)
 
 ResourceFormat DXGIFormat2ResourceFormat(DXGI_FORMAT format)
@@ -246,6 +251,8 @@ ResourceFormat DXGIFormat2ResourceFormat(DXGI_FORMAT format)
   fmt8.compCount = 1;
   fmt8.compType = CompType::UNorm;
   fmt8.type = ResourceFormatType::Regular;
+
+  special.compCount = 4;
 
   switch(format)
   {
@@ -271,16 +278,19 @@ ResourceFormat DXGIFormat2ResourceFormat(DXGI_FORMAT format)
     case DXGI_FORMAT_BC4_SNORM:
       special.type = ResourceFormatType::BC4;
       special.compType = (format == DXGI_FORMAT_BC4_UNORM ? CompType::UNorm : CompType::SNorm);
+      special.compCount = 1;
       return special;
     case DXGI_FORMAT_BC5_UNORM:
     case DXGI_FORMAT_BC5_SNORM:
       special.type = ResourceFormatType::BC5;
       special.compType = (format == DXGI_FORMAT_BC5_UNORM ? CompType::UNorm : CompType::SNorm);
+      special.compCount = 2;
       return special;
     case DXGI_FORMAT_BC6H_UF16:
     case DXGI_FORMAT_BC6H_SF16:
       special.type = ResourceFormatType::BC6;
       special.compType = (format == DXGI_FORMAT_BC6H_UF16 ? CompType::UNorm : CompType::SNorm);
+      special.compCount = 3;
       return special;
     case DXGI_FORMAT_BC7_UNORM:
     case DXGI_FORMAT_BC7_UNORM_SRGB:
@@ -293,25 +303,50 @@ ResourceFormat DXGIFormat2ResourceFormat(DXGI_FORMAT format)
       special.type = ResourceFormatType::R10G10B10A2;
       special.compType = (format == DXGI_FORMAT_R10G10B10A2_UNORM ? CompType::UNorm : CompType::UInt);
       return special;
-    case DXGI_FORMAT_R11G11B10_FLOAT: special.type = ResourceFormatType::R11G11B10; return special;
+    case DXGI_FORMAT_R11G11B10_FLOAT:
+      special.type = ResourceFormatType::R11G11B10;
+      special.compCount = 3;
+      return special;
     case DXGI_FORMAT_B5G6R5_UNORM:
-      fmt8.SetBGRAOrder(true);
+      special.SetBGRAOrder(true);
       special.type = ResourceFormatType::R5G6B5;
+      special.compCount = 3;
       return special;
     case DXGI_FORMAT_B5G5R5A1_UNORM:
-      fmt8.SetBGRAOrder(true);
+      special.SetBGRAOrder(true);
       special.type = ResourceFormatType::R5G5B5A1;
       return special;
     case DXGI_FORMAT_R9G9B9E5_SHAREDEXP:
       special.type = ResourceFormatType::R9G9B9E5;
+      special.compCount = 3;
       return special;
-    case DXGI_FORMAT_A8_UNORM: special.type = ResourceFormatType::A8; return special;
+    case DXGI_FORMAT_A8_UNORM:
+      special.type = ResourceFormatType::A8;
+      special.compType = CompType::UNorm;
+      special.compByteWidth = 1;
+      special.compCount = 1;
+      return special;
     case DXGI_FORMAT_B4G4R4A4_UNORM:
-      fmt8.SetBGRAOrder(true);
+      special.SetBGRAOrder(true);
       special.type = ResourceFormatType::R4G4B4A4;
       return special;
-    case DXGI_FORMAT_D24_UNORM_S8_UINT: special.type = ResourceFormatType::D24S8; return special;
-    case DXGI_FORMAT_D32_FLOAT_S8X24_UINT: special.type = ResourceFormatType::D32S8; return special;
+    case DXGI_FORMAT_D24_UNORM_S8_UINT:
+      special.compType = CompType::Depth;
+      special.type = ResourceFormatType::D24S8;
+      special.compCount = 2;
+      return special;
+    case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+      special.compType = CompType::Depth;
+      special.type = ResourceFormatType::D32S8;
+      special.compCount = 2;
+      return special;
+    case DXGI_FORMAT_YUY2:
+      special.type = ResourceFormatType::YUV8;
+      special.compByteWidth = 1;
+      special.compCount = 3;
+      special.compType = CompType::UNorm;
+      special.SetYUVSubsampling(422);
+      return special;
 
     case DXGI_FORMAT_R32G32B32A32_UINT:
       fmt32.compType = CompType::UInt;
@@ -345,6 +380,7 @@ ResourceFormat DXGIFormat2ResourceFormat(DXGI_FORMAT format)
 
     case DXGI_FORMAT_R32_UINT: fmt32.compType = CompType::UInt; return fmt32;
     case DXGI_FORMAT_R32_SINT: fmt32.compType = CompType::SInt; return fmt32;
+    case DXGI_FORMAT_D32_FLOAT: fmt32.compType = CompType::Depth; return fmt32;
     case DXGI_FORMAT_R32_FLOAT: return fmt32;
 
     case DXGI_FORMAT_R16G16B16A16_UINT:
@@ -383,6 +419,7 @@ ResourceFormat DXGIFormat2ResourceFormat(DXGI_FORMAT format)
       return fmt16;
     case DXGI_FORMAT_R16G16_FLOAT: fmt16.compCount = 2; return fmt16;
 
+    case DXGI_FORMAT_D16_UNORM: fmt16.compType = CompType::Depth; return fmt16;
     case DXGI_FORMAT_R16_UINT: fmt16.compType = CompType::UInt; return fmt16;
     case DXGI_FORMAT_R16_SINT: fmt16.compType = CompType::SInt; return fmt16;
     case DXGI_FORMAT_R16_UNORM: fmt16.compType = CompType::UNorm; return fmt16;
@@ -406,12 +443,16 @@ ResourceFormat DXGIFormat2ResourceFormat(DXGI_FORMAT format)
       fmt8.compCount = 4;
       return fmt8;
     case DXGI_FORMAT_R8G8B8A8_UNORM: fmt8.compCount = 4; return fmt8;
+    case DXGI_FORMAT_B8G8R8X8_UNORM:
+    case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB:
     case DXGI_FORMAT_B8G8R8A8_UNORM:
     case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
       fmt8.compCount = 4;
       fmt8.SetBGRAOrder(true);
       fmt8.compType =
-          (format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB) ? CompType::UNormSRGB : CompType::UNorm;
+          (format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB || format == DXGI_FORMAT_B8G8R8X8_UNORM_SRGB)
+              ? CompType::UNormSRGB
+              : CompType::UNorm;
       return fmt8;
 
     case DXGI_FORMAT_R8G8_UINT:
@@ -452,26 +493,31 @@ DXGI_FORMAT ResourceFormat2DXGIFormat(ResourceFormat format)
       case ResourceFormatType::BC3:
         return format.SRGBCorrected() ? DXGI_FORMAT_BC3_UNORM_SRGB : DXGI_FORMAT_BC3_UNORM;
       case ResourceFormatType::BC4:
-        return format.compType == CompType::UNorm ? DXGI_FORMAT_BC4_UNORM : DXGI_FORMAT_BC4_SNORM;
+        return format.compType == CompType::SNorm ? DXGI_FORMAT_BC4_SNORM : DXGI_FORMAT_BC4_UNORM;
       case ResourceFormatType::BC5:
-        return format.compType == CompType::UNorm ? DXGI_FORMAT_BC5_UNORM : DXGI_FORMAT_BC5_SNORM;
+        return format.compType == CompType::SNorm ? DXGI_FORMAT_BC5_SNORM : DXGI_FORMAT_BC5_UNORM;
       case ResourceFormatType::BC6:
-        return format.compType == CompType::UNorm ? DXGI_FORMAT_BC6H_UF16 : DXGI_FORMAT_BC6H_SF16;
+        return format.compType == CompType::SNorm ? DXGI_FORMAT_BC6H_SF16 : DXGI_FORMAT_BC6H_UF16;
       case ResourceFormatType::BC7:
         return format.SRGBCorrected() ? DXGI_FORMAT_BC7_UNORM_SRGB : DXGI_FORMAT_BC7_UNORM;
       case ResourceFormatType::R10G10B10A2:
-        return format.compType == CompType::UNorm ? DXGI_FORMAT_R10G10B10A2_UNORM
-                                                  : DXGI_FORMAT_R10G10B10A2_UINT;
+        if(format.BGRAOrder())
+          return DXGI_FORMAT_UNKNOWN;
+        return format.compType == CompType::UInt ? DXGI_FORMAT_R10G10B10A2_UINT
+                                                 : DXGI_FORMAT_R10G10B10A2_UNORM;
       case ResourceFormatType::R11G11B10: return DXGI_FORMAT_R11G11B10_FLOAT;
       case ResourceFormatType::R5G6B5:
-        RDCASSERT(format.BGRAOrder());
+        if(!format.BGRAOrder())
+          return DXGI_FORMAT_UNKNOWN;
         return DXGI_FORMAT_B5G6R5_UNORM;
       case ResourceFormatType::R5G5B5A1:
-        RDCASSERT(format.BGRAOrder());
+        if(!format.BGRAOrder())
+          return DXGI_FORMAT_UNKNOWN;
         return DXGI_FORMAT_B5G5R5A1_UNORM;
       case ResourceFormatType::R9G9B9E5: return DXGI_FORMAT_R9G9B9E5_SHAREDEXP;
       case ResourceFormatType::R4G4B4A4:
-        RDCASSERT(format.BGRAOrder());
+        if(!format.BGRAOrder())
+          return DXGI_FORMAT_UNKNOWN;
         return DXGI_FORMAT_B4G4R4A4_UNORM;
       case ResourceFormatType::D24S8: return DXGI_FORMAT_D24_UNORM_S8_UINT;
       case ResourceFormatType::D32S8: return DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
@@ -486,9 +532,7 @@ DXGI_FORMAT ResourceFormat2DXGIFormat(ResourceFormat format)
       case ResourceFormatType::YUV8:
       case ResourceFormatType::YUV10:
       case ResourceFormatType::YUV12:
-      case ResourceFormatType::YUV16:
-        RDCERR("Unsupported writing format %u", format.type);
-        return DXGI_FORMAT_UNKNOWN;
+      case ResourceFormatType::YUV16: return DXGI_FORMAT_UNKNOWN;
     }
   }
 
@@ -540,7 +584,6 @@ DXGI_FORMAT ResourceFormat2DXGIFormat(ResourceFormat format)
           }
       }
     }
-    RDCERR("Unexpected component byte width %u for 4-component type", format.compByteWidth);
     return DXGI_FORMAT_UNKNOWN;
   }
   else if(format.compCount == 3)
@@ -554,7 +597,6 @@ DXGI_FORMAT ResourceFormat2DXGIFormat(ResourceFormat format)
         default: return DXGI_FORMAT_R32G32B32_FLOAT;
       }
     }
-    RDCERR("Unexpected component byte width %u for 3-component type", format.compByteWidth);
     return DXGI_FORMAT_UNKNOWN;
   }
   else if(format.compCount == 2)
@@ -589,7 +631,6 @@ DXGI_FORMAT ResourceFormat2DXGIFormat(ResourceFormat format)
         default: return DXGI_FORMAT_R8G8_UNORM;
       }
     }
-    RDCERR("Unexpected component byte width %u for 2-component type", format.compByteWidth);
     return DXGI_FORMAT_UNKNOWN;
   }
   else if(format.compCount == 1)
@@ -600,6 +641,7 @@ DXGI_FORMAT ResourceFormat2DXGIFormat(ResourceFormat format)
       {
         case CompType::UInt: return DXGI_FORMAT_R32_UINT;
         case CompType::SInt: return DXGI_FORMAT_R32_SINT;
+        case CompType::Depth: return DXGI_FORMAT_D32_FLOAT;
         default: return DXGI_FORMAT_R32_FLOAT;
       }
     }
@@ -607,6 +649,7 @@ DXGI_FORMAT ResourceFormat2DXGIFormat(ResourceFormat format)
     {
       switch(format.compType)
       {
+        case CompType::Depth: return DXGI_FORMAT_D16_UNORM;
         case CompType::UInt: return DXGI_FORMAT_R16_UINT;
         case CompType::SInt: return DXGI_FORMAT_R16_SINT;
         case CompType::UNorm: return DXGI_FORMAT_R16_UNORM;
@@ -624,18 +667,16 @@ DXGI_FORMAT ResourceFormat2DXGIFormat(ResourceFormat format)
         default: return DXGI_FORMAT_R8_UNORM;
       }
     }
-    RDCERR("Unexpected component byte width %u for 1-component type", format.compByteWidth);
     return DXGI_FORMAT_UNKNOWN;
   }
 
-  RDCERR("Unexpected component count %u", format.compCount);
   return DXGI_FORMAT_UNKNOWN;
 }
 
-bool write_dds_to_file(FILE *f, const dds_data &data)
+RDResult write_dds_to_file(FILE *f, const write_dds_data &data)
 {
   if(!f)
-    return false;
+    return RDResult(ResultCode::InvalidParameter, "Missing file handle writing DDS file");
 
   uint32_t magic = dds_fourcc;
   DDS_HEADER header;
@@ -678,8 +719,11 @@ bool write_dds_to_file(FILE *f, const dds_data &data)
       case ResourceFormatType::YUV10:
       case ResourceFormatType::YUV12:
       case ResourceFormatType::YUV16:
-        RDCERR("Unsupported file format, %u", data.format.type);
-        return false;
+      {
+        RETURN_ERROR_RESULT(ResultCode::ImageUnsupported,
+                            "Unsupported file format %s to write to DDS",
+                            ToStr(data.format.type).c_str());
+      }
       default: break;
     }
   }
@@ -707,8 +751,9 @@ bool write_dds_to_file(FILE *f, const dds_data &data)
 
   if(headerDXT10.dxgiFormat == DXGI_FORMAT_UNKNOWN)
   {
-    RDCERR("Couldn't convert resource format to DXGI format");
-    return false;
+    RETURN_ERROR_RESULT(ResultCode::ImageUnsupported,
+                        "Couldn't convert resource format %s to DDS-compatible DXGI format",
+                        data.format.Name().c_str());
   }
 
   if(data.cubemap)
@@ -729,7 +774,8 @@ bool write_dds_to_file(FILE *f, const dds_data &data)
         (data.format.type == ResourceFormatType::BC1 || data.format.type == ResourceFormatType::BC4)
             ? 8
             : 16;
-    header.dwPitchOrLinearSize = RDCMAX(1U, ((header.dwWidth + 3) / 4)) * blockSize;
+    header.dwPitchOrLinearSize =
+        RDCMAX(1U, ((header.dwWidth + 3) / 4)) * blockSize * RDCMAX(1U, data.height / 4);
   }
   else
   {
@@ -751,8 +797,11 @@ bool write_dds_to_file(FILE *f, const dds_data &data)
       case ResourceFormatType::YUV12:
       case ResourceFormatType::YUV16:
       case ResourceFormatType::R4G4:
-        RDCERR("Unsupported file format %u", data.format.type);
-        return false;
+      {
+        RETURN_ERROR_RESULT(ResultCode::ImageUnsupported,
+                            "Unsupported file format %s to write to DDS",
+                            ToStr(data.format.type).c_str());
+      }
       default: bytesPerPixel = data.format.compCount * data.format.compByteWidth;
     }
 
@@ -761,30 +810,63 @@ bool write_dds_to_file(FILE *f, const dds_data &data)
 
   // special case a couple of formats to write out non-DX10 style, for
   // backwards compatibility
-  if(data.format.compByteWidth == 1 && data.format.compCount == 4 &&
-     (data.format.compType == CompType::UNorm || data.format.compType == CompType::UNormSRGB))
+  if(data.format.compByteWidth * data.format.compCount <= 4 &&
+     data.format.type == ResourceFormatType::Regular && data.format.compType == CompType::UNorm)
   {
-    header.ddspf.dwFlags = DDPF_RGBA;
-    header.ddspf.dwRGBBitCount = 32;
-    header.ddspf.dwRBitMask = 0x000000ff;
-    header.ddspf.dwGBitMask = 0x0000ff00;
-    header.ddspf.dwBBitMask = 0x00ff0000;
-    header.ddspf.dwABitMask = 0xff000000;
+    uint32_t bits = data.format.compByteWidth * 8;
 
-    if(data.format.BGRAOrder())
+    header.ddspf.dwFlags = DDPF_RGBA;
+    header.ddspf.dwRGBBitCount = data.format.compCount * bits;
+
+    header.ddspf.dwRBitMask = (1U << bits) - 1;
+    if(data.format.compCount >= 2)
+      header.ddspf.dwGBitMask = header.ddspf.dwRBitMask << bits;
+    if(data.format.compCount >= 3)
+      header.ddspf.dwBBitMask = header.ddspf.dwGBitMask << bits;
+    if(data.format.compCount >= 4)
+      header.ddspf.dwABitMask = header.ddspf.dwBBitMask << bits;
+
+    if(data.format.BGRAOrder() && data.format.compCount >= 3)
       std::swap(header.ddspf.dwRBitMask, header.ddspf.dwBBitMask);
   }
-  else if(data.format.type == ResourceFormatType::BC1)
+  else if(data.format.type == ResourceFormatType::R4G4B4A4)
+  {
+    header.ddspf.dwFlags = DDPF_RGBA;
+    header.ddspf.dwRGBBitCount = 16;
+    header.ddspf.dwRBitMask = 0x0f00;
+    header.ddspf.dwGBitMask = 0x00f0;
+    header.ddspf.dwBBitMask = 0x000f;
+    header.ddspf.dwABitMask = 0xf000;
+  }
+  else if(data.format.type == ResourceFormatType::R5G5B5A1)
+  {
+    header.ddspf.dwFlags = DDPF_RGBA;
+    header.ddspf.dwRGBBitCount = 16;
+    header.ddspf.dwRBitMask = 0x7c00;
+    header.ddspf.dwGBitMask = 0x03e0;
+    header.ddspf.dwBBitMask = 0x001f;
+    header.ddspf.dwABitMask = 0x8000;
+  }
+  else if(data.format.type == ResourceFormatType::R5G6B5)
+  {
+    header.ddspf.dwFlags = DDPF_RGBA;
+    header.ddspf.dwRGBBitCount = 16;
+    header.ddspf.dwRBitMask = 0xf800;
+    header.ddspf.dwGBitMask = 0x07e0;
+    header.ddspf.dwBBitMask = 0x001f;
+    header.ddspf.dwABitMask = 0x0000;
+  }
+  else if(data.format.type == ResourceFormatType::BC1 && data.format.compType == CompType::UNorm)
   {
     header.ddspf.dwFlags = DDPF_FOURCC;
     header.ddspf.dwFourCC = MAKE_FOURCC('D', 'X', 'T', '1');
   }
-  else if(data.format.type == ResourceFormatType::BC2)
+  else if(data.format.type == ResourceFormatType::BC2 && data.format.compType == CompType::UNorm)
   {
     header.ddspf.dwFlags = DDPF_FOURCC;
     header.ddspf.dwFourCC = MAKE_FOURCC('D', 'X', 'T', '3');
   }
-  else if(data.format.type == ResourceFormatType::BC3)
+  else if(data.format.type == ResourceFormatType::BC3 && data.format.compType == CompType::UNorm)
   {
     header.ddspf.dwFlags = DDPF_FOURCC;
     header.ddspf.dwFourCC = MAKE_FOURCC('D', 'X', 'T', '5');
@@ -828,33 +910,33 @@ bool write_dds_to_file(FILE *f, const dds_data &data)
       FileIO::fwrite(&headerDXT10, sizeof(headerDXT10), 1, f);
 
     int i = 0;
-    for(int slice = 0; slice < RDCMAX(1, data.slices); slice++)
+    for(uint32_t slice = 0; slice < RDCMAX(1U, data.slices); slice++)
     {
-      for(int mip = 0; mip < RDCMAX(1, data.mips); mip++)
+      for(uint32_t mip = 0; mip < RDCMAX(1U, data.mips); mip++)
       {
-        int numdepths = RDCMAX(1, data.depth >> mip);
-        for(int d = 0; d < numdepths; d++)
+        uint32_t numdepths = RDCMAX(1U, data.depth >> mip);
+        for(uint32_t d = 0; d < numdepths; d++)
         {
-          byte *bytedata = data.subdata[i];
+          byte *bytedata = data.subresources[i];
 
-          int rowlen = RDCMAX(1, data.width >> mip);
-          int numRows = RDCMAX(1, data.height >> mip);
-          int pitch = RDCMAX(1U, rowlen * bytesPerPixel);
+          uint32_t rowlen = RDCMAX(1U, data.width >> mip);
+          uint32_t numRows = RDCMAX(1U, data.height >> mip);
+          uint32_t pitch = RDCMAX(1U, rowlen * bytesPerPixel);
 
           // pitch/rows are in blocks, not pixels, for block formats.
           if(blockFormat)
           {
-            numRows = RDCMAX(1, numRows / 4);
+            numRows = RDCMAX(1U, (numRows + 3) / 4);
 
-            int blockSize = (data.format.type == ResourceFormatType::BC1 ||
-                             data.format.type == ResourceFormatType::BC4)
-                                ? 8
-                                : 16;
+            uint32_t blockSize = (data.format.type == ResourceFormatType::BC1 ||
+                                  data.format.type == ResourceFormatType::BC4)
+                                     ? 8
+                                     : 16;
 
             pitch = RDCMAX(blockSize, (((rowlen + 3) / 4)) * blockSize);
           }
 
-          for(int row = 0; row < numRows; row++)
+          for(uint32_t row = 0; row < numRows; row++)
           {
             FileIO::fwrite(bytedata, 1, pitch, f);
 
@@ -867,40 +949,34 @@ bool write_dds_to_file(FILE *f, const dds_data &data)
     }
   }
 
-  return true;
+  return RDResult();
 }
 
-bool is_dds_file(FILE *f)
+bool is_dds_file(byte *headerBuffer, size_t size)
 {
-  FileIO::fseek64(f, 0, SEEK_SET);
-
-  uint32_t magic = 0;
-  FileIO::fread(&magic, sizeof(magic), 1, f);
-
-  FileIO::fseek64(f, 0, SEEK_SET);
-
-  return magic == dds_fourcc;
+  if(size < 4)
+  {
+    return false;
+  }
+  return memcmp(headerBuffer, &dds_fourcc, 4) == 0;
 }
 
-dds_data load_dds_from_file(FILE *f)
+RDResult load_dds_from_file(StreamReader *reader, read_dds_data &ret)
 {
-  dds_data ret = {};
-  dds_data error = {};
-
-  FileIO::fseek64(f, 0, SEEK_SET);
+  uint64_t fileSize = reader->GetSize();
 
   uint32_t magic = 0;
-  FileIO::fread(&magic, sizeof(magic), 1, f);
+  reader->Read(magic);
 
   DDS_HEADER header = {};
-  FileIO::fread(&header, sizeof(header), 1, f);
+  reader->Read(header);
 
   bool dx10Header = false;
   DDS_HEADER_DXT10 headerDXT10 = {};
 
-  if(header.ddspf.dwFlags == DDPF_FOURCC && header.ddspf.dwFourCC == MAKE_FOURCC('D', 'X', '1', '0'))
+  if(header.ddspf.dwFlags & DDPF_FOURCC && header.ddspf.dwFourCC == MAKE_FOURCC('D', 'X', '1', '0'))
   {
-    FileIO::fread(&headerDXT10, sizeof(headerDXT10), 1, f);
+    reader->Read(headerDXT10);
     dx10Header = true;
   }
 
@@ -909,6 +985,19 @@ dds_data load_dds_from_file(FILE *f)
   ret.depth = RDCMAX(1U, header.dwDepth);
   ret.slices = dx10Header ? RDCMAX(1U, headerDXT10.arraySize) : 1;
   ret.mips = RDCMAX(1U, header.dwMipMapCount);
+
+  // maximum dimension of textures)
+  if(ret.width > 0x20000 || ret.height > 0x20000)
+    RDCWARN("Possibly invalid DDS dimension: %u x %u", ret.width, ret.height);
+
+  if(ret.depth > 2048)
+    RDCWARN("Possibly invalid DDS 3D depth: %u", ret.depth);
+
+  if(ret.slices > 2048)
+    RDCWARN("Possibly invalid DDS array size: %u", ret.slices);
+
+  if(ret.mips > 18)
+    RDCERR("Invalid DDS mip count: %u", ret.mips);
 
   uint32_t cubeFlags = DDSCAPS2_CUBEMAP | DDSCAPS2_CUBEMAP_ALLFACES;
 
@@ -921,13 +1010,15 @@ dds_data load_dds_from_file(FILE *f)
   if(ret.cubemap)
     ret.slices *= 6;
 
+  bool bgrSwap = false;
+
   if(dx10Header)
   {
     ret.format = DXGIFormat2ResourceFormat(headerDXT10.dxgiFormat);
     if(ret.format.type == ResourceFormatType::Undefined)
     {
-      RDCWARN("Unsupported DXGI_FORMAT: %u", (uint32_t)headerDXT10.dxgiFormat);
-      return error;
+      RETURN_ERROR_RESULT(ResultCode::ImageUnsupported, "Unsupported DXGI_FORMAT %u loaded from DDS",
+                          uint32_t(headerDXT10.dxgiFormat));
     }
   }
   else if(header.ddspf.dwFlags & DDPF_FOURCC)
@@ -937,9 +1028,11 @@ dds_data load_dds_from_file(FILE *f)
       case MAKE_FOURCC('D', 'X', 'T', '1'):
         ret.format = DXGIFormat2ResourceFormat(DXGI_FORMAT_BC1_UNORM);
         break;
+      case MAKE_FOURCC('D', 'X', 'T', '2'):
       case MAKE_FOURCC('D', 'X', 'T', '3'):
         ret.format = DXGIFormat2ResourceFormat(DXGI_FORMAT_BC2_UNORM);
         break;
+      case MAKE_FOURCC('D', 'X', 'T', '4'):
       case MAKE_FOURCC('D', 'X', 'T', '5'):
         ret.format = DXGIFormat2ResourceFormat(DXGI_FORMAT_BC3_UNORM);
         break;
@@ -963,7 +1056,13 @@ dds_data load_dds_from_file(FILE *f)
       case MAKE_FOURCC('G', 'R', 'G', 'B'):
         ret.format = DXGIFormat2ResourceFormat(DXGI_FORMAT_G8R8_G8B8_UNORM);
         break;
+      case MAKE_FOURCC('U', 'Y', 'V', 'Y'): bgrSwap = true; DELIBERATE_FALLTHROUGH();
+      case MAKE_FOURCC('Y', 'U', 'Y', '2'):
+        ret.format = DXGIFormat2ResourceFormat(DXGI_FORMAT_YUY2);
+        break;
+      case 21: ret.format = DXGIFormat2ResourceFormat(DXGI_FORMAT_B8G8R8A8_UNORM); break;
       case 36: ret.format = DXGIFormat2ResourceFormat(DXGI_FORMAT_R16G16B16A16_UNORM); break;
+      case 82: ret.format = DXGIFormat2ResourceFormat(DXGI_FORMAT_D32_FLOAT); break;
       case 110: ret.format = DXGIFormat2ResourceFormat(DXGI_FORMAT_R16G16B16A16_SNORM); break;
       case 111: ret.format = DXGIFormat2ResourceFormat(DXGI_FORMAT_R16_FLOAT); break;
       case 112: ret.format = DXGIFormat2ResourceFormat(DXGI_FORMAT_R16G16_FLOAT); break;
@@ -971,7 +1070,18 @@ dds_data load_dds_from_file(FILE *f)
       case 114: ret.format = DXGIFormat2ResourceFormat(DXGI_FORMAT_R32_FLOAT); break;
       case 115: ret.format = DXGIFormat2ResourceFormat(DXGI_FORMAT_R32G32_FLOAT); break;
       case 116: ret.format = DXGIFormat2ResourceFormat(DXGI_FORMAT_R32G32B32A32_FLOAT); break;
-      default: RDCWARN("Unsupported FourCC: %08x", header.ddspf.dwFourCC); return error;
+      case 117:
+      {
+        RETURN_ERROR_RESULT(ResultCode::ImageUnsupported,
+                            "Legacy CxV8U8 DDS format is unsupported");
+      }
+      default:
+      {
+        RETURN_ERROR_RESULT(
+            ResultCode::ImageUnsupported, "Unsupported DDS FourCC: %c%c%c%c",
+            char((header.ddspf.dwFourCC >> 0) & 0xff), char((header.ddspf.dwFourCC >> 8) & 0xff),
+            char((header.ddspf.dwFourCC >> 16) & 0xff), char((header.ddspf.dwFourCC >> 24) & 0xff));
+      }
     }
   }
   else
@@ -979,20 +1089,75 @@ dds_data load_dds_from_file(FILE *f)
     if(header.ddspf.dwRGBBitCount != 32 && header.ddspf.dwRGBBitCount != 24 &&
        header.ddspf.dwRGBBitCount != 16 && header.ddspf.dwRGBBitCount != 8)
     {
-      RDCWARN("Unsupported RGB bit count: %u", header.ddspf.dwRGBBitCount);
-      return error;
+      RETURN_ERROR_RESULT(ResultCode::ImageUnsupported, "Unsupported RGB bit count %u in DDS file",
+                          header.ddspf.dwRGBBitCount);
     }
 
-    ret.format.compByteWidth = 1;
-    ret.format.compCount = uint8_t(header.ddspf.dwRGBBitCount / 8);
-    ret.format.compType = CompType::UNorm;
-    ret.format.type = ResourceFormatType::Regular;
+    if(header.ddspf.dwABitMask == 0x0000 && header.ddspf.dwRBitMask == 0xf800 &&
+       header.ddspf.dwGBitMask == 0x07e0 && header.ddspf.dwBBitMask == 0x001f)
+    {
+      ret.format = DXGIFormat2ResourceFormat(DXGI_FORMAT_B5G6R5_UNORM);
+    }
+    else if(header.ddspf.dwABitMask == 0x8000 && header.ddspf.dwRBitMask == 0x7c00 &&
+            header.ddspf.dwGBitMask == 0x03e0 && header.ddspf.dwBBitMask == 0x001f)
+    {
+      ret.format = DXGIFormat2ResourceFormat(DXGI_FORMAT_B5G5R5A1_UNORM);
+    }
+    else if(header.ddspf.dwABitMask == 0xf000 && header.ddspf.dwRBitMask == 0x0f00 &&
+            header.ddspf.dwGBitMask == 0x00f0 && header.ddspf.dwBBitMask == 0x000f)
+    {
+      ret.format = DXGIFormat2ResourceFormat(DXGI_FORMAT_B4G4R4A4_UNORM);
+    }
+    else if(header.ddspf.dwABitMask == 0xff && header.ddspf.dwRBitMask == 0x00 &&
+            header.ddspf.dwGBitMask == 0x00 && header.ddspf.dwBBitMask == 0x00)
+    {
+      ret.format = DXGIFormat2ResourceFormat(DXGI_FORMAT_A8_UNORM);
+    }
+    else
+    {
+      const uint32_t bits[] = {
+          Bits::CountOnes(header.ddspf.dwRBitMask),
+          Bits::CountOnes(header.ddspf.dwGBitMask),
+          Bits::CountOnes(header.ddspf.dwBBitMask),
+          Bits::CountOnes(header.ddspf.dwABitMask),
+      };
+      if((bits[1] != 0 && bits[1] != bits[0]) || (bits[2] != 0 && bits[2] != bits[0]) ||
+         (bits[3] != 0 && bits[3] != bits[0]))
+      {
+        RETURN_ERROR_RESULT(ResultCode::ImageUnsupported,
+                            "Unsupported RGBA mask: %08x %08x %08x %08x", header.ddspf.dwRBitMask,
+                            header.ddspf.dwGBitMask, header.ddspf.dwBBitMask,
+                            header.ddspf.dwABitMask);
+      }
 
-    if(header.ddspf.dwBBitMask < header.ddspf.dwRBitMask)
-      ret.format.SetBGRAOrder(true);
+      uint32_t bitWidth = bits[0];
+      for(size_t i = 1; i < 4; i++)
+        if(bits[i] < bits[0] && bits[i] > 0)
+          bitWidth = bits[i];
+
+      if(bitWidth == 0)
+      {
+        RETURN_ERROR_RESULT(ResultCode::ImageUnsupported,
+                            "Unsupported RGBA mask: %08x %08x %08x %08x", header.ddspf.dwRBitMask,
+                            header.ddspf.dwGBitMask, header.ddspf.dwBBitMask,
+                            header.ddspf.dwABitMask);
+      }
+
+      ret.format.compByteWidth = uint8_t(bitWidth / 8);
+      ret.format.compCount = uint8_t(header.ddspf.dwRGBBitCount / bitWidth);
+      ret.format.compType = CompType::UNorm;
+      ret.format.type = ResourceFormatType::Regular;
+
+      if(header.ddspf.dwFlags & DDPF_BUMPDUDV)
+        ret.format.compType = CompType::SNorm;
+
+      if(header.ddspf.dwBBitMask > 0 && header.ddspf.dwBBitMask < header.ddspf.dwRBitMask)
+        ret.format.SetBGRAOrder(true);
+    }
   }
 
   uint32_t bytesPerPixel = 1;
+  uint32_t subsamplePacking = 1;
   switch(ret.format.type)
   {
     case ResourceFormatType::S8:
@@ -1005,14 +1170,24 @@ dds_data load_dds_from_file(FILE *f)
     case ResourceFormatType::R5G5B5A1:
     case ResourceFormatType::R4G4B4A4: bytesPerPixel = 2; break;
     case ResourceFormatType::D32S8: bytesPerPixel = 8; break;
-    case ResourceFormatType::D16S8:
     case ResourceFormatType::YUV8:
+      if(ret.format.YUVPlaneCount() == 1 && ret.format.YUVSubsampling() == 422)
+      {
+        subsamplePacking = 2;
+        bytesPerPixel = 2;
+        break;
+      }
+      DELIBERATE_FALLTHROUGH();
     case ResourceFormatType::YUV10:
     case ResourceFormatType::YUV12:
     case ResourceFormatType::YUV16:
+    case ResourceFormatType::D16S8:
     case ResourceFormatType::R4G4:
-      RDCERR("Unsupported file format %u", ret.format.type);
-      return error;
+    {
+      RETURN_ERROR_RESULT(ResultCode::ImageUnsupported,
+                          "Unsupported file format %s to load from DDS",
+                          ToStr(ret.format.type).c_str());
+    }
     default: bytesPerPixel = ret.format.compCount * ret.format.compByteWidth;
   }
 
@@ -1032,51 +1207,114 @@ dds_data load_dds_from_file(FILE *f)
       case ResourceFormatType::ETC2:
       case ResourceFormatType::EAC:
       case ResourceFormatType::ASTC:
-      case ResourceFormatType::YUV8:
-      case ResourceFormatType::YUV10:
-      case ResourceFormatType::YUV12:
-      case ResourceFormatType::YUV16:
-        RDCERR("Unsupported file format, %u", ret.format.type);
-        return error;
+      {
+        RETURN_ERROR_RESULT(ResultCode::ImageUnsupported,
+                            "Unsupported file format %s to load from DDS",
+                            ToStr(ret.format.type).c_str());
+      }
       default: break;
     }
   }
 
-  ret.subsizes = new uint32_t[ret.slices * ret.mips];
-  ret.subdata = new byte *[ret.slices * ret.mips];
+  // catch any invalid dimensions here, including the total dimension with a very conservative 1/16
+  // byte per pixel
+  if(uint64_t(ret.width) > fileSize || uint64_t(ret.height) > fileSize ||
+     uint64_t(ret.depth) > fileSize || uint64_t(ret.slices) > fileSize ||
+     uint64_t(ret.mips) > fileSize || uint64_t(ret.slices) * ret.mips > fileSize ||
+     (uint64_t(ret.width) * uint64_t(ret.height) * uint64_t(ret.depth) *
+      RDCMAX(uint64_t(ret.slices), uint64_t(RDCMIN(2U, ret.mips)))) /
+             16 >
+         fileSize)
+  {
+    RETURN_ERROR_RESULT(
+        ResultCode::ImageUnsupported,
+        "Invalid dimension (%ux%ux%u) slice count %u or mip count %u loaded from DDS of size %llu",
+        ret.width, ret.height, ret.depth, ret.slices, ret.mips, fileSize);
+  }
+
+  // we reserve space for a full mip-chain (twice the size of the top mip) just to be conservative
+  {
+    uint32_t rowlen = AlignUp(ret.width, subsamplePacking);
+    uint32_t numRows = ret.height;
+    uint32_t pitch = RDCMAX(1U, rowlen * bytesPerPixel);
+
+    // pitch/rows are in blocks, not pixels, for block formats.
+    if(blockFormat)
+    {
+      numRows = RDCMAX(1U, (numRows + 3) / 4);
+
+      uint32_t blockSize =
+          (ret.format.type == ResourceFormatType::BC1 || ret.format.type == ResourceFormatType::BC4)
+              ? 8
+              : 16;
+
+      pitch = RDCMAX(blockSize, (((rowlen + 3) / 4)) * blockSize);
+    }
+
+    ret.buffer.reserve(ret.slices * 2 * ret.depth * numRows * pitch);
+  }
+  ret.subresources.reserve(ret.slices * ret.mips);
 
   int i = 0;
-  for(int slice = 0; slice < ret.slices; slice++)
+  for(uint32_t slice = 0; slice < ret.slices; slice++)
   {
-    for(int mip = 0; mip < ret.mips; mip++)
+    for(uint32_t mip = 0; mip < ret.mips; mip++)
     {
-      int rowlen = RDCMAX(1, ret.width >> mip);
-      int numRows = RDCMAX(1, ret.height >> mip);
-      int numdepths = RDCMAX(1, ret.depth >> mip);
-      int pitch = RDCMAX(1U, rowlen * bytesPerPixel);
+      uint32_t rowlen = RDCMAX(1U, ret.width >> mip);
+      rowlen = AlignUp(rowlen, subsamplePacking);
+      uint32_t numRows = RDCMAX(1U, ret.height >> mip);
+      uint32_t numdepths = RDCMAX(1U, ret.depth >> mip);
+      uint32_t pitch = RDCMAX(1U, rowlen * bytesPerPixel);
 
       // pitch/rows are in blocks, not pixels, for block formats.
       if(blockFormat)
       {
-        numRows = RDCMAX(1, numRows / 4);
+        numRows = RDCMAX(1U, (numRows + 3) / 4);
 
-        int blockSize = (ret.format.type == ResourceFormatType::BC1 ||
-                         ret.format.type == ResourceFormatType::BC4)
-                            ? 8
-                            : 16;
+        uint32_t blockSize = (ret.format.type == ResourceFormatType::BC1 ||
+                              ret.format.type == ResourceFormatType::BC4)
+                                 ? 8
+                                 : 16;
 
         pitch = RDCMAX(blockSize, (((rowlen + 3) / 4)) * blockSize);
       }
 
-      ret.subsizes[i] = numdepths * numRows * pitch;
+      size_t subOffs = ret.buffer.size();
+      size_t subSize = numdepths * numRows * pitch;
 
-      byte *bytedata = ret.subdata[i] = new byte[ret.subsizes[i]];
+      ret.subresources.push_back({subOffs, subSize});
 
-      for(int d = 0; d < numdepths; d++)
+      ret.buffer.resize(ret.buffer.size() + subSize);
+
+      byte *bytedata = ret.buffer.data() + subOffs;
+
+      for(uint32_t d = 0; d < numdepths; d++)
       {
-        for(int row = 0; row < numRows; row++)
+        for(uint32_t row = 0; row < numRows; row++)
         {
-          FileIO::fread(bytedata, 1, pitch, f);
+          reader->Read(bytedata, pitch);
+
+          if(bgrSwap)
+          {
+            byte *rgba = bytedata;
+
+            if(bytesPerPixel >= 3)
+            {
+              for(uint32_t p = 0; p < rowlen; p++)
+              {
+                std::swap(rgba[0], rgba[2]);
+                rgba += bytesPerPixel;
+              }
+            }
+            else
+            {
+              for(uint32_t p = 0; p < rowlen; p++)
+              {
+                std::swap(rgba[0], rgba[1]);
+                rgba += bytesPerPixel;
+              }
+            }
+          }
 
           bytedata += pitch;
         }
@@ -1086,5 +1324,5 @@ dds_data load_dds_from_file(FILE *f)
     }
   }
 
-  return ret;
+  return RDResult();
 }

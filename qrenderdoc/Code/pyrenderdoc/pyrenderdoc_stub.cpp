@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2017-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -61,6 +61,14 @@ extern "C" bool IsThreadBlocking(PyObject *global_handle)
 }
 
 extern "C" void SetThreadBlocking(PyObject *global_handle, bool block)
+{
+}
+
+extern "C" void QueueDecRef(PyObject *obj)
+{
+}
+
+extern "C" void ProcessDecRefQueue()
 {
 }
 

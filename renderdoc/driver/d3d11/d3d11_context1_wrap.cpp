@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  * Copyright (c) 2014 Crytek
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -25,6 +25,7 @@
 
 #include "d3d11_context.h"
 #include "strings/string_utils.h"
+#include "d3d11_debug.h"
 #include "d3d11_renderstate.h"
 #include "d3d11_resources.h"
 #include "d3d11_video.h"
@@ -76,7 +77,7 @@ bool WrappedID3D11DeviceContext::Serialise_UpdateSubresource1(
     SerialiserType &ser, ID3D11Resource *pDstResource, UINT DstSubresource, const D3D11_BOX *pDstBox,
     const void *pSrcData, UINT SrcRowPitch, UINT SrcDepthPitch, UINT CopyFlags)
 {
-  SERIALISE_ELEMENT(pDstResource);
+  SERIALISE_ELEMENT(pDstResource).Important();
   SERIALISE_ELEMENT(DstSubresource);
   SERIALISE_ELEMENT_OPT(pDstBox);
   SERIALISE_ELEMENT(SrcRowPitch);
@@ -90,7 +91,7 @@ bool WrappedID3D11DeviceContext::Serialise_UpdateSubresource1(
 
   if(ser.IsWriting())
   {
-    record = m_pDevice->GetResourceManager()->GetResourceRecord(GetIDForResource(pDstResource));
+    record = m_pDevice->GetResourceManager()->GetResourceRecord(GetIDForDeviceChild(pDstResource));
 
     if(record && record->NumSubResources > (int)DstSubresource)
       record = (D3D11ResourceRecord *)record->SubResources[DstSubresource];
@@ -112,7 +113,10 @@ bool WrappedID3D11DeviceContext::Serialise_UpdateSubresource1(
     {
       RDCASSERT(record);
 
-      if(WrappedID3D11Buffer::IsAlloc(pDstResource))
+      D3D11_RESOURCE_DIMENSION dstDim;
+      pDstResource->GetType(&dstDim);
+
+      if(dstDim == D3D11_RESOURCE_DIMENSION_BUFFER)
       {
         SourceDataLength = (uint32_t)record->Length;
 
@@ -121,13 +125,13 @@ bool WrappedID3D11DeviceContext::Serialise_UpdateSubresource1(
       }
       else
       {
-        WrappedID3D11Texture1D *tex1 = WrappedID3D11Texture1D::IsAlloc(pDstResource)
+        WrappedID3D11Texture1D *tex1 = dstDim == D3D11_RESOURCE_DIMENSION_TEXTURE1D
                                            ? (WrappedID3D11Texture1D *)pDstResource
                                            : NULL;
-        WrappedID3D11Texture2D1 *tex2 = WrappedID3D11Texture2D1::IsAlloc(pDstResource)
+        WrappedID3D11Texture2D1 *tex2 = dstDim == D3D11_RESOURCE_DIMENSION_TEXTURE2D
                                             ? (WrappedID3D11Texture2D1 *)pDstResource
                                             : NULL;
-        WrappedID3D11Texture3D1 *tex3 = WrappedID3D11Texture3D1::IsAlloc(pDstResource)
+        WrappedID3D11Texture3D1 *tex3 = dstDim == D3D11_RESOURCE_DIMENSION_TEXTURE3D
                                             ? (WrappedID3D11Texture3D1 *)pDstResource
                                             : NULL;
 
@@ -184,7 +188,7 @@ bool WrappedID3D11DeviceContext::Serialise_UpdateSubresource1(
       }
     }
 
-    SERIALISE_ELEMENT_ARRAY(pSrcData, SourceDataLength);
+    SERIALISE_ELEMENT_ARRAY(pSrcData, SourceDataLength).Important();
     SERIALISE_ELEMENT(SourceDataLength);
 
     SERIALISE_CHECK_READ_ERRORS();
@@ -198,17 +202,15 @@ bool WrappedID3D11DeviceContext::Serialise_UpdateSubresource1(
         // don't need to apply update subresource workaround here because we never replay on
         // deferred contexts, so the bug doesn't arise (we don't record-in the workaround).
 
-        m_pRealContext->UpdateSubresource(
-            m_pDevice->GetResourceManager()->UnwrapResource(pDstResource), DstSubresource, pDstBox,
-            pSrcData, SrcRowPitch, SrcDepthPitch);
+        m_pRealContext->UpdateSubresource(UnwrapResource(pDstResource), DstSubresource, pDstBox,
+                                          pSrcData, SrcRowPitch, SrcDepthPitch);
       }
       else
       {
         if(m_pRealContext1)
         {
-          m_pRealContext1->UpdateSubresource1(
-              m_pDevice->GetResourceManager()->UnwrapResource(pDstResource), DstSubresource,
-              pDstBox, pSrcData, SrcRowPitch, SrcDepthPitch, CopyFlags);
+          m_pRealContext1->UpdateSubresource1(UnwrapResource(pDstResource), DstSubresource, pDstBox,
+                                              pSrcData, SrcRowPitch, SrcDepthPitch, CopyFlags);
         }
         else if(CopyFlags == 0)
         {
@@ -216,9 +218,8 @@ bool WrappedID3D11DeviceContext::Serialise_UpdateSubresource1(
           // according to the docs. The only case is the deferred context bug workaround
           // isn't needed, but this wasn't properly handled before, and now this ambiguity
           // is resolved by passing ~0U as the flags to indicate a 'real' call to UpdateSubresource
-          m_pRealContext->UpdateSubresource(
-              m_pDevice->GetResourceManager()->UnwrapResource(pDstResource), DstSubresource,
-              pDstBox, pSrcData, SrcRowPitch, SrcDepthPitch);
+          m_pRealContext->UpdateSubresource(UnwrapResource(pDstResource), DstSubresource, pDstBox,
+                                            pSrcData, SrcRowPitch, SrcDepthPitch);
         }
         else
         {
@@ -228,6 +229,12 @@ bool WrappedID3D11DeviceContext::Serialise_UpdateSubresource1(
               MessageSource::UnsupportedConfiguration,
               "Replaying a call to UpdateSubresource1() without D3D11.1 available");
         }
+      }
+
+      if(IsLoading(m_State))
+      {
+        m_ResourceUses[GetIDForDeviceChild(pDstResource)].push_back(
+            EventUsage(m_CurEventID, ResourceUsage::CPUWrite));
       }
     }
   }
@@ -262,13 +269,16 @@ bool WrappedID3D11DeviceContext::Serialise_UpdateSubresource1(
 
     if(IsReplayingAndReading() && pDstResource)
     {
-      WrappedID3D11Texture1D *tex1 = WrappedID3D11Texture1D::IsAlloc(pDstResource)
+      D3D11_RESOURCE_DIMENSION dstDim;
+      pDstResource->GetType(&dstDim);
+
+      WrappedID3D11Texture1D *tex1 = dstDim == D3D11_RESOURCE_DIMENSION_TEXTURE1D
                                          ? (WrappedID3D11Texture1D *)pDstResource
                                          : NULL;
-      WrappedID3D11Texture2D1 *tex2 = WrappedID3D11Texture2D1::IsAlloc(pDstResource)
+      WrappedID3D11Texture2D1 *tex2 = dstDim == D3D11_RESOURCE_DIMENSION_TEXTURE2D
                                           ? (WrappedID3D11Texture2D1 *)pDstResource
                                           : NULL;
-      WrappedID3D11Texture3D1 *tex3 = WrappedID3D11Texture3D1::IsAlloc(pDstResource)
+      WrappedID3D11Texture3D1 *tex3 = dstDim == D3D11_RESOURCE_DIMENSION_TEXTURE3D
                                           ? (WrappedID3D11Texture3D1 *)pDstResource
                                           : NULL;
 
@@ -314,17 +324,15 @@ bool WrappedID3D11DeviceContext::Serialise_UpdateSubresource1(
       // idly to the record's data pointer).
       if(CopyFlags == ~0U)
       {
-        m_pRealContext->UpdateSubresource(
-            m_pDevice->GetResourceManager()->UnwrapResource(pDstResource), DstSubresource, NULL,
-            Contents, SourceRowPitch, SourceDepthPitch);
+        m_pRealContext->UpdateSubresource(UnwrapResource(pDstResource), DstSubresource, NULL,
+                                          Contents, SourceRowPitch, SourceDepthPitch);
       }
       else
       {
         if(m_pRealContext1)
         {
-          m_pRealContext1->UpdateSubresource1(
-              m_pDevice->GetResourceManager()->UnwrapResource(pDstResource), DstSubresource, NULL,
-              Contents, SourceRowPitch, SourceDepthPitch, CopyFlags);
+          m_pRealContext1->UpdateSubresource1(UnwrapResource(pDstResource), DstSubresource, NULL,
+                                              Contents, SourceRowPitch, SourceDepthPitch, CopyFlags);
         }
         else if(CopyFlags == 0)
         {
@@ -332,9 +340,8 @@ bool WrappedID3D11DeviceContext::Serialise_UpdateSubresource1(
           // according to the docs. The only case is the deferred context bug workaround
           // isn't needed, but this wasn't properly handled before, and now this ambiguity
           // is resolved by passing ~0U as the flags to indicate a 'real' call to UpdateSubresource
-          m_pRealContext->UpdateSubresource(
-              m_pDevice->GetResourceManager()->UnwrapResource(pDstResource), DstSubresource, NULL,
-              Contents, SourceRowPitch, SourceDepthPitch);
+          m_pRealContext->UpdateSubresource(UnwrapResource(pDstResource), DstSubresource, NULL,
+                                            Contents, SourceRowPitch, SourceDepthPitch);
         }
         else
         {
@@ -344,6 +351,12 @@ bool WrappedID3D11DeviceContext::Serialise_UpdateSubresource1(
               MessageSource::UnsupportedConfiguration,
               "Replaying a call to UpdateSubresource1() without D3D11.1 available");
         }
+      }
+
+      if(IsLoading(m_State))
+      {
+        m_ResourceUses[GetIDForDeviceChild(pDstResource)].push_back(
+            EventUsage(m_CurEventID, ResourceUsage::CPUWrite));
       }
     }
   }
@@ -365,9 +378,9 @@ void WrappedID3D11DeviceContext::UpdateSubresource1(ID3D11Resource *pDstResource
 
   m_EmptyCommandList = false;
 
-  SERIALISE_TIME_CALL(m_pRealContext1->UpdateSubresource1(
-      m_pDevice->GetResourceManager()->UnwrapResource(pDstResource), DstSubresource, pDstBox,
-      pSrcData, SrcRowPitch, SrcDepthPitch, CopyFlags));
+  SERIALISE_TIME_CALL(m_pRealContext1->UpdateSubresource1(UnwrapResource(pDstResource),
+                                                          DstSubresource, pDstBox, pSrcData,
+                                                          SrcRowPitch, SrcDepthPitch, CopyFlags));
 
   if(IsActiveCapturing(m_State))
   {
@@ -377,16 +390,16 @@ void WrappedID3D11DeviceContext::UpdateSubresource1(ID3D11Resource *pDstResource
     Serialise_UpdateSubresource1(ser, pDstResource, DstSubresource, pDstBox, pSrcData, SrcRowPitch,
                                  SrcDepthPitch, CopyFlags);
 
-    MarkResourceReferenced(GetIDForResource(pDstResource), eFrameRef_PartialWrite);
+    MarkResourceReferenced(GetIDForDeviceChild(pDstResource), eFrameRef_PartialWrite);
 
-    MarkDirtyResource(GetIDForResource(pDstResource));
+    MarkDirtyResource(GetIDForDeviceChild(pDstResource));
 
     m_ContextRecord->AddChunk(scope.Get());
   }
   else
   {
     // just mark dirty
-    MarkDirtyResource(GetIDForResource(pDstResource));
+    MarkDirtyResource(GetIDForDeviceChild(pDstResource));
   }
 }
 
@@ -396,12 +409,12 @@ bool WrappedID3D11DeviceContext::Serialise_CopySubresourceRegion1(
     UINT DstZ, ID3D11Resource *pSrcResource, UINT SrcSubresource, const D3D11_BOX *pSrcBox,
     UINT CopyFlags)
 {
-  SERIALISE_ELEMENT(pDstResource);
+  SERIALISE_ELEMENT(pDstResource).Important();
   SERIALISE_ELEMENT(DstSubresource);
   SERIALISE_ELEMENT(DstX);
   SERIALISE_ELEMENT(DstY);
   SERIALISE_ELEMENT(DstZ);
-  SERIALISE_ELEMENT(pSrcResource);
+  SERIALISE_ELEMENT(pSrcResource).Important();
   SERIALISE_ELEMENT(SrcSubresource);
   SERIALISE_ELEMENT_OPT(pSrcBox);
   SERIALISE_ELEMENT_TYPED(D3D11_COPY_FLAGS, CopyFlags);
@@ -412,16 +425,16 @@ bool WrappedID3D11DeviceContext::Serialise_CopySubresourceRegion1(
   {
     if(m_pRealContext1)
     {
-      m_pRealContext1->CopySubresourceRegion1(
-          GetResourceManager()->UnwrapResource(pDstResource), DstSubresource, DstX, DstY, DstZ,
-          GetResourceManager()->UnwrapResource(pSrcResource), SrcSubresource, pSrcBox, CopyFlags);
+      m_pRealContext1->CopySubresourceRegion1(UnwrapResource(pDstResource), DstSubresource, DstX,
+                                              DstY, DstZ, UnwrapResource(pSrcResource),
+                                              SrcSubresource, pSrcBox, CopyFlags);
     }
     else if(CopyFlags == 0)
     {
       // CopyFlags == 0 just degrades to the old CopySubresourceRegion
-      m_pRealContext->CopySubresourceRegion(
-          GetResourceManager()->UnwrapResource(pDstResource), DstSubresource, DstX, DstY, DstZ,
-          GetResourceManager()->UnwrapResource(pSrcResource), SrcSubresource, pSrcBox);
+      m_pRealContext->CopySubresourceRegion(UnwrapResource(pDstResource), DstSubresource, DstX,
+                                            DstY, DstZ, UnwrapResource(pSrcResource),
+                                            SrcSubresource, pSrcBox);
     }
     else
     {
@@ -430,6 +443,46 @@ bool WrappedID3D11DeviceContext::Serialise_CopySubresourceRegion1(
           MessageCategory::Portability, MessageSeverity::High,
           MessageSource::UnsupportedConfiguration,
           "Replaying a call to CopySubresourceRegion1() without D3D11.1 available");
+    }
+
+    if(IsLoading(m_State))
+    {
+      ResourceId dstLiveID = GetIDForDeviceChild(pDstResource);
+      ResourceId srcLiveID = GetIDForDeviceChild(pSrcResource);
+      ResourceId dstOrigID = GetResourceManager()->GetOriginalID(dstLiveID);
+      ResourceId srcOrigID = GetResourceManager()->GetOriginalID(srcLiveID);
+
+      AddEvent();
+
+      ActionDescription action;
+      action.flags |= ActionFlags::Copy;
+
+      if(pDstResource && pSrcResource)
+      {
+        action.copySource = srcOrigID;
+        action.copySourceSubresource =
+            Subresource(GetMipForSubresource(pSrcResource, SrcSubresource),
+                        GetSliceForSubresource(pSrcResource, SrcSubresource));
+        action.copyDestination = dstOrigID;
+        action.copyDestinationSubresource =
+            Subresource(GetMipForSubresource(pDstResource, DstSubresource),
+                        GetSliceForSubresource(pDstResource, DstSubresource));
+
+        if(m_CurEventID)
+        {
+          if(dstLiveID == srcLiveID)
+          {
+            m_ResourceUses[dstLiveID].push_back(EventUsage(m_CurEventID, ResourceUsage::Copy));
+          }
+          else
+          {
+            m_ResourceUses[dstLiveID].push_back(EventUsage(m_CurEventID, ResourceUsage::CopyDst));
+            m_ResourceUses[srcLiveID].push_back(EventUsage(m_CurEventID, ResourceUsage::CopySrc));
+          }
+        }
+      }
+
+      AddAction(action);
     }
   }
 
@@ -452,8 +505,8 @@ void WrappedID3D11DeviceContext::CopySubresourceRegion1(ID3D11Resource *pDstReso
   m_EmptyCommandList = false;
 
   SERIALISE_TIME_CALL(m_pRealContext1->CopySubresourceRegion1(
-      GetResourceManager()->UnwrapResource(pDstResource), DstSubresource, DstX, DstY, DstZ,
-      GetResourceManager()->UnwrapResource(pSrcResource), SrcSubresource, pSrcBox, CopyFlags));
+      UnwrapResource(pDstResource), DstSubresource, DstX, DstY, DstZ, UnwrapResource(pSrcResource),
+      SrcSubresource, pSrcBox, CopyFlags));
 
   if(IsActiveCapturing(m_State))
   {
@@ -463,7 +516,7 @@ void WrappedID3D11DeviceContext::CopySubresourceRegion1(ID3D11Resource *pDstReso
     Serialise_CopySubresourceRegion1(ser, pDstResource, DstSubresource, DstX, DstY, DstZ,
                                      pSrcResource, SrcSubresource, pSrcBox, CopyFlags);
 
-    MarkDirtyResource(GetIDForResource(pDstResource));
+    MarkDirtyResource(GetIDForDeviceChild(pDstResource));
 
     m_ContextRecord->AddChunk(scope.Get());
   }
@@ -471,10 +524,10 @@ void WrappedID3D11DeviceContext::CopySubresourceRegion1(ID3D11Resource *pDstReso
   {
     // just mark dirty
     D3D11ResourceRecord *record =
-        GetResourceManager()->GetResourceRecord(GetIDForResource(pDstResource));
+        GetResourceManager()->GetResourceRecord(GetIDForDeviceChild(pDstResource));
     RDCASSERT(record);
 
-    MarkDirtyResource(GetIDForResource(pDstResource));
+    MarkDirtyResource(GetIDForDeviceChild(pDstResource));
   }
 }
 
@@ -484,7 +537,7 @@ bool WrappedID3D11DeviceContext::Serialise_ClearView(SerialiserType &ser, ID3D11
                                                      const D3D11_RECT *pRect, UINT NumRects)
 {
   SERIALISE_ELEMENT(pView);
-  SERIALISE_ELEMENT_ARRAY(ColorRGBA, 4);
+  SERIALISE_ELEMENT_ARRAY(ColorRGBA, 4).Important();
   SERIALISE_ELEMENT_ARRAY(pRect, NumRects);
   SERIALISE_ELEMENT(NumRects);
 
@@ -494,32 +547,9 @@ bool WrappedID3D11DeviceContext::Serialise_ClearView(SerialiserType &ser, ID3D11
 
   if(ser.IsReading())
   {
-    ResourceId resid;
-
     if(IsReplayMode(m_State) && pView)
     {
-      ID3D11View *real = NULL;
-
-      if(WrappedID3D11RenderTargetView1::IsAlloc(pView))
-      {
-        real = UNWRAP(WrappedID3D11RenderTargetView1, pView);
-        resid = ((WrappedID3D11RenderTargetView1 *)pView)->GetResourceID();
-      }
-      else if(WrappedID3D11DepthStencilView::IsAlloc(pView))
-      {
-        real = UNWRAP(WrappedID3D11DepthStencilView, pView);
-        resid = ((WrappedID3D11DepthStencilView *)pView)->GetResourceID();
-      }
-      else if(WrappedID3D11ShaderResourceView1::IsAlloc(pView))
-      {
-        real = UNWRAP(WrappedID3D11ShaderResourceView1, pView);
-        resid = ((WrappedID3D11ShaderResourceView1 *)pView)->GetResourceID();
-      }
-      else if(WrappedID3D11UnorderedAccessView1::IsAlloc(pView))
-      {
-        real = UNWRAP(WrappedID3D11UnorderedAccessView1, pView);
-        resid = ((WrappedID3D11UnorderedAccessView1 *)pView)->GetResourceID();
-      }
+      ID3D11View *real = (ID3D11View *)UnwrapResource(pView);
 
       RDCASSERT(real);
 
@@ -531,19 +561,24 @@ bool WrappedID3D11DeviceContext::Serialise_ClearView(SerialiserType &ser, ID3D11
       // add this event
       AddEvent();
 
-      DrawcallDescription draw;
+      ActionDescription action;
 
-      draw.name = StringFormat::Fmt("ClearView(%f, %f, %f, %f, %u rects)", ColorRGBA[0],
-                                    ColorRGBA[1], ColorRGBA[2], ColorRGBA[3], NumRects);
-      draw.flags |= DrawFlags::Clear;
+      action.flags |= ActionFlags::Clear;
+
+      ResourceId resid = GetViewResourceResID(pView);
 
       if(resid != ResourceId())
       {
-        m_ResourceUses[resid].push_back(EventUsage(m_CurEventID, ResourceUsage::Clear, resid));
-        draw.copyDestination = GetResourceManager()->GetOriginalID(resid);
+        m_ResourceUses[resid].push_back(
+            EventUsage(m_CurEventID, ResourceUsage::Clear, GetIDForDeviceChild(pView)));
+        action.copyDestination = GetResourceManager()->GetOriginalID(resid);
+        action.copyDestinationSubresource = Subresource();
+
+        const ResourceRange &range = GetResourceRange(pView);
+        action.copyDestinationSubresource = Subresource(range.GetMinMip(), range.GetMinSlice());
       }
 
-      AddDrawcall(draw, true);
+      AddAction(action);
     }
   }
 
@@ -570,23 +605,7 @@ void WrappedID3D11DeviceContext::ClearView(ID3D11View *pView, const FLOAT Color[
   {
     ID3D11View *real = NULL;
 
-    if(WrappedID3D11RenderTargetView1::IsAlloc(pView))
-    {
-      real = UNWRAP(WrappedID3D11RenderTargetView1, pView);
-    }
-    else if(WrappedID3D11DepthStencilView::IsAlloc(pView))
-    {
-      real = UNWRAP(WrappedID3D11DepthStencilView, pView);
-    }
-    else if(WrappedID3D11ShaderResourceView1::IsAlloc(pView))
-    {
-      real = UNWRAP(WrappedID3D11ShaderResourceView1, pView);
-    }
-    else if(WrappedID3D11UnorderedAccessView1::IsAlloc(pView))
-    {
-      real = UNWRAP(WrappedID3D11UnorderedAccessView1, pView);
-    }
-    else if(WrappedID3D11VideoDecoderOutputView::IsAlloc(pView))
+    if(WrappedID3D11VideoDecoderOutputView::IsAlloc(pView))
     {
       real = UNWRAP(WrappedID3D11VideoDecoderOutputView, pView);
       isVideo = true;
@@ -601,6 +620,10 @@ void WrappedID3D11DeviceContext::ClearView(ID3D11View *pView, const FLOAT Color[
       real = UNWRAP(WrappedID3D11VideoProcessorOutputView, pView);
       isVideo = true;
     }
+    else
+    {
+      real = (ID3D11View *)UnwrapResource(pView);
+    }
 
     RDCASSERT(real);
 
@@ -613,7 +636,7 @@ void WrappedID3D11DeviceContext::ClearView(ID3D11View *pView, const FLOAT Color[
     if(IsActiveCapturing(m_State))
     {
       USE_SCRATCH_SERIALISER();
-      ser.SetDrawChunk();
+      ser.SetActionChunk();
       SCOPED_SERIALISE_CHUNK(D3D11Chunk::ClearView);
       SERIALISE_ELEMENT(m_ResourceID).Named("Context"_lit).TypedAs("ID3D11DeviceContext *"_lit);
       Serialise_ClearView(ser, pView, Color, pRect, NumRects);
@@ -621,8 +644,8 @@ void WrappedID3D11DeviceContext::ClearView(ID3D11View *pView, const FLOAT Color[
       ID3D11Resource *viewRes = NULL;
       pView->GetResource(&viewRes);
 
-      MarkDirtyResource(GetIDForResource(viewRes));
-      MarkResourceReferenced(GetIDForResource(viewRes), eFrameRef_PartialWrite);
+      MarkDirtyResource(GetIDForDeviceChild(viewRes));
+      MarkResourceReferenced(GetIDForDeviceChild(viewRes), eFrameRef_PartialWrite);
 
       SAFE_RELEASE(viewRes);
 
@@ -633,7 +656,7 @@ void WrappedID3D11DeviceContext::ClearView(ID3D11View *pView, const FLOAT Color[
       ID3D11Resource *viewRes = NULL;
       pView->GetResource(&viewRes);
 
-      MarkDirtyResource(GetIDForResource(viewRes));
+      MarkDirtyResource(GetIDForDeviceChild(viewRes));
 
       SAFE_RELEASE(viewRes);
     }
@@ -645,9 +668,9 @@ bool WrappedID3D11DeviceContext::Serialise_VSSetConstantBuffers1(
     SerialiserType &ser, UINT StartSlot, UINT NumBuffers, ID3D11Buffer *const *ppConstantBuffers,
     const UINT *pFirstConstant, const UINT *pNumConstants)
 {
-  SERIALISE_ELEMENT(StartSlot);
+  SERIALISE_ELEMENT(StartSlot).Important();
   SERIALISE_ELEMENT(NumBuffers);
-  SERIALISE_ELEMENT_ARRAY(ppConstantBuffers, NumBuffers);
+  SERIALISE_ELEMENT_ARRAY(ppConstantBuffers, NumBuffers).Important();
   SERIALISE_ELEMENT_ARRAY(pFirstConstant, NumBuffers);
   SERIALISE_ELEMENT_ARRAY(pNumConstants, NumBuffers);
 
@@ -719,7 +742,7 @@ void WrappedID3D11DeviceContext::VSSetConstantBuffers1(UINT StartSlot, UINT NumB
     if(ppConstantBuffers && ppConstantBuffers[i])
     {
       if(IsActiveCapturing(m_State))
-        MarkResourceReferenced(GetIDForResource(ppConstantBuffers[i]), eFrameRef_Read);
+        MarkResourceReferenced(GetIDForDeviceChild(ppConstantBuffers[i]), eFrameRef_Read);
 
       bufs[i] = UNWRAP(WrappedID3D11Buffer, ppConstantBuffers[i]);
     }
@@ -776,9 +799,9 @@ bool WrappedID3D11DeviceContext::Serialise_HSSetConstantBuffers1(
     SerialiserType &ser, UINT StartSlot, UINT NumBuffers, ID3D11Buffer *const *ppConstantBuffers,
     const UINT *pFirstConstant, const UINT *pNumConstants)
 {
-  SERIALISE_ELEMENT(StartSlot);
+  SERIALISE_ELEMENT(StartSlot).Important();
   SERIALISE_ELEMENT(NumBuffers);
-  SERIALISE_ELEMENT_ARRAY(ppConstantBuffers, NumBuffers);
+  SERIALISE_ELEMENT_ARRAY(ppConstantBuffers, NumBuffers).Important();
   SERIALISE_ELEMENT_ARRAY(pFirstConstant, NumBuffers);
   SERIALISE_ELEMENT_ARRAY(pNumConstants, NumBuffers);
 
@@ -850,7 +873,7 @@ void WrappedID3D11DeviceContext::HSSetConstantBuffers1(UINT StartSlot, UINT NumB
     if(ppConstantBuffers && ppConstantBuffers[i])
     {
       if(IsActiveCapturing(m_State))
-        MarkResourceReferenced(GetIDForResource(ppConstantBuffers[i]), eFrameRef_Read);
+        MarkResourceReferenced(GetIDForDeviceChild(ppConstantBuffers[i]), eFrameRef_Read);
 
       bufs[i] = UNWRAP(WrappedID3D11Buffer, ppConstantBuffers[i]);
     }
@@ -907,9 +930,9 @@ bool WrappedID3D11DeviceContext::Serialise_DSSetConstantBuffers1(
     SerialiserType &ser, UINT StartSlot, UINT NumBuffers, ID3D11Buffer *const *ppConstantBuffers,
     const UINT *pFirstConstant, const UINT *pNumConstants)
 {
-  SERIALISE_ELEMENT(StartSlot);
+  SERIALISE_ELEMENT(StartSlot).Important();
   SERIALISE_ELEMENT(NumBuffers);
-  SERIALISE_ELEMENT_ARRAY(ppConstantBuffers, NumBuffers);
+  SERIALISE_ELEMENT_ARRAY(ppConstantBuffers, NumBuffers).Important();
   SERIALISE_ELEMENT_ARRAY(pFirstConstant, NumBuffers);
   SERIALISE_ELEMENT_ARRAY(pNumConstants, NumBuffers);
 
@@ -981,7 +1004,7 @@ void WrappedID3D11DeviceContext::DSSetConstantBuffers1(UINT StartSlot, UINT NumB
     if(ppConstantBuffers && ppConstantBuffers[i])
     {
       if(IsActiveCapturing(m_State))
-        MarkResourceReferenced(GetIDForResource(ppConstantBuffers[i]), eFrameRef_Read);
+        MarkResourceReferenced(GetIDForDeviceChild(ppConstantBuffers[i]), eFrameRef_Read);
 
       bufs[i] = UNWRAP(WrappedID3D11Buffer, ppConstantBuffers[i]);
     }
@@ -1038,9 +1061,9 @@ bool WrappedID3D11DeviceContext::Serialise_GSSetConstantBuffers1(
     SerialiserType &ser, UINT StartSlot, UINT NumBuffers, ID3D11Buffer *const *ppConstantBuffers,
     const UINT *pFirstConstant, const UINT *pNumConstants)
 {
-  SERIALISE_ELEMENT(StartSlot);
+  SERIALISE_ELEMENT(StartSlot).Important();
   SERIALISE_ELEMENT(NumBuffers);
-  SERIALISE_ELEMENT_ARRAY(ppConstantBuffers, NumBuffers);
+  SERIALISE_ELEMENT_ARRAY(ppConstantBuffers, NumBuffers).Important();
   SERIALISE_ELEMENT_ARRAY(pFirstConstant, NumBuffers);
   SERIALISE_ELEMENT_ARRAY(pNumConstants, NumBuffers);
 
@@ -1112,7 +1135,7 @@ void WrappedID3D11DeviceContext::GSSetConstantBuffers1(UINT StartSlot, UINT NumB
     if(ppConstantBuffers && ppConstantBuffers[i])
     {
       if(IsActiveCapturing(m_State))
-        MarkResourceReferenced(GetIDForResource(ppConstantBuffers[i]), eFrameRef_Read);
+        MarkResourceReferenced(GetIDForDeviceChild(ppConstantBuffers[i]), eFrameRef_Read);
 
       bufs[i] = UNWRAP(WrappedID3D11Buffer, ppConstantBuffers[i]);
     }
@@ -1169,9 +1192,9 @@ bool WrappedID3D11DeviceContext::Serialise_PSSetConstantBuffers1(
     SerialiserType &ser, UINT StartSlot, UINT NumBuffers, ID3D11Buffer *const *ppConstantBuffers,
     const UINT *pFirstConstant, const UINT *pNumConstants)
 {
-  SERIALISE_ELEMENT(StartSlot);
+  SERIALISE_ELEMENT(StartSlot).Important();
   SERIALISE_ELEMENT(NumBuffers);
-  SERIALISE_ELEMENT_ARRAY(ppConstantBuffers, NumBuffers);
+  SERIALISE_ELEMENT_ARRAY(ppConstantBuffers, NumBuffers).Important();
   SERIALISE_ELEMENT_ARRAY(pFirstConstant, NumBuffers);
   SERIALISE_ELEMENT_ARRAY(pNumConstants, NumBuffers);
 
@@ -1243,7 +1266,7 @@ void WrappedID3D11DeviceContext::PSSetConstantBuffers1(UINT StartSlot, UINT NumB
     if(ppConstantBuffers && ppConstantBuffers[i])
     {
       if(IsActiveCapturing(m_State))
-        MarkResourceReferenced(GetIDForResource(ppConstantBuffers[i]), eFrameRef_Read);
+        MarkResourceReferenced(GetIDForDeviceChild(ppConstantBuffers[i]), eFrameRef_Read);
 
       bufs[i] = UNWRAP(WrappedID3D11Buffer, ppConstantBuffers[i]);
     }
@@ -1300,9 +1323,9 @@ bool WrappedID3D11DeviceContext::Serialise_CSSetConstantBuffers1(
     SerialiserType &ser, UINT StartSlot, UINT NumBuffers, ID3D11Buffer *const *ppConstantBuffers,
     const UINT *pFirstConstant, const UINT *pNumConstants)
 {
-  SERIALISE_ELEMENT(StartSlot);
+  SERIALISE_ELEMENT(StartSlot).Important();
   SERIALISE_ELEMENT(NumBuffers);
-  SERIALISE_ELEMENT_ARRAY(ppConstantBuffers, NumBuffers);
+  SERIALISE_ELEMENT_ARRAY(ppConstantBuffers, NumBuffers).Important();
   SERIALISE_ELEMENT_ARRAY(pFirstConstant, NumBuffers);
   SERIALISE_ELEMENT_ARRAY(pNumConstants, NumBuffers);
 
@@ -1374,7 +1397,7 @@ void WrappedID3D11DeviceContext::CSSetConstantBuffers1(UINT StartSlot, UINT NumB
     if(ppConstantBuffers && ppConstantBuffers[i])
     {
       if(IsActiveCapturing(m_State))
-        MarkResourceReferenced(GetIDForResource(ppConstantBuffers[i]), eFrameRef_Read);
+        MarkResourceReferenced(GetIDForDeviceChild(ppConstantBuffers[i]), eFrameRef_Read);
 
       bufs[i] = UNWRAP(WrappedID3D11Buffer, ppConstantBuffers[i]);
     }
@@ -1688,7 +1711,7 @@ template <typename SerialiserType>
 bool WrappedID3D11DeviceContext::Serialise_DiscardResource(SerialiserType &ser,
                                                            ID3D11Resource *pResource)
 {
-  SERIALISE_ELEMENT(pResource);
+  SERIALISE_ELEMENT(pResource).Important();
 
   Serialise_DebugMessages(ser);
 
@@ -1696,33 +1719,35 @@ bool WrappedID3D11DeviceContext::Serialise_DiscardResource(SerialiserType &ser,
 
   if(IsReplayingAndReading())
   {
-    if(pResource)
+    if(m_pDevice->GetReplayOptions().optimisation != ReplayOptimisationLevel::Fastest)
     {
-      // don't replay the discard, as it effectively does nothing meaningful but hint
-      // to the driver that the contents can be discarded.
-      // Instead we should overwrite the contents with something (during capture too)
-      // to indicate that the discard has happened visually like a clear.
-      // This also means we don't have to require/diverge if a 11.1 context is not
-      // available on replay.
+      UINT numSubs = GetSubresourceCount(pResource);
+      for(UINT sub = 0; sub < numSubs; sub++)
+        m_pDevice->GetDebugManager()->FillWithDiscardPattern(DiscardType::DiscardCall, pResource,
+                                                             sub, NULL, 0);
+    }
+    else if(m_pRealContext1)
+    {
+      m_pRealContext1->DiscardResource(UnwrapResource(pResource));
     }
 
     if(IsLoading(m_State))
     {
-      ResourceId dstLiveID = GetIDForResource(pResource);
+      ResourceId dstLiveID = GetIDForDeviceChild(pResource);
       ResourceId dstOrigID = GetResourceManager()->GetOriginalID(dstLiveID);
 
       AddEvent();
 
-      DrawcallDescription draw;
+      ActionDescription action;
 
-      draw.name = "DiscardResource()";
-      draw.flags |= DrawFlags::Clear;
-      draw.copyDestination = dstOrigID;
+      action.flags |= ActionFlags::Clear;
+      action.copyDestination = dstOrigID;
+      action.copyDestinationSubresource = Subresource();
 
-      AddDrawcall(draw, true);
+      AddAction(action);
 
       if(pResource)
-        m_ResourceUses[dstLiveID].push_back(EventUsage(m_CurEventID, ResourceUsage::Clear));
+        m_ResourceUses[dstLiveID].push_back(EventUsage(m_CurEventID, ResourceUsage::Discard));
     }
   }
 
@@ -1744,16 +1769,7 @@ void WrappedID3D11DeviceContext::DiscardResource(ID3D11Resource *pResource)
   m_EmptyCommandList = false;
 
   {
-    ID3D11Resource *real = NULL;
-
-    if(WrappedID3D11Buffer::IsAlloc(pResource))
-      real = UNWRAP(WrappedID3D11Buffer, pResource);
-    else if(WrappedID3D11Texture1D::IsAlloc(pResource))
-      real = UNWRAP(WrappedID3D11Texture1D, pResource);
-    else if(WrappedID3D11Texture2D1::IsAlloc(pResource))
-      real = UNWRAP(WrappedID3D11Texture2D1, pResource);
-    else if(WrappedID3D11Texture3D1::IsAlloc(pResource))
-      real = UNWRAP(WrappedID3D11Texture3D1, pResource);
+    ID3D11Resource *real = UnwrapResource(pResource);
 
     RDCASSERT(real);
 
@@ -1763,26 +1779,26 @@ void WrappedID3D11DeviceContext::DiscardResource(ID3D11Resource *pResource)
   if(IsActiveCapturing(m_State))
   {
     USE_SCRATCH_SERIALISER();
-    ser.SetDrawChunk();
+    ser.SetActionChunk();
     SCOPED_SERIALISE_CHUNK(D3D11Chunk::DiscardResource);
     SERIALISE_ELEMENT(m_ResourceID).Named("Context"_lit).TypedAs("ID3D11DeviceContext *"_lit);
     Serialise_DiscardResource(ser, pResource);
 
-    MarkDirtyResource(GetIDForResource(pResource));
-    MarkResourceReferenced(GetIDForResource(pResource), eFrameRef_PartialWrite);
+    MarkDirtyResource(GetIDForDeviceChild(pResource));
+    MarkResourceReferenced(GetIDForDeviceChild(pResource), eFrameRef_PartialWrite);
 
     m_ContextRecord->AddChunk(scope.Get());
   }
   else if(IsCaptureMode(m_State))
   {
-    MarkDirtyResource(GetIDForResource(pResource));
+    MarkDirtyResource(GetIDForDeviceChild(pResource));
   }
 }
 
 template <typename SerialiserType>
 bool WrappedID3D11DeviceContext::Serialise_DiscardView(SerialiserType &ser, ID3D11View *pResourceView)
 {
-  SERIALISE_ELEMENT(pResourceView);
+  SERIALISE_ELEMENT(pResourceView).Important();
 
   Serialise_DebugMessages(ser);
 
@@ -1790,64 +1806,39 @@ bool WrappedID3D11DeviceContext::Serialise_DiscardView(SerialiserType &ser, ID3D
 
   if(IsReplayingAndReading())
   {
-    if(pResourceView)
+    if(m_pDevice->GetReplayOptions().optimisation != ReplayOptimisationLevel::Fastest)
     {
-      // don't replay the discard, as it effectively does nothing meaningful but hint
-      // to the driver that the contents can be discarded.
-      // Instead we should overwrite the contents with something (during capture too)
-      // to indicate that the discard has happened visually like a clear.
-      // This also means we don't have to require/diverge if a 11.1 context is not
-      // available on replay.
+      m_pDevice->GetDebugManager()->FillWithDiscardPattern(DiscardType::DiscardCall, pResourceView,
+                                                           NULL, 0);
+    }
+    else if(m_pRealContext1)
+    {
+      ID3D11View *real = (ID3D11View *)UnwrapResource(pResourceView);
+
+      RDCASSERT(real);
+
+      m_pRealContext1->DiscardView(real);
     }
 
     if(IsLoading(m_State))
     {
       AddEvent();
 
-      DrawcallDescription draw;
+      ActionDescription action;
 
-      draw.name = "DiscardView()";
-
-      draw.flags |= DrawFlags::Clear;
-
+      action.flags |= ActionFlags::Clear;
+      action.copyDestinationSubresource = Subresource();
       if(pResourceView)
       {
-        if(WrappedID3D11RenderTargetView1::IsAlloc(pResourceView))
-        {
-          WrappedID3D11RenderTargetView1 *view = (WrappedID3D11RenderTargetView1 *)pResourceView;
-          m_ResourceUses[view->GetResourceResID()].push_back(
-              EventUsage(m_CurEventID, ResourceUsage::Clear, view->GetResourceID()));
-          draw.copyDestination =
-              m_pDevice->GetResourceManager()->GetOriginalID(view->GetResourceResID());
-        }
-        else if(WrappedID3D11DepthStencilView::IsAlloc(pResourceView))
-        {
-          WrappedID3D11DepthStencilView *view = (WrappedID3D11DepthStencilView *)pResourceView;
-          m_ResourceUses[view->GetResourceResID()].push_back(
-              EventUsage(m_CurEventID, ResourceUsage::Clear, view->GetResourceID()));
-          draw.copyDestination =
-              m_pDevice->GetResourceManager()->GetOriginalID(view->GetResourceResID());
-        }
-        else if(WrappedID3D11ShaderResourceView1::IsAlloc(pResourceView))
-        {
-          WrappedID3D11ShaderResourceView1 *view = (WrappedID3D11ShaderResourceView1 *)pResourceView;
-          m_ResourceUses[view->GetResourceResID()].push_back(
-              EventUsage(m_CurEventID, ResourceUsage::Clear, view->GetResourceID()));
-          draw.copyDestination =
-              m_pDevice->GetResourceManager()->GetOriginalID(view->GetResourceResID());
-        }
-        else if(WrappedID3D11UnorderedAccessView1::IsAlloc(pResourceView))
-        {
-          WrappedID3D11UnorderedAccessView1 *view =
-              (WrappedID3D11UnorderedAccessView1 *)pResourceView;
-          m_ResourceUses[view->GetResourceResID()].push_back(
-              EventUsage(m_CurEventID, ResourceUsage::Clear, view->GetResourceID()));
-          draw.copyDestination =
-              m_pDevice->GetResourceManager()->GetOriginalID(view->GetResourceResID());
-        }
+        const ResourceRange &range = GetResourceRange(pResourceView);
+        ResourceId resid = GetViewResourceResID(pResourceView);
+        action.copyDestination = m_pDevice->GetResourceManager()->GetOriginalID(resid);
+        action.copyDestinationSubresource = Subresource(range.GetMinMip(), range.GetMinSlice());
+        m_ResourceUses[resid].push_back(
+            EventUsage(m_CurEventID, ResourceUsage::Discard, GetIDForDeviceChild(pResourceView)));
       }
 
-      AddDrawcall(draw, true);
+      AddAction(action);
     }
   }
 
@@ -1873,23 +1864,7 @@ void WrappedID3D11DeviceContext::DiscardView(ID3D11View *pResourceView)
   {
     ID3D11View *real = NULL;
 
-    if(WrappedID3D11RenderTargetView1::IsAlloc(pResourceView))
-    {
-      real = UNWRAP(WrappedID3D11RenderTargetView1, pResourceView);
-    }
-    else if(WrappedID3D11DepthStencilView::IsAlloc(pResourceView))
-    {
-      real = UNWRAP(WrappedID3D11DepthStencilView, pResourceView);
-    }
-    else if(WrappedID3D11ShaderResourceView1::IsAlloc(pResourceView))
-    {
-      real = UNWRAP(WrappedID3D11ShaderResourceView1, pResourceView);
-    }
-    else if(WrappedID3D11UnorderedAccessView1::IsAlloc(pResourceView))
-    {
-      real = UNWRAP(WrappedID3D11UnorderedAccessView1, pResourceView);
-    }
-    else if(WrappedID3D11VideoDecoderOutputView::IsAlloc(pResourceView))
+    if(WrappedID3D11VideoDecoderOutputView::IsAlloc(pResourceView))
     {
       real = UNWRAP(WrappedID3D11VideoDecoderOutputView, pResourceView);
       isVideo = true;
@@ -1904,6 +1879,10 @@ void WrappedID3D11DeviceContext::DiscardView(ID3D11View *pResourceView)
       real = UNWRAP(WrappedID3D11VideoProcessorOutputView, pResourceView);
       isVideo = true;
     }
+    else
+    {
+      real = (ID3D11View *)UnwrapResource(pResourceView);
+    }
 
     RDCASSERT(real);
 
@@ -1916,7 +1895,7 @@ void WrappedID3D11DeviceContext::DiscardView(ID3D11View *pResourceView)
     if(IsActiveCapturing(m_State))
     {
       USE_SCRATCH_SERIALISER();
-      ser.SetDrawChunk();
+      ser.SetActionChunk();
       SCOPED_SERIALISE_CHUNK(D3D11Chunk::DiscardView);
       SERIALISE_ELEMENT(m_ResourceID).Named("Context"_lit).TypedAs("ID3D11DeviceContext *"_lit);
       Serialise_DiscardView(ser, pResourceView);
@@ -1924,8 +1903,9 @@ void WrappedID3D11DeviceContext::DiscardView(ID3D11View *pResourceView)
       ID3D11Resource *viewRes = NULL;
       pResourceView->GetResource(&viewRes);
 
-      MarkDirtyResource(GetIDForResource(viewRes));
-      MarkResourceReferenced(GetIDForResource(viewRes), eFrameRef_PartialWrite);
+      MarkDirtyResource(GetIDForDeviceChild(viewRes));
+      MarkResourceReferenced(GetIDForDeviceChild(viewRes), eFrameRef_PartialWrite);
+      MarkResourceReferenced(GetIDForDeviceChild(pResourceView), eFrameRef_Read);
 
       SAFE_RELEASE(viewRes);
 
@@ -1936,7 +1916,7 @@ void WrappedID3D11DeviceContext::DiscardView(ID3D11View *pResourceView)
       ID3D11Resource *viewRes = NULL;
       pResourceView->GetResource(&viewRes);
 
-      MarkDirtyResource(GetIDForResource(viewRes));
+      MarkDirtyResource(GetIDForDeviceChild(viewRes));
 
       SAFE_RELEASE(viewRes);
     }
@@ -1948,7 +1928,7 @@ bool WrappedID3D11DeviceContext::Serialise_DiscardView1(SerialiserType &ser,
                                                         ID3D11View *pResourceView,
                                                         const D3D11_RECT *pRect, UINT NumRects)
 {
-  SERIALISE_ELEMENT(pResourceView);
+  SERIALISE_ELEMENT(pResourceView).Important();
   SERIALISE_ELEMENT_ARRAY(pRect, NumRects);
   SERIALISE_ELEMENT(NumRects);
 
@@ -1960,61 +1940,40 @@ bool WrappedID3D11DeviceContext::Serialise_DiscardView1(SerialiserType &ser,
   {
     if(pResourceView)
     {
-      // don't replay the discard, as it effectively does nothing meaningful but hint
-      // to the driver that the contents can be discarded.
-      // Instead we should overwrite the contents with something (during capture too)
-      // to indicate that the discard has happened visually like a clear.
-      // This also means we don't have to require/diverge if a 11.1 context is not
-      // available on replay.
+      if(m_pDevice->GetReplayOptions().optimisation != ReplayOptimisationLevel::Fastest)
+      {
+        m_pDevice->GetDebugManager()->FillWithDiscardPattern(DiscardType::DiscardCall,
+                                                             pResourceView, pRect, NumRects);
+      }
+      else if(m_pRealContext1)
+      {
+        ID3D11View *real = (ID3D11View *)UnwrapResource(pResourceView);
+
+        RDCASSERT(real);
+
+        m_pRealContext1->DiscardView1(real, pRect, NumRects);
+      }
     }
 
     if(IsLoading(m_State))
     {
       AddEvent();
 
-      DrawcallDescription draw;
+      ActionDescription action;
 
-      draw.name = StringFormat::Fmt("DiscardView1(%u)", NumRects);
-      draw.flags |= DrawFlags::Clear;
+      action.flags |= ActionFlags::Clear;
 
       if(pResourceView)
       {
-        if(WrappedID3D11RenderTargetView1::IsAlloc(pResourceView))
-        {
-          WrappedID3D11RenderTargetView1 *view = (WrappedID3D11RenderTargetView1 *)pResourceView;
-          m_ResourceUses[view->GetResourceResID()].push_back(
-              EventUsage(m_CurEventID, ResourceUsage::Clear, view->GetResourceID()));
-          draw.copyDestination =
-              m_pDevice->GetResourceManager()->GetOriginalID(view->GetResourceResID());
-        }
-        else if(WrappedID3D11DepthStencilView::IsAlloc(pResourceView))
-        {
-          WrappedID3D11DepthStencilView *view = (WrappedID3D11DepthStencilView *)pResourceView;
-          m_ResourceUses[view->GetResourceResID()].push_back(
-              EventUsage(m_CurEventID, ResourceUsage::Clear, view->GetResourceID()));
-          draw.copyDestination =
-              m_pDevice->GetResourceManager()->GetOriginalID(view->GetResourceResID());
-        }
-        else if(WrappedID3D11ShaderResourceView1::IsAlloc(pResourceView))
-        {
-          WrappedID3D11ShaderResourceView1 *view = (WrappedID3D11ShaderResourceView1 *)pResourceView;
-          m_ResourceUses[view->GetResourceResID()].push_back(
-              EventUsage(m_CurEventID, ResourceUsage::Clear, view->GetResourceID()));
-          draw.copyDestination =
-              m_pDevice->GetResourceManager()->GetOriginalID(view->GetResourceResID());
-        }
-        else if(WrappedID3D11UnorderedAccessView1::IsAlloc(pResourceView))
-        {
-          WrappedID3D11UnorderedAccessView1 *view =
-              (WrappedID3D11UnorderedAccessView1 *)pResourceView;
-          m_ResourceUses[view->GetResourceResID()].push_back(
-              EventUsage(m_CurEventID, ResourceUsage::Clear, view->GetResourceID()));
-          draw.copyDestination =
-              m_pDevice->GetResourceManager()->GetOriginalID(view->GetResourceResID());
-        }
+        const ResourceRange &range = GetResourceRange(pResourceView);
+        ResourceId resid = GetViewResourceResID(pResourceView);
+        action.copyDestination = m_pDevice->GetResourceManager()->GetOriginalID(resid);
+        action.copyDestinationSubresource = Subresource(range.GetMinMip(), range.GetMinSlice());
+        m_ResourceUses[resid].push_back(
+            EventUsage(m_CurEventID, ResourceUsage::Discard, GetIDForDeviceChild(pResourceView)));
       }
 
-      AddDrawcall(draw, true);
+      AddAction(action);
     }
   }
 
@@ -2041,23 +2000,7 @@ void WrappedID3D11DeviceContext::DiscardView1(ID3D11View *pResourceView, const D
   {
     ID3D11View *real = NULL;
 
-    if(WrappedID3D11RenderTargetView1::IsAlloc(pResourceView))
-    {
-      real = UNWRAP(WrappedID3D11RenderTargetView1, pResourceView);
-    }
-    else if(WrappedID3D11DepthStencilView::IsAlloc(pResourceView))
-    {
-      real = UNWRAP(WrappedID3D11DepthStencilView, pResourceView);
-    }
-    else if(WrappedID3D11ShaderResourceView1::IsAlloc(pResourceView))
-    {
-      real = UNWRAP(WrappedID3D11ShaderResourceView1, pResourceView);
-    }
-    else if(WrappedID3D11UnorderedAccessView1::IsAlloc(pResourceView))
-    {
-      real = UNWRAP(WrappedID3D11UnorderedAccessView1, pResourceView);
-    }
-    else if(WrappedID3D11VideoDecoderOutputView::IsAlloc(pResourceView))
+    if(WrappedID3D11VideoDecoderOutputView::IsAlloc(pResourceView))
     {
       real = UNWRAP(WrappedID3D11VideoDecoderOutputView, pResourceView);
       isVideo = true;
@@ -2072,6 +2015,10 @@ void WrappedID3D11DeviceContext::DiscardView1(ID3D11View *pResourceView, const D
       real = UNWRAP(WrappedID3D11VideoProcessorOutputView, pResourceView);
       isVideo = true;
     }
+    else
+    {
+      real = (ID3D11View *)UnwrapResource(pResourceView);
+    }
 
     RDCASSERT(real);
 
@@ -2084,7 +2031,7 @@ void WrappedID3D11DeviceContext::DiscardView1(ID3D11View *pResourceView, const D
     if(IsActiveCapturing(m_State))
     {
       USE_SCRATCH_SERIALISER();
-      ser.SetDrawChunk();
+      ser.SetActionChunk();
       SCOPED_SERIALISE_CHUNK(D3D11Chunk::DiscardView1);
       SERIALISE_ELEMENT(m_ResourceID).Named("Context"_lit).TypedAs("ID3D11DeviceContext *"_lit);
       Serialise_DiscardView1(ser, pResourceView, pRects, NumRects);
@@ -2092,8 +2039,9 @@ void WrappedID3D11DeviceContext::DiscardView1(ID3D11View *pResourceView, const D
       ID3D11Resource *viewRes = NULL;
       pResourceView->GetResource(&viewRes);
 
-      MarkDirtyResource(GetIDForResource(viewRes));
-      MarkResourceReferenced(GetIDForResource(viewRes), eFrameRef_PartialWrite);
+      MarkDirtyResource(GetIDForDeviceChild(viewRes));
+      MarkResourceReferenced(GetIDForDeviceChild(viewRes), eFrameRef_PartialWrite);
+      MarkResourceReferenced(GetIDForDeviceChild(pResourceView), eFrameRef_Read);
 
       SAFE_RELEASE(viewRes);
 
@@ -2104,7 +2052,7 @@ void WrappedID3D11DeviceContext::DiscardView1(ID3D11View *pResourceView, const D
       ID3D11Resource *viewRes = NULL;
       pResourceView->GetResource(&viewRes);
 
-      MarkDirtyResource(GetIDForResource(viewRes));
+      MarkDirtyResource(GetIDForDeviceChild(viewRes));
 
       SAFE_RELEASE(viewRes);
     }
@@ -2160,11 +2108,15 @@ void WrappedID3D11DeviceContext::SwapDeviceContextState(ID3DDeviceContextState *
   {
     WrappedID3DDeviceContextState *wrapped = NULL;
 
+    // need to flush pending dead now so we don't find a 'dead' wrapper below
+    m_pDevice->FlushPendingDead();
+
     if(m_pDevice->GetResourceManager()->HasWrapper(prev))
     {
       wrapped = (WrappedID3DDeviceContextState *)m_pDevice->GetResourceManager()->GetWrapper(prev);
 
       wrapped->AddRef();
+      m_pDevice->Resurrect(wrapped);
     }
     else if(prev)
     {
@@ -2210,7 +2162,7 @@ SERIALISED_ID3D11CONTEXT1_FUNCTIONS();
 
 #if ENABLED(ENABLE_UNIT_TESTS)
 
-#include "3rdparty/catch/catch.hpp"
+#include "catch/catch.hpp"
 
 static D3D11_BOX *box(UINT x, UINT w, UINT y = 0, UINT h = 1, UINT z = 0, UINT d = 1)
 {

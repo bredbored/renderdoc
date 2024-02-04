@@ -21,11 +21,11 @@ INCLUDEPATH += $$_PRO_FILE_PWD_/../renderdoc/api/replay
 # Allow includes relative to the root
 INCLUDEPATH += $$_PRO_FILE_PWD_/
 
-# For ToolWindowManager
-INCLUDEPATH += $$_PRO_FILE_PWD_/3rdparty/toolwindowmanager
-# For FlowLayout
-INCLUDEPATH += $$_PRO_FILE_PWD_/3rdparty/flowlayout
-# For Scintilla
+# And relative to 3rdparty
+INCLUDEPATH += $$_PRO_FILE_PWD_/3rdparty
+
+# For Scintilla source builds - we unfortunately are not able to scope these to only
+# those source files
 INCLUDEPATH += $$_PRO_FILE_PWD_/3rdparty/scintilla/include/qt
 INCLUDEPATH += $$_PRO_FILE_PWD_/3rdparty/scintilla/include
 
@@ -34,6 +34,9 @@ DEFINES += QT_NO_CAST_FROM_ASCII QT_NO_CAST_TO_ASCII
 
 # Disable deprecation warnings that are default on in 5.13 and up
 DEFINES += QT_NO_DEPRECATED_WARNINGS
+
+# HA HA good joke, QT_NO_DEPRECATED_WARNINGS only covers SOME warnings, not all
+QMAKE_CXXFLAGS += -Wno-deprecated-declarations
 
 # Different output folders per platform
 win32 {
@@ -125,9 +128,7 @@ win32 {
 
 	# Add the SWIG files that were generated in cmake
 	SOURCES += $$CMAKE_DIR/qrenderdoc/renderdoc_python.cxx
-	SOURCES += $$CMAKE_DIR/qrenderdoc/renderdoc.py.c
 	SOURCES += $$CMAKE_DIR/qrenderdoc/qrenderdoc_python.cxx
-	SOURCES += $$CMAKE_DIR/qrenderdoc/qrenderdoc.py.c
 
 	CONFIG += warn_off
 	CONFIG += c++14
@@ -168,7 +169,8 @@ SOURCES += Code/qrenderdoc.cpp \
     Code/CaptureContext.cpp \
     Code/ScintillaSyntax.cpp \
     Code/QRDUtils.cpp \
-    Code/FormatElement.cpp \
+    Code/MiniQtHelper.cpp \
+    Code/BufferFormatter.cpp \
     Code/Resources.cpp \
     Code/RGPInterop.cpp \
     Code/pyrenderdoc/PythonContext.cpp \
@@ -186,16 +188,21 @@ SOURCES += Code/qrenderdoc.cpp \
     Windows/MainWindow.cpp \
     Windows/EventBrowser.cpp \
     Windows/TextureViewer.cpp \
+    Windows/ShaderViewer.cpp \
+    Windows/ShaderMessageViewer.cpp \
     Widgets/Extended/RDLineEdit.cpp \
     Widgets/Extended/RDTextEdit.cpp \
     Widgets/Extended/RDLabel.cpp \
+    Widgets/Extended/RDMenu.cpp \
     Widgets/Extended/RDHeaderView.cpp \
     Widgets/Extended/RDToolButton.cpp \
     Widgets/Extended/RDDoubleSpinBox.cpp \
     Widgets/Extended/RDListView.cpp \
+    Widgets/ComputeDebugSelector.cpp \
     Widgets/CustomPaintWidget.cpp \
     Widgets/ResourcePreview.cpp \
     Widgets/ThumbnailStrip.cpp \
+    Widgets/ReplayOptionsSelector.cpp \
     Widgets/TextureGoto.cpp \
     Widgets/RangeHistogram.cpp \
     Widgets/CollapseGroupBox.cpp \
@@ -211,7 +218,6 @@ SOURCES += Code/qrenderdoc.cpp \
     Windows/PipelineState/GLPipelineStateViewer.cpp \
     Widgets/Extended/RDTreeView.cpp \
     Widgets/Extended/RDTreeWidget.cpp \
-    Windows/ConstantBufferPreviewer.cpp \
     Widgets/BufferFormatSpecifier.cpp \
     Windows/BufferViewer.cpp \
     Widgets/Extended/RDTableView.cpp \
@@ -222,6 +228,7 @@ SOURCES += Code/qrenderdoc.cpp \
     Windows/TimelineBar.cpp \
     Windows/Dialogs/SettingsDialog.cpp \
     Widgets/OrderedListEditor.cpp \
+    Widgets/MarkerBreadcrumbs.cpp \
     Widgets/Extended/RDTableWidget.cpp \
     Windows/Dialogs/SuggestRemoteDialog.cpp \
     Windows/Dialogs/VirtualFileDialog.cpp \
@@ -233,17 +240,20 @@ SOURCES += Code/qrenderdoc.cpp \
     Widgets/FindReplace.cpp \
     Widgets/Extended/RDSplitter.cpp \
     Windows/Dialogs/TipsDialog.cpp \
+    Windows/Dialogs/ConfigEditor.cpp \
     Windows/PythonShell.cpp \
     Windows/Dialogs/PerformanceCounterSelection.cpp \
     Windows/PerformanceCounterViewer.cpp \
     Windows/ResourceInspector.cpp \
     Windows/Dialogs/AnalyticsConfirmDialog.cpp \
-    Windows/Dialogs/AnalyticsPromptDialog.cpp
+    Windows/Dialogs/AnalyticsPromptDialog.cpp \
+    Windows/Dialogs/AxisMappingDialog.cpp
 HEADERS += Code/CaptureContext.h \
     Code/qprocessinfo.h \
     Code/ReplayManager.h \
     Code/ScintillaSyntax.h \
     Code/QRDUtils.h \
+    Code/MiniQtHelper.h \
     Code/Resources.h \
     Code/RGPInterop.h \
     Code/pyrenderdoc/PythonContext.h \
@@ -263,16 +273,21 @@ HEADERS += Code/CaptureContext.h \
     Windows/MainWindow.h \
     Windows/EventBrowser.h \
     Windows/TextureViewer.h \
+    Windows/ShaderViewer.h \
+    Windows/ShaderMessageViewer.h \
     Widgets/Extended/RDLineEdit.h \
     Widgets/Extended/RDTextEdit.h \
     Widgets/Extended/RDLabel.h \
+    Widgets/Extended/RDMenu.h \
     Widgets/Extended/RDHeaderView.h \
     Widgets/Extended/RDToolButton.h \
     Widgets/Extended/RDDoubleSpinBox.h \
     Widgets/Extended/RDListView.h \
+    Widgets/ComputeDebugSelector.h \
     Widgets/CustomPaintWidget.h \
     Widgets/ResourcePreview.h \
     Widgets/ThumbnailStrip.h \
+    Widgets/ReplayOptionsSelector.h \
     Widgets/TextureGoto.h \
     Widgets/RangeHistogram.h \
     Widgets/CollapseGroupBox.h \
@@ -288,7 +303,6 @@ HEADERS += Code/CaptureContext.h \
     Windows/PipelineState/GLPipelineStateViewer.h \
     Widgets/Extended/RDTreeView.h \
     Widgets/Extended/RDTreeWidget.h \
-    Windows/ConstantBufferPreviewer.h \
     Widgets/BufferFormatSpecifier.h \
     Windows/BufferViewer.h \
     Widgets/Extended/RDTableView.h \
@@ -299,6 +313,7 @@ HEADERS += Code/CaptureContext.h \
     Windows/TimelineBar.h \
     Windows/Dialogs/SettingsDialog.h \
     Widgets/OrderedListEditor.h \
+    Widgets/MarkerBreadcrumbs.h \
     Widgets/Extended/RDTableWidget.h \
     Windows/Dialogs/SuggestRemoteDialog.h \
     Windows/Dialogs/VirtualFileDialog.h \
@@ -310,12 +325,14 @@ HEADERS += Code/CaptureContext.h \
     Widgets/FindReplace.h \
     Widgets/Extended/RDSplitter.h \
     Windows/Dialogs/TipsDialog.h \
+    Windows/Dialogs/ConfigEditor.h \
     Windows/PythonShell.h \
     Windows/Dialogs/PerformanceCounterSelection.h \
     Windows/PerformanceCounterViewer.h \
     Windows/ResourceInspector.h \
     Windows/Dialogs/AnalyticsConfirmDialog.h \
-    Windows/Dialogs/AnalyticsPromptDialog.h
+    Windows/Dialogs/AnalyticsPromptDialog.h \
+    Windows/Dialogs/AxisMappingDialog.h
 FORMS    += Windows/Dialogs/AboutDialog.ui \
     Windows/Dialogs/CrashDialog.ui \
     Windows/Dialogs/UpdateDialog.ui \
@@ -324,6 +341,7 @@ FORMS    += Windows/Dialogs/AboutDialog.ui \
     Windows/TextureViewer.ui \
     Widgets/ResourcePreview.ui \
     Widgets/ThumbnailStrip.ui \
+    Widgets/ReplayOptionsSelector.ui \
     Windows/Dialogs/TextureSaveDialog.ui \
     Windows/Dialogs/CaptureDialog.ui \
     Windows/Dialogs/LiveCapture.ui \
@@ -333,10 +351,11 @@ FORMS    += Windows/Dialogs/AboutDialog.ui \
     Windows/PipelineState/D3D11PipelineStateViewer.ui \
     Windows/PipelineState/D3D12PipelineStateViewer.ui \
     Windows/PipelineState/GLPipelineStateViewer.ui \
-    Windows/ConstantBufferPreviewer.ui \
     Widgets/BufferFormatSpecifier.ui \
+    Widgets/ComputeDebugSelector.ui \
     Windows/BufferViewer.ui \
     Windows/ShaderViewer.ui \
+    Windows/ShaderMessageViewer.ui \
     Windows/DebugMessageView.ui \
     Windows/LogView.ui \
     Windows/CommentView.ui \
@@ -350,12 +369,14 @@ FORMS    += Windows/Dialogs/AboutDialog.ui \
     Windows/Dialogs/EnvironmentEditor.ui \
     Widgets/FindReplace.ui \
     Windows/Dialogs/TipsDialog.ui \
+    Windows/Dialogs/ConfigEditor.ui \
     Windows/PythonShell.ui \
     Windows/Dialogs/PerformanceCounterSelection.ui \
     Windows/PerformanceCounterViewer.ui \
     Windows/ResourceInspector.ui \
     Windows/Dialogs/AnalyticsConfirmDialog.ui \
-    Windows/Dialogs/AnalyticsPromptDialog.ui
+    Windows/Dialogs/AnalyticsPromptDialog.ui \
+    Windows/Dialogs/AxisMappingDialog.ui
 
 RESOURCES += Resources/resources.qrc
 
@@ -389,12 +410,10 @@ SOURCES += $$_PRO_FILE_PWD_/3rdparty/scintilla/lexlib/*.cxx \
     $$_PRO_FILE_PWD_/3rdparty/scintilla/lexers/*.cxx \
     $$_PRO_FILE_PWD_/3rdparty/scintilla/src/*.cxx \
     $$_PRO_FILE_PWD_/3rdparty/scintilla/qt/ScintillaEdit/*.cpp \
-    $$_PRO_FILE_PWD_/3rdparty/scintilla/qt/ScintillaEditBase/*.cpp \
-    Windows/ShaderViewer.cpp
+    $$_PRO_FILE_PWD_/3rdparty/scintilla/qt/ScintillaEditBase/*.cpp
 
 HEADERS += $$_PRO_FILE_PWD_/3rdparty/scintilla/lexlib/*.h \
     $$_PRO_FILE_PWD_/3rdparty/scintilla/src/*.h \
     $$_PRO_FILE_PWD_/3rdparty/scintilla/qt/ScintillaEdit/*.h \
-    $$_PRO_FILE_PWD_/3rdparty/scintilla/qt/ScintillaEditBase/*.h \
-    Windows/ShaderViewer.h
+    $$_PRO_FILE_PWD_/3rdparty/scintilla/qt/ScintillaEditBase/*.h
 

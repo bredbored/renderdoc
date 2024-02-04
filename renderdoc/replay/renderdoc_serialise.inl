@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2017-2019 Baldur Karlsson
+ * Copyright (c) 2017-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -54,15 +54,6 @@ class undersized
 #endif
 
 template <class SerialiserType>
-void DoSerialise(SerialiserType &ser, ExecuteResult &el)
-{
-  SERIALISE_MEMBER(status);
-  SERIALISE_MEMBER(ident);
-
-  SIZE_CHECK(8);
-}
-
-template <class SerialiserType>
 void DoSerialise(SerialiserType &ser, PathEntry &el)
 {
   SERIALISE_MEMBER(filename);
@@ -104,15 +95,16 @@ void DoSerialise(SerialiserType &ser, CaptureOptions &el)
   SERIALISE_MEMBER(allowFullscreen);
   SERIALISE_MEMBER(apiValidation);
   SERIALISE_MEMBER(captureCallstacks);
-  SERIALISE_MEMBER(captureCallstacksOnlyDraws);
+  SERIALISE_MEMBER(captureCallstacksOnlyActions);
   SERIALISE_MEMBER(delayForDebugger);
   SERIALISE_MEMBER(verifyBufferAccess);
   SERIALISE_MEMBER(hookIntoChildren);
   SERIALISE_MEMBER(refAllResources);
   SERIALISE_MEMBER(captureAllCmdLists);
   SERIALISE_MEMBER(debugOutputMute);
+  SERIALISE_MEMBER(softMemoryLimit);
 
-  SIZE_CHECK(20);
+  SIZE_CHECK(24);
 }
 
 template <typename SerialiserType>
@@ -159,39 +151,32 @@ void DoSerialise(SerialiserType &ser, SigParameter &el)
   SERIALISE_MEMBER(semanticIndex);
   SERIALISE_MEMBER(regIndex);
   SERIALISE_MEMBER(systemValue);
-  SERIALISE_MEMBER(compType);
+  SERIALISE_MEMBER(varType);
   SERIALISE_MEMBER(regChannelMask);
   SERIALISE_MEMBER(channelUsedMask);
   SERIALISE_MEMBER(needSemanticIndex);
   SERIALISE_MEMBER(compCount);
   SERIALISE_MEMBER(stream);
-  SERIALISE_MEMBER(arrayIndex);
+  SERIALISE_MEMBER(perPrimitiveRate);
 
-  SIZE_CHECK(104);
+  SIZE_CHECK(96);
 }
 
 template <typename SerialiserType>
-void DoSerialise(SerialiserType &ser, ShaderVariableDescriptor &el)
+void DoSerialise(SerialiserType &ser, ShaderConstantType &el)
 {
-  SERIALISE_MEMBER(type);
+  SERIALISE_MEMBER(baseType);
   SERIALISE_MEMBER(rows);
   SERIALISE_MEMBER(columns);
   SERIALISE_MEMBER(matrixByteStride);
-  SERIALISE_MEMBER(rowMajorStorage);
   SERIALISE_MEMBER(elements);
   SERIALISE_MEMBER(arrayByteStride);
   SERIALISE_MEMBER(name);
-
-  SIZE_CHECK(40);
-}
-
-template <typename SerialiserType>
-void DoSerialise(SerialiserType &ser, ShaderVariableType &el)
-{
-  SERIALISE_MEMBER(descriptor);
+  SERIALISE_MEMBER(flags);
+  SERIALISE_MEMBER(pointerTypeID);
   SERIALISE_MEMBER(members);
 
-  SIZE_CHECK(64);
+  SIZE_CHECK(72);
 }
 
 template <typename SerialiserType>
@@ -199,10 +184,12 @@ void DoSerialise(SerialiserType &ser, ShaderConstant &el)
 {
   SERIALISE_MEMBER(name);
   SERIALISE_MEMBER(byteOffset);
+  SERIALISE_MEMBER(bitFieldOffset);
+  SERIALISE_MEMBER(bitFieldSize);
   SERIALISE_MEMBER(defaultValue);
   SERIALISE_MEMBER(type);
 
-  SIZE_CHECK(104);
+  SIZE_CHECK(112);
 }
 
 template <typename SerialiserType>
@@ -213,6 +200,7 @@ void DoSerialise(SerialiserType &ser, ConstantBlock &el)
   SERIALISE_MEMBER(bindPoint);
   SERIALISE_MEMBER(byteSize);
   SERIALISE_MEMBER(bufferBacked);
+  SERIALISE_MEMBER(compileConstants);
 
   SIZE_CHECK(64);
 }
@@ -236,7 +224,7 @@ void DoSerialise(SerialiserType &ser, ShaderResource &el)
   SERIALISE_MEMBER(isTexture);
   SERIALISE_MEMBER(isReadOnly);
 
-  SIZE_CHECK(104);
+  SIZE_CHECK(112);
 }
 
 template <typename SerialiserType>
@@ -279,9 +267,15 @@ void DoSerialise(SerialiserType &ser, ShaderDebugInfo &el)
 {
   SERIALISE_MEMBER(compileFlags);
   SERIALISE_MEMBER(files);
+  SERIALISE_MEMBER(entryLocation);
+  SERIALISE_MEMBER(editBaseFile);
   SERIALISE_MEMBER(encoding);
+  SERIALISE_MEMBER(compiler);
+  SERIALISE_MEMBER(debuggable);
+  SERIALISE_MEMBER(sourceDebugInformation);
+  SERIALISE_MEMBER(debugStatus);
 
-  SIZE_CHECK(56);
+  SIZE_CHECK(112);
 }
 
 template <typename SerialiserType>
@@ -297,6 +291,7 @@ void DoSerialise(SerialiserType &ser, ShaderReflection &el)
   SERIALISE_MEMBER(encoding);
   SERIALISE_MEMBER(rawBytes);
 
+  SERIALISE_MEMBER(outputTopology);
   SERIALISE_MEMBER(dispatchThreadsDimension);
 
   SERIALISE_MEMBER(inputSignature);
@@ -311,7 +306,11 @@ void DoSerialise(SerialiserType &ser, ShaderReflection &el)
 
   SERIALISE_MEMBER(interfaces);
 
-  SIZE_CHECK(312);
+  SERIALISE_MEMBER(pointerTypes);
+
+  SERIALISE_MEMBER(taskPayload);
+
+  SIZE_CHECK(456);
 }
 
 template <typename SerialiserType>
@@ -322,78 +321,104 @@ void DoSerialise(SerialiserType &ser, ShaderVariable &el)
   SERIALISE_MEMBER(name);
   SERIALISE_MEMBER(type);
 
-  SERIALISE_MEMBER(displayAsHex);
-  SERIALISE_MEMBER(isStruct);
-  SERIALISE_MEMBER(rowMajor);
+  SERIALISE_MEMBER(flags);
 
   SERIALISE_MEMBER(value.u64v);
 
   SERIALISE_MEMBER(members);
 
-  SIZE_CHECK(200);
+  SIZE_CHECK(184);
 }
 
 template <typename SerialiserType>
-void DoSerialise(SerialiserType &ser, RegisterRange &el)
+void DoSerialise(SerialiserType &ser, DebugVariableReference &el)
 {
+  SERIALISE_MEMBER(name);
   SERIALISE_MEMBER(type);
-  SERIALISE_MEMBER(index);
   SERIALISE_MEMBER(component);
 
-  SIZE_CHECK(8);
+  SIZE_CHECK(32);
 }
 
 template <typename SerialiserType>
-void DoSerialise(SerialiserType &ser, LocalVariableMapping &el)
+void DoSerialise(SerialiserType &ser, SourceVariableMapping &el)
 {
-  SERIALISE_MEMBER(localName);
+  SERIALISE_MEMBER(name);
   SERIALISE_MEMBER(type);
   SERIALISE_MEMBER(rows);
   SERIALISE_MEMBER(columns);
-  SERIALISE_MEMBER(elements);
-  SERIALISE_MEMBER(regCount);
-  SERIALISE_MEMBER(registers);
+  SERIALISE_MEMBER(offset);
+  SERIALISE_MEMBER(signatureIndex);
+  SERIALISE_MEMBER(variables);
 
-  SIZE_CHECK(176);
+  SIZE_CHECK(72);
 }
 
 template <typename SerialiserType>
 void DoSerialise(SerialiserType &ser, LineColumnInfo &el)
 {
+  SERIALISE_MEMBER(disassemblyLine);
   SERIALISE_MEMBER(fileIndex);
   SERIALISE_MEMBER(lineStart);
   SERIALISE_MEMBER(lineEnd);
   SERIALISE_MEMBER(colStart);
   SERIALISE_MEMBER(colEnd);
-  SERIALISE_MEMBER(callstack);
 
-  SIZE_CHECK(48);
+  SIZE_CHECK(24);
+}
+
+template <typename SerialiserType>
+void DoSerialise(SerialiserType &ser, InstructionSourceInfo &el)
+{
+  SERIALISE_MEMBER(instruction);
+  SERIALISE_MEMBER(lineInfo);
+  SERIALISE_MEMBER(sourceVars);
+
+  SIZE_CHECK(56);
+}
+
+template <typename SerialiserType>
+void DoSerialise(SerialiserType &ser, ShaderVariableChange &el)
+{
+  SERIALISE_MEMBER(before);
+  SERIALISE_MEMBER(after);
+
+  SIZE_CHECK(368);
 }
 
 template <typename SerialiserType>
 void DoSerialise(SerialiserType &ser, ShaderDebugState &el)
 {
-  SERIALISE_MEMBER(registers);
-  SERIALISE_MEMBER(outputs);
-  SERIALISE_MEMBER(indexableTemps);
-  SERIALISE_MEMBER(locals);
-  SERIALISE_MEMBER(modified);
   SERIALISE_MEMBER(nextInstruction);
+  SERIALISE_MEMBER(stepIndex);
   SERIALISE_MEMBER(flags);
+  SERIALISE_MEMBER(changes);
+  SERIALISE_MEMBER(callstack);
 
-  SIZE_CHECK(128);
+  SIZE_CHECK(64);
 }
 
 template <typename SerialiserType>
 void DoSerialise(SerialiserType &ser, ShaderDebugTrace &el)
 {
+  SERIALISE_MEMBER(stage);
   SERIALISE_MEMBER(inputs);
   SERIALISE_MEMBER(constantBlocks);
-  SERIALISE_MEMBER(states);
-  SERIALISE_MEMBER(hasLocals);
-  SERIALISE_MEMBER(lineInfo);
+  SERIALISE_MEMBER(samplers);
+  SERIALISE_MEMBER(readOnlyResources);
+  SERIALISE_MEMBER(readWriteResources);
+  SERIALISE_MEMBER(sourceVars);
+  SERIALISE_MEMBER(instInfo);
 
-  SIZE_CHECK(104);
+  // serialise the debugger pointer entirely opaquely, this is only used for replay proxying
+  uint64_t debugger = 0;
+  if(ser.IsWriting())
+    debugger = (uint64_t)(uintptr_t)el.debugger;
+  SERIALISE_ELEMENT(debugger);
+  if(ser.IsReading())
+    el.debugger = (ShaderDebugger *)debugger;
+
+  SIZE_CHECK(184);
 }
 
 template <typename SerialiserType>
@@ -405,6 +430,17 @@ void DoSerialise(SerialiserType &ser, TextureFilter &el)
   SERIALISE_MEMBER(filter);
 
   SIZE_CHECK(16);
+}
+
+template <typename SerialiserType>
+void DoSerialise(SerialiserType &ser, TextureSwizzle4 &el)
+{
+  SERIALISE_MEMBER(red);
+  SERIALISE_MEMBER(green);
+  SERIALISE_MEMBER(blue);
+  SERIALISE_MEMBER(alpha);
+
+  SIZE_CHECK(4);
 }
 
 template <typename SerialiserType>
@@ -447,9 +483,10 @@ void DoSerialise(SerialiserType &ser, BufferDescription &el)
 {
   SERIALISE_MEMBER(resourceId);
   SERIALISE_MEMBER(creationFlags);
+  SERIALISE_MEMBER(gpuAddress);
   SERIALISE_MEMBER(length);
 
-  SIZE_CHECK(24);
+  SIZE_CHECK(32);
 }
 
 template <typename SerialiserType>
@@ -461,13 +498,18 @@ void DoSerialise(SerialiserType &ser, APIProperties &el)
   SERIALISE_MEMBER(degraded);
   SERIALISE_MEMBER(shadersMutable);
 
+  SERIALISE_MEMBER(shaderDebugging);
+  SERIALISE_MEMBER(pixelHistory);
+  SERIALISE_MEMBER(rgpCapture);
+
   SERIALISE_MEMBER(ShaderLinkage);
   SERIALISE_MEMBER(YUVTextures);
   SERIALISE_MEMBER(SparseResources);
   SERIALISE_MEMBER(MultiGPU);
   SERIALISE_MEMBER(D3D12Bundle);
+  SERIALISE_MEMBER(DXILShaders);
 
-  SIZE_CHECK(20);
+  SIZE_CHECK(24);
 }
 
 template <typename SerialiserType>
@@ -496,20 +538,19 @@ template <typename SerialiserType>
 void DoSerialise(SerialiserType &ser, APIEvent &el)
 {
   SERIALISE_MEMBER(eventId);
-  SERIALISE_MEMBER(callstack);
   SERIALISE_MEMBER(chunkIndex);
   SERIALISE_MEMBER(fileOffset);
 
-  SIZE_CHECK(48);
+  SIZE_CHECK(16);
 }
 
 template <typename SerialiserType>
-void DoSerialise(SerialiserType &ser, DrawcallDescription &el)
+void DoSerialise(SerialiserType &ser, ActionDescription &el)
 {
   SERIALISE_MEMBER(eventId);
-  SERIALISE_MEMBER(drawcallId);
+  SERIALISE_MEMBER(actionId);
 
-  SERIALISE_MEMBER(name);
+  SERIALISE_MEMBER(customName);
 
   SERIALISE_MEMBER(flags);
 
@@ -527,11 +568,10 @@ void DoSerialise(SerialiserType &ser, DrawcallDescription &el)
   SERIALISE_MEMBER(dispatchThreadsDimension);
   SERIALISE_MEMBER(dispatchBase);
 
-  SERIALISE_MEMBER(indexByteWidth);
-  SERIALISE_MEMBER(topology);
-
   SERIALISE_MEMBER(copySource);
+  SERIALISE_MEMBER(copySourceSubresource);
   SERIALISE_MEMBER(copyDestination);
+  SERIALISE_MEMBER(copyDestinationSubresource);
 
   if(ser.IsReading())
     el.parent = el.previous = el.next = NULL;
@@ -542,7 +582,7 @@ void DoSerialise(SerialiserType &ser, DrawcallDescription &el)
   SERIALISE_MEMBER(events);
   SERIALISE_MEMBER(children);
 
-  SIZE_CHECK(288);
+  SIZE_CHECK(312);
 }
 
 template <typename SerialiserType>
@@ -719,7 +759,7 @@ void DoSerialise(SerialiserType &ser, FrameStatistics &el)
   SERIALISE_MEMBER(rasters);
   SERIALISE_MEMBER(outputs);
 
-  SIZE_CHECK(1432);
+  SIZE_CHECK(424);
 }
 
 template <typename SerialiserType>
@@ -735,16 +775,35 @@ void DoSerialise(SerialiserType &ser, FrameDescription &el)
   SERIALISE_MEMBER(stats);
   SERIALISE_MEMBER(debugMessages);
 
-  SIZE_CHECK(1512);
+  SIZE_CHECK(504);
 }
 
 template <typename SerialiserType>
 void DoSerialise(SerialiserType &ser, FrameRecord &el)
 {
   SERIALISE_MEMBER(frameInfo);
-  SERIALISE_MEMBER(drawcallList);
+  SERIALISE_MEMBER(actionList);
 
-  SIZE_CHECK(1536);
+  SIZE_CHECK(528);
+}
+
+template <typename SerialiserType>
+void DoSerialise(SerialiserType &ser, TaskGroupSize &el)
+{
+  SERIALISE_MEMBER(x);
+  SERIALISE_MEMBER(y);
+  SERIALISE_MEMBER(z);
+
+  SIZE_CHECK(12);
+}
+
+template <typename SerialiserType>
+void DoSerialise(SerialiserType &ser, MeshletSize &el)
+{
+  SERIALISE_MEMBER(numIndices);
+  SERIALISE_MEMBER(numVertices);
+
+  SIZE_CHECK(8);
 }
 
 template <typename SerialiserType>
@@ -753,10 +812,18 @@ void DoSerialise(SerialiserType &ser, MeshFormat &el)
   SERIALISE_MEMBER(indexResourceId);
   SERIALISE_MEMBER(indexByteOffset);
   SERIALISE_MEMBER(indexByteStride);
+  SERIALISE_MEMBER(indexByteSize);
   SERIALISE_MEMBER(baseVertex);
   SERIALISE_MEMBER(vertexResourceId);
   SERIALISE_MEMBER(vertexByteOffset);
   SERIALISE_MEMBER(vertexByteStride);
+  SERIALISE_MEMBER(vertexByteSize);
+  SERIALISE_MEMBER(meshletSizes);
+  SERIALISE_MEMBER(dispatchSize);
+  SERIALISE_MEMBER(taskSizes);
+  SERIALISE_MEMBER(meshletIndexOffset);
+  SERIALISE_MEMBER(perPrimitiveOffset);
+  SERIALISE_MEMBER(perPrimitiveStride);
   SERIALISE_MEMBER(format);
   SERIALISE_MEMBER(meshColor);
   SERIALISE_MEMBER(topology);
@@ -767,8 +834,18 @@ void DoSerialise(SerialiserType &ser, MeshFormat &el)
   SERIALISE_MEMBER(unproject);
   SERIALISE_MEMBER(instanced);
   SERIALISE_MEMBER(showAlpha);
+  SERIALISE_MEMBER(status);
 
-  SIZE_CHECK(96);
+  SIZE_CHECK(240);
+}
+
+template <typename SerialiserType>
+void DoSerialise(SerialiserType &ser, Offset &el)
+{
+  SERIALISE_MEMBER(x);
+  SERIALISE_MEMBER(y);
+
+  SIZE_CHECK(8);
 }
 
 template <typename SerialiserType>
@@ -814,6 +891,16 @@ void DoSerialise(SerialiserType &ser, PixelValue &el)
 }
 
 template <typename SerialiserType>
+void DoSerialise(SerialiserType &ser, Subresource &el)
+{
+  SERIALISE_MEMBER(mip);
+  SERIALISE_MEMBER(slice);
+  SERIALISE_MEMBER(sample);
+
+  SIZE_CHECK(12);
+}
+
+template <typename SerialiserType>
 void DoSerialise(SerialiserType &ser, ModificationValue &el)
 {
   SERIALISE_MEMBER(col);
@@ -841,6 +928,7 @@ void DoSerialise(SerialiserType &ser, PixelModification &el)
   SERIALISE_MEMBER(sampleMasked);
   SERIALISE_MEMBER(backfaceCulled);
   SERIALISE_MEMBER(depthClipped);
+  SERIALISE_MEMBER(depthBoundsFailed);
   SERIALISE_MEMBER(viewClipped);
   SERIALISE_MEMBER(scissorClipped);
   SERIALISE_MEMBER(shaderDiscarded);
@@ -877,6 +965,30 @@ void DoSerialise(SerialiserType &ser, CounterValue &el)
   SERIALISE_MEMBER(u64);
 
   SIZE_CHECK(8);
+}
+
+template <typename SerialiserType>
+void DoSerialise(SerialiserType &ser, GPUDevice &el)
+{
+  SERIALISE_MEMBER(vendor);
+  SERIALISE_MEMBER(deviceID);
+  SERIALISE_MEMBER(driver);
+  SERIALISE_MEMBER(name);
+  SERIALISE_MEMBER(apis);
+
+  SIZE_CHECK(80);
+}
+
+template <typename SerialiserType>
+void DoSerialise(SerialiserType &ser, ReplayOptions &el)
+{
+  SERIALISE_MEMBER(apiValidation);
+  SERIALISE_MEMBER(forceGPUVendor);
+  SERIALISE_MEMBER(forceGPUDeviceID);
+  SERIALISE_MEMBER(forceGPUDriverName);
+  SERIALISE_MEMBER(optimisation);
+
+  SIZE_CHECK(48);
 }
 
 #pragma region Common pipeline state
@@ -946,6 +1058,73 @@ void DoSerialise(SerialiserType &ser, StencilFace &el)
   SIZE_CHECK(28);
 }
 
+template <typename SerialiserType>
+void DoSerialise(SerialiserType &ser, ShaderMeshMessageLocation &el)
+{
+  SERIALISE_MEMBER(taskGroup);
+  SERIALISE_MEMBER(meshGroup);
+  SERIALISE_MEMBER(thread);
+
+  SIZE_CHECK(36);
+}
+
+template <typename SerialiserType>
+void DoSerialise(SerialiserType &ser, ShaderComputeMessageLocation &el)
+{
+  SERIALISE_MEMBER(workgroup);
+  SERIALISE_MEMBER(thread);
+
+  SIZE_CHECK(24);
+}
+
+template <typename SerialiserType>
+void DoSerialise(SerialiserType &ser, ShaderVertexMessageLocation &el)
+{
+  SERIALISE_MEMBER(vertexIndex);
+  SERIALISE_MEMBER(instance);
+  SERIALISE_MEMBER(view);
+
+  SIZE_CHECK(12);
+}
+
+template <typename SerialiserType>
+void DoSerialise(SerialiserType &ser, ShaderPixelMessageLocation &el)
+{
+  SERIALISE_MEMBER(x);
+  SERIALISE_MEMBER(y);
+  SERIALISE_MEMBER(sample);
+  SERIALISE_MEMBER(primitive);
+  SERIALISE_MEMBER(view);
+
+  SIZE_CHECK(20);
+}
+
+template <typename SerialiserType>
+void DoSerialise(SerialiserType &ser, ShaderGeometryMessageLocation &el)
+{
+  SERIALISE_MEMBER(primitive);
+
+  SIZE_CHECK(4);
+}
+
+template <typename SerialiserType>
+void DoSerialise(SerialiserType &ser, ShaderMessageLocation &el)
+{
+  SERIALISE_MEMBER(mesh);
+
+  SIZE_CHECK(36);
+}
+
+template <typename SerialiserType>
+void DoSerialise(SerialiserType &ser, ShaderMessage &el)
+{
+  SERIALISE_MEMBER(stage);
+  SERIALISE_MEMBER(location);
+  SERIALISE_MEMBER(message);
+
+  SIZE_CHECK(72);
+}
+
 #pragma endregion
 
 #pragma region D3D11 pipeline state
@@ -979,6 +1158,7 @@ void DoSerialise(SerialiserType &ser, D3D11Pipe::IndexBuffer &el)
 {
   SERIALISE_MEMBER(resourceId);
   SERIALISE_MEMBER(byteOffset);
+  SERIALISE_MEMBER(byteStride);
 
   SIZE_CHECK(16);
 }
@@ -992,8 +1172,9 @@ void DoSerialise(SerialiserType &ser, D3D11Pipe::InputAssembly &el)
   SERIALISE_MEMBER_OPT_EMPTY(bytecode);
   SERIALISE_MEMBER(vertexBuffers);
   SERIALISE_MEMBER(indexBuffer);
+  SERIALISE_MEMBER(topology);
 
-  SIZE_CHECK(80);
+  SIZE_CHECK(88);
 }
 
 template <typename SerialiserType>
@@ -1001,6 +1182,7 @@ void DoSerialise(SerialiserType &ser, D3D11Pipe::View &el)
 {
   SERIALISE_MEMBER(viewResourceId);
   SERIALISE_MEMBER(resourceResourceId);
+  SERIALISE_MEMBER(counterResourceId);
   SERIALISE_MEMBER(type);
   SERIALISE_MEMBER(viewFormat);
 
@@ -1016,7 +1198,7 @@ void DoSerialise(SerialiserType &ser, D3D11Pipe::View &el)
   SERIALISE_MEMBER(firstSlice);
   SERIALISE_MEMBER(numSlices);
 
-  SIZE_CHECK(64);
+  SIZE_CHECK(72);
 }
 
 template <typename SerialiserType>
@@ -1077,8 +1259,9 @@ template <typename SerialiserType>
 void DoSerialise(SerialiserType &ser, D3D11Pipe::StreamOut &el)
 {
   SERIALISE_MEMBER(outputs);
+  SERIALISE_MEMBER(rasterizedStream);
 
-  SIZE_CHECK(24);
+  SIZE_CHECK(32);
 }
 
 template <typename SerialiserType>
@@ -1150,7 +1333,7 @@ void DoSerialise(SerialiserType &ser, D3D11Pipe::OutputMerger &el)
   SERIALISE_MEMBER(depthReadOnly);
   SERIALISE_MEMBER(stencilReadOnly);
 
-  SIZE_CHECK(272);
+  SIZE_CHECK(280);
 }
 
 template <typename SerialiserType>
@@ -1182,7 +1365,7 @@ void DoSerialise(SerialiserType &ser, D3D11Pipe::State &el)
 
   SERIALISE_MEMBER(predication);
 
-  SIZE_CHECK(2072);
+  SIZE_CHECK(2096);
 }
 
 #pragma endregion D3D11 pipeline state
@@ -1220,6 +1403,7 @@ void DoSerialise(SerialiserType &ser, D3D12Pipe::IndexBuffer &el)
   SERIALISE_MEMBER(resourceId);
   SERIALISE_MEMBER(byteOffset);
   SERIALISE_MEMBER(byteSize);
+  SERIALISE_MEMBER(byteStride);
 
   SIZE_CHECK(24);
 }
@@ -1232,21 +1416,40 @@ void DoSerialise(SerialiserType &ser, D3D12Pipe::InputAssembly &el)
   SERIALISE_MEMBER(indexBuffer);
 
   SERIALISE_MEMBER(indexStripCutValue);
+  SERIALISE_MEMBER(topology);
 
   SIZE_CHECK(80);
 }
 
 template <typename SerialiserType>
-void DoSerialise(SerialiserType &ser, D3D12Pipe::View &el)
+void DoSerialise(SerialiserType &ser, D3D12Pipe::RootSignatureRange &el)
 {
   SERIALISE_MEMBER(immediate);
-  SERIALISE_MEMBER(rootElement);
+  SERIALISE_MEMBER(rootSignatureIndex);
+  SERIALISE_MEMBER(type);
+  SERIALISE_MEMBER(visibility);
+  SERIALISE_MEMBER(registerSpace);
+  SERIALISE_MEMBER(dynamicallyUsedCount);
+  SERIALISE_MEMBER(firstUsedIndex);
+  SERIALISE_MEMBER(lastUsedIndex);
+  SERIALISE_MEMBER(constantBuffers);
+  SERIALISE_MEMBER(samplers);
+  SERIALISE_MEMBER(views);
+
+  SIZE_CHECK(104);
+}
+
+template <typename SerialiserType>
+void DoSerialise(SerialiserType &ser, D3D12Pipe::View &el)
+{
+  SERIALISE_MEMBER(bind);
   SERIALISE_MEMBER(tableIndex);
   SERIALISE_MEMBER(resourceId);
   SERIALISE_MEMBER(type);
   SERIALISE_MEMBER(viewFormat);
 
   SERIALISE_MEMBER(swizzle);
+  SERIALISE_MEMBER(dynamicallyUsed);
   SERIALISE_MEMBER(bufferFlags);
   SERIALISE_MEMBER(bufferStructCount);
   SERIALISE_MEMBER(elementByteSize);
@@ -1263,19 +1466,20 @@ void DoSerialise(SerialiserType &ser, D3D12Pipe::View &el)
 
   SERIALISE_MEMBER(minLODClamp);
 
-  SIZE_CHECK(120);
+  SIZE_CHECK(72);
 }
 
 template <typename SerialiserType>
 void DoSerialise(SerialiserType &ser, D3D12Pipe::Sampler &el)
 {
-  SERIALISE_MEMBER(immediate);
-  SERIALISE_MEMBER(rootElement);
+  SERIALISE_MEMBER(bind);
   SERIALISE_MEMBER(tableIndex);
   SERIALISE_MEMBER(addressU);
   SERIALISE_MEMBER(addressV);
   SERIALISE_MEMBER(addressW);
-  SERIALISE_MEMBER(borderColor);
+  SERIALISE_MEMBER(borderColorValue);
+  SERIALISE_MEMBER(borderColorType);
+  SERIALISE_MEMBER(unnormalized);
   SERIALISE_MEMBER(compareFunction);
   SERIALISE_MEMBER(filter);
   SERIALISE_MEMBER(maxAnisotropy);
@@ -1289,27 +1493,14 @@ void DoSerialise(SerialiserType &ser, D3D12Pipe::Sampler &el)
 template <typename SerialiserType>
 void DoSerialise(SerialiserType &ser, D3D12Pipe::ConstantBuffer &el)
 {
-  SERIALISE_MEMBER(immediate);
-  SERIALISE_MEMBER(rootElement);
+  SERIALISE_MEMBER(bind);
   SERIALISE_MEMBER(tableIndex);
   SERIALISE_MEMBER(resourceId);
   SERIALISE_MEMBER(byteOffset);
   SERIALISE_MEMBER(byteSize);
   SERIALISE_MEMBER(rootValues);
 
-  SIZE_CHECK(64);
-}
-
-template <typename SerialiserType>
-void DoSerialise(SerialiserType &ser, D3D12Pipe::RegisterSpace &el)
-{
-  SERIALISE_MEMBER(spaceIndex);
-  SERIALISE_MEMBER(constantBuffers);
-  SERIALISE_MEMBER(samplers);
-  SERIALISE_MEMBER(srvs);
-  SERIALISE_MEMBER(uavs);
-
-  SIZE_CHECK(104);
+  SIZE_CHECK(56);
 }
 
 template <typename SerialiserType>
@@ -1320,9 +1511,8 @@ void DoSerialise(SerialiserType &ser, D3D12Pipe::Shader &el)
   SERIALISE_MEMBER_OPT_EMPTY(reflection);
   SERIALISE_MEMBER(bindpointMapping);
   SERIALISE_MEMBER(stage);
-  SERIALISE_MEMBER(spaces);
 
-  SIZE_CHECK(168);
+  SIZE_CHECK(144);
 }
 
 template <typename SerialiserType>
@@ -1341,8 +1531,9 @@ template <typename SerialiserType>
 void DoSerialise(SerialiserType &ser, D3D12Pipe::StreamOut &el)
 {
   SERIALISE_MEMBER(outputs);
+  SERIALISE_MEMBER(rasterizedStream);
 
-  SIZE_CHECK(24);
+  SIZE_CHECK(32);
 }
 
 template <typename SerialiserType>
@@ -1355,12 +1546,14 @@ void DoSerialise(SerialiserType &ser, D3D12Pipe::RasterizerState &el)
   SERIALISE_MEMBER(depthBiasClamp);
   SERIALISE_MEMBER(slopeScaledDepthBias);
   SERIALISE_MEMBER(depthClip);
-  SERIALISE_MEMBER(multisampleEnable);
-  SERIALISE_MEMBER(antialiasedLines);
+  SERIALISE_MEMBER(lineRasterMode);
   SERIALISE_MEMBER(forcedSampleCount);
   SERIALISE_MEMBER(conservativeRasterization);
+  SERIALISE_MEMBER(baseShadingRate);
+  SERIALISE_MEMBER(shadingRateCombiners);
+  SERIALISE_MEMBER(shadingRateImage);
 
-  SIZE_CHECK(36);
+  SIZE_CHECK(64);
 }
 
 template <typename SerialiserType>
@@ -1371,7 +1564,7 @@ void DoSerialise(SerialiserType &ser, D3D12Pipe::Rasterizer &el)
   SERIALISE_MEMBER(scissors);
   SERIALISE_MEMBER(state);
 
-  SIZE_CHECK(96);
+  SIZE_CHECK(120);
 }
 
 template <typename SerialiserType>
@@ -1415,7 +1608,7 @@ void DoSerialise(SerialiserType &ser, D3D12Pipe::OM &el)
   SERIALISE_MEMBER(multiSampleCount);
   SERIALISE_MEMBER(multiSampleQuality);
 
-  SIZE_CHECK(288);
+  SIZE_CHECK(240);
 }
 
 template <typename SerialiserType>
@@ -1440,6 +1633,7 @@ void DoSerialise(SerialiserType &ser, D3D12Pipe::State &el)
 {
   SERIALISE_MEMBER(pipelineResourceId);
   SERIALISE_MEMBER(rootSignatureResourceId);
+  SERIALISE_MEMBER(rootElements);
 
   SERIALISE_MEMBER(inputAssembly);
 
@@ -1449,6 +1643,8 @@ void DoSerialise(SerialiserType &ser, D3D12Pipe::State &el)
   SERIALISE_MEMBER(geometryShader);
   SERIALISE_MEMBER(pixelShader);
   SERIALISE_MEMBER(computeShader);
+  SERIALISE_MEMBER(ampShader);
+  SERIALISE_MEMBER(meshShader);
 
   SERIALISE_MEMBER(streamOut);
 
@@ -1458,7 +1654,7 @@ void DoSerialise(SerialiserType &ser, D3D12Pipe::State &el)
 
   SERIALISE_MEMBER(resourceStates);
 
-  SIZE_CHECK(1536);
+  SIZE_CHECK(1688);
 }
 
 #pragma endregion D3D12 pipeline state
@@ -1469,6 +1665,7 @@ template <typename SerialiserType>
 void DoSerialise(SerialiserType &ser, GLPipe::VertexAttribute &el)
 {
   SERIALISE_MEMBER(enabled);
+  SERIALISE_MEMBER(floatCast);
   SERIALISE_MEMBER(format);
   SERIALISE_MEMBER(genericValue);
   SERIALISE_MEMBER(vertexBufferSlot);
@@ -1495,11 +1692,13 @@ void DoSerialise(SerialiserType &ser, GLPipe::VertexInput &el)
   SERIALISE_MEMBER(attributes);
   SERIALISE_MEMBER(vertexBuffers);
   SERIALISE_MEMBER(indexBuffer);
+  SERIALISE_MEMBER(indexByteStride);
+  SERIALISE_MEMBER(topology);
   SERIALISE_MEMBER(primitiveRestart);
   SERIALISE_MEMBER(restartIndex);
   SERIALISE_MEMBER(provokingVertexLast);
 
-  SIZE_CHECK(80);
+  SIZE_CHECK(88);
 }
 
 template <typename SerialiserType>
@@ -1540,8 +1739,10 @@ void DoSerialise(SerialiserType &ser, GLPipe::Texture &el)
   SERIALISE_MEMBER(type);
   SERIALISE_MEMBER(swizzle);
   SERIALISE_MEMBER(depthReadChannel);
+  SERIALISE_MEMBER(completeStatus);
+  SERIALISE_MEMBER(typeConflict);
 
-  SIZE_CHECK(40);
+  SIZE_CHECK(80);
 }
 
 template <typename SerialiserType>
@@ -1670,10 +1871,11 @@ void DoSerialise(SerialiserType &ser, GLPipe::Attachment &el)
 {
   SERIALISE_MEMBER(resourceId);
   SERIALISE_MEMBER(slice);
+  SERIALISE_MEMBER(numSlices);
   SERIALISE_MEMBER(mipLevel);
   SERIALISE_MEMBER(swizzle);
 
-  SIZE_CHECK(32);
+  SIZE_CHECK(24);
 }
 
 template <typename SerialiserType>
@@ -1686,7 +1888,7 @@ void DoSerialise(SerialiserType &ser, GLPipe::FBO &el)
   SERIALISE_MEMBER(drawBuffers);
   SERIALISE_MEMBER(readBuffer);
 
-  SIZE_CHECK(128);
+  SIZE_CHECK(112);
 }
 
 template <typename SerialiserType>
@@ -1707,7 +1909,7 @@ void DoSerialise(SerialiserType &ser, GLPipe::FrameBuffer &el)
   SERIALISE_MEMBER(readFBO);
   SERIALISE_MEMBER(blendState);
 
-  SIZE_CHECK(304);
+  SIZE_CHECK(272);
 }
 
 template <typename SerialiserType>
@@ -1756,7 +1958,7 @@ void DoSerialise(SerialiserType &ser, GLPipe::State &el)
 
   SERIALISE_MEMBER(hints);
 
-  SIZE_CHECK(1984);
+  SIZE_CHECK(1960);
 }
 
 #pragma endregion OpenGL pipeline state
@@ -1766,6 +1968,7 @@ void DoSerialise(SerialiserType &ser, GLPipe::State &el)
 template <typename SerialiserType>
 void DoSerialise(SerialiserType &ser, VKPipe::BindingElement &el)
 {
+  SERIALISE_MEMBER(type);
   SERIALISE_MEMBER(viewResourceId);
   SERIALISE_MEMBER(resourceResourceId);
   SERIALISE_MEMBER(samplerResourceId);
@@ -1790,20 +1993,22 @@ void DoSerialise(SerialiserType &ser, VKPipe::BindingElement &el)
   SERIALISE_MEMBER(compareFunction);
   SERIALISE_MEMBER(minLOD);
   SERIALISE_MEMBER(maxLOD);
-  SERIALISE_MEMBER(borderColor);
+  SERIALISE_MEMBER(borderColorValue);
+  SERIALISE_MEMBER(borderColorType);
+  SERIALISE_MEMBER(samplerSwizzle);
   SERIALISE_MEMBER(unnormalized);
+  SERIALISE_MEMBER(inlineBlock);
 
   SERIALISE_MEMBER(ycbcrSampler);
 
   SERIALISE_MEMBER(ycbcrModel);
   SERIALISE_MEMBER(ycbcrRange);
-  SERIALISE_MEMBER(ycbcrSwizzle);
   SERIALISE_MEMBER(xChromaOffset);
   SERIALISE_MEMBER(yChromaOffset);
   SERIALISE_MEMBER(chromaFilter);
   SERIALISE_MEMBER(forceExplicitReconstruction);
 
-  SIZE_CHECK(200);
+  SIZE_CHECK(192);
 };
 
 template <typename SerialiserType>
@@ -1811,12 +2016,13 @@ void DoSerialise(SerialiserType &ser, VKPipe::DescriptorBinding &el)
 {
   SERIALISE_MEMBER(descriptorCount);
   SERIALISE_MEMBER(dynamicallyUsedCount);
-  SERIALISE_MEMBER(type);
+  SERIALISE_MEMBER(firstUsedIndex);
+  SERIALISE_MEMBER(lastUsedIndex);
   SERIALISE_MEMBER(stageFlags);
 
   SERIALISE_MEMBER(binds);
 
-  SIZE_CHECK(40);
+  SIZE_CHECK(48);
 }
 
 template <typename SerialiserType>
@@ -1828,19 +2034,23 @@ void DoSerialise(SerialiserType &ser, VKPipe::DescriptorSet &el)
 
   SERIALISE_MEMBER(bindings);
 
-  SIZE_CHECK(48);
+  SERIALISE_MEMBER(inlineData);
+
+  SIZE_CHECK(72);
 }
 
 template <typename SerialiserType>
 void DoSerialise(SerialiserType &ser, VKPipe::Pipeline &el)
 {
   SERIALISE_MEMBER(pipelineResourceId);
-  SERIALISE_MEMBER(pipelineLayoutResourceId);
+  SERIALISE_MEMBER(pipelineComputeLayoutResourceId);
+  SERIALISE_MEMBER(pipelinePreRastLayoutResourceId);
+  SERIALISE_MEMBER(pipelineFragmentLayoutResourceId);
   SERIALISE_MEMBER(flags);
 
   SERIALISE_MEMBER(descriptorSets);
 
-  SIZE_CHECK(48);
+  SIZE_CHECK(64);
 }
 
 template <typename SerialiserType>
@@ -1848,8 +2058,9 @@ void DoSerialise(SerialiserType &ser, VKPipe::IndexBuffer &el)
 {
   SERIALISE_MEMBER(resourceId);
   SERIALISE_MEMBER(byteOffset);
+  SERIALISE_MEMBER(byteStride);
 
-  SIZE_CHECK(16);
+  SIZE_CHECK(24);
 }
 
 template <typename SerialiserType>
@@ -1857,8 +2068,9 @@ void DoSerialise(SerialiserType &ser, VKPipe::InputAssembly &el)
 {
   SERIALISE_MEMBER(primitiveRestartEnable);
   SERIALISE_MEMBER(indexBuffer);
+  SERIALISE_MEMBER(topology);
 
-  SIZE_CHECK(24);
+  SIZE_CHECK(40);
 }
 
 template <typename SerialiserType>
@@ -1876,11 +2088,10 @@ template <typename SerialiserType>
 void DoSerialise(SerialiserType &ser, VKPipe::VertexBinding &el)
 {
   SERIALISE_MEMBER(vertexBufferBinding);
-  SERIALISE_MEMBER(byteStride);
   SERIALISE_MEMBER(perInstance);
   SERIALISE_MEMBER(instanceDivisor);
 
-  SIZE_CHECK(16);
+  SIZE_CHECK(12);
 }
 
 template <typename SerialiserType>
@@ -1888,8 +2099,10 @@ void DoSerialise(SerialiserType &ser, VKPipe::VertexBuffer &el)
 {
   SERIALISE_MEMBER(resourceId);
   SERIALISE_MEMBER(byteOffset);
+  SERIALISE_MEMBER(byteStride);
+  SERIALISE_MEMBER(byteSize);
 
-  SIZE_CHECK(16);
+  SIZE_CHECK(24);
 }
 
 template <typename SerialiserType>
@@ -1903,15 +2116,6 @@ void DoSerialise(SerialiserType &ser, VKPipe::VertexInput &el)
 }
 
 template <typename SerialiserType>
-void DoSerialise(SerialiserType &ser, VKPipe::SpecializationConstant &el)
-{
-  SERIALISE_MEMBER(specializationId);
-  SERIALISE_MEMBER(data);
-
-  SIZE_CHECK(32);
-}
-
-template <typename SerialiserType>
 void DoSerialise(SerialiserType &ser, VKPipe::Shader &el)
 {
   SERIALISE_MEMBER(resourceId);
@@ -1922,9 +2126,12 @@ void DoSerialise(SerialiserType &ser, VKPipe::Shader &el)
   SERIALISE_MEMBER(bindpointMapping);
 
   SERIALISE_MEMBER(stage);
-  SERIALISE_MEMBER(specialization);
+  SERIALISE_MEMBER(pushConstantRangeByteOffset);
+  SERIALISE_MEMBER(pushConstantRangeByteSize);
+  SERIALISE_MEMBER(specializationData);
+  SERIALISE_MEMBER(specializationIds);
 
-  SIZE_CHECK(192);
+  SIZE_CHECK(224);
 }
 
 template <typename SerialiserType>
@@ -1953,8 +2160,9 @@ template <typename SerialiserType>
 void DoSerialise(SerialiserType &ser, VKPipe::TransformFeedback &el)
 {
   SERIALISE_MEMBER(buffers);
+  SERIALISE_MEMBER(rasterizedStream);
 
-  SIZE_CHECK(16);
+  SIZE_CHECK(24);
 }
 
 template <typename SerialiserType>
@@ -1972,6 +2180,7 @@ void DoSerialise(SerialiserType &ser, VKPipe::ViewState &el)
   SERIALISE_MEMBER(viewportScissors);
   SERIALISE_MEMBER(discardRectangles);
   SERIALISE_MEMBER(discardRectanglesExclusive);
+  SERIALISE_MEMBER(depthNegativeOneToOne);
 
   SIZE_CHECK(56);
 }
@@ -1989,12 +2198,21 @@ void DoSerialise(SerialiserType &ser, VKPipe::Rasterizer &el)
   SERIALISE_MEMBER(conservativeRasterization);
   SERIALISE_MEMBER(extraPrimitiveOverestimationSize);
 
+  SERIALISE_MEMBER(provokingVertexFirst);
+  SERIALISE_MEMBER(depthBiasEnable);
   SERIALISE_MEMBER(depthBias);
   SERIALISE_MEMBER(depthBiasClamp);
   SERIALISE_MEMBER(slopeScaledDepthBias);
   SERIALISE_MEMBER(lineWidth);
 
-  SIZE_CHECK(36);
+  SERIALISE_MEMBER(lineRasterMode);
+  SERIALISE_MEMBER(lineStippleFactor);
+  SERIALISE_MEMBER(lineStipplePattern);
+
+  SERIALISE_MEMBER(pipelineShadingRate);
+  SERIALISE_MEMBER(shadingRateCombiners);
+
+  SIZE_CHECK(68);
 }
 
 template <typename SerialiserType>
@@ -2060,10 +2278,15 @@ void DoSerialise(SerialiserType &ser, VKPipe::RenderPass &el)
   SERIALISE_MEMBER(colorAttachments);
   SERIALISE_MEMBER(resolveAttachments);
   SERIALISE_MEMBER(depthstencilAttachment);
+  SERIALISE_MEMBER(depthstencilResolveAttachment);
   SERIALISE_MEMBER(fragmentDensityAttachment);
+  SERIALISE_MEMBER(shadingRateAttachment);
+  SERIALISE_MEMBER(shadingRateTexelSize);
   SERIALISE_MEMBER(multiviews);
+  SERIALISE_MEMBER(fragmentDensityOffsets);
+  SERIALISE_MEMBER(tileOnlyMSAASampleCount);
 
-  SIZE_CHECK(120);
+  SIZE_CHECK(168);
 }
 
 template <typename SerialiserType>
@@ -2080,7 +2303,7 @@ void DoSerialise(SerialiserType &ser, VKPipe::Attachment &el)
   SERIALISE_MEMBER(numMips);
   SERIALISE_MEMBER(numSlices);
 
-  SIZE_CHECK(56);
+  SIZE_CHECK(48);
 }
 
 template <typename SerialiserType>
@@ -2112,8 +2335,11 @@ void DoSerialise(SerialiserType &ser, VKPipe::CurrentPass &el)
   SERIALISE_MEMBER(renderpass);
   SERIALISE_MEMBER(framebuffer);
   SERIALISE_MEMBER(renderArea);
+  SERIALISE_MEMBER(colorFeedbackAllowed);
+  SERIALISE_MEMBER(depthFeedbackAllowed);
+  SERIALISE_MEMBER(stencilFeedbackAllowed);
 
-  SIZE_CHECK(184);
+  SIZE_CHECK(240);
 }
 
 template <typename SerialiserType>
@@ -2165,6 +2391,8 @@ void DoSerialise(SerialiserType &ser, VKPipe::State &el)
   SERIALISE_MEMBER(geometryShader);
   SERIALISE_MEMBER(fragmentShader);
   SERIALISE_MEMBER(computeShader);
+  SERIALISE_MEMBER(taskShader);
+  SERIALISE_MEMBER(meshShader);
 
   SERIALISE_MEMBER(tessellation);
 
@@ -2177,14 +2405,15 @@ void DoSerialise(SerialiserType &ser, VKPipe::State &el)
 
   SERIALISE_MEMBER(images);
 
+  SERIALISE_MEMBER(shaderMessages);
+
   SERIALISE_MEMBER(conditionalRendering);
 
-  SIZE_CHECK(1904);
+  SIZE_CHECK(2712);
 }
 
 #pragma endregion Vulkan pipeline state
 
-INSTANTIATE_SERIALISE_TYPE(ExecuteResult)
 INSTANTIATE_SERIALISE_TYPE(PathEntry)
 INSTANTIATE_SERIALISE_TYPE(SectionProperties)
 INSTANTIATE_SERIALISE_TYPE(EnvironmentModification)
@@ -2193,17 +2422,18 @@ INSTANTIATE_SERIALISE_TYPE(ResourceFormat)
 INSTANTIATE_SERIALISE_TYPE(Bindpoint)
 INSTANTIATE_SERIALISE_TYPE(ShaderBindpointMapping)
 INSTANTIATE_SERIALISE_TYPE(SigParameter)
-INSTANTIATE_SERIALISE_TYPE(ShaderVariableType)
+INSTANTIATE_SERIALISE_TYPE(ShaderConstantType)
 INSTANTIATE_SERIALISE_TYPE(ShaderConstant)
 INSTANTIATE_SERIALISE_TYPE(ConstantBlock)
 INSTANTIATE_SERIALISE_TYPE(ShaderSampler)
+INSTANTIATE_SERIALISE_TYPE(ShaderMessage);
 INSTANTIATE_SERIALISE_TYPE(ShaderResource)
 INSTANTIATE_SERIALISE_TYPE(ShaderEntryPoint)
 INSTANTIATE_SERIALISE_TYPE(ShaderCompileFlags)
 INSTANTIATE_SERIALISE_TYPE(ShaderDebugInfo)
 INSTANTIATE_SERIALISE_TYPE(ShaderReflection)
 INSTANTIATE_SERIALISE_TYPE(ShaderVariable)
-INSTANTIATE_SERIALISE_TYPE(LocalVariableMapping);
+INSTANTIATE_SERIALISE_TYPE(SourceVariableMapping);
 INSTANTIATE_SERIALISE_TYPE(ShaderDebugState)
 INSTANTIATE_SERIALISE_TYPE(ShaderDebugTrace)
 INSTANTIATE_SERIALISE_TYPE(ResourceDescription)
@@ -2213,7 +2443,7 @@ INSTANTIATE_SERIALISE_TYPE(APIProperties)
 INSTANTIATE_SERIALISE_TYPE(DriverInformation)
 INSTANTIATE_SERIALISE_TYPE(DebugMessage)
 INSTANTIATE_SERIALISE_TYPE(APIEvent)
-INSTANTIATE_SERIALISE_TYPE(DrawcallDescription)
+INSTANTIATE_SERIALISE_TYPE(ActionDescription)
 INSTANTIATE_SERIALISE_TYPE(ConstantBindStats)
 INSTANTIATE_SERIALISE_TYPE(SamplerBindStats)
 INSTANTIATE_SERIALISE_TYPE(ResourceBindStats)
@@ -2233,12 +2463,17 @@ INSTANTIATE_SERIALISE_TYPE(FrameDescription)
 INSTANTIATE_SERIALISE_TYPE(FrameRecord)
 INSTANTIATE_SERIALISE_TYPE(MeshFormat)
 INSTANTIATE_SERIALISE_TYPE(FloatVector)
+INSTANTIATE_SERIALISE_TYPE(Offset);
 INSTANTIATE_SERIALISE_TYPE(Uuid)
 INSTANTIATE_SERIALISE_TYPE(CounterDescription)
+INSTANTIATE_SERIALISE_TYPE(PixelValue)
+INSTANTIATE_SERIALISE_TYPE(Subresource)
 INSTANTIATE_SERIALISE_TYPE(PixelModification)
 INSTANTIATE_SERIALISE_TYPE(EventUsage)
 INSTANTIATE_SERIALISE_TYPE(CounterResult)
 INSTANTIATE_SERIALISE_TYPE(CounterValue)
+INSTANTIATE_SERIALISE_TYPE(GPUDevice)
+INSTANTIATE_SERIALISE_TYPE(ReplayOptions)
 INSTANTIATE_SERIALISE_TYPE(D3D11Pipe::Layout)
 INSTANTIATE_SERIALISE_TYPE(D3D11Pipe::InputAssembly)
 INSTANTIATE_SERIALISE_TYPE(D3D11Pipe::View)
@@ -2249,10 +2484,10 @@ INSTANTIATE_SERIALISE_TYPE(D3D11Pipe::OutputMerger)
 INSTANTIATE_SERIALISE_TYPE(D3D11Pipe::State)
 INSTANTIATE_SERIALISE_TYPE(D3D12Pipe::Layout)
 INSTANTIATE_SERIALISE_TYPE(D3D12Pipe::InputAssembly)
+INSTANTIATE_SERIALISE_TYPE(D3D12Pipe::RootSignatureRange)
 INSTANTIATE_SERIALISE_TYPE(D3D12Pipe::ConstantBuffer)
 INSTANTIATE_SERIALISE_TYPE(D3D12Pipe::Sampler)
 INSTANTIATE_SERIALISE_TYPE(D3D12Pipe::View)
-INSTANTIATE_SERIALISE_TYPE(D3D12Pipe::RegisterSpace)
 INSTANTIATE_SERIALISE_TYPE(D3D12Pipe::Shader)
 INSTANTIATE_SERIALISE_TYPE(D3D12Pipe::Rasterizer)
 INSTANTIATE_SERIALISE_TYPE(D3D12Pipe::OM)
@@ -2277,7 +2512,6 @@ INSTANTIATE_SERIALISE_TYPE(VKPipe::DescriptorSet)
 INSTANTIATE_SERIALISE_TYPE(VKPipe::Pipeline)
 INSTANTIATE_SERIALISE_TYPE(VKPipe::VertexAttribute)
 INSTANTIATE_SERIALISE_TYPE(VKPipe::VertexInput)
-INSTANTIATE_SERIALISE_TYPE(VKPipe::SpecializationConstant)
 INSTANTIATE_SERIALISE_TYPE(VKPipe::Shader)
 INSTANTIATE_SERIALISE_TYPE(VKPipe::ViewState)
 INSTANTIATE_SERIALISE_TYPE(VKPipe::ColorBlendState)

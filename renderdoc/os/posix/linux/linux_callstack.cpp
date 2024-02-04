@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2016-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -22,11 +22,18 @@
  * THE SOFTWARE.
  ******************************************************************************/
 
+// for dl_iterate_phdr
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include <execinfo.h>
+#include <link.h>
 #include <stdio.h>
 #include <string.h>
 #include <map>
-#include <vector>
+#include "common/common.h"
+#include "common/formatting.h"
 #include "os/os_specific.h"
 
 void *renderdocBase = NULL;
@@ -46,11 +53,11 @@ public:
   void Set(uint64_t *calls, size_t num)
   {
     numLevels = num;
-    for(int i = 0; i < numLevels; i++)
+    for(size_t i = 0; i < numLevels; i++)
       addrs[i] = calls[i];
   }
 
-  size_t NumLevels() const { return size_t(numLevels); }
+  size_t NumLevels() const { return numLevels; }
   const uint64_t *GetAddrs() const { return addrs; }
 private:
   LinuxCallstack(const Callstack::Stackwalk &other);
@@ -59,7 +66,11 @@ private:
   {
     void *addrs_ptr[ARRAY_COUNT(addrs)];
 
-    numLevels = backtrace(addrs_ptr, ARRAY_COUNT(addrs));
+    int ret = backtrace(addrs_ptr, ARRAY_COUNT(addrs));
+
+    numLevels = 0;
+    if(ret > 0)
+      numLevels = (size_t)ret;
 
     int offs = 0;
     // if we want to trim levels of the stack, we can do that here
@@ -70,12 +81,12 @@ private:
       numLevels--;
     }
 
-    for(int i = 0; i < numLevels; i++)
+    for(size_t i = 0; i < numLevels; i++)
       addrs[i] = (uint64_t)addrs_ptr[i + offs];
   }
 
   uint64_t addrs[128];
-  int numLevels;
+  size_t numLevels;
 };
 
 namespace Callstack
@@ -83,7 +94,7 @@ namespace Callstack
 void Init()
 {
   // look for our own line
-  FILE *f = FileIO::fopen("/proc/self/maps", "r");
+  FILE *f = FileIO::fopen("/proc/self/maps", FileIO::ReadText);
 
   if(f)
   {
@@ -92,7 +103,7 @@ void Init()
       char line[512] = {0};
       if(fgets(line, 511, f))
       {
-        if(strstr(line, "librenderdoc") && strstr(line, "r-xp"))
+        if(strstr(line, "lib" STRINGIZE(RDOC_BASE_NAME)) && strstr(line, "r-xp"))
         {
           sscanf(line, "%p-%p", &renderdocBase, &renderdocEnd);
           break;
@@ -114,28 +125,60 @@ Stackwalk *Create()
   return new LinuxCallstack(NULL, 0);
 }
 
+static int dl_iterate_callback(struct dl_phdr_info *info, size_t size, void *data)
+{
+  if(info->dlpi_name == NULL)
+  {
+    RDCLOG("Skipping NULL entry!");
+    return 0;
+  }
+
+  rdcstr *out = (rdcstr *)data;
+
+  rdcstr name = info->dlpi_name;
+  if(name.empty())
+    FileIO::GetExecutableFilename(name);
+
+  name = FileIO::GetFullPathname(name);
+
+  for(int j = 0; j < info->dlpi_phnum; j++)
+  {
+    uint32_t rxMask = PF_R | PF_X;
+    if(info->dlpi_phdr[j].p_type == PT_LOAD && (info->dlpi_phdr[j].p_flags & rxMask) == rxMask)
+    {
+      uint64_t baseAddr = info->dlpi_addr + info->dlpi_phdr[j].p_vaddr;
+      *out += StringFormat::Fmt("%llx-%llx r-xp %08x 123:45 12345678    %s\n", baseAddr,
+                                baseAddr + info->dlpi_phdr[j].p_memsz, info->dlpi_phdr[j].p_vaddr,
+                                name.c_str());
+    }
+  }
+
+  return 0;
+}
+
 bool GetLoadedModules(byte *buf, size_t &size)
 {
-  // we just dump the whole file rather than pre-parsing, that way we can improve
-  // parsing without needing to recapture
-  FILE *f = FileIO::fopen("/proc/self/maps", "r");
-
   size = 0;
 
   if(buf)
+  {
     memcpy(buf, "LNUXCALL", 8);
+    buf += 8;
+  }
 
   size += 8;
 
-  byte dummy[512];
+  // generate a fake /proc/self/maps. This is mostly for backwards compatibility, we could generate
+  // a more compact representation. The slight difference is that we change how we calculate the
+  // offset for each segment, so that we handle non-PIE executables properly.
+  rdcstr fake_maps;
 
-  while(!feof(f))
-  {
-    byte *readbuf = buf ? buf + size : dummy;
-    size += FileIO::fread(readbuf, 1, 512, f);
-  }
+  dl_iterate_phdr(dl_iterate_callback, &fake_maps);
 
-  FileIO::fclose(f);
+  size += fake_maps.size();
+
+  if(buf)
+    memcpy(buf, fake_maps.data(), fake_maps.size());
 
   return true;
 }
@@ -151,7 +194,7 @@ struct LookupModule
 class LinuxResolver : public Callstack::StackResolver
 {
 public:
-  LinuxResolver(std::vector<LookupModule> modules) { m_Modules = modules; }
+  LinuxResolver(rdcarray<LookupModule> modules) { m_Modules = modules; }
   Callstack::AddressDetails GetAddr(uint64_t addr)
   {
     EnsureCached(addr);
@@ -177,16 +220,19 @@ private:
     {
       if(addr >= m_Modules[i].base && addr < m_Modules[i].end)
       {
+        RDCLOG("%llx relative to module %llx-%llx, with offset %llx", addr, m_Modules[i].base,
+               m_Modules[i].end, m_Modules[i].offset);
         uint64_t relative = addr - m_Modules[i].base + m_Modules[i].offset;
-        std::string cmd =
-            StringFormat::Fmt("addr2line -fCe \"%s\" 0x%llx", m_Modules[i].path, relative);
+        rdcstr cmd = StringFormat::Fmt("addr2line -fCe \"%s\" 0x%llx", m_Modules[i].path, relative);
+
+        RDCLOG(": %s", cmd.c_str());
 
         FILE *f = ::popen(cmd.c_str(), "r");
 
         char result[2048] = {0};
         fread(result, 1, 2047, f);
 
-        fclose(f);
+        ::pclose(f);
 
         char *line2 = strchr(result, '\n');
         if(line2)
@@ -226,11 +272,12 @@ private:
     }
   }
 
-  std::vector<LookupModule> m_Modules;
+  rdcarray<LookupModule> m_Modules;
   std::map<uint64_t, Callstack::AddressDetails> m_Cache;
 };
 
-StackResolver *MakeResolver(byte *moduleDB, size_t DBSize, RENDERDOC_ProgressCallback progress)
+StackResolver *MakeResolver(bool interactive, byte *moduleDB, size_t DBSize,
+                            RENDERDOC_ProgressCallback progress)
 {
   // we look in the original locations for the files, we don't prompt if we can't
   // find the file, or the file doesn't have symbols (and we don't validate that
@@ -247,7 +294,7 @@ StackResolver *MakeResolver(byte *moduleDB, size_t DBSize, RENDERDOC_ProgressCal
   char *search = start;
   char *dbend = (char *)(moduleDB + DBSize);
 
-  std::vector<LookupModule> modules;
+  rdcarray<LookupModule> modules;
 
   while(search && search < dbend)
   {

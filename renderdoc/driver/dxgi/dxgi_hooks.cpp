@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  * Copyright (c) 2014 Crytek
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -54,18 +54,18 @@ struct RenderDocAnalysis : IDXGraphicsAnalysis
   // IDXGraphicsAnalysis
   void STDMETHODCALLTYPE BeginCapture()
   {
-    void *dev = NULL, *wnd = NULL;
-    RenderDoc::Inst().GetActiveWindow(dev, wnd);
+    DeviceOwnedWindow devWnd;
+    RenderDoc::Inst().GetActiveWindow(devWnd);
 
-    RenderDoc::Inst().StartFrameCapture(dev, wnd);
+    RenderDoc::Inst().StartFrameCapture(devWnd);
   }
 
   void STDMETHODCALLTYPE EndCapture()
   {
-    void *dev = NULL, *wnd = NULL;
-    RenderDoc::Inst().GetActiveWindow(dev, wnd);
+    DeviceOwnedWindow devWnd;
+    RenderDoc::Inst().GetActiveWindow(devWnd);
 
-    RenderDoc::Inst().EndFrameCapture(dev, wnd);
+    RenderDoc::Inst().EndFrameCapture(devWnd);
   }
 };
 
@@ -277,7 +277,7 @@ private:
     HRESULT ret = dxgihooks.CreateDXGIFactory()(riid, ppFactory);
 
     if(SUCCEEDED(ret))
-      RefCountDXGIObject::HandleWrap(riid, ppFactory);
+      RefCountDXGIObject::HandleWrap("CreateDXGIFactory", riid, ppFactory);
 
     return ret;
   }
@@ -289,7 +289,7 @@ private:
     HRESULT ret = dxgihooks.CreateDXGIFactory1()(riid, ppFactory);
 
     if(SUCCEEDED(ret))
-      RefCountDXGIObject::HandleWrap(riid, ppFactory);
+      RefCountDXGIObject::HandleWrap("CreateDXGIFactory1", riid, ppFactory);
 
     return ret;
   }
@@ -301,7 +301,7 @@ private:
     HRESULT ret = dxgihooks.CreateDXGIFactory2()(Flags, riid, ppFactory);
 
     if(SUCCEEDED(ret))
-      RefCountDXGIObject::HandleWrap(riid, ppFactory);
+      RefCountDXGIObject::HandleWrap("CreateDXGIFactory2", riid, ppFactory);
 
     return ret;
   }
@@ -314,7 +314,8 @@ private:
     if(riid == __uuidof(IDXGraphicsAnalysis))
     {
       dxgihooks.m_RenderDocAnalysis.AddRef();
-      *ppDebug = &dxgihooks.m_RenderDocAnalysis;
+      if(ppDebug)
+        *ppDebug = &dxgihooks.m_RenderDocAnalysis;
       return S_OK;
     }
     if(riid == __uuidof(IDXGIInfoQueue))
@@ -323,7 +324,8 @@ private:
           "Returning a dummy IDXGIInfoQueue that does nothing. RenderDoc takes control of the "
           "debug layer.");
       dxgihooks.m_DummyInfoQueue.AddRef();
-      *ppDebug = &dxgihooks.m_DummyInfoQueue;
+      if(ppDebug)
+        *ppDebug = &dxgihooks.m_DummyInfoQueue;
       return S_OK;
     }
 
@@ -343,7 +345,8 @@ private:
     if(riid == __uuidof(IDXGraphicsAnalysis))
     {
       dxgihooks.m_RenderDocAnalysis.AddRef();
-      *ppDebug = &dxgihooks.m_RenderDocAnalysis;
+      if(ppDebug)
+        *ppDebug = &dxgihooks.m_RenderDocAnalysis;
       return S_OK;
     }
     if(riid == __uuidof(IDXGIInfoQueue))
@@ -352,7 +355,8 @@ private:
           "Returning a dummy IDXGIInfoQueue that does nothing. RenderDoc takes control of the "
           "debug layer.");
       dxgihooks.m_DummyInfoQueue.AddRef();
-      *ppDebug = &dxgihooks.m_DummyInfoQueue;
+      if(ppDebug)
+        *ppDebug = &dxgihooks.m_DummyInfoQueue;
       return S_OK;
     }
 

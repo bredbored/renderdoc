@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2017-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -26,15 +26,63 @@
 #define SERIALISER_IMPL
 
 #include "serialiser.h"
+#include "api/replay/renderdoc_replay.h"
 #include "core/core.h"
 #include "strings/string_utils.h"
 
-#if !defined(RELEASE)
+#if ENABLED(RDOC_DEVEL)
 
 int64_t Chunk::m_LiveChunks = 0;
 int64_t Chunk::m_TotalMem = 0;
 
 #endif
+
+void DumpObject(FileIO::LogFileHandle *log, const rdcstr &indent, SDObject *obj)
+{
+  if(obj->NumChildren() > 0)
+  {
+    rdcstr msg =
+        StringFormat::Fmt("%s%s%s %s:\n", indent.c_str(), obj->type.name.c_str(),
+                          obj->type.basetype == SDBasic::Array ? "[]" : "", obj->name.c_str());
+    FileIO::logfile_append(log, msg.c_str(), msg.length());
+    for(size_t i = 0; i < obj->NumChildren(); i++)
+      DumpObject(log, indent + "  ", obj->GetChild(i));
+  }
+  else
+  {
+    rdcstr val;
+    switch(obj->type.basetype)
+    {
+      case SDBasic::Chunk: val = "{Chunk}"; break;
+      case SDBasic::Struct: val = "{Struct}"; break;
+      case SDBasic::Array:
+        // this must be an empty array, or it would have children above
+        val = "{}";
+        break;
+      case SDBasic::Buffer: val = "[buffer]"; break;
+      case SDBasic::Null: val = "NULL"; break;
+      case SDBasic::String: val = obj->data.str; break;
+      case SDBasic::Enum: val = obj->data.str; break;
+      case SDBasic::UnsignedInteger: val = ToStr(obj->data.basic.u); break;
+      case SDBasic::SignedInteger: val = ToStr(obj->data.basic.i); break;
+      case SDBasic::Float: val = ToStr(obj->data.basic.d); break;
+      case SDBasic::Boolean: val = ToStr(obj->data.basic.b); break;
+      case SDBasic::Character: val = ToStr(obj->data.basic.c); break;
+      case SDBasic::Resource: val = ToStr(obj->data.basic.id); break;
+    }
+    rdcstr msg = StringFormat::Fmt("%s%s %s = %s\n", indent.c_str(), obj->type.name.c_str(),
+                                   obj->name.c_str(), val.c_str());
+    FileIO::logfile_append(log, msg.c_str(), msg.length());
+  }
+}
+
+void DumpChunk(bool reading, FileIO::LogFileHandle *log, SDChunk *chunk)
+{
+  rdcstr msg = StringFormat::Fmt("%s %s @ %llu:\n", reading ? "Read" : "Wrote", chunk->name.c_str(),
+                                 chunk->metadata.timestampMicro);
+  FileIO::logfile_append(log, msg.c_str(), msg.length());
+  DumpObject(log, "  ", chunk);
+}
 
 /////////////////////////////////////////////////////////////
 // Read Serialiser functions
@@ -85,20 +133,40 @@ uint32_t Serialiser<SerialiserMode::Reading>::BeginChunk(uint32_t, uint64_t)
       uint32_t numFrames = 0;
       m_Read->Read(numFrames);
 
-      m_ChunkMetadata.flags |= SDChunkFlags::HasCallstack;
+      // try to sanity check the number of frames
+      if(numFrames < 4096)
+      {
+        m_ChunkMetadata.flags |= SDChunkFlags::HasCallstack;
 
-      m_ChunkMetadata.callstack.resize((size_t)numFrames);
-      m_Read->Read(m_ChunkMetadata.callstack.data(), m_ChunkMetadata.callstack.byteSize());
+        m_ChunkMetadata.callstack.resize((size_t)numFrames);
+        m_Read->Read(m_ChunkMetadata.callstack.data(), m_ChunkMetadata.callstack.byteSize());
+      }
+      else
+      {
+        RDCERR("Read invalid number of callstack frames: %u", numFrames);
+        // still read the size that we should, even though we expect this to be broken after here
+        m_Read->Read(NULL, numFrames * sizeof(uint64_t));
+      }
     }
 
     if(c & ChunkThreadID)
       m_Read->Read(m_ChunkMetadata.threadID);
 
     if(c & ChunkDuration)
+    {
       m_Read->Read(m_ChunkMetadata.durationMicro);
+      if(m_TimerFrequency != 1.0)
+        m_ChunkMetadata.durationMicro =
+            int64_t(double(m_ChunkMetadata.durationMicro) / m_TimerFrequency);
+    }
 
     if(c & ChunkTimestamp)
+    {
       m_Read->Read(m_ChunkMetadata.timestampMicro);
+      if(m_TimerFrequency != 1.0 || m_TimerBase != 0)
+        m_ChunkMetadata.timestampMicro =
+            int64_t(double(m_ChunkMetadata.timestampMicro - m_TimerBase) / m_TimerFrequency);
+    }
 
     if(c & Chunk64BitSize)
     {
@@ -111,23 +179,30 @@ uint32_t Serialiser<SerialiserMode::Reading>::BeginChunk(uint32_t, uint64_t)
       m_ChunkMetadata.length = chunkSize;
     }
 
+    uint64_t len = m_ChunkMetadata.length;
+    VerifyArraySize(m_ChunkMetadata.length);
+    // if length was set to 0 by VerifyArraySize due to being invalid, set it to something
+    // reasonable just to prevent knock-on problems with error handling
+    if(len != 0 && m_ChunkMetadata.length == 0)
+      m_ChunkMetadata.length = 1024;
+
     m_LastChunkOffset = m_Read->GetOffset();
   }
 
   if(ExportStructure())
   {
-    std::string name = m_ChunkLookup ? m_ChunkLookup(chunkID) : "";
+    rdcstr name = m_ChunkLookup ? m_ChunkLookup(chunkID) : "";
 
     if(name.empty())
       name = "<Unknown Chunk>";
 
-    SDChunk *chunk = new SDChunk(name.c_str());
+    SDChunk *chunk = new SDChunk(name);
     chunk->metadata = m_ChunkMetadata;
 
     m_StructuredFile->chunks.push_back(chunk);
     m_StructureStack.push_back(chunk);
 
-    m_InternalElement = false;
+    m_InternalElement = 0;
   }
 
   return chunkID;
@@ -143,10 +218,8 @@ void Serialiser<SerialiserMode::Reading>::SkipCurrentChunk()
 
     SDObject &current = *m_StructureStack.back();
 
-    current.data.basic.numChildren++;
-    current.data.children.push_back(new SDObject("Opaque chunk"_lit, "Byte Buffer"_lit));
+    SDObject &obj = *current.AddAndOwnChild(new SDObject("Opaque chunk"_lit, "Byte Buffer"_lit));
 
-    SDObject &obj = *current.data.children.back();
     obj.type.basetype = SDBasic::Buffer;
     obj.type.byteSize = m_ChunkMetadata.length;
 
@@ -177,7 +250,7 @@ void Serialiser<SerialiserMode::Reading>::SkipCurrentChunk()
     {
       SDObject &current = *m_StructureStack.back();
 
-      SDObject &obj = *current.data.children.back();
+      SDObject &obj = *current.GetChild(current.NumChildren() - 1);
 
       obj.data.basic.u = m_StructuredFile->buffers.size();
 
@@ -206,6 +279,11 @@ void Serialiser<SerialiserMode::Reading>::EndChunk()
     {
       m_StructureStack.back()->type.byteSize = m_ChunkMetadata.length;
       m_StructureStack.pop_back();
+    }
+
+    if(m_DebugDumpLog && !m_StructuredFile->chunks.empty())
+    {
+      DumpChunk(true, m_DebugDumpLog, m_StructuredFile->chunks.back());
     }
   }
 
@@ -271,6 +349,10 @@ void Serialiser<SerialiserMode::Writing>::SetChunkMetadataRecording(uint32_t fla
 template <>
 uint32_t Serialiser<SerialiserMode::Writing>::BeginChunk(uint32_t chunkID, uint64_t byteLength)
 {
+  // cannot start a chunk inside a chunk
+  RDCASSERTMSG("Beginning a chunk inside another chunk", m_ChunkMetadata.chunkID == 0,
+               m_ChunkMetadata.chunkID);
+
   {
     // chunk index needs to be valid
     RDCASSERT(chunkID > 0);
@@ -295,8 +377,8 @@ uint32_t Serialiser<SerialiserMode::Writing>::BeginChunk(uint32_t chunkID, uint6
         {
           bool collect = RenderDoc::Inst().GetCaptureOptions().captureCallstacks;
 
-          if(RenderDoc::Inst().GetCaptureOptions().captureCallstacksOnlyDraws)
-            collect = collect && m_DrawChunk;
+          if(RenderDoc::Inst().GetCaptureOptions().captureCallstacksOnlyActions)
+            collect = collect && m_ActionChunk;
 
           if(collect)
           {
@@ -336,7 +418,7 @@ uint32_t Serialiser<SerialiserMode::Writing>::BeginChunk(uint32_t chunkID, uint6
       if(c & ChunkTimestamp)
       {
         if(m_ChunkMetadata.timestampMicro == 0)
-          m_ChunkMetadata.timestampMicro = RenderDoc::Inst().GetMicrosecondTimestamp();
+          m_ChunkMetadata.timestampMicro = Timing::GetTick();
 
         m_Write->Write(m_ChunkMetadata.timestampMicro);
       }
@@ -369,13 +451,29 @@ uint32_t Serialiser<SerialiserMode::Writing>::BeginChunk(uint32_t chunkID, uint6
     }
   }
 
+  if(ExportStructure())
+  {
+    rdcstr name = m_ChunkLookup ? m_ChunkLookup(chunkID) : "";
+
+    if(name.empty())
+      name = "<Unknown Chunk>";
+
+    SDChunk *chunk = new SDChunk(name);
+    chunk->metadata = m_ChunkMetadata;
+
+    m_StructuredFile->chunks.push_back(chunk);
+    m_StructureStack.push_back(chunk);
+
+    m_InternalElement = 0;
+  }
+
   return chunkID;
 }
 
 template <>
 void Serialiser<SerialiserMode::Writing>::EndChunk()
 {
-  m_DrawChunk = false;
+  m_ActionChunk = false;
 
   if(m_DataStreaming)
   {
@@ -399,6 +497,8 @@ void Serialiser<SerialiserMode::Writing>::EndChunk()
     }
 
     m_Write->WriteAt(chunkOffset, uint32_t(chunkLength & 0xffffffff));
+
+    m_ChunkMetadata.length = chunkLength;
   }
   else
   {
@@ -408,6 +508,17 @@ void Serialiser<SerialiserMode::Writing>::EndChunk()
     {
       uint64_t numPadBytes = m_ChunkMetadata.length - writtenLength;
 
+      if(numPadBytes > 1024)
+      {
+        byte padding[1024] = {};
+        memset(padding, 0xbb, 1024);
+        while(numPadBytes > 1024)
+        {
+          m_Write->Write(padding, 1024);
+          numPadBytes -= 1024;
+        }
+      }
+
       // need to write some padding bytes so that the length is accurate
       for(uint64_t i = 0; i < numPadBytes; i++)
       {
@@ -415,8 +526,12 @@ void Serialiser<SerialiserMode::Writing>::EndChunk()
         m_Write->Write(padByte);
       }
 
-      RDCDEBUG("Chunk estimated at %llu bytes, actual length %llu. Added %llu bytes padding.",
-               m_ChunkMetadata.length, writtenLength, numPadBytes);
+      // only log if there's more than 128 bytes of padding
+      if(m_ChunkMetadata.length - writtenLength > 128)
+      {
+        RDCDEBUG("Chunk estimated at %llu bytes, actual length %llu. Added %llu bytes padding.",
+                 m_ChunkMetadata.length, writtenLength, m_ChunkMetadata.length - writtenLength);
+      }
     }
     else if(writtenLength > m_ChunkMetadata.length)
     {
@@ -429,7 +544,24 @@ void Serialiser<SerialiserMode::Writing>::EndChunk()
     }
     else
     {
-      RDCDEBUG("Chunk was exactly the estimate of %llu bytes.", m_ChunkMetadata.length);
+      // RDCDEBUG("Chunk was exactly the estimate of %llu bytes.", m_ChunkMetadata.length);
+    }
+  }
+
+  if(ExportStructure())
+  {
+    RDCASSERTMSG("Object Stack is imbalanced!", m_StructureStack.size() <= 1,
+                 m_StructureStack.size());
+
+    if(!m_StructureStack.empty())
+    {
+      m_StructureStack.back()->type.byteSize = m_ChunkMetadata.length;
+      m_StructureStack.pop_back();
+    }
+
+    if(m_DebugDumpLog && !m_StructuredFile->chunks.empty())
+    {
+      DumpChunk(false, m_DebugDumpLog, m_StructuredFile->chunks.back());
     }
   }
 
@@ -480,13 +612,15 @@ void Serialiser<SerialiserMode::Writing>::WriteStructuredFile(const SDFile &file
       scratchWriter.m_ChunkFlags = m_ChunkFlags;
     }
 
-    ser->BeginChunk(m_ChunkMetadata.chunkID, m_ChunkMetadata.length);
+    m_ChunkMetadata.chunkID = 0;
+
+    ser->BeginChunk(chunk.metadata.chunkID, m_ChunkMetadata.length);
 
     if(chunk.metadata.flags & SDChunkFlags::OpaqueChunk)
     {
-      RDCASSERT(chunk.data.children.size() == 1);
+      RDCASSERT(chunk.NumChildren() == 1);
 
-      size_t bufID = (size_t)chunk.data.children[0]->data.basic.u;
+      size_t bufID = (size_t)chunk.GetChild(0)->data.basic.u;
       byte *ptr = m_StructuredFile->buffers[bufID]->data();
       size_t len = m_StructuredFile->buffers[bufID]->size();
 
@@ -494,10 +628,10 @@ void Serialiser<SerialiserMode::Writing>::WriteStructuredFile(const SDFile &file
     }
     else
     {
-      for(size_t o = 0; o < chunk.data.children.size(); o++)
+      for(size_t o = 0; o < chunk.NumChildren(); o++)
       {
         // note, we don't need names because we aren't exporting structured data
-        ser->Serialise(""_lit, chunk.data.children[o]);
+        ser->Serialise(""_lit, (SDObject *)chunk.GetChild(o));
       }
     }
 
@@ -521,27 +655,6 @@ void Serialiser<SerialiserMode::Writing>::WriteStructuredFile(const SDFile &file
 }
 
 template <>
-rdcstr DoStringise(const SDBasic &el)
-{
-  BEGIN_ENUM_STRINGISE(SDBasic);
-  {
-    STRINGISE_ENUM_CLASS(Chunk);
-    STRINGISE_ENUM_CLASS(Struct);
-    STRINGISE_ENUM_CLASS(Array);
-    STRINGISE_ENUM_CLASS(Null);
-    STRINGISE_ENUM_CLASS(Buffer);
-    STRINGISE_ENUM_CLASS(String);
-    STRINGISE_ENUM_CLASS(Enum);
-    STRINGISE_ENUM_CLASS(UnsignedInteger);
-    STRINGISE_ENUM_CLASS(SignedInteger);
-    STRINGISE_ENUM_CLASS(Float);
-    STRINGISE_ENUM_CLASS(Boolean);
-    STRINGISE_ENUM_CLASS(Character);
-  }
-  END_ENUM_STRINGISE();
-}
-
-template <>
 rdcstr DoStringise(const SDTypeFlags &el)
 {
   BEGIN_BITFIELD_STRINGISE(SDTypeFlags);
@@ -552,6 +665,8 @@ rdcstr DoStringise(const SDTypeFlags &el)
     STRINGISE_BITFIELD_CLASS_BIT(Hidden);
     STRINGISE_BITFIELD_CLASS_BIT(Nullable);
     STRINGISE_BITFIELD_CLASS_BIT(NullString);
+    STRINGISE_BITFIELD_CLASS_BIT(FixedArray);
+    STRINGISE_BITFIELD_CLASS_BIT(Union);
   }
   END_BITFIELD_STRINGISE();
 }
@@ -564,6 +679,7 @@ rdcstr DoStringise(const SDChunkFlags &el)
     STRINGISE_BITFIELD_CLASS_VALUE(NoFlags);
 
     STRINGISE_BITFIELD_CLASS_BIT(OpaqueChunk);
+    STRINGISE_BITFIELD_CLASS_BIT(HasCallstack);
   }
   END_BITFIELD_STRINGISE();
 }
@@ -596,33 +712,42 @@ void DoSerialise(SerialiserType &ser, SDObjectPODData &el)
 }
 
 template <class SerialiserType>
-void DoSerialise(SerialiserType &ser, StructuredObjectList &el)
-{
-  // since structured objects aren't intended to be exported as nice structured data, only for pure
-  // transfer purposes, we don't make a proper array here and instead just manually serialise count
-  // + elements
-  uint64_t count = el.size();
-  ser.Serialise("count"_lit, count);
-
-  if(ser.IsReading())
-    el.resize((size_t)count);
-
-  for(size_t c = 0; c < (size_t)count; c++)
-  {
-    // we also assume that the caller serialising these objects will handle lifetime management.
-    if(ser.IsReading())
-      el[c] = new SDObject("", "");
-
-    ser.Serialise("$el"_lit, *el[c]);
-  }
-}
-
-template <class SerialiserType>
 void DoSerialise(SerialiserType &ser, SDObjectData &el)
 {
   SERIALISE_MEMBER(basic);
   SERIALISE_MEMBER(str);
-  SERIALISE_MEMBER(children);
+
+  // this is deliberately not serialised here, it's serialised in the parent SDObject. See below
+  // SERIALISE_MEMBER(children);
+}
+
+template <class SerialiserType>
+void DoSerialise(SerialiserType &ser, SDObject &el, StructuredObjectList &children)
+{
+  // serialising the data above doesn't serialise the children, so we can do it here using a
+  // potential lazy generator. This is so that we don't incur the full cost of populating lazy
+  // children all at once (which could be slow). This is a bit of a hack as this can take many
+  // seconds and cause a timeout during transfer, and it would be uglier to try and keep the
+  // connection alive while serialising chunks.
+  uint64_t childCount = children.size();
+  SERIALISE_ELEMENT(childCount).Hidden();
+
+  if(ser.IsReading())
+    children.resize((size_t)childCount);
+
+  for(size_t c = 0; c < el.NumChildren(); c++)
+  {
+    // we also assume that the caller serialising these objects will handle lifetime management.
+    if(ser.IsReading())
+      children[c] = new SDObject(""_lit, ""_lit);
+    else
+      el.PopulateChild(c);
+
+    ser.Serialise("$el"_lit, *children[c]);
+
+    if(ser.IsReading())
+      children[c]->m_Parent = &el;
+  }
 }
 
 template <class SerialiserType>
@@ -631,6 +756,8 @@ void DoSerialise(SerialiserType &ser, SDObject &el)
   SERIALISE_MEMBER(name);
   SERIALISE_MEMBER(type);
   SERIALISE_MEMBER(data);
+
+  DoSerialise(ser, el, el.data.children);
 }
 
 template <class SerialiserType>
@@ -638,8 +765,10 @@ void DoSerialise(SerialiserType &ser, SDChunk &el)
 {
   SERIALISE_MEMBER(name);
   SERIALISE_MEMBER(type);
-  SERIALISE_MEMBER(data);
   SERIALISE_MEMBER(metadata);
+  SERIALISE_MEMBER(data);
+
+  DoSerialise(ser, el, el.data.children);
 }
 
 INSTANTIATE_SERIALISE_TYPE(SDChunk);
@@ -665,10 +794,18 @@ void DoSerialise(SerialiserType &ser, SDObject *el)
   {
     case SDBasic::Chunk: RDCERR("Unexpected chunk inside object!"); break;
     case SDBasic::Struct:
-      for(size_t o = 0; o < el->data.children.size(); o++)
-        ser.Serialise(""_lit, el->data.children[o]);
+      for(size_t o = 0; o < el->NumChildren(); o++)
+        ser.Serialise(""_lit, el->GetChild(o));
       break;
-    case SDBasic::Array: ser.Serialise(""_lit, (rdcarray<SDObject *> &)el->data.children); break;
+    case SDBasic::Array:
+    {
+      uint64_t arraySize = el->NumChildren();
+      ser.Serialise(""_lit, arraySize);
+      // ensure all children are ready
+      for(size_t o = 0; o < el->NumChildren(); o++)
+        ser.Serialise(""_lit, el->GetChild(o));
+      break;
+    }
     case SDBasic::Null:
       // nothing to do, we serialised present flag above
       RDCASSERT(el->type.flags & SDTypeFlags::Nullable);
@@ -694,15 +831,10 @@ void DoSerialise(SerialiserType &ser, SDObject *el)
       }
       break;
     }
-    case SDBasic::Enum:
-    {
-      uint32_t e = (uint32_t)el->data.basic.u;
-      ser.Serialise(""_lit, e);
-      break;
-    }
     case SDBasic::Boolean: ser.Serialise(""_lit, el->data.basic.b); break;
     case SDBasic::Character: ser.Serialise(""_lit, el->data.basic.c); break;
     case SDBasic::Resource: ser.Serialise(""_lit, el->data.basic.id); break;
+    case SDBasic::Enum:
     case SDBasic::UnsignedInteger:
       if(el->type.byteSize == 1)
       {
@@ -775,13 +907,19 @@ void DoSerialise(SerialiserType &ser, SDObject *el)
 // Basic types
 
 template <>
-rdcstr DoStringise(const std::string &el)
+rdcstr DoStringise(const rdcstr &el)
 {
   return el;
 }
 
 template <>
-rdcstr DoStringise(const rdcstr &el)
+rdcstr DoStringise(const rdcinflexiblestr &el)
+{
+  return el;
+}
+
+template <>
+rdcstr DoStringise(const rdcliteral &el)
 {
   return el;
 }
@@ -837,6 +975,12 @@ rdcstr DoStringise(const byte &el)
 }
 
 template <>
+rdcstr DoStringise(const int8_t &el)
+{
+  return StringFormat::Fmt("%hhd", el);
+}
+
+template <>
 rdcstr DoStringise(const uint16_t &el)
 {
   return StringFormat::Fmt("%hu", el);
@@ -861,6 +1005,12 @@ rdcstr DoStringise(const float &el)
 }
 
 template <>
+rdcstr DoStringise(const rdhalf &el)
+{
+  return StringFormat::Fmt("%0.4f", (float)el);
+}
+
+template <>
 rdcstr DoStringise(const double &el)
 {
   return StringFormat::Fmt("%0.4lf", el);
@@ -873,4 +1023,232 @@ rdcstr DoStringise(const bool &el)
     return "True";
 
   return "False";
+}
+
+Chunk *Chunk::Create(Serialiser<SerialiserMode::Writing> &ser, uint16_t chunkType,
+                     ChunkAllocator *allocator, bool stealDataFromWriter)
+{
+  RDCCOMPILE_ASSERT(sizeof(Chunk) <= 16, "Chunk should be no more than 16 bytes");
+
+  RDCASSERT(ser.GetWriter()->GetOffset() < 0xffffffff);
+  uint32_t length = (uint32_t)ser.GetWriter()->GetOffset();
+
+  byte *data = NULL;
+
+  if(stealDataFromWriter)
+  {
+    data = ser.GetWriter()->StealDataAndRewind();
+  }
+  else
+  {
+    if(allocator)
+    {
+      // try to allocate from the allocator
+      data = allocator->AllocAlignedBuffer(length);
+
+      // if we couldn't satisfy the allocation then pretend we never had an allocator in the first
+      // place. We'll externally allocate the chunk and the data.
+      if(!data)
+        allocator = NULL;
+    }
+
+    // if we don't have an allocator or we gave up on it above, allocate the data externally
+    if(!allocator)
+      data = AllocAlignedBuffer(length);
+
+    memcpy(data, ser.GetWriter()->GetData(), (size_t)length);
+
+    ser.GetWriter()->Rewind();
+  }
+
+  Chunk *ret = NULL;
+
+  // if allocator wasn't NULL'd above, use it to allocate the chunk as well. We always either
+  // allocate both chunk and data from the allocator (so we don't have anything to do on
+  // destruction) or neither. Otherwise if we allocated the chunk from the allocator and the data
+  // externally, our data pointer might be corrupted or the bool indicating that it's external.
+  // Consider the case where we allocate some chunks from an allocator - one of which allocated
+  // external data - then the allocator is reset. Now the chunk could be overwritten by subsequent
+  // recording before it is deleted. We don't want the allocator to have to explicitly delete all
+  // chunks that were allocated from it and external data allocations should be rare (only really
+  // massive chunks bigger than a page) so we can afford to externally allocate the chunk too.
+  if(allocator)
+    ret = new(allocator->AllocChunk()) Chunk(true);
+  else
+    ret = new Chunk(false);
+
+  ret->m_Length = length;
+  ret->m_ChunkType = chunkType;
+  ret->m_Data = data;
+
+  if(allocator == NULL)
+  {
+#if ENABLED(RDOC_DEVEL)
+    Atomic::Inc64(&m_LiveChunks);
+    Atomic::ExchAdd64(&m_TotalMem, int64_t(length));
+#endif
+  }
+
+  return ret;
+}
+
+ChunkPagePool::~ChunkPagePool()
+{
+  // all allocated pages are in precisely one list, so just free the contents of both lists
+  for(ChunkPage &p : freePages)
+  {
+    FreeAlignedBuffer(p.chunkBase);
+    FreeAlignedBuffer(p.bufferBase);
+  }
+
+  for(ChunkPage &p : allocatedPages)
+  {
+    FreeAlignedBuffer(p.chunkBase);
+    FreeAlignedBuffer(p.bufferBase);
+  }
+}
+
+ChunkPage ChunkPagePool::AllocPage()
+{
+  if(!freePages.empty())
+  {
+    // if there's a free page, move it to the allocated list and return it
+    ChunkPage free = freePages.back();
+    freePages.pop_back();
+    allocatedPages.push_back(free);
+  }
+  else
+  {
+    // otherwise allocate a new one straight into the allocated list
+    byte *buffers = ::AllocAlignedBuffer(BufferPageSize);
+    byte *chunks = ::AllocAlignedBuffer(ChunkPageSize);
+    allocatedPages.push_back({m_ID++, buffers, buffers, chunks, chunks});
+  }
+
+  return allocatedPages.back();
+}
+
+void ChunkPagePool::Trim()
+{
+  // truly release any currently free pages back to the system
+  for(ChunkPage &p : freePages)
+  {
+    FreeAlignedBuffer(p.chunkBase);
+    FreeAlignedBuffer(p.bufferBase);
+  }
+
+  freePages.clear();
+}
+
+void ChunkPagePool::Reset()
+{
+  // forcibly move all allocated pages into the free list
+  freePages.append(allocatedPages);
+  allocatedPages.clear();
+
+  for(ChunkPage &p : freePages)
+  {
+    // reset head pointers
+    p.bufferHead = p.bufferBase;
+    p.chunkHead = p.chunkBase;
+
+    // assign a new ID so these pages can't get reset again by any allocator currently holding them
+    p.ID = m_ID++;
+  }
+}
+
+void ChunkPagePool::ResetPageSet(const rdcarray<ChunkPage> &pages)
+{
+  // iterate over each page being freed
+  for(const ChunkPage &p : pages)
+  {
+    // try to find it in the allocated page list. This compares by ID, so if the page was already
+    // freed with a pool reset we won't find it at all because it will have a new ID - that's fine.
+    int32_t idx = allocatedPages.indexOf(p);
+    if(idx >= 0)
+    {
+      ChunkPage &alloc = allocatedPages[idx];
+      // give a new ID to be safe
+      alloc.ID = m_ID++;
+      // reset head pointers
+      alloc.bufferHead = alloc.bufferBase;
+      alloc.chunkHead = alloc.chunkBase;
+      // move to free list
+      freePages.push_back(alloc);
+      // allocatedPages is not sorted, swap with the back and pop to avoid expensive erases in the
+      // middle of the list
+      std::swap(allocatedPages[idx], allocatedPages.back());
+      allocatedPages.pop_back();
+      continue;
+    }
+  }
+}
+
+ChunkAllocator::~ChunkAllocator()
+{
+  // move any pages we have back to the pool on destruction
+  Reset();
+}
+
+void ChunkAllocator::swap(ChunkAllocator &alloc)
+{
+  if(&m_Pool != &alloc.m_Pool)
+  {
+    RDCERR(
+        "Allocator swap with allocator from another pool! Losing all pages to leak instead of "
+        "crashing");
+    pages.clear();
+    alloc.pages.clear();
+    return;
+  }
+
+  pages.swap(alloc.pages);
+}
+
+byte *ChunkAllocator::AllocAlignedBuffer(uint64_t size)
+{
+  // always allocate 64-bytes at a time even if the size is smaller
+  return AllocateFromPages(false, AlignUp((size_t)size, (size_t)64));
+}
+
+byte *ChunkAllocator::AllocChunk()
+{
+  RDCCOMPILE_ASSERT(sizeof(ChunkAllocator) <= 128, "foo");
+  return AllocateFromPages(true, sizeof(Chunk));
+}
+
+void ChunkAllocator::Reset()
+{
+  m_Pool.ResetPageSet(pages);
+  pages.clear();
+}
+
+byte *ChunkAllocator::AllocateFromPages(bool chunkAlloc, size_t size)
+{
+  // if the size can't be satisfied in a page, return NULL and we'll force a full allocation which
+  // will be freed on its own
+  if(size > m_Pool.GetBufferPageSize())
+    return NULL;
+
+  // if we don't have a current page, or it can't satisfy the allocation, get a new page from the
+  // pool
+  if(pages.empty() || GetRemainingBytes(chunkAlloc, pages.back()) < size)
+    pages.push_back(m_Pool.AllocPage());
+
+  ChunkPage &p = pages.back();
+
+  byte *ret = NULL;
+
+  if(chunkAlloc)
+  {
+    ret = p.chunkHead;
+    p.chunkHead += size;
+  }
+  else
+  {
+    ret = p.bufferHead;
+    p.bufferHead += size;
+  }
+
+  return ret;
 }

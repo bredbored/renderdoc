@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -139,7 +139,27 @@ void NuklearShutdown()
   UnregisterClassW(wc.lpszClassName, wc.hInstance);
 }
 
-#else
+#elif defined(ANDROID)
+
+nk_context *NuklearInit(int width, int height, const char *title)
+{
+  return NULL;
+}
+
+bool NuklearTick(nk_context *ctx)
+{
+  return false;
+}
+
+void NuklearRender()
+{
+}
+
+void NuklearShutdown()
+{
+}
+
+#elif defined(__linux__)
 
 #define NK_XLIB_IMPLEMENTATION
 #include "3rdparty/nuklear/nuklear_xlib.h"
@@ -214,6 +234,72 @@ void NuklearShutdown()
   XCloseDisplay(dpy);
 }
 
+#elif defined(__APPLE__)
+
+#include "apple/official/metal-cpp.h"
+extern "C" void *const NSDefaultRunLoopMode;
+
+#define NK_APPKIT_IMPLEMENTATION
+#include "apple/nuklear_appkit.h"
+
+static nk_appkit_window *window;
+static AppkitFont *font;
+static NS::Application *pSharedApplication = NULL;
+
+nk_context *NuklearInit(int width, int height, const char *title)
+{
+  if(!nk_appkit_core_initialize())
+    exit(EXIT_FAILURE);
+
+  pSharedApplication = NS::Application::sharedApplication();
+
+  window = nk_appkit_window_create(width, height, title);
+  if(!window)
+    exit(EXIT_FAILURE);
+
+  nk_context *ctx = nk_appkit_create(window);
+  font = nk_appkit_create_font("Menlo Regular", 9);
+  nk_appkit_init(font);
+  return ctx;
+}
+
+bool NuklearTick(nk_context *ctx)
+{
+  NS::AutoreleasePool *pAutoreleasePool = NS::AutoreleasePool::alloc()->init();
+  while(true)
+  {
+    NS::Event *event = pSharedApplication->nextEventMatchingMask(
+        (int)NS::EventMaskAny, NS::Date::distantPast(), (NS::String *)NSDefaultRunLoopMode, true);
+    if(event == NULL)
+      break;
+    pSharedApplication->sendEvent(event);
+  }
+  pAutoreleasePool->release();
+  nk_appkit_new_frame();
+
+  if(nk_appkit_window_is_closed(window))
+    return false;
+
+  return true;
+}
+
+void NuklearRender()
+{
+  nk_appkit_render(nk_rgb(30, 30, 30));
+}
+
+void NuklearShutdown()
+{
+  nk_appkit_delete_font(font);
+  nk_appkit_shutdown();
+  nk_appkit_window_delete(window);
+  nk_appkit_core_shutdown();
+}
+
+#else
+
+#error UNKNOWN PLATFORM
+
 #endif
 
 // nuklear
@@ -238,6 +324,68 @@ void RegisterTest(TestMetadata test)
   test_list().push_back(test);
 }
 
+#if defined(_WIN64)
+#pragma warning(disable : 4091)
+
+#include <ImageHlp.h>
+
+LONG exceptionHandler(_EXCEPTION_POINTERS *ExceptionInfo)
+{
+  TEST_ERROR("Unhandled exception, code %08x", ExceptionInfo->ExceptionRecord->ExceptionCode);
+
+  if(HMODULE dbghelp = GetModuleHandleA("dbghelp.dll"))
+  {
+    using PFN_getLine = decltype(&SymGetLineFromAddr64);
+
+    PFN_getLine getLine = (PFN_getLine)GetProcAddress(dbghelp, "SymGetLineFromAddr64");
+
+    if(getLine)
+    {
+      DWORD64 stack[64] = {};
+
+      USHORT num = RtlCaptureStackBackTrace(1, 63, (void **)stack, NULL);
+
+      for(USHORT i = 0; i < num; i++)
+      {
+        DWORD offs = 0;
+        IMAGEHLP_LINE64 line = {};
+        getLine(GetCurrentProcess(), stack[i], &offs, &line);
+
+        if(line.FileName && line.FileName[0])
+        {
+          TEST_LOG("[%u] %s:%u", i, line.FileName, line.LineNumber);
+        }
+        else
+        {
+          HMODULE mod = NULL;
+          GetModuleHandleExA(
+              GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+              (const char *)stack[i], &mod);
+
+          if(mod)
+          {
+            char file[512] = {0};
+            GetModuleFileNameA(mod, file, 511);
+
+            TEST_LOG("[%u] %s+0x%x", i, file, stack[i] - (DWORD64)mod);
+          }
+          else
+          {
+            TEST_LOG("[%u] ??? %p", i, stack[i]);
+          }
+        }
+      }
+
+      return EXCEPTION_EXECUTE_HANDLER;
+    }
+  }
+
+  TEST_LOG("No callstack available");
+
+  return EXCEPTION_EXECUTE_HANDLER;
+}
+#endif
+
 int main(int argc, char **argv)
 {
   std::vector<TestMetadata> &tests = test_list();
@@ -253,7 +401,7 @@ Usage: %s Test_Name [test_options]
 
   --help                        Print this help message.
   --list                        Lists all tests, with name, API, description, availability.
-  --list-available              Lists the available test names only, one per line.
+  --list-raw                    Lists the available test names only, one per line.
   --validate
   --debug                       Run the demo with API validation enabled.
   --gpu [identifier]            Try to select the corresponding GPU where available and possible
@@ -328,9 +476,37 @@ Usage: %s Test_Name [test_options]
     return 1;
   }
 
+  // Check if the first arg is a valid test name. If it isn't,
+  // allow the UI to appear, so that flags can be used with the UI
+  bool validTestArg = false;
+  if(argc >= 2)
+  {
+    for(const TestMetadata &test : tests)
+    {
+      if(!strcmp(test.Name, argv[1]))
+      {
+        validTestArg = true;
+        break;
+      }
+    }
+  }
+
   std::string testchoice;
 
-  if(argc >= 2)
+#if 0
+  testchoice = "Hardcoded test name";
+#endif
+
+  if(!testchoice.empty())
+  {
+    // hardcoded test, ignore everything else
+  }
+  else if(tests.size() == 1)
+  {
+    // if there's only one test we've probably hardcoded this for a repro. Launch it
+    testchoice = tests[0].Name;
+  }
+  else if(validTestArg)
   {
     testchoice = argv[1];
   }
@@ -347,12 +523,13 @@ Usage: %s Test_Name [test_options]
 
     int curtest = 0;
     bool allow[(int)TestAPI::Count] = {};
+    bool nofilters = true;
     const char *allow_names[] = {
-        "D3D11", "Vulkan", "OpenGL", "D3D12",
+        "D3D11",
+        "Vulkan",
+        "OpenGL",
+        "D3D12",
     };
-
-    for(size_t i = 0; i < ARRAY_COUNT(allow); i++)
-      allow[i] = true;
 
     char name_filter[256] = {};
 
@@ -363,18 +540,28 @@ Usage: %s Test_Name [test_options]
       if(nk_begin(ctx, "Demo", nk_rect(0, 0, (float)width, (float)height), NK_WINDOW_NO_SCROLLBAR))
       {
         nk_layout_row_dynamic(ctx, 100, 1);
-        if(nk_group_begin(ctx, "Test Filter", NK_WINDOW_BORDER | NK_WINDOW_TITLE))
+        if(nk_group_begin(ctx, "Test Filter",
+                          NK_WINDOW_BORDER | NK_WINDOW_TITLE | NK_WINDOW_NO_SCROLLBAR))
         {
           nk_layout_row_dynamic(ctx, 30, ARRAY_COUNT(allow_names) + 1);
 
-          nk_label(ctx, "Filter tests:", NK_TEXT_LEFT);
+          nk_label(ctx, "API Filter:", NK_TEXT_LEFT);
 
+          nofilters = true;
           for(size_t i = 0; i < ARRAY_COUNT(allow); i++)
           {
             std::string text = allow_names[i];
 
             allow[i] = nk_check_label(ctx, text.c_str(), allow[i]) != 0;
+            nofilters &= !allow[i];
           }
+
+          nk_layout_row_begin(ctx, NK_STATIC, 20, 2);
+          nk_layout_row_push(ctx, 60.0f);
+          nk_label(ctx, "Name Filter:", NK_TEXT_LEFT);
+          nk_layout_row_push(ctx, 280.0f);
+          nk_edit_string_zero_terminated(ctx, NK_EDIT_FIELD, name_filter, 256, NULL);
+          nk_layout_row_end(ctx);
 
           nk_group_end(ctx);
         }
@@ -382,13 +569,6 @@ Usage: %s Test_Name [test_options]
         nk_layout_row_dynamic(ctx, 270, 1);
         if(nk_group_begin(ctx, "Test", NK_WINDOW_BORDER | NK_WINDOW_TITLE))
         {
-          nk_layout_row_begin(ctx, NK_STATIC, 20, 2);
-          nk_layout_row_push(ctx, 60.0f);
-          nk_label(ctx, "Test Filter:", NK_TEXT_ALIGN_MIDDLE | NK_TEXT_ALIGN_RIGHT);
-          nk_layout_row_push(ctx, 280.0f);
-          nk_edit_string_zero_terminated(ctx, NK_EDIT_FIELD, name_filter, 256, NULL);
-          nk_layout_row_end(ctx);
-
           float prevSpacing = 0;
           std::swap(prevSpacing, ctx->style.window.spacing.y);
 
@@ -404,7 +584,7 @@ Usage: %s Test_Name [test_options]
             std::string lower_name = strlower(tests[i].Name);
 
             // apply filters
-            if(!allow[(int)tests[i].API] ||
+            if((!allow[(int)tests[i].API] && !nofilters) ||
                (!lower_filter.empty() && !strstr(lower_name.c_str(), lower_filter.c_str())))
             {
               // if this was the selected test, unselect it. The next unfiltered test will grab it
@@ -434,32 +614,30 @@ Usage: %s Test_Name [test_options]
         {
           if(curtest >= 0)
           {
-            nk_layout_row_begin(ctx, NK_DYNAMIC, 20, 2);
-            nk_layout_row_push(ctx, 0.25f);
-            nk_label(ctx, "Test name:", NK_TEXT_ALIGN_TOP | NK_TEXT_ALIGN_RIGHT);
-            nk_layout_row_push(ctx, 0.75f);
+            nk_layout_row_begin(ctx, NK_STATIC, 20, 2);
+            nk_layout_row_push(ctx, 60.0f);
+            nk_label(ctx, "Test name: ", NK_TEXT_ALIGN_TOP | NK_TEXT_ALIGN_LEFT);
+            nk_layout_row_push(ctx, 280.0f);
             nk_label(ctx, selected_test.Name, NK_TEXT_ALIGN_TOP | NK_TEXT_ALIGN_LEFT);
             nk_layout_row_end(ctx);
 
-            nk_layout_row_begin(ctx, NK_DYNAMIC, 20, 2);
-            nk_layout_row_push(ctx, 0.25f);
-            nk_label(ctx, "API:", NK_TEXT_ALIGN_TOP | NK_TEXT_ALIGN_RIGHT);
-            nk_layout_row_push(ctx, 0.75f);
+            nk_layout_row_begin(ctx, NK_STATIC, 20, 2);
+            nk_layout_row_push(ctx, 60.0f);
+            nk_label(ctx, "API:", NK_TEXT_ALIGN_TOP | NK_TEXT_ALIGN_LEFT);
+            nk_layout_row_push(ctx, 280.0f);
             nk_label(ctx, APIName(selected_test.API), NK_TEXT_ALIGN_TOP | NK_TEXT_ALIGN_LEFT);
             nk_layout_row_end(ctx);
 
-            nk_layout_row_begin(ctx, NK_DYNAMIC, 0, 2);
-            nk_layout_row_push(ctx, 0.25f);
-            nk_label(ctx, "Description:", NK_TEXT_ALIGN_TOP | NK_TEXT_ALIGN_RIGHT);
-            nk_layout_row_push(ctx, 0.75f);
+            nk_layout_row_begin(ctx, NK_DYNAMIC, 50, 1);
+            nk_layout_row_push(ctx, 1.0f);
             nk_label_wrap(ctx, selected_test.Description);
             nk_layout_row_end(ctx);
           }
           else
           {
             nk_layout_row_begin(ctx, NK_DYNAMIC, 20, 1);
-            nk_layout_row_push(ctx, 0.25f);
-            nk_label(ctx, "No test selected", NK_TEXT_ALIGN_TOP | NK_TEXT_ALIGN_CENTERED);
+            nk_layout_row_push(ctx, 1.0f);
+            nk_label(ctx, "No test selected", NK_TEXT_ALIGN_TOP | NK_TEXT_ALIGN_LEFT);
             nk_layout_row_end(ctx);
           }
 
@@ -492,12 +670,17 @@ Usage: %s Test_Name [test_options]
   if(testchoice.empty())
     return 0;
 
+#if defined(_WIN64)
+  SetUnhandledExceptionFilter(&exceptionHandler);
+#endif
+
   for(const TestMetadata &test : tests)
   {
     if(testchoice == test.Name)
     {
-      TEST_LOG("\n\n======\nRunning %s\n\n", test.Name);
+      TEST_LOG("Running '%s'", test.Name);
       test.test->Prepare(argc, argv);
+      test.test->SetName(test.Name);
 
       if(!test.IsAvailable())
       {
@@ -547,6 +730,112 @@ int WINAPI wWinMain(_In_ HINSTANCE hInst, _In_opt_ HINSTANCE hPrevInstance, _In_
 
   delete[] argv;
   LocalFree(wargv);
+}
+
+#endif
+
+#if defined(ANDROID)
+#include <android_native_app_glue.h>
+#include <sstream>
+
+#include <android/log.h>
+
+struct android_app *android_state;
+pthread_t cmdthread_handle = 0;
+
+#define ANDROID_LOG(...) __android_log_print(ANDROID_LOG_INFO, "rd_demos", __VA_ARGS__);
+
+std::vector<std::string> getArgs()
+{
+  JNIEnv *env;
+  android_state->activity->vm->AttachCurrentThread(&env, 0);
+
+  jobject me = android_state->activity->clazz;
+
+  jclass acl = env->GetObjectClass(me);    // class pointer of NativeActivity
+  jmethodID giid = env->GetMethodID(acl, "getIntent", "()Landroid/content/Intent;");
+  jobject intent = env->CallObjectMethod(me, giid);    // Got our intent
+
+  jclass icl = env->GetObjectClass(intent);    // class pointer of Intent
+  jmethodID gseid =
+      env->GetMethodID(icl, "getStringExtra", "(Ljava/lang/String;)Ljava/lang/String;");
+
+  jstring jsParam1 = (jstring)env->CallObjectMethod(intent, gseid, env->NewStringUTF("rd_demos"));
+
+  std::vector<std::string> ret;
+  if(jsParam1)    // Check if arg value found
+  {
+    ret.push_back("rd_demos");
+    const char *param1 = env->GetStringUTFChars(jsParam1, 0);
+    std::istringstream iss(param1);
+    while(iss)
+    {
+      std::string sub;
+      iss >> sub;
+      ret.push_back(sub);
+    }
+  }
+  android_state->activity->vm->DetachCurrentThread();
+
+  return ret;
+}
+
+void *cmdthread(void *)
+{
+  ANDROID_LOG("cmdthread");
+  std::vector<std::string> args = getArgs();
+  if(args.size())
+  {
+    std::vector<char *> argv;
+    for(size_t i = 0; i < args.size(); i++)
+    {
+      ANDROID_LOG("argv %d: %s", (int)i, args[i].c_str());
+      argv.push_back(&args[i][0]);
+    }
+    int argc = argv.size();
+    argv.push_back(NULL);
+    ANDROID_LOG("premain");
+    main(argc, argv.data());
+    ANDROID_LOG("postmain");
+  }
+
+  // activity is done and should be closed
+  ANativeActivity_finish(android_state->activity);
+
+  return NULL;
+}
+
+void handle_cmd(android_app *app, int32_t cmd)
+{
+  if(cmd == APP_CMD_INIT_WINDOW)
+  {
+    ANDROID_LOG("APP_CMD_INIT_WINDOW");
+    pthread_create(&cmdthread_handle, NULL, cmdthread, NULL);
+  }
+}
+
+void android_main(struct android_app *state)
+{
+  android_state = state;
+  android_state->onAppCmd = handle_cmd;
+
+  ANDROID_LOG("android_main");
+
+  // Used to poll the events in the main loop
+  int events;
+  android_poll_source *source;
+  do
+  {
+    if(ALooper_pollAll(1, nullptr, &events, (void **)&source) >= 0)
+    {
+      if(source != NULL)
+        source->process(android_state, source);
+    }
+  } while(android_state->destroyRequested == 0);
+
+  ANDROID_LOG("end android_main");
+
+  android_state = NULL;
 }
 
 #endif

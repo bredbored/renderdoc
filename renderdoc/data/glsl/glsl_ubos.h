@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -35,15 +35,36 @@ BINDING(0) uniform MeshUBOData
   mat4 mvp;
   mat4 invProj;
   vec4 color;
+
   int displayFormat;
   uint homogenousInput;
   vec2 pointSpriteSize;
+
   uint rawoutput;
-  vec3 padding;
+  uint flipY;
+  float vtxExploderSNorm;
+  float exploderScale;
+
+  vec3 exploderCentre;
+  float padding;
+
+  uvec4 meshletColours[12];
 }
 INST_NAME(Mesh);
 
 #endif    // defined(MESH_UBO) || defined(__cplusplus)
+
+#if defined(MESH_UBO) && defined(VULKAN)
+
+layout(binding = 1, std140) readonly buffer meshlet_data
+{
+  uint meshletCount;
+  uint meshletOffset;
+  uvec4 data[];
+}
+meshlet;
+
+#endif    // defined(MESH_UBO)
 
 #if defined(CHECKER_UBO) || defined(__cplusplus)
 
@@ -112,9 +133,10 @@ BINDING(0) uniform MeshPickUBOData
 
   uint meshMode;    // triangles, triangle strip, fan, etc...
   uint unproject;
-  vec2 padding;
+  uint flipY;
+  uint ortho;
 
-  mat4 mvp;
+  mat4 transformMat;
 }
 INST_NAME(meshpick);
 

@@ -12,6 +12,10 @@ I want to ensure that anyone can contribute to RenderDoc with only the next bug 
 
 If you have any queries or concerns in this regard you can get in touch with me [directly over email](mailto:baldurk@baldurk.org).
 
+## Acceptable use of RenderDoc
+
+RenderDoc is a tool intended for debugging your own projects and programs, those to which you have true ownership of. Use and abuse of RenderDoc for illegal or unethical uses including but not limited to capturing copyrighted programs that you do not own the rights to will not be tolerated. Any questions or issues related to any such use will not be answered and no support will be provided.
+
 ## Copyright / Contributor License Agreement
 
 Any code you submit will become part of the repository and be distributed under the [RenderDoc license](../LICENSE.md). By submitting code to the project you agree that the code is your own work and that you have the ability to give it to the project.
@@ -26,6 +30,8 @@ You also agree by submitting your code that you grant all transferrable rights t
 4. [Developing a change](CONTRIBUTING/Developing-Change.md)
 5. [Testing](CONTRIBUTING/Testing.md)
 6. [Code Explanation](CONTRIBUTING/Code-Explanation.md)
+7. [Filing issues](CONTRIBUTING/Filing-Issues.md)
+8. [Asking Questions](CONTRIBUTING/Questions.md)
 
 ## Quick Start
 
@@ -35,7 +41,7 @@ Commit messages should have a first line with a **maximum of 72 characters**, th
 
 For more information, check the section about [commit messages](CONTRIBUTING/Preparing-Commits.md#commit-messages).
 
-Code should be formatted using **clang-format 3.8**. The reason we fix a specific version of clang-format is that unfortunately different versions can format code in different ways using the same config file, so this would cause problems with automatic verification of code formatting.
+Code should be formatted using **clang-format 15.0**. The reason we fix a specific version of clang-format is that unfortunately different versions can format code in different ways using the same config file, so this would cause problems with automatic verification of code formatting.
 
 For more information, check the section about [code formatting](CONTRIBUTING/Preparing-Commits.md#code-formatting).
 

@@ -6,35 +6,27 @@ class GL_Buffer_Updates(rdtest.TestCase):
     demos_test_name = 'GL_Buffer_Updates'
 
     def check_capture(self):
-        # Make an output so we can pick pixels
-        out: rd.ReplayOutput = self.controller.CreateOutput(rd.CreateHeadlessWindowingData(100, 100), rd.ReplayOutputType.Texture)
-
-        self.check(out is not None)
-
         tex = rd.TextureDisplay()
 
-        # At each draw, the centre pixel of the viewport should be green
-        draw = self.get_first_draw()
-        while draw is not None:
-            self.controller.SetFrameEvent(draw.eventId, False)
+        # At each action, the centre pixel of the viewport should be green
+        action = self.get_first_action()
+        while action is not None:
+            self.controller.SetFrameEvent(action.eventId, False)
 
-            if draw.flags & rd.DrawFlags.Drawcall:
-                tex.resourceId = self.controller.GetPipelineState().GetOutputTargets()[0].resourceId
-                out.SetTextureDisplay(tex)
+            if action.flags & rd.ActionFlags.Drawcall:
+                pipe = self.controller.GetPipelineState()
+                tex = self.controller.GetPipelineState().GetOutputTargets()[0].resourceId
 
                 view: rd.Viewport = self.controller.GetPipelineState().GetViewport(0)
 
                 x,y = int(view.x + view.width / 2), int(view.y + view.height / 2)
 
                 # convert to top-left co-ordinates for use with PickPixel
-                y = self.get_texture(tex.resourceId).height - y
+                y = self.get_texture(tex).height - y
 
-                picked: rd.PixelValue = out.PickPixel(tex.resourceId, False, x, y, 0, 0, 0)
+                self.check_pixel_value(tex, x, y, [0.0, 1.0, 0.0, 1.0])
 
-                if not rdtest.value_compare(picked.floatValue, [0.0, 1.0, 0.0, 1.0]):
-                    raise rdtest.TestFailureException("Picked value {} at {} doesn't match expected green".format(picked.floatValue, (x,y)))
-
-            draw = draw.next
+            action = action.next
 
         rdtest.log.success("Draws are all green")
 
@@ -42,7 +34,7 @@ class GL_Buffer_Updates(rdtest.TestCase):
         ref_path = rdtest.get_tmp_path('backbuffer.png')
 
         save_data = rd.TextureSave()
-        save_data.resourceId = tex.resourceId
+        save_data.resourceId = tex
         save_data.destType = rd.FileType.PNG
 
         self.controller.SaveTexture(save_data, ref_path)
@@ -52,12 +44,12 @@ class GL_Buffer_Updates(rdtest.TestCase):
         cap = rd.OpenCaptureFile()
 
         # Open a particular file
-        status = cap.OpenFile(self.capture_filename, '', None)
+        result = cap.OpenFile(self.capture_filename, '', None)
 
         # Make sure the file opened successfully
-        if status != rd.ReplayStatus.Succeeded:
+        if result != rd.ResultCode.Succeeded:
             cap.Shutdown()
-            raise rdtest.TestFailureException("Couldn't open '{}': {}".format(self.capture_filename, str(status)))
+            raise rdtest.TestFailureException("Couldn't open '{}': {}".format(self.capture_filename, str(result)))
 
         thumb: rd.Thumbnail = cap.GetThumbnail(rd.FileType.PNG, 0)
 
@@ -72,6 +64,3 @@ class GL_Buffer_Updates(rdtest.TestCase):
             raise rdtest.TestFailureException("Reference backbuffer and thumbnail image differ", tmp_path, ref_path)
 
         rdtest.log.success("Thumbnail is identical to reference")
-
-        out.Shutdown()
-

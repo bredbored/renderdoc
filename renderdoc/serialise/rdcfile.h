@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2017-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -27,21 +27,11 @@
 #include "core/core.h"
 #include "streamio.h"
 
-enum class ContainerError
-{
-  NoError = 0,
-  FileNotFound,
-  FileIO,
-  Corrupt,
-  UnsupportedVersion,
-};
-
 extern const char *SectionTypeNames[];
 
 struct RDCThumb
 {
-  const byte *pixels = NULL;
-  uint32_t len = 0;
+  bytebuf pixels;
   uint16_t width = 0;
   uint16_t height = 0;
   FileType format = FileType::JPG;
@@ -61,36 +51,39 @@ public:
   // version number of overall file format or chunk organisation. If the contents/meaning/order of
   // chunks have changed this does not need to be bumped, there are version numbers within each
   // API that interprets the stream that can be bumped.
-  static const uint32_t SERIALISE_VERSION = 0x00000101;
+  static const uint32_t SERIALISE_VERSION = 0x00000102;
 
   // this must never be changed - files before this were in the v0.x series and didn't have embedded
   // version numbers
   static const uint32_t V1_0_VERSION = 0x00000100;
   static const uint32_t V1_1_VERSION = 0x00000101;
+  static const uint32_t V1_2_VERSION = 0x00000102;
 
   ~RDCFile();
 
   // opens an existing file for read and/or modification. Error if file doesn't exist
-  void Open(const char *filename);
-  void Open(const std::vector<byte> &buffer);
+  void Open(const rdcstr &filename);
+  void Open(const bytebuf &buffer);
 
-  bool CopyFileTo(const char *filename);
+  RDResult CopyFileTo(const rdcstr &filename);
 
   // Sets the parameters of an RDCFile in memory.
-  void SetData(RDCDriver driver, const char *driverName, uint64_t machineIdent,
-               const RDCThumb *thumb);
+  void SetData(RDCDriver driver, const rdcstr &driverName, uint64_t machineIdent,
+               const RDCThumb *thumb, uint64_t timeBase, double timeFreq);
 
   // creates a new file with current properties, file will be overwritten if it already exists
-  void Create(const char *filename);
+  void Create(const rdcstr &filename);
 
-  ContainerError ErrorCode() const { return m_Error; }
-  std::string ErrorString() const { return m_ErrorString; }
+  bool IsUntrusted() const { return m_Untrusted; }
+  const RDResult &Error() const { return m_Error; }
   RDCDriver GetDriver() const { return m_Driver; }
-  const std::string &GetDriverName() const { return m_DriverName; }
+  const rdcstr &GetDriverName() const { return m_DriverName; }
   uint64_t GetMachineIdent() const { return m_MachineIdent; }
+  uint64_t GetTimestampBase() const { return m_TimeBase; }
+  double GetTimestampFrequency() const { return m_TimeFrequency; }
   const RDCThumb &GetThumbnail() const { return m_Thumb; }
   int SectionIndex(SectionType type) const;
-  int SectionIndex(const char *name) const;
+  int SectionIndex(const rdcstr &name) const;
   int NumSections() const { return int(m_Sections.size()); }
   const SectionProperties &GetSectionProperties(int index) const { return m_Sections[index]; }
   StreamReader *ReadSection(int index) const;
@@ -98,26 +91,28 @@ public:
 
   // Only valid if GetDriver returns RDCDriver::Image, passes over the underlying FILE * for use
   // loading the image directly, since the RDC container isn't there to read from a section.
-  FILE *StealImageFileHandle(std::string &filename);
+  FILE *StealImageFileHandle(rdcstr &filename);
 
 private:
   void Init(StreamReader &reader);
 
   FILE *m_File = NULL;
-  std::string m_Filename;
-  std::vector<byte> m_Buffer;
+  rdcstr m_Filename;
+  bytebuf m_Buffer;
 
   SectionProperties m_CurrentWritingProps;
 
   uint32_t m_SerVer = 0;
 
   RDCDriver m_Driver = RDCDriver::Unknown;
-  std::string m_DriverName;
+  rdcstr m_DriverName;
   uint64_t m_MachineIdent = 0;
+  uint64_t m_TimeBase = 0;
+  double m_TimeFrequency = 1.0;
   RDCThumb m_Thumb;
 
-  ContainerError m_Error = ContainerError::NoError;
-  std::string m_ErrorString;
+  bool m_Untrusted = false;
+  RDResult m_Error;
 
   struct SectionLocation
   {
@@ -126,7 +121,7 @@ private:
     uint64_t diskLength;
   };
 
-  std::vector<SectionProperties> m_Sections;
-  std::vector<SectionLocation> m_SectionLocations;
-  std::vector<std::vector<byte>> m_MemorySections;
+  rdcarray<SectionProperties> m_Sections;
+  rdcarray<SectionLocation> m_SectionLocations;
+  rdcarray<bytebuf> m_MemorySections;
 };

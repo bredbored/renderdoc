@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2018-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -22,12 +22,12 @@
  * THE SOFTWARE.
  ******************************************************************************/
 
-#include "driver/gl/apple_gl_hook_defs.h"
-#include "driver/gl/gl_common.h"
-#include "driver/gl/gl_dispatch_table.h"
-#include "driver/gl/gl_dispatch_table_defs.h"
-#include "driver/gl/gl_driver.h"
 #include "hooks/hooks.h"
+#include "apple_gl_hook_defs.h"
+#include "gl_common.h"
+#include "gl_dispatch_table.h"
+#include "gl_dispatch_table_defs.h"
+#include "gl_driver.h"
 
 #if ENABLED(RDOC_POSIX)
 #include <dlfcn.h>
@@ -55,6 +55,7 @@ public:
 
   void RegisterHooks();
 
+  void UseUnusedSupportedFunction(const char *name);
   void *GetUnsupportedFunction(const char *name);
 
   void *handle = NULL;
@@ -87,16 +88,24 @@ int ScopedPrinter::depth = 0;
 // This checks that we're not infinite looping by calling our own hooks from ourselves. Mostly
 // useful on android where you can only debug by printf and the stack dumps are often corrupted when
 // the callstack overflows.
-#define SCOPED_GLCALL(funcname)    \
-  SCOPED_LOCK(glLock);             \
-  gl_CurChunk = GLChunk::funcname; \
+#define SCOPED_GLCALL(funcname)           \
+  SCOPED_LOCK(glLock);                    \
+  gl_CurChunk = GLChunk::funcname;        \
+  if(glhook.enabled)                      \
+  {                                       \
+    glhook.driver->CheckImplicitThread(); \
+  }                                       \
   ScopedPrinter CONCAT(scopedprint, __LINE__)(STRINGIZE(funcname));
 
 #else
 
-#define SCOPED_GLCALL(funcname) \
-  SCOPED_LOCK(glLock);          \
-  gl_CurChunk = GLChunk::funcname;
+#define SCOPED_GLCALL(funcname)           \
+  SCOPED_LOCK(glLock);                    \
+  gl_CurChunk = GLChunk::funcname;        \
+  if(glhook.enabled)                      \
+  {                                       \
+    glhook.driver->CheckImplicitThread(); \
+  }
 
 #endif
 
@@ -105,7 +114,6 @@ void SetDriverForHooks(WrappedOpenGL *driver)
   glhook.driver = driver;
 }
 
-#if ENABLED(RDOC_WIN32) || ENABLED(RDOC_APPLE)
 void EnableGLHooks()
 {
   glhook.enabled = true;
@@ -127,24 +135,34 @@ void default_ret()
 {
 }
 
-// if we were injected and aren't ready to capture, skip out and call the real function
-#define UNINIT_CALL(function, ...)                                                      \
-  if(!glhook.enabled)                                                                   \
-  {                                                                                     \
-    if(GL.function == NULL)                                                             \
-    {                                                                                   \
-      RDCERR("No function pointer for '%s' while uninitialised!", STRINGIZE(function)); \
-      return default_ret<decltype(GL.function(__VA_ARGS__))>();                         \
-    }                                                                                   \
-    return GL.function(__VA_ARGS__);                                                    \
+template <>
+const char *default_ret()
+{
+  return "";
+}
+
+template <>
+const GLubyte *default_ret()
+{
+  return (const GLubyte *)"";
+}
+
+// on windows we can be injected and not ready to capture when we intercept a GL call. If that
+// happens we need to skip and call the real function
+
+// on linux some systems inject external code into Qt which initialises GL behind our back. If this
+// calls glXGetProcAddress it will get the real function pointers, but if it links against GL it
+// will get routed here via our public exported symbols so we try to call the real function
+#define UNINIT_CALL(function, ...)                                                              \
+  if(!glhook.enabled)                                                                           \
+  {                                                                                             \
+    if(GL.function == NULL)                                                                     \
+    {                                                                                           \
+      RDCERR("No function pointer for '%s' while doing replay fallback!", STRINGIZE(function)); \
+      return default_ret<decltype(GL.function(__VA_ARGS__))>();                                 \
+    }                                                                                           \
+    return GL.function(__VA_ARGS__);                                                            \
   }
-
-#else
-
-// nothing to do - we always assume we are ready to capture
-#define UNINIT_CALL(function, ...)
-
-#endif
 
 DefineSupportedHooks();
 DefineUnsupportedHooks();
@@ -164,19 +182,20 @@ bool FullyImplementedFunction(const char *funcname)
       !strcmp(funcname, "glInsertEventMarkerEXT") || !strcmp(funcname, "glPushGroupMarkerEXT") ||
       !strcmp(funcname, "glPopGroupMarkerEXT") ||
       // GL_KHR_debug (Core variants)
-      !strcmp(funcname, "DebugMessageControl") || !strcmp(funcname, "DebugMessageInsert") ||
-      !strcmp(funcname, "DebugMessageCallback") || !strcmp(funcname, "GetDebugMessageLog") ||
-      !strcmp(funcname, "GetPointerv") || !strcmp(funcname, "PushDebugGroup") ||
-      !strcmp(funcname, "PopDebugGroup") || !strcmp(funcname, "ObjectLabel") ||
-      !strcmp(funcname, "GetObjectLabel") || !strcmp(funcname, "ObjectPtrLabel") ||
-      !strcmp(funcname, "GetObjectPtrLabel") ||
+      !strcmp(funcname, "glDebugMessageControl") || !strcmp(funcname, "glDebugMessageInsert") ||
+      !strcmp(funcname, "glDebugMessageCallback") || !strcmp(funcname, "glGetDebugMessageLog") ||
+      !strcmp(funcname, "glGetPointerv") || !strcmp(funcname, "glPushDebugGroup") ||
+      !strcmp(funcname, "glPopDebugGroup") || !strcmp(funcname, "glObjectLabel") ||
+      !strcmp(funcname, "glGetObjectLabel") || !strcmp(funcname, "glObjectPtrLabel") ||
+      !strcmp(funcname, "glGetObjectPtrLabel") ||
       // GL_KHR_debug (KHR variants)
-      !strcmp(funcname, "DebugMessageControlKHR") || !strcmp(funcname, "DebugMessageInsertKHR") ||
-      !strcmp(funcname, "DebugMessageCallbackKHR") || !strcmp(funcname, "GetDebugMessageLogKHR") ||
-      !strcmp(funcname, "GetPointervKHR") || !strcmp(funcname, "PushDebugGroupKHR") ||
-      !strcmp(funcname, "PopDebugGroupKHR") || !strcmp(funcname, "ObjectLabelKHR") ||
-      !strcmp(funcname, "GetObjectLabelKHR") || !strcmp(funcname, "ObjectPtrLabelKHR") ||
-      !strcmp(funcname, "GetObjectPtrLabelKHR");
+      !strcmp(funcname, "glDebugMessageControlKHR") ||
+      !strcmp(funcname, "glDebugMessageInsertKHR") ||
+      !strcmp(funcname, "glDebugMessageCallbackKHR") ||
+      !strcmp(funcname, "glGetDebugMessageLogKHR") || !strcmp(funcname, "glGetPointervKHR") ||
+      !strcmp(funcname, "glPushDebugGroupKHR") || !strcmp(funcname, "glPopDebugGroupKHR") ||
+      !strcmp(funcname, "glObjectLabelKHR") || !strcmp(funcname, "glGetObjectLabelKHR") ||
+      !strcmp(funcname, "glObjectPtrLabelKHR") || !strcmp(funcname, "glGetObjectPtrLabelKHR");
 }
 
 void *HookedGetProcAddress(const char *func, void *realFunc)
@@ -204,6 +223,13 @@ void *HookedGetProcAddress(const char *func, void *realFunc)
   RDCDEBUG("Returning real pointer for entirely unknown function '%s': %p", func, realFunc);
 
   return realFunc;
+}
+
+void GLHook::UseUnusedSupportedFunction(const char *name)
+{
+  SCOPED_LOCK(glLock);
+  if(glhook.driver)
+    glhook.driver->UseUnusedSupportedFunction(name);
 }
 
 void *GLHook::GetUnsupportedFunction(const char *name)
@@ -242,6 +268,15 @@ static void GLHooked(void *handle)
 
 void GLHook::RegisterHooks()
 {
+#if ENABLED(RDOC_ANDROID)
+  // on android if EGL hooking is disabled we're using GLES layering, don't register any GL hooks
+  if(!ShouldHookEGL())
+  {
+    RDCLOG("Not registering OpenGL hooks for Android");
+    return;
+  }
+#endif
+
   RDCLOG("Registering OpenGL hooks");
 
 // pick the 'primary' library we consider GL functions to come from. This is mostly important on
@@ -259,12 +294,29 @@ void GLHook::RegisterHooks()
 
   LibraryHooks::RegisterLibraryHook(libraryName, &GLHooked);
 
-#define RegisterFunc(func, name)      \
-  LibraryHooks::RegisterFunctionHook( \
-      libraryName,                    \
-      FunctionHook(STRINGIZE(name), (void **)&GL.func, (void *)&CONCAT(func, _renderdoc_hooked)));
+  // MSVC compiles this function to use a huge amount of stack by initialising all the FunctionHook
+  // locals all at once. So we instead explicitly re-use the same hook (since it's going to be
+  // copied anyway, these are temporaries).
+  FunctionHook tmphook;
+
+#define RegisterFunc(func, name)                              \
+  {                                                           \
+    tmphook.function = STRINGIZE(name);                       \
+    tmphook.orig = (void **)&GL.func;                         \
+    tmphook.hook = (void *)&CONCAT(func, _renderdoc_hooked);  \
+    LibraryHooks::RegisterFunctionHook(libraryName, tmphook); \
+  }
+
+#define RegisterUnsupportedFunc(name)                         \
+  {                                                           \
+    tmphook.function = STRINGIZE(name);                       \
+    tmphook.orig = NULL;                                      \
+    tmphook.hook = (void *)&CONCAT(name, _renderdoc_hooked);  \
+    LibraryHooks::RegisterFunctionHook(libraryName, tmphook); \
+  }
 
   ForEachSupported(RegisterFunc);
+  ForEachUnsupported(RegisterUnsupportedFunc);
 
 #if ENABLED(RDOC_WIN32)
   if(ShouldHookEGL())
@@ -279,7 +331,7 @@ void GLHook::RegisterHooks()
 
 #if ENABLED(RDOC_APPLE)
 
-// dlsym is unreliable with interposing, we must fetch the functions directly here at compile-time.
+  // dlsym is unreliable with interposing, we must fetch the functions directly here at compile-time.
 
 #undef APPLE_FUNC
 #define APPLE_FUNC(function) CONCAT(unsupported_real_, function) = &function;

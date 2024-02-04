@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2017-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -39,6 +39,8 @@
 #include "Code/QRDUtils.h"
 #include "ui_CrashDialog.h"
 
+const qint64 MaxUploadSize = 2250LL * 1024LL * 1024LL;
+
 CrashDialog::CrashDialog(PersistantConfig &cfg, QVariantMap crashReportJSON, QWidget *parent)
     : QDialog(parent), ui(new Ui::CrashDialog), m_Config(cfg)
 {
@@ -49,10 +51,14 @@ CrashDialog::CrashDialog(PersistantConfig &cfg, QVariantMap crashReportJSON, QWi
   m_ReportPath = crashReportJSON[lit("report")].toString();
   m_ReportMetadata = crashReportJSON;
 
-  bool replayCrash = crashReportJSON[lit("replaycrash")].toUInt() != 0;
+  const bool replayCrash = crashReportJSON[lit("replaycrash")].toUInt() != 0;
+  const bool forceCapture = crashReportJSON[lit("forcecapture")].toUInt() != 0;
+  const bool manualReport =
+      crashReportJSON.contains(lit("manual")) && crashReportJSON[lit("manual")].toUInt() != 0;
 
   // remove metadata we don't send directly
   m_ReportMetadata.remove(lit("report"));
+  m_ReportMetadata.remove(lit("forcecapture"));
   m_ReportMetadata.remove(lit("replaycrash"));
 
   setStage(ReportStage::FillingDetails);
@@ -77,9 +83,9 @@ CrashDialog::CrashDialog(PersistantConfig &cfg, QVariantMap crashReportJSON, QWi
 
     ICaptureFile *cap = RENDERDOC_OpenCaptureFile();
 
-    ReplayStatus status = cap->OpenFile(capInfo.absoluteFilePath().toUtf8().data(), "", NULL);
+    ResultDetails result = cap->OpenFile(capInfo.absoluteFilePath(), "", NULL);
 
-    if(status == ReplayStatus::Succeeded)
+    if(result.OK())
     {
       Thumbnail thumb = cap->GetThumbnail(FileType::Raw, 320);
       QImage i = QImage(thumb.data.data(), (int)thumb.width, (int)thumb.height, QImage::Format_RGB888)
@@ -96,7 +102,7 @@ CrashDialog::CrashDialog(PersistantConfig &cfg, QVariantMap crashReportJSON, QWi
 
     cap->Shutdown();
 
-    if(capInfo.size() > 2250LL * 1024LL * 1024LL)
+    if(capInfo.size() > MaxUploadSize)
     {
       // capture is too large to upload :(
       ui->captureFilename->setText(
@@ -105,6 +111,13 @@ CrashDialog::CrashDialog(PersistantConfig &cfg, QVariantMap crashReportJSON, QWi
       ui->captureUpload->setEnabled(false);
 
       ui->capturePreviewFrame->hide();
+    }
+
+    if(forceCapture)
+    {
+      ui->captureUpload->setChecked(true);
+      ui->captureUpload->setEnabled(false);
+      ui->captureUpload->setText(ui->captureUpload->text() + tr(" (required)"));
     }
   }
   else
@@ -119,9 +132,32 @@ CrashDialog::CrashDialog(PersistantConfig &cfg, QVariantMap crashReportJSON, QWi
     ui->capturePreviewFrame->hide();
   }
 
-  QString text =
-      tr("<p>RenderDoc encountered a serious problem. Please take a moment to look over this "
-         "form and send it off so that RenderDoc can get better!</p>");
+  QString text;
+
+  if(manualReport)
+  {
+    text =
+        tr("<p>Thank you for reporting a problem! Please take a moment to look over this "
+           "form to check what is being sent.</p>");
+  }
+  else if(replayCrash)
+  {
+    text =
+        tr("<p>RenderDoc encountered a serious problem. Please take a moment to look over this "
+           "form to check what has been gathered then send it off so that RenderDoc can get "
+           "better!</p>");
+  }
+  else
+  {
+    text =
+        tr("<p>A crash happened while RenderDoc was injected into your application. It's not "
+           "feasible to tell whether the crash was in your application or in RenderDoc's capturing "
+           "code. The minidump <a href=\"%1\">in the zip</a> might show the problem.</p>"
+           "<p>If you don't think your application crashed on its own please take a moment to "
+           "look over this form to check what has been gathered then send it off so that RenderDoc "
+           "can get better!</p>")
+            .arg(QUrl::fromLocalFile(m_ReportPath).toString());
+  }
 
   if(m_Config.CheckUpdate_UpdateAvailable)
   {
@@ -159,10 +195,27 @@ CrashDialog::CrashDialog(PersistantConfig &cfg, QVariantMap crashReportJSON, QWi
            "libraries needed for SSL support. "
            "If you are building locally, check that ");
 
+#if(QT_VERSION >= QT_VERSION_CHECK(5, 14, 0))
+
+#if defined(Q_OS_WIN32)
+#if QT_POINTER_SIZE == 8
+    text +=
+        tr("you have libcrypto-1_1-64.dll and libssl-1_1-64.dll available next to qrenderdoc.exe.");
+#else
+    text += tr("you have libcrypto-1_1.dll and libssl-1_1.dll available next to qrenderdoc.exe.");
+#endif
+#else
+    text += tr("you have the runtime libopenssl library >= 1.1.1 available in your system.");
+#endif
+
+#else
+
 #if defined(Q_OS_WIN32)
     text += tr("you have libeay32.dll and ssleay32.dll available next to qrenderdoc.exe.");
 #else
     text += tr("you have the runtime libopenssl library >= 1.0.0 available in your system.");
+#endif
+
 #endif
 
     text += lit("</p>");
@@ -194,6 +247,20 @@ CrashDialog::~CrashDialog()
   delete m_Thumbnail;
 
   delete ui;
+}
+
+bool CrashDialog::HasCaptureReady(PersistantConfig &cfg)
+{
+  QFileInfo capInfo(cfg.CrashReport_LastOpenedCapture);
+
+  return capInfo.exists() && capInfo.size() <= MaxUploadSize;
+}
+
+bool CrashDialog::CaptureTooLarge(PersistantConfig &cfg)
+{
+  QFileInfo capInfo(cfg.CrashReport_LastOpenedCapture);
+
+  return capInfo.exists() && capInfo.size() > MaxUploadSize;
 }
 
 void CrashDialog::showEvent(QShowEvent *)
@@ -247,17 +314,28 @@ void CrashDialog::on_send_clicked()
   // confirm if the user REALLY wants to upload their capture
   if(ui->captureUpload->isChecked())
   {
-    QMessageBox::StandardButton result = RDDialog::question(
-        this, tr("Are you sure?"), tr("Uploading your capture file will send it privately to the "
-                                      "RenderDoc server where I can "
-                                      "use it to reproduce your problem.\n\nAre you sure you are "
-                                      "OK with sending the capture "
-                                      "securely to RenderDoc's website?"));
+    QMessageBox::StandardButton result =
+        RDDialog::question(this, tr("Are you sure?"),
+                           tr("Uploading your capture file will send it privately to the "
+                              "RenderDoc server where I can "
+                              "use it to reproduce your problem.\n\nAre you sure you are "
+                              "OK with sending the capture "
+                              "securely to RenderDoc's website?"));
 
     if(result != QMessageBox::Yes)
     {
       // uncheck and return back so they can confirm
-      ui->captureUpload->setChecked(false);
+      if(ui->captureUpload->isEnabled())
+        ui->captureUpload->setChecked(false);
+      else
+        RDDialog::information(
+            this, tr("Capture required"),
+            tr("<html>For unrecoverable errors like the one you encountered, without a "
+               "capture to reproduce the problem it's impossible to tell what "
+               "went wrong so a crash report is unfortunately required.\n\n"
+               "If you don't wish to share your capture that is OK. You can also email me at <a "
+               "href=\"mailto:baldurk@baldurk.org?subject=RenderDoc%20Unrecoverable%20error\">"
+               "baldurk@baldurk.org</a> with information and I can help investigate.</html>"));
       return;
     }
   }
@@ -421,7 +499,6 @@ void CrashDialog::sendReport()
   });
 
   QObject::connect(m_Request, &QNetworkReply::finished, [this]() {
-
     // don't do anything if we're finished after an error
     if(ui->uploadRetry->isEnabled())
       return;

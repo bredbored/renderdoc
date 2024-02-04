@@ -53,15 +53,13 @@ There are several thumbnail strip panels available, by default they are docked i
 
 These strips display thumbnails of the resources bound to their respective parts of the pipeline, to give some context and allow quick preview without having to switch the main display between these textures.
 
-The texture that the following tab is currently displaying is highlighted in red, and each thumbnail shows both the slot number and the name of the texture bound at that point. To follow a given slot simply left click on it. If the currently followed texture slot is empty (i.e. it was following a texture and then that slot became unbound in a different drawcall) it will show up simply named "Unbound" and with no name or slot number.
+The texture that the following tab is currently displaying is highlighted in red, and each thumbnail shows both the slot number and the name of the texture bound at that point. To follow a given slot simply left click on it. If the currently followed texture slot is empty (i.e. it was following a texture and then that slot became unbound in a different action) it will show up simply named "Unbound" and with no name or slot number.
 
 Each thumbnail has a context menu available via right click. This menu allows you to open a locked tab (:doc:`../how/how_view_texture`), jump to the :doc:`resource inspector <../window/resource_inspector>`, as well as containing a list of all the uses of this texture - as read-only resource and writable output. This is similar to the resource display strip on the :doc:`timeline_bar`. Clicking on any of these entries will jump to the first of the events in the event range listed.
 
 .. figure:: ../imgs/Screenshots/OpenLockedTab.png
 
   Thumbnail Menu: Thumbnail context menu with several options.
-
-There are also two general options - show unused and show empty. These behave the same as the options in the :doc:`pipeline_state` window - temporarily overriding the default behaviour in RenderDoc to only show texture slots that are referenced in the shader.
 
 Pixel Context Display
 ---------------------
@@ -76,7 +74,7 @@ You can adjust the selected pixel with the arrow keys on your keyboard after pic
 
   Pixel context: Pixel context displaying the surrounds of the picked pixel.
 
-From here, once you have selected a pixel, you can also launch the :doc:`pixel debugger <../how/how_debug_shader>` if you have the drawcall that you want to debug selected. You can also launch the :ref:`pixel-history` view which shows all modifications that have happened to the texture since the start of the frame to the currently selected event.
+From here, once you have selected a pixel, you can also launch the :doc:`pixel debugger <../how/how_debug_shader>` if you have the draw that you want to debug selected. You can also launch the :ref:`pixel-history` view which shows all modifications that have happened to the texture since the start of the frame to the currently selected event.
 
 Visible Range Control
 ---------------------
@@ -180,6 +178,8 @@ Gamma display of Linear Data
   | γ Gamma display
 
 A proper explanation of this is available in the :ref:`FAQ <gamma-linear-display>`. In short, linear data is 'over-corrected' to look as expected, but this behaviour can be overridden by toggling off this option.
+
+.. _Alpha background:
 
 Alpha background
 ~~~~~~~~~~~~~~~~
@@ -314,6 +314,8 @@ Render Overlay
 
 This is a powerful tool for quickly diagnosing issues and can be very useful for locating what you're looking for. Several overlays are available that can be rendered over any texture, although most of them are only meaningful for currently bound render targets.
 
+These overlays are only relevant when the currently selected action is a rasterization draw, for other actions the overlays will be empty.
+
 * ``Highlight Drawcall`` will do show the area covered by the drawcall. It darkens everything except the current drawcall which is highlighted in a flat color. This makes whatever is being drawn stand out and can be useful for seeing where the current object is on screen, especially if rapidly browsing through the frame.
 
 * ``Wireframe Mesh`` will render a wireframe mesh of the current drawcall over the top of the image.
@@ -330,8 +332,12 @@ This is a powerful tool for quickly diagnosing issues and can be very useful for
 
 * ``Clipping`` will simply highlight in red any values that are below the current black point (as defined by the range control - see above), and in green any values above the white point. This can be useful in identifying invalid ranges if the range control is adjusted correctly, or in combination with a custom shader visualiser.
 
-* ``Clear before Pass`` will act as if the current target had been cleared to black right before the current pass. This can sometimes make it easier to see the results of a draw, especially if it is blending and only makes a subtle change. If the current API does not have the concept of a pass, it is defined as all the drawcalls with the same set of render targets.
+* ``Clear before Pass`` will act as if the current target had been cleared right before the current pass. This can sometimes make it easier to see the results of a draw, especially if it is blending and only makes a subtle change. If the current API does not have the concept of a pass, it is defined as all the drawcalls with the same set of render targets.
 
+   * If the current target is a render target, it is cleared to the :ref:`Alpha background` color.
+
+   * If the current target is a depth/stencil target, the behavior depends on the depth function for the current draw. If it is ``EQUAL``, ``NOT EQUAL``, or ``ALWAYS``, the target is not cleared. If it is ``LESS`` or ``LESS EQUAL``, it is cleared to 1. If it is ``GREATER`` or ``GREATER EQUAL``, it is cleared to 0. Stencil is never cleared.
+   
 * ``Clear before Draw`` works similarly to the above overlay, but clearing immediately before the selected draw.
 
 * ``Quad Overdraw (Pass)`` will show a visualisation of the level of 2x2 quad overdraw in the 'pass' up to the selected draw. If the current API does not have the concept of a pass, it is defined as all the drawcalls with the same set of render targets.

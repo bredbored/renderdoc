@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2018-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -108,12 +108,11 @@ void CommandData::ReadBytes(void *bytes, size_t length)
 
 void CommandData::WriteBytes(const void *bytes, size_t length)
 {
-  const byte *start = (const byte *)bytes;
-  data.insert(data.end(), start, start + length);
+  data.append((const byte *)bytes, length);
 }
 
 template <>
-CommandData &CommandData::Read(std::string &str)
+CommandData &CommandData::Read(rdcstr &str)
 {
   uint32_t length = 0;
   Read(length);
@@ -123,7 +122,7 @@ CommandData &CommandData::Read(std::string &str)
 }
 
 template <>
-CommandData &CommandData::Write(const std::string &str)
+CommandData &CommandData::Write(const rdcstr &str)
 {
   uint32_t length = (uint32_t)str.size();
   Write(length);

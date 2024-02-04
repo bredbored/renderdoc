@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2018-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -26,9 +26,9 @@
 
 namespace JDWP
 {
-// short helper functions to read/write vectors - always preceeded by an int length
+// short helper functions to read/write vectors - always preceded by an int length
 template <typename inner>
-void ReadVector(CommandData &data, std::vector<inner> &vec,
+void ReadVector(CommandData &data, rdcarray<inner> &vec,
                 std::function<void(CommandData &data, inner &i)> process)
 {
   int32_t count = 0;
@@ -40,7 +40,7 @@ void ReadVector(CommandData &data, std::vector<inner> &vec,
 }
 
 template <typename inner>
-void WriteVector(CommandData &data, const std::vector<inner> &vec,
+void WriteVector(CommandData &data, const rdcarray<inner> &vec,
                  std::function<void(CommandData &data, const inner &i)> process)
 {
   int32_t count = (int32_t)vec.size();
@@ -63,7 +63,7 @@ Connection::Connection(Network::Socket *sock)
   char response[15] = {};
   reader.Read(response, handshakeLength);
 
-  if(memcmp(handshake, response, 14))
+  if(memcmp(handshake, response, 14) != 0)
   {
     RDCERR("handshake failed - received >%s< - expected >%s<", response, handshake);
     error = true;
@@ -86,16 +86,22 @@ Connection::~Connection()
 
 bool Connection::SendReceive(Command &cmd)
 {
-  // send the command, and recieve the reply back into the same object.
+  CommandSet sentSet = cmd.commandset;
+  byte sentCmd = cmd.command;
+
+  // send the command, and receive the reply back into the same object.
   // save the auto-generated ID for this command so we can compare it to the reply - we expect a
   // synchronous reply, no other commands in the way.
   uint32_t id = cmd.Send(writer);
+  cmd.commandset = CommandSet::Unknown;
+  cmd.command = 0;
   cmd.Recv(reader);
   Threading::Sleep(10);
 
   if(id != cmd.GetID())
   {
-    RDCERR("Didn't get matching reply packet for %d/%d", cmd.commandset, cmd.command);
+    RDCERR("Didn't get matching reply packet for %d/%d (id %u), received %d/%d (id %u)", sentSet,
+           sentCmd, id, cmd.commandset, cmd.command, cmd.GetID());
     error = true;
     return false;
   }
@@ -199,7 +205,7 @@ void Connection::Resume()
   SendReceive(cmd);
 }
 
-referenceTypeID Connection::GetType(const std::string &signature)
+referenceTypeID Connection::GetType(const rdcstr &signature)
 {
   Command cmd(CommandSet::VirtualMachine, 2);
   cmd.GetData().Write(signature);
@@ -237,8 +243,8 @@ referenceTypeID Connection::GetType(objectID obj)
   return ret;
 }
 
-methodID Connection::GetMethod(referenceTypeID type, const std::string &name,
-                               const std::string &signature, referenceTypeID *methClass)
+methodID Connection::GetMethod(referenceTypeID type, const rdcstr &name, const rdcstr &signature,
+                               referenceTypeID *methClass)
 {
   referenceTypeID searchClass = type;
 
@@ -249,7 +255,7 @@ methodID Connection::GetMethod(referenceTypeID type, const std::string &name,
              GetSignature(searchClass).c_str());
              */
 
-    std::vector<Method> methods = GetMethods(searchClass);
+    rdcarray<Method> methods = GetMethods(searchClass);
 
     for(const Method &m : methods)
     {
@@ -267,34 +273,28 @@ methodID Connection::GetMethod(referenceTypeID type, const std::string &name,
   return {};
 }
 
-int32_t Connection::GetLocalVariable(referenceTypeID type, methodID method, const std::string &name,
-                                     const std::string &signature)
+rdcarray<VariableSlot> Connection::GetLocalVariables(referenceTypeID type, methodID method)
 {
   Command cmd(CommandSet::Method, 2);
   cmd.GetData().Write(type).Write(method);
 
   if(!SendReceive(cmd))
-    return -1;
+    return {};
 
   int32_t argumentCount = 0;
-  std::vector<VariableSlot> slots;
+  rdcarray<VariableSlot> slots;
 
   CommandData data = cmd.GetData();
   data.Read(argumentCount);    // unused for now
-  ReadVector<VariableSlot>(data, slots, [](CommandData &data, VariableSlot &s) {
-    data.Read(s.codeIndex).Read(s.name).Read(s.signature).Read(s.length).Read(s.slot);
+  ReadVector<VariableSlot>(data, slots, [](CommandData &d, VariableSlot &s) {
+    d.Read(s.codeIndex).Read(s.name).Read(s.signature).Read(s.length).Read(s.slot);
   });
   data.Done();
 
-  for(const VariableSlot &s : slots)
-    if(s.name == name && (signature == "" || signature == s.signature))
-      return s.slot;
-
-  return -1;
+  return slots;
 }
 
-fieldID Connection::GetField(referenceTypeID type, const std::string &name,
-                             const std::string &signature)
+fieldID Connection::GetField(referenceTypeID type, const rdcstr &name, const rdcstr &signature)
 {
   Command cmd(CommandSet::ReferenceType, 4);
   cmd.GetData().Write(type);
@@ -302,10 +302,10 @@ fieldID Connection::GetField(referenceTypeID type, const std::string &name,
   if(!SendReceive(cmd))
     return {};
 
-  std::vector<Field> fields;
+  rdcarray<Field> fields;
   CommandData data = cmd.GetData();
-  ReadVector<Field>(data, fields, [](CommandData &data, Field &f) {
-    data.Read(f.id).Read(f.name).Read(f.signature).Read(f.modBits);
+  ReadVector<Field>(data, fields, [](CommandData &d, Field &f) {
+    d.Read(f.id).Read(f.name).Read(f.signature).Read(f.modBits);
   });
   data.Done();
 
@@ -335,7 +335,7 @@ value Connection::GetFieldValue(referenceTypeID type, fieldID field)
   return ret;
 }
 
-std::vector<StackFrame> Connection::GetCallStack(threadID thread)
+rdcarray<StackFrame> Connection::GetCallStack(threadID thread)
 {
   Command cmd(CommandSet::ThreadReference, 6);
   // always fetch full stack
@@ -344,10 +344,10 @@ std::vector<StackFrame> Connection::GetCallStack(threadID thread)
   if(!SendReceive(cmd))
     return {};
 
-  std::vector<StackFrame> ret;
+  rdcarray<StackFrame> ret;
   CommandData data = cmd.GetData();
-  ReadVector<StackFrame>(
-      data, ret, [](CommandData &data, StackFrame &f) { data.Read(f.id).Read(f.location); });
+  ReadVector<StackFrame>(data, ret,
+                         [](CommandData &d, StackFrame &f) { d.Read(f.id).Read(f.location); });
   data.Done();
 
   // simplify error handling, if the stack came back as nonsense then clear it
@@ -394,7 +394,7 @@ void Connection::ReadEvent(CommandData &data, Event &ev)
   }
 }
 
-Event Connection::WaitForEvent(EventKind kind, const std::vector<EventFilter> &eventFilters,
+Event Connection::WaitForEvent(EventKind kind, const rdcarray<EventFilter> &eventFilters,
                                EventFilterFunction filterCallback)
 {
   int32_t eventRequestID = 0;
@@ -406,10 +406,10 @@ Event Connection::WaitForEvent(EventKind kind, const std::vector<EventFilter> &e
     // always suspend all threads
     data.Write((byte)kind).Write((byte)SuspendPolicy::All);
 
-    WriteVector<EventFilter>(data, eventFilters, [](CommandData &data, const EventFilter &f) {
-      data.Write((byte)f.modKind);
+    WriteVector<EventFilter>(data, eventFilters, [](CommandData &d, const EventFilter &f) {
+      d.Write((byte)f.modKind);
       if(f.modKind == ModifierKind::ClassOnly)
-        data.Write(f.ClassOnly);
+        d.Write(f.ClassOnly);
       else
         RDCERR("Unsupported event filter %d", f.modKind);
     });
@@ -427,18 +427,38 @@ Event Connection::WaitForEvent(EventKind kind, const std::vector<EventFilter> &e
     return {};
   }
 
-  // now resume execution
-  Resume();
+  // unfortunately because JDWP is shit, from the point the event request is sent we might get
+  // events at any time. This means we could get event replies before we even get confirmation of
+  // the resume. That means we have to resume manually without calling Resume() which expects a
+  // synchronous reply.
+
+  RDCASSERTEQUAL(suspendRefCount, 1);
+
+  uint32_t resumeID = ~0U;
+  {
+    Command cmd(CommandSet::VirtualMachine, 9);
+    resumeID = cmd.Send(writer);
+    suspendRefCount = 0;
+  }
 
   // wait for method entry on the method we care about
   while(!reader.IsErrored())
   {
     SuspendPolicy suspendPolicy;
-    std::vector<Event> events;
+    rdcarray<Event> events;
 
     Command msg;
     msg.Recv(reader);
 
+    if(resumeID == msg.GetID())
+    {
+      // got the resume reply. This will *probably* happen the first time around, but it might not.
+      // Just skip it whenever we encounter it.
+      resumeID = ~0U;
+      continue;
+    }
+
+    // if this wasn't the resume reply, we only expect event packets
     if(msg.commandset != CommandSet::Event || msg.command != 100)
     {
       RDCERR("Expected event packet, but got %d/%d", msg.commandset, msg.command);
@@ -449,8 +469,20 @@ Event Connection::WaitForEvent(EventKind kind, const std::vector<EventFilter> &e
     CommandData data = msg.GetData();
 
     data.Read((byte &)suspendPolicy);
-    ReadVector<Event>(data, events, [this](CommandData &data, Event &ev) { ReadEvent(data, ev); });
+    ReadVector<Event>(data, events, [this](CommandData &d, Event &ev) { ReadEvent(d, ev); });
     data.Done();
+
+    // if we haven't gotten the resume reply yet, wait for that now so that we're up to date.
+    if(resumeID != ~0U)
+    {
+      Command resumeReply;
+      resumeReply.Recv(reader);
+
+      if(resumeReply.GetID() != resumeID)
+        RDCERR("Expected resume reply for %u, but got %u", resumeID, resumeReply.GetID());
+
+      resumeID = ~0U;
+    }
 
     // event arrived, we're now suspended
     if(suspendPolicy != SuspendPolicy::None)
@@ -474,15 +506,21 @@ Event Connection::WaitForEvent(EventKind kind, const std::vector<EventFilter> &e
       }
     }
 
-    // resume to get the next event
-    Resume();
+    // resume to get the next event. Save the resume ID because we still can't assume we'll get the
+    // reply synchronously.
+    RDCASSERTEQUAL(suspendRefCount, 1);
+    {
+      Command cmd(CommandSet::VirtualMachine, 9);
+      resumeID = cmd.Send(writer);
+      suspendRefCount = 0;
+    }
   }
 
   // something went wrong, we stopped receiving events before the found we wanted.
   return {};
 }
 
-value Connection::NewString(threadID thread, const std::string &str)
+value Connection::NewString(threadID thread, const rdcstr &str)
 {
   Command cmd(CommandSet::VirtualMachine, 11);
   cmd.GetData().Write(str);
@@ -524,7 +562,7 @@ void Connection::SetLocalValue(threadID thread, frameID frame, int32_t slot, val
 }
 
 value Connection::InvokeInstance(threadID thread, classID clazz, methodID method, objectID object,
-                                 const std::vector<value> &arguments, InvokeOptions options)
+                                 const rdcarray<value> &arguments, InvokeOptions options)
 {
   Command cmd;
   CommandData data = cmd.GetData();
@@ -545,7 +583,7 @@ value Connection::InvokeInstance(threadID thread, classID clazz, methodID method
     data.Write(object).Write(thread).Write(clazz).Write(method);
   }
 
-  WriteVector<value>(data, arguments, [](CommandData &data, const value &v) { data.Write(v); });
+  WriteVector<value>(data, arguments, [](CommandData &d, const value &v) { d.Write(v); });
 
   data.Write((int32_t)options);
 
@@ -566,7 +604,7 @@ value Connection::InvokeInstance(threadID thread, classID clazz, methodID method
   return returnValue;
 }
 
-std::string Connection::GetString(objectID str)
+rdcstr Connection::GetString(objectID str)
 {
   Command cmd(CommandSet::StringReference, 1);
   cmd.GetData().Write(str);
@@ -574,7 +612,7 @@ std::string Connection::GetString(objectID str)
   if(!SendReceive(cmd))
     return "";
 
-  std::string ret;
+  rdcstr ret;
   cmd.GetData().Read(ret).Done();
   return ret;
 }
@@ -592,7 +630,7 @@ classID Connection::GetSuper(classID clazz)
   return ret;
 }
 
-std::string Connection::GetSignature(referenceTypeID typeID)
+rdcstr Connection::GetSignature(referenceTypeID typeID)
 {
   Command cmd(CommandSet::ReferenceType, 1);
   cmd.GetData().Write(typeID);
@@ -600,12 +638,12 @@ std::string Connection::GetSignature(referenceTypeID typeID)
   if(!SendReceive(cmd))
     return {};
 
-  std::string ret;
+  rdcstr ret;
   cmd.GetData().Read(ret).Done();
   return ret;
 }
 
-std::vector<Method> Connection::GetMethods(referenceTypeID searchClass)
+rdcarray<Method> Connection::GetMethods(referenceTypeID searchClass)
 {
   Command cmd(CommandSet::ReferenceType, 5);
   cmd.GetData().Write(searchClass);
@@ -613,10 +651,10 @@ std::vector<Method> Connection::GetMethods(referenceTypeID searchClass)
   if(!SendReceive(cmd))
     return {};
 
-  std::vector<Method> ret;
+  rdcarray<Method> ret;
   CommandData data = cmd.GetData();
-  ReadVector<Method>(data, ret, [](CommandData &data, Method &m) {
-    data.Read(m.id).Read(m.name).Read(m.signature).Read(m.modBits);
+  ReadVector<Method>(data, ret, [](CommandData &d, Method &m) {
+    d.Read(m.id).Read(m.name).Read(m.signature).Read(m.modBits);
   });
   data.Done();
   return ret;

@@ -6,16 +6,11 @@ class D3D11_CBuffer_Zoo(rdtest.TestCase):
     demos_test_name = 'D3D11_CBuffer_Zoo'
 
     def check_capture(self):
-        draw = self.find_draw("Draw")
+        action = self.find_action("Draw")
 
-        self.check(draw is not None)
+        self.check(action is not None)
 
-        self.controller.SetFrameEvent(draw.eventId, False)
-
-        # Make an output so we can pick pixels
-        out: rd.ReplayOutput = self.controller.CreateOutput(rd.CreateHeadlessWindowingData(100, 100), rd.ReplayOutputType.Texture)
-
-        self.check(out is not None)
+        self.controller.SetFrameEvent(action.eventId, False)
 
         pipe: rd.PipeState = self.controller.GetPipelineState()
 
@@ -23,10 +18,70 @@ class D3D11_CBuffer_Zoo(rdtest.TestCase):
         cbuf: rd.BoundCBuffer = pipe.GetConstantBuffer(stage, 0, 0)
 
         var_check = rdtest.ConstantBufferChecker(
-            self.controller.GetCBufferVariableContents(pipe.GetShader(stage),
+            self.controller.GetCBufferVariableContents(pipe.GetGraphicsPipelineObject(),
+                                                       pipe.GetShader(stage), stage,
                                                        pipe.GetShaderEntryPoint(stage), 0,
-                                                       cbuf.resourceId, cbuf.byteOffset))
+                                                       cbuf.resourceId, cbuf.byteOffset, cbuf.byteSize))
 
+        self.check_cbuffer(var_check)
+
+        rdtest.log.success("CBuffer variables are as expected")
+
+        if self.controller.GetAPIProperties().shaderDebugging and pipe.GetShaderReflection(
+                rd.ShaderStage.Pixel).debugInfo.debuggable:
+            trace: rd.ShaderDebugTrace = self.controller.DebugPixel(int(pipe.GetViewport(0).width / 2.0),
+                                                                    int(pipe.GetViewport(0).height / 2.0),
+                                                                    rd.ReplayController.NoPreference,
+                                                                    rd.ReplayController.NoPreference)
+
+            debugVars = dict()
+
+            for base in trace.constantBlocks:
+                for var in base.members:
+                    debugVars[base.name + var.name] = var
+
+            cbufferVars = []
+
+            for sourceVar in trace.sourceVars:
+                sourceVar: rd.SourceVariableMapping
+
+                if sourceVar.variables[0].name not in debugVars.keys():
+                    continue
+
+                eval: rd.ShaderVariable = self.evaluate_source_var(sourceVar, debugVars)
+                cbufferVars.append(eval)
+
+            cbufferVars = self.combine_source_vars(cbufferVars)
+
+            self.check(len(cbufferVars) == 1)
+            self.check(cbufferVars[0].name == 'consts')
+
+            var_check = rdtest.ConstantBufferChecker(cbufferVars[0].members)
+
+            self.check_cbuffer(var_check)
+
+            rdtest.log.success("Debugged CBuffer variables are as expected")
+
+            cycles, variables = self.process_trace(trace)
+
+            output = self.find_output_source_var(trace, rd.ShaderBuiltin.ColorOutput, 0)
+
+            debugged = self.evaluate_source_var(output, variables)
+
+            if not rdtest.util.value_compare(debugged.value.f32v[0:4], [536.1, 537.0, 538.0, 539.0]):
+                raise rdtest.TestFailureException(
+                    "Debugged output {} did not match expected {}".format(
+                        debugged.value.f32v[0:4], [536.1, 537.0, 538.0, 539.0]))
+
+            rdtest.log.success("Debugged output matched as expected")
+
+            self.controller.FreeTrace(trace)
+
+        self.check_pixel_value(pipe.GetOutputTargets()[0].resourceId, 0.5, 0.5, [536.1, 537.0, 538.0, 539.0])
+
+        rdtest.log.success("Picked value is as expected")
+
+    def check_cbuffer(self, var_check):
         # For more detailed reference for the below checks, see the commented definition of the cbuffer
         # in the shader source code in the demo itself
 
@@ -304,25 +359,86 @@ class D3D11_CBuffer_Zoo(rdtest.TestCase):
                                                                  433.0, 437.0]),
         })
 
+        # struct nested_with_padding
+        # {
+        #   float a; // float3 padding
+        #   float4 b;
+        #   float c; // float3 padding
+        #   float3 d[4]; // float padding after each one
+        # };
+        # nested_with_padding ak[2];
+        var_check.check('ak').rows(0).cols(0).arraySize(2).members({
+            # ak[0]
+            0: lambda s: s.rows(0).cols(0).structSize(4).members({
+                'a': lambda y: y.rows(1).cols(1).value([440.0]),
+                'b': lambda y: y.rows(1).cols(4).value([444.0, 445.0, 446.0, 447.0]),
+                'c': lambda y: y.rows(1).cols(1).value([448.0]),
+                'd': lambda x: x.rows(0).cols(0).arraySize(4).members({
+                    0: lambda z: z.rows(1).cols(3).value([452.0, 453.0, 454.0]),
+                    1: lambda z: z.rows(1).cols(3).value([456.0, 457.0, 458.0]),
+                    2: lambda z: z.rows(1).cols(3).value([460.0, 461.0, 462.0]),
+                    3: lambda z: z.rows(1).cols(3).value([464.0, 465.0, 466.0]),
+                }),
+            }),
+            # ak[1]
+            1: lambda s: s.rows(0).cols(0).structSize(4).members({
+                'a': lambda y: y.rows(1).cols(1).value([468.0]),
+                'b': lambda y: y.rows(1).cols(4).value([472.0, 473.0, 474.0, 475.0]),
+                'c': lambda y: y.rows(1).cols(1).value([476.0]),
+                'd': lambda x: x.rows(0).cols(0).arraySize(4).members({
+                    0: lambda z: z.rows(1).cols(3).value([480.0, 481.0, 482.0]),
+                    1: lambda z: z.rows(1).cols(3).value([484.0, 485.0, 486.0]),
+                    2: lambda z: z.rows(1).cols(3).value([488.0, 489.0, 490.0]),
+                    3: lambda z: z.rows(1).cols(3).value([492.0, 493.0, 494.0]),
+                }),
+            }),
+        })
+
+        # float2 dummy13;
+        var_check.check('dummy13')
+
+        # float al;
+        var_check.check('al').rows(1).cols(1).value([500.0])
+
+        # struct float2_struct
+        # {
+        #   float x, y;
+        # };
+        # float2_struct am;
+        var_check.check('am').rows(0).cols(0).members({
+            'x': lambda y: y.rows(1).cols(1).value([504.0]),
+            'y': lambda y: y.rows(1).cols(1).value([505.0]),
+        })
+
+        # float an;
+        var_check.check('an').rows(1).cols(1).value([506.0])
+
+        # float4 gldummy4;
+        var_check.check('gldummy4')
+
+        # empty_struct empty; - completely omitted
+
+        # nested_with_empty nested_empty;
+        var_check.check('nested_empty').rows(0).cols(0).members({
+            'a': lambda y: y.rows(1).cols(3).value([512.0, 513.0, 514.0]),
+            'b': lambda y: y.rows(0).cols(0),
+            'c': lambda y: y.rows(1).cols(2).value([516.0, 517.0]),
+        })
+
+        # misaligned_struct ao[2];
+        var_check.check('ao').rows(0).cols(0).arraySize(2).members({
+            # ao[0]
+            0: lambda s: s.rows(0).cols(0).structSize(2).members({
+                'a': lambda y: y.rows(1).cols(4).value([520.0, 521.0, 522.0, 523.0]),
+                'b': lambda y: y.rows(1).cols(2).value([524.0, 525.0]),
+            }),
+            1: lambda s: s.rows(0).cols(0).structSize(2).members({
+                'a': lambda y: y.rows(1).cols(4).value([528.0, 529.0, 530.0, 531.0]),
+                'b': lambda y: y.rows(1).cols(2).value([532.0, 533.0]),
+            }),
+        })
+
         # float4 test;
-        var_check.check('test').rows(1).cols(4).value([440.0, 441.0, 442.0, 443.0])
+        var_check.check('test').rows(1).cols(4).value([536.0, 537.0, 538.0, 539.0])
 
         var_check.done()
-
-        rdtest.log.success("CBuffer variables are as expected")
-
-        tex = rd.TextureDisplay()
-        tex.resourceId = pipe.GetOutputTargets()[0].resourceId
-        out.SetTextureDisplay(tex)
-
-        texdetails = self.get_texture(tex.resourceId)
-
-        picked: rd.PixelValue = out.PickPixel(tex.resourceId, False,
-                                              int(texdetails.width / 2), int(texdetails.height / 2), 0, 0, 0)
-
-        if not rdtest.value_compare(picked.floatValue, [440.1, 441.0, 442.0, 443.0]):
-            raise rdtest.TestFailureException("Picked value {} doesn't match expectation".format(picked.floatValue))
-
-        rdtest.log.success("Picked value is as expected")
-
-        out.Shutdown()

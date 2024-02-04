@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2020-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -26,10 +26,6 @@
 
 #extension GL_EXT_texture_cube_map_array : enable
 #extension GL_EXT_texture_buffer : enable
-
-#else
-
-#extension GL_ARB_gpu_shader5 : enable
 
 #endif
 
@@ -151,7 +147,7 @@ void main(void)
 
   if(texdisplay.RawOutput != 0)
   {
-#ifdef GL_ARB_gpu_shader5
+#ifdef HAS_BIT_CONVERSION
     if(uintTex)
       color_out = uintBitsToFloat(ucol);
     else if(sintTex)

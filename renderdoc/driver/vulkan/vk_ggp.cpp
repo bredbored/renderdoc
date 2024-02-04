@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2016-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -22,8 +22,6 @@
  * THE SOFTWARE.
  ******************************************************************************/
 
-#include "api/replay/renderdoc_replay.h"
-
 #include "vk_core.h"
 #include "vk_replay.h"
 
@@ -43,7 +41,8 @@ VkResult WrappedVulkan::vkCreateStreamDescriptorSurfaceGGP(
 
     WrappedVkSurfaceKHR *wrapped = GetWrapped(*pSurface);
 
-    wrapped->record = (VkResourceRecord *)(uintptr_t)pCreateInfo->streamDescriptor;
+    wrapped->record =
+        RegisterSurface(WindowingSystem::GGP, (void *)(uintptr_t)pCreateInfo->streamDescriptor);
   }
   return ret;
 }
@@ -54,7 +53,7 @@ void VulkanReplay::OutputWindow::SetWindowHandle(WindowingData window)
   return;    // there are no OS specific handles to save.
 }
 
-void VulkanReplay::OutputWindow::CreateSurface(VkInstance inst)
+void VulkanReplay::OutputWindow::CreateSurface(WrappedVulkan *driver, VkInstance inst)
 {
   VkStreamDescriptorSurfaceCreateInfoGGP createInfo;
 
@@ -64,7 +63,7 @@ void VulkanReplay::OutputWindow::CreateSurface(VkInstance inst)
 
   VkResult vkr =
       ObjDisp(inst)->CreateStreamDescriptorSurfaceGGP(Unwrap(inst), &createInfo, NULL, &surface);
-  RDCASSERTEQUAL(vkr, VK_SUCCESS);
+  driver->CheckVkResult(vkr);
 
   return;
 }

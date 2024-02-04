@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -24,7 +24,7 @@
 
 #include "gl_test.h"
 
-TEST(GL_Resource_Lifetimes, OpenGLGraphicsTest)
+RD_TEST(GL_Resource_Lifetimes, OpenGLGraphicsTest)
 {
   static constexpr const char *Description =
       "Test various edge-case resource lifetimes: a resource that is first dirtied within a frame "
@@ -33,7 +33,7 @@ TEST(GL_Resource_Lifetimes, OpenGLGraphicsTest)
 
   std::string common = R"EOSHADER(
 
-#version 420 core
+#version 450 core
 
 #define v2f v2f_block \
 {                     \
@@ -56,12 +56,36 @@ out gl_PerVertex {
 
 out v2f vertOut;
 
+layout(std140) uniform constsbuf
+{
+  vec4 flags;
+};
+
+layout(binding = 0, std430) buffer storebuffer
+{
+  vec4 data;
+} sbuf;
+
+uniform vec4 flags2;
+
 void main()
 {
+  sbuf.data = vec4(1,2,3,4);
+
 	vertOut.pos = vec4(Position.xyz, 1);
 	gl_Position = vertOut.pos;
 	vertOut.col = Color;
 	vertOut.uv = vec4(UV.xy, 0, 1);
+
+  if(flags.x != 1.0f || flags.y != 2.0f || flags.z != 4.0f || flags.w != 8.0f)
+  {
+    vertOut.uv.x *= 3.0f;
+  }
+
+  if(flags != flags2)
+  {
+    vertOut.uv.y *= 3.0f;
+  }
 }
 
 )EOSHADER";
@@ -72,18 +96,26 @@ in v2f vertIn;
 
 layout(location = 0, index = 0) out vec4 Color;
 
-layout(binding = 0) uniform sampler2D checker;
-layout(binding = 1) uniform sampler2D smiley;
+layout(binding = 0) uniform sampler2D smiley;
+layout(binding = 1) uniform sampler2D white;
+layout(binding = 2) uniform sampler2D checker;
 
 layout(std140) uniform constsbuf
 {
   vec4 flags;
 };
 
+layout(binding = 0, std430) buffer storebuffer
+{
+  vec4 data;
+} sbuf;
+
 uniform vec4 flags2;
 
 void main()
 {
+  sbuf.data = vec4(1,2,3,4);
+
   if(flags.x != 1.0f || flags.y != 2.0f || flags.z != 4.0f || flags.w != 8.0f)
   {
     Color = vec4(1.0f, 0.0f, 1.0f, 1.0f);
@@ -96,20 +128,8 @@ void main()
     return;
   }
 
-  Color = texture(smiley, vertIn.uv.xy * 2.0f) * texture(checker, vertIn.uv.xy * 5.0f);
+  Color = texture(smiley, vertIn.uv.xy * 2.0f) * texture(white, vertIn.uv.xy * 2.0f) * texture(checker, vertIn.uv.xy * 5.0f);
   Color.w = 1.0f;
-}
-
-)EOSHADER";
-
-  std::string dummy = R"EOSHADER(
-#version 420 core
-
-layout(location = 0, index = 0) out vec4 Color;
-
-void main()
-{
-	Color = vec4(1.0f, 0.0f, 0.0f, 1.0f);
 }
 
 )EOSHADER";
@@ -136,6 +156,7 @@ void main()
     glBindTexture(GL_TEXTURE_2D, offscreen);
     glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, 128, 128);
 
+    glActiveTexture(GL_TEXTURE0);
     GLuint smiley = MakeTexture();
     glBindTexture(GL_TEXTURE_2D, smiley);
     glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, rgba8.width, rgba8.height);
@@ -143,17 +164,21 @@ void main()
                     rgba8.data.data());
 
     glActiveTexture(GL_TEXTURE1);
-    glBindTexture(GL_TEXTURE_2D, smiley);
+    uint32_t whiteData[4 * 4];
+    memset(whiteData, 0xff, sizeof(whiteData));
+    GLuint white = MakeTexture();
+    glBindTexture(GL_TEXTURE_2D, white);
+    glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, 4, 4);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 4, 4, GL_RGBA, GL_UNSIGNED_BYTE, whiteData);
 
-    glActiveTexture(GL_TEXTURE0);
+    glActiveTexture(GL_TEXTURE2);
     glBindTexture(GL_TEXTURE_2D, 0);
 
-    GLuint vsprog = MakeProgram(common + vertex, "");
+    std::string vssrc = common + vertex;
+    const char *vssrc_c = vssrc.c_str();
 
     std::string fssrc = common + pixel;
     const char *fssrc_c = fssrc.c_str();
-
-    const char *dummysrc_c = dummy.c_str();
 
     // function to set up a VAO
     auto SetupVAO = [ib]() {
@@ -191,7 +216,7 @@ void main()
     auto SetupSampler = []() {
       GLuint sampler = 0;
       glGenSamplers(1, &sampler);
-      glBindSampler(1, sampler);
+      glBindSampler(0, sampler);
 
       glSamplerParameteri(sampler, GL_TEXTURE_WRAP_R, GL_REPEAT);
       glSamplerParameteri(sampler, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -204,6 +229,20 @@ void main()
       glSamplerParameteri(sampler, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
 
       glDeleteSamplers(1, &sampler);
+    };
+
+    auto SetupSingleCallProgram = [vssrc_c]() {
+      GLuint prog = glCreateShaderProgramv(GL_VERTEX_SHADER, 1, &vssrc_c);
+
+      glUniformBlockBinding(prog, glGetUniformBlockIndex(prog, "constsbuf"), 5);
+
+      glShaderStorageBlockBinding(prog, 0, 3);
+
+      const Vec4f flags = {1.0f, 2.0f, 4.0f, 8.0f};
+
+      glProgramUniform4fv(prog, glGetUniformLocation(prog, "flags2"), 1, &flags.x);
+
+      return prog;
     };
 
     auto SetupProgram = [fssrc_c]() {
@@ -224,6 +263,8 @@ void main()
 
       glUniformBlockBinding(prog, glGetUniformBlockIndex(prog, "constsbuf"), 5);
 
+      glShaderStorageBlockBinding(prog, 0, 3);
+
       const Vec4f flags = {1.0f, 2.0f, 4.0f, 8.0f};
 
       glProgramUniform4fv(prog, glGetUniformLocation(prog, "flags2"), 1, &flags.x);
@@ -231,8 +272,10 @@ void main()
       return prog;
     };
 
-    auto TrashProgram = [dummysrc_c](GLuint prog) {
+    auto TrashProgram = [](GLuint prog) {
       glUniformBlockBinding(prog, glGetUniformBlockIndex(prog, "constsbuf"), 4);
+
+      glShaderStorageBlockBinding(prog, 0, 2);
 
       const Vec4f empty = {};
       glProgramUniform4fv(prog, glGetUniformLocation(prog, "flags2"), 1, &empty.x);
@@ -241,13 +284,13 @@ void main()
     };
 
     // Program pipeline setup and trashing
-    auto SetupPipe = [vsprog](GLuint prog) {
+    auto SetupPipe = [](GLuint vsprog, GLuint fsprog) {
       GLuint pipe = 0;
       glGenProgramPipelines(1, &pipe);
       glBindProgramPipeline(pipe);
 
       glUseProgramStages(pipe, GL_VERTEX_SHADER_BIT, vsprog);
-      glUseProgramStages(pipe, GL_FRAGMENT_SHADER_BIT, prog);
+      glUseProgramStages(pipe, GL_FRAGMENT_SHADER_BIT, fsprog);
 
       return pipe;
     };
@@ -283,13 +326,25 @@ void main()
     auto SetupTex = []() {
       const uint32_t checker[4 * 4] = {
           // X X O O
-          0xffffffff, 0xffffffff, 0, 0,
+          0xffffffff,
+          0xffffffff,
+          0,
+          0,
           // X X O O
-          0xffffffff, 0xffffffff, 0, 0,
+          0xffffffff,
+          0xffffffff,
+          0,
+          0,
           // O O X X
-          0, 0, 0xffffffff, 0xffffffff,
+          0,
+          0,
+          0xffffffff,
+          0xffffffff,
           // O O X X
-          0, 0, 0xffffffff, 0xffffffff,
+          0,
+          0,
+          0xffffffff,
+          0xffffffff,
       };
 
       GLuint tex = 0;
@@ -305,6 +360,16 @@ void main()
 
       return tex;
     };
+
+    GLuint packbuf = MakeBuffer();
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, packbuf);
+    glBufferData(GL_PIXEL_PACK_BUFFER, 4, NULL, GL_STATIC_DRAW);
+    GLuint unpackbuf = MakeBuffer();
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, unpackbuf);
+    glBufferData(GL_PIXEL_UNPACK_BUFFER, 4, NULL, GL_STATIC_DRAW);
+
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
 
     auto TrashTex = [](GLuint tex) {
       const uint32_t empty[4 * 4] = {};
@@ -336,32 +401,47 @@ void main()
       glDeleteBuffers(1, &buf);
     };
 
+    {
+      const Vec4f empty = {};
+      GLuint buf = MakeBuffer();
+      glBindBuffer(GL_SHADER_STORAGE_BUFFER, buf);
+      glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(empty), &empty, GL_STATIC_DRAW);
+
+      glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, buf);
+    }
+
     glUseProgram(0);
     glViewport(0, 0, 128, 128);
 
     GLuint fbo = SetupFBO();
     GLuint vao = SetupVAO();
     GLuint sampler = SetupSampler();
+    GLuint vsprog = SetupSingleCallProgram();
     GLuint fsprog = SetupProgram();
-    GLuint pipe = SetupPipe(fsprog);
+    GLuint pipe = SetupPipe(vsprog, fsprog);
     GLuint tex = SetupTex();
     GLuint buf = SetupBuf();
     while(Running())
     {
-      float col[] = {0.4f, 0.5f, 0.6f, 1.0f};
+      glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+      glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+
+      float col[] = {0.2f, 0.2f, 0.2f, 1.0f};
       glClearNamedFramebufferfv(0, GL_COLOR, 0, col);
 
       // render with last frame's resources
-      float col1[] = {0.5f, 0.1f, 0.1f, 1.0f};
+      float col1[] = {0.0f, 1.0f, 0.0f, 1.0f};
       glClearBufferfv(GL_COLOR, 0, col1);
 
       glDrawElements(GL_TRIANGLES, 3, GL_UNSIGNED_SHORT, NULL);
-      glBlitNamedFramebuffer(fbo, 0, 0, 0, 128, 128, 0, 0, 128, 128, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+      glBlitNamedFramebuffer(fbo, 0, 0, 0, 128, 128, 0, screenHeight - 128, 128, screenHeight,
+                             GL_COLOR_BUFFER_BIT, GL_NEAREST);
 
       // trash last frame's resources
       TrashFBO(fbo);
       TrashVAO(vao);
       TrashSampler(sampler);
+      TrashProgram(vsprog);
       TrashProgram(fsprog);
       TrashPipe(pipe);
       TrashTex(tex);
@@ -371,19 +451,21 @@ void main()
       fbo = SetupFBO();
       vao = SetupVAO();
       sampler = SetupSampler();
+      vsprog = SetupSingleCallProgram();
       fsprog = SetupProgram();
-      pipe = SetupPipe(fsprog);
+      pipe = SetupPipe(vsprog, fsprog);
       tex = SetupTex();
       buf = SetupBuf();
-      float col2[] = {0.1f, 0.1f, 0.5f, 1.0f};
+      float col2[] = {0.0f, 0.0f, 1.0f, 1.0f};
       glClearBufferfv(GL_COLOR, 0, col2);
 
       glDrawElements(GL_TRIANGLES, 3, GL_UNSIGNED_SHORT, NULL);
-      glBlitNamedFramebuffer(fbo, 0, 0, 0, 128, 128, 128, 0, 256, 128, GL_COLOR_BUFFER_BIT,
-                             GL_NEAREST);
+      glBlitNamedFramebuffer(fbo, 0, 0, 0, 128, 128, 128, screenHeight - 128, 256, screenHeight,
+                             GL_COLOR_BUFFER_BIT, GL_NEAREST);
       TrashFBO(fbo);
       TrashVAO(vao);
       TrashSampler(sampler);
+      TrashProgram(vsprog);
       TrashProgram(fsprog);
       TrashPipe(pipe);
       TrashTex(tex);
@@ -393,10 +475,14 @@ void main()
       fbo = SetupFBO();
       vao = SetupVAO();
       sampler = SetupSampler();
+      vsprog = SetupSingleCallProgram();
       fsprog = SetupProgram();
-      pipe = SetupPipe(fsprog);
+      pipe = SetupPipe(vsprog, fsprog);
       tex = SetupTex();
       buf = SetupBuf();
+
+      glBindBuffer(GL_PIXEL_PACK_BUFFER, packbuf);
+      glBindBuffer(GL_PIXEL_UNPACK_BUFFER, unpackbuf);
 
       Present();
     }
@@ -405,6 +491,7 @@ void main()
     TrashFBO(fbo);
     TrashVAO(vao);
     TrashSampler(sampler);
+    TrashProgram(vsprog);
     TrashProgram(fsprog);
     TrashPipe(pipe);
     TrashBuf(buf);

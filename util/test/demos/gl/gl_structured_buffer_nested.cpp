@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -24,7 +24,7 @@
 
 #include "gl_test.h"
 
-TEST(GL_Structured_Buffer_Nested, OpenGLGraphicsTest)
+RD_TEST(GL_Structured_Buffer_Nested, OpenGLGraphicsTest)
 {
   static constexpr const char *Description =
       "Just draws a simple triangle, using normal pipeline. Basic test that can be used "
@@ -188,7 +188,7 @@ void main()
       glBindBuffer(GL_SHADER_STORAGE_BUFFER, outbuf);
       glClearBufferSubData(GL_SHADER_STORAGE_BUFFER, GL_RGBA32F, 0, 1024, GL_RGBA, GL_FLOAT, zeros);
 
-      float col[] = {0.4f, 0.5f, 0.6f, 1.0f};
+      float col[] = {0.2f, 0.2f, 0.2f, 1.0f};
       glClearBufferfv(GL_COLOR, 0, col);
 
       glBindVertexArray(vao);

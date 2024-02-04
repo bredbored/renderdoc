@@ -16,13 +16,15 @@ parser.add_argument('-t', '--test_include', default=".*",
 parser.add_argument('-x', '--test_exclude', default="",
                     help="The tests to exclude, as a regexp filter", type=str)
 parser.add_argument('--in-process',
-                    help="Lists the tests available to run", action="store_true")
+                    help="Run test code in the same process as test runner", action="store_true")
 parser.add_argument('--slow-tests',
                     help="Run potentially slow tests", action="store_true")
 parser.add_argument('--data', default=os.path.join(script_dir, "data"),
                     help="The folder that reference data is in. Will not be modified.", type=str)
 parser.add_argument('--demos-binary', default="",
                     help="The path to the built demos binary.", type=str)
+parser.add_argument('--demos-timeout', default=None,
+                    help="The timeout to use when expecting the demos to run.", type=int)
 parser.add_argument('--data-extra', default=os.path.join(script_dir, "data_extra"),
                     help="The folder that extra reference data is in (typically very large captures that aren't part "
                          "of the normal repo). Will not be modified.", type=str)
@@ -36,15 +38,9 @@ parser.add_argument('--debugger',
 parser.add_argument('--internal_run_test', help=argparse.SUPPRESS, type=str, required=False)
 # Internal command, when we re-run as admin to register vulkan layer
 parser.add_argument('--internal_vulkan_register', help=argparse.SUPPRESS, action="store_true", required=False)
+# Internal command, when we re-run as a remote server
+parser.add_argument('--internal_remote_server', help=argparse.SUPPRESS, action="store_true", required=False)
 args = parser.parse_args()
-
-if args.renderdoc is not None:
-    if os.path.isfile(args.renderdoc):
-        os.environ["PATH"] += os.pathsep + os.path.abspath(os.path.dirname(args.renderdoc))
-    elif os.path.isdir(args.renderdoc):
-        os.environ["PATH"] += os.pathsep + os.path.abspath(args.renderdoc)
-    else:
-        raise RuntimeError("'{}' is not a valid path to the renderdoc library".format(args.renderdoc))
 
 custom_pyrenderdoc = None
 
@@ -56,7 +52,31 @@ if args.pyrenderdoc is not None:
     else:
         raise RuntimeError("'{}' is not a valid path to the pyrenderdoc module".format(args.pyrenderdoc))
 
-    sys.path.insert(0, custom_pyrenderdoc)
+if args.renderdoc is not None:
+    if os.path.isfile(args.renderdoc):
+        renderdoc_dirpath = os.path.abspath(os.path.dirname(args.renderdoc))
+    elif os.path.isdir(args.renderdoc):
+        renderdoc_dirpath = os.path.abspath(args.renderdoc)
+    else:
+        raise RuntimeError("'{}' is not a valid path to the renderdoc library".format(args.renderdoc))
+    os.environ["PATH"] += os.pathsep + renderdoc_dirpath
+    # Python 3.8 doesn't search PATH so add it to the DLL search path
+    if sys.platform == 'win32' and sys.version_info[1] >= 8:
+        os.add_dll_directory(renderdoc_dirpath)
+
+    # if the user didn't specify a pyrenderdoc but we do have a renderdoc, try the default location as a backup
+    if custom_pyrenderdoc is None:
+        if sys.platform == 'win32':
+            custom_pyrenderdoc = os.path.abspath(args.renderdoc) + os.path.sep + "pymodules"
+        else:
+            custom_pyrenderdoc = os.path.abspath(args.renderdoc)
+
+if custom_pyrenderdoc is not None:
+    # explicit paths go at the start, implicit paths go at the end
+    if args.pyrenderdoc is not None:
+        sys.path.insert(0, custom_pyrenderdoc)
+    else:
+        sys.path.append(custom_pyrenderdoc)
 
 sys.path.insert(0, os.path.realpath(os.path.dirname(__file__)))
 
@@ -66,6 +86,7 @@ temp_path = os.path.realpath(args.temp)
 demos_binary = args.demos_binary
 if demos_binary != "":
     demos_binary = os.path.realpath(demos_binary)
+demos_timeout = args.demos_timeout
 
 os.chdir(sys.path[0])
 
@@ -103,6 +124,7 @@ rdtest.set_data_dir(data_path)
 rdtest.set_data_extra_dir(data_extra_path)
 rdtest.set_temp_dir(temp_path)
 rdtest.set_demos_binary(demos_binary)
+rdtest.set_demos_timeout(demos_timeout)
 
 # debugger option implies in-process test running
 if args.debugger:
@@ -110,6 +132,8 @@ if args.debugger:
 
 if args.internal_vulkan_register:
     rdtest.vulkan_register()
+elif args.internal_remote_server:
+    rdtest.become_remote_server()
 elif args.internal_run_test is not None:
     rdtest.internal_run_test(args.internal_run_test)
 else:

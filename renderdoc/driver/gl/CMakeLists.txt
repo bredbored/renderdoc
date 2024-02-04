@@ -6,6 +6,7 @@ set(sources
     gl_postvs.cpp
     gl_overlay.cpp
     gl_outputwindow.cpp
+    gl_pixelhistory.cpp
     gl_rendermesh.cpp
     gl_rendertexture.cpp
     gl_rendertext.cpp
@@ -53,8 +54,10 @@ list(APPEND sources gl_hooks.cpp)
 
 if(APPLE)
     list(APPEND sources
+        apple_gl_hook_defs.h
+        apple_gl_hook_defs.cpp
         cgl_dispatch_table.h
-        cgl_platform.mm
+        cgl_platform_helpers.mm
         cgl_platform.cpp
         cgl_hooks.cpp)
 else()
@@ -68,10 +71,13 @@ else()
     endif()
     if(ENABLE_GLES)
         list(APPEND sources
+            official/glesext.h)
+    endif()
+    if(ENABLE_EGL)
+        list(APPEND sources
             official/egl.h
             official/eglext.h
             official/eglplatform.h
-            official/glesext.h
             egl_dispatch_table.h
             egl_platform.cpp
             egl_hooks.cpp)

@@ -26,7 +26,7 @@ f.write('''
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019 Baldur Karlsson
+ * Copyright (c) 2020-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -164,7 +164,7 @@ def process_feature(root, name):
 # Look at all features
 for feat in registry.findall('feature'):
     # Only process vulkan features
-    if 'api' in feat.attrib and feat.attrib['api'] == 'vulkan':
+    if 'api' in feat.attrib and 'vulkan' in feat.attrib['api'].split(','):
         process_feature(feat, feat.attrib['comment'])
 
 # And all extensions (with KHR extensions sorted to the front)
@@ -176,7 +176,7 @@ def ext_sort(ext):
 
 for ext in sorted(registry.findall('extensions/extension'), key=ext_sort):
     # Only process vulkan extensions
-    if 'supported' in ext.attrib and ext.attrib['supported'] == 'vulkan':
+    if 'supported' in ext.attrib and 'vulkan' in ext.attrib['supported'].split(','):
 
         process_feature(ext, ext.attrib['name'])
 
@@ -196,4 +196,5 @@ struct VkDevDispatchTable
   // for consistency with macros, we declare the CreateDevice pointer here
   // even though it won't actually ever get used and is on the instance dispatch chain
   PFN_vkCreateDevice CreateDevice;
-}};'''.format(**locals()))
+}};
+'''.format(**locals()))

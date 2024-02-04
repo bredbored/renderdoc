@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2016-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -24,6 +24,7 @@
 
 #pragma once
 
+#include <QDir>
 #include <QFrame>
 #include <QMenu>
 #include <QMouseEvent>
@@ -35,18 +36,12 @@ namespace Ui
 class TextureViewer;
 }
 
+class RDTreeWidgetItem;
 class ResourcePreview;
 class ThumbnailStrip;
 class TextureGoto;
 class QFileSystemWatcher;
-
-enum struct FollowType
-{
-  OutputColour,
-  OutputDepth,
-  ReadWrite,
-  ReadOnly
-};
+class TextureViewer;
 
 struct Following
 {
@@ -55,15 +50,17 @@ struct Following
   int index;
   int arrayEl;
 
-  static const Following Default;
-
+  // this is only for QVariant compatibility and will generate an invalid Following instance! do not
+  // use!
   Following();
 
-  Following(FollowType t, ShaderStage s, int i, int a);
+  Following(const TextureViewer &tex, FollowType t, ShaderStage s, int i, int a);
+  Following(const Following &other);
+  Following &operator=(const Following &other);
 
   bool operator==(const Following &o);
   bool operator!=(const Following &o);
-  static void GetDrawContext(ICaptureContext &ctx, bool &copy, bool &clear, bool &compute);
+  static void GetActionContext(ICaptureContext &ctx, bool &copy, bool &clear, bool &compute);
 
   int GetHighestMip(ICaptureContext &ctx);
   int GetFirstArraySlice(ICaptureContext &ctx);
@@ -75,20 +72,20 @@ struct Following
   static rdcarray<BoundResource> GetOutputTargets(ICaptureContext &ctx);
 
   static BoundResource GetDepthTarget(ICaptureContext &ctx);
-
-  rdcarray<BoundResourceArray> GetReadWriteResources(ICaptureContext &ctx);
-
-  static rdcarray<BoundResourceArray> GetReadWriteResources(ICaptureContext &ctx, ShaderStage stage);
-
-  rdcarray<BoundResourceArray> GetReadOnlyResources(ICaptureContext &ctx);
-
-  static rdcarray<BoundResourceArray> GetReadOnlyResources(ICaptureContext &ctx, ShaderStage stage);
+  static BoundResource GetDepthResolveTarget(ICaptureContext &ctx);
+  static rdcarray<BoundResourceArray> GetReadWriteResources(ICaptureContext &ctx, ShaderStage stage,
+                                                            bool onlyUsed);
+  static rdcarray<BoundResourceArray> GetReadOnlyResources(ICaptureContext &ctx, ShaderStage stage,
+                                                           bool onlyUsed);
 
   const ShaderReflection *GetReflection(ICaptureContext &ctx);
   static const ShaderReflection *GetReflection(ICaptureContext &ctx, ShaderStage stage);
 
   const ShaderBindpointMapping &GetMapping(ICaptureContext &ctx);
   static const ShaderBindpointMapping &GetMapping(ICaptureContext &ctx, ShaderStage stage);
+
+private:
+  const TextureViewer &tex;
 };
 
 struct TexSettings
@@ -105,7 +102,7 @@ struct TexSettings
     slice = 0;
     minrange = 0.0f;
     maxrange = 1.0f;
-    typeHint = CompType::Typeless;
+    typeCast = CompType::Typeless;
   }
 
   int displayType;    // RGBA, RGBM, YUV Decode, Custom
@@ -115,7 +112,7 @@ struct TexSettings
   bool depth, stencil;
   int mip, slice;
   float minrange, maxrange;
-  CompType typeHint;
+  CompType typeCast;
 };
 
 class TextureViewer : public QFrame, public ITextureViewer, public ICaptureViewer
@@ -125,14 +122,42 @@ private:
 
   Q_PROPERTY(QVariant persistData READ persistData WRITE setPersistData DESIGNABLE false SCRIPTABLE false)
 
+  // Texture List
+  enum class FilterType
+  {
+    None,
+    Textures,
+    RenderTargets,
+    String
+  };
+
 public:
   explicit TextureViewer(ICaptureContext &ctx, QWidget *parent = 0);
   ~TextureViewer();
 
   // ITextureViewer
   QWidget *Widget() override { return this; }
-  void ViewTexture(ResourceId ID, bool focus) override;
-  void GotoLocation(int x, int y) override;
+  void ViewTexture(ResourceId ID, CompType typeCast, bool focus) override;
+  void ViewFollowedResource(FollowType followType, ShaderStage stage, int32_t index,
+                            int32_t arrayElement) override;
+  ResourceId GetCurrentResource() override;
+
+  Subresource GetSelectedSubresource() override;
+  void SetSelectedSubresource(Subresource sub) override;
+  rdcpair<int32_t, int32_t> GetPickedLocation() override;
+  void GotoLocation(uint32_t x, uint32_t y) override;
+  DebugOverlay GetTextureOverlay() override;
+  void SetTextureOverlay(DebugOverlay overlay) override;
+
+  bool IsZoomAutoFit() override;
+  float GetZoomLevel() override;
+  void SetZoomLevel(bool autofit, float zoom) override;
+
+  rdcpair<float, float> GetHistogramRange() override;
+  void SetHistogramRange(float blackpoint, float whitepoint) override;
+
+  uint32_t GetChannelVisibilityBits() override;
+  void SetChannelVisibility(bool red, bool green, bool blue, bool alpha) override;
 
   // ICaptureViewer
   void OnCaptureLoaded() override;
@@ -179,7 +204,8 @@ private slots:
   void on_cancelTextureListFilter_clicked();
   void on_textureListFilter_editTextChanged(const QString &text);
   void on_textureListFilter_currentIndexChanged(int index);
-  void on_textureList_clicked(const QModelIndex &index);
+  void on_colSelect_clicked();
+  void texture_itemActivated(RDTreeWidgetItem *item, int column);
 
   // manual slots
   void render_mouseClick(QMouseEvent *e);
@@ -195,8 +221,6 @@ private slots:
   void thumb_clicked(QMouseEvent *);
   void thumb_doubleClicked(QMouseEvent *);
   void texContextItem_triggered();
-  void showUnused_triggered();
-  void showEmpty_triggered();
 
   void zoomOption_returnPressed();
 
@@ -213,32 +237,34 @@ private slots:
 protected:
   void enterEvent(QEvent *event) override;
   void showEvent(QShowEvent *event) override;
-  void changeEvent(QEvent *event) override;
 
 private:
-  void RT_FetchCurrentPixel(uint32_t x, uint32_t y, PixelValue &pickValue, PixelValue &realValue);
+  void RT_FetchCurrentPixel(IReplayController *r, uint32_t x, uint32_t y, PixelValue &pickValue,
+                            PixelValue &realValue);
   void RT_PickPixelsAndUpdate(IReplayController *);
   void RT_PickHoverAndUpdate(IReplayController *);
   void RT_UpdateAndDisplay(IReplayController *);
   void RT_UpdateVisualRange(IReplayController *);
 
-  void UI_RecreatePanels();
-
   void UI_UpdateStatusText();
   void UI_UpdateTextureDetails();
-  void UI_OnTextureSelectionChanged(bool newdraw);
+  void UI_OnTextureSelectionChanged(bool newAction);
 
-  void UI_SetHistogramRange(const TextureDescription *tex, CompType typeHint);
+  void UI_SetHistogramRange(const TextureDescription *tex, CompType typeCast);
 
   void UI_UpdateChannels();
 
   void HighlightUsage();
 
+  void SelectPreview(ResourcePreview *prev);
+
   void SetupTextureTabs();
+  void RemoveTextureTabs(int firstIndex);
 
   void Reset();
 
   void refreshTextureList();
+  void refreshTextureList(FilterType filterType, const QString &filterStr);
 
   ResourcePreview *UI_CreateThumbnail(ThumbnailStrip *strip);
   void UI_CreateThumbnails();
@@ -249,6 +275,8 @@ private:
                                  const rdcarray<Bindpoint> &mapping,
                                  rdcarray<BoundResourceArray> &ResList, ThumbnailStrip *prevs,
                                  int &prevIndex, bool copy, bool rw);
+
+  void UI_PreviewResized(ResourcePreview *prev);
 
   void AddResourceUsageEntry(QMenu &menu, uint32_t start, uint32_t end, ResourceUsage usage);
   void OpenResourceContextMenu(ResourceId id, bool input, const rdcarray<EventUsage> &usage);
@@ -262,7 +290,6 @@ private:
   void setFitToWindow(bool checked);
 
   void setCurrentZoomValue(float zoom);
-  float getCurrentZoomValue();
 
   bool ScrollUpdateScrollbars = true;
 
@@ -281,6 +308,10 @@ private:
   void UI_UpdateCachedTexture();
 
   void ShowGotoPopup();
+
+  bool ShouldFlipForGL();
+  uint32_t MipCoordFromBase(int coord, const uint32_t dim);
+  uint32_t BaseCoordFromMip(int coord, const uint32_t dim);
 
   void UI_UpdateFittedScale();
   void UI_SetScale(float s);
@@ -305,15 +336,13 @@ private:
   int m_PrevFirstArraySlice = -1;
   int m_PrevHighestMip = -1;
 
-  bool m_ShowEmpty = false;
-  bool m_ShowUnused = false;
-
   bool m_Visualise = false;
   bool m_NoRangePaint = false;
   bool m_RangePoint_Dirty = false;
 
   ResourceId m_LockedId;
   QMap<ResourceId, QWidget *> m_LockedTabs;
+  int m_ResourceCacheID = -1;
 
   TextureGoto *m_Goto;
 
@@ -326,8 +355,13 @@ private:
   bool m_NeedCustomReload = false;
 
   TextureDescription *m_CachedTexture;
-  Following m_Following = Following::Default;
+  Following m_Following;
   QMap<ResourceId, TexSettings> m_TextureSettings;
+
+  friend struct Following;
+
+  rdcarray<BoundResourceArray> m_ReadOnlyResources[NumShaderStages];
+  rdcarray<BoundResourceArray> m_ReadWriteResources[NumShaderStages];
 
   QTime m_CustomShaderTimer;
   int m_CustomShaderWriteTime = 0;
@@ -339,6 +373,8 @@ private:
 
   bool canCompileCustomShader(ShaderEncoding encoding);
   void reloadCustomShaders(const QString &filter);
+  QList<QDir> getShaderDirectories() const;
+  QString getShaderPath(const QString &filename) const;
 
   TextureDisplay m_TexDisplay;
 };

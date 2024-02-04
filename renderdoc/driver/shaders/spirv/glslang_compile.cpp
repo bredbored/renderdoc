@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -23,144 +23,33 @@
  ******************************************************************************/
 
 #include "glslang_compile.h"
+#include "api/replay/rdcstr.h"
 #include "common/common.h"
 
 #undef min
 #undef max
 
-#include "3rdparty/glslang/glslang/Include/Types.h"
-#include "3rdparty/glslang/glslang/Public/ShaderLang.h"
+#include "glslang/glslang/Include/Types.h"
+#include "glslang/glslang/Public/ResourceLimits.h"
+#include "glslang/glslang/Public/ShaderLang.h"
 
 static bool glslang_inited = false;
-std::vector<glslang::TShader *> *allocatedShaders = NULL;
-std::vector<glslang::TProgram *> *allocatedPrograms = NULL;
+rdcarray<glslang::TShader *> *allocatedShaders = NULL;
+rdcarray<glslang::TProgram *> *allocatedPrograms = NULL;
 
-static TBuiltInResource DefaultResources = {
-    /*.maxLights =*/32,
-    /*.maxClipPlanes =*/6,
-    /*.maxTextureUnits =*/32,
-    /*.maxTextureCoords =*/32,
-    /*.maxVertexAttribs =*/64,
-    /*.maxVertexUniformComponents =*/4096,
-    /*.maxVaryingFloats =*/64,
-    /*.maxVertexTextureImageUnits =*/32,
-    /*.maxCombinedTextureImageUnits =*/80,
-    /*.maxTextureImageUnits =*/32,
-    /*.maxFragmentUniformComponents =*/4096,
-    /*.maxDrawBuffers =*/32,
-    /*.maxVertexUniformVectors =*/128,
-    /*.maxVaryingVectors =*/8,
-    /*.maxFragmentUniformVectors =*/16,
-    /*.maxVertexOutputVectors =*/16,
-    /*.maxFragmentInputVectors =*/15,
-    /*.minProgramTexelOffset =*/-8,
-    /*.maxProgramTexelOffset =*/7,
-    /*.maxClipDistances =*/8,
-    /*.maxComputeWorkGroupCountX =*/65535,
-    /*.maxComputeWorkGroupCountY =*/65535,
-    /*.maxComputeWorkGroupCountZ =*/65535,
-    /*.maxComputeWorkGroupSizeX =*/1024,
-    /*.maxComputeWorkGroupSizeY =*/1024,
-    /*.maxComputeWorkGroupSizeZ =*/64,
-    /*.maxComputeUniformComponents =*/1024,
-    /*.maxComputeTextureImageUnits =*/16,
-    /*.maxComputeImageUniforms =*/8,
-    /*.maxComputeAtomicCounters =*/8,
-    /*.maxComputeAtomicCounterBuffers =*/1,
-    /*.maxVaryingComponents =*/60,
-    /*.maxVertexOutputComponents =*/64,
-    /*.maxGeometryInputComponents =*/64,
-    /*.maxGeometryOutputComponents =*/128,
-    /*.maxFragmentInputComponents =*/128,
-    /*.maxImageUnits =*/8,
-    /*.maxCombinedImageUnitsAndFragmentOutputs =*/8,
-    /*.maxCombinedShaderOutputResources =*/8,
-    /*.maxImageSamples =*/0,
-    /*.maxVertexImageUniforms =*/0,
-    /*.maxTessControlImageUniforms =*/0,
-    /*.maxTessEvaluationImageUniforms =*/0,
-    /*.maxGeometryImageUniforms =*/0,
-    /*.maxFragmentImageUniforms =*/8,
-    /*.maxCombinedImageUniforms =*/8,
-    /*.maxGeometryTextureImageUnits =*/16,
-    /*.maxGeometryOutputVertices =*/256,
-    /*.maxGeometryTotalOutputComponents =*/1024,
-    /*.maxGeometryUniformComponents =*/1024,
-    /*.maxGeometryVaryingComponents =*/64,
-    /*.maxTessControlInputComponents =*/128,
-    /*.maxTessControlOutputComponents =*/128,
-    /*.maxTessControlTextureImageUnits =*/16,
-    /*.maxTessControlUniformComponents =*/1024,
-    /*.maxTessControlTotalOutputComponents =*/4096,
-    /*.maxTessEvaluationInputComponents =*/128,
-    /*.maxTessEvaluationOutputComponents =*/128,
-    /*.maxTessEvaluationTextureImageUnits =*/16,
-    /*.maxTessEvaluationUniformComponents =*/1024,
-    /*.maxTessPatchComponents =*/120,
-    /*.maxPatchVertices =*/32,
-    /*.maxTessGenLevel =*/64,
-    /*.maxViewports =*/16,
-    /*.maxVertexAtomicCounters =*/0,
-    /*.maxTessControlAtomicCounters =*/0,
-    /*.maxTessEvaluationAtomicCounters =*/0,
-    /*.maxGeometryAtomicCounters =*/0,
-    /*.maxFragmentAtomicCounters =*/8,
-    /*.maxCombinedAtomicCounters =*/8,
-    /*.maxAtomicCounterBindings =*/1,
-    /*.maxVertexAtomicCounterBuffers =*/0,
-    /*.maxTessControlAtomicCounterBuffers =*/0,
-    /*.maxTessEvaluationAtomicCounterBuffers =*/0,
-    /*.maxGeometryAtomicCounterBuffers =*/0,
-    /*.maxFragmentAtomicCounterBuffers =*/1,
-    /*.maxCombinedAtomicCounterBuffers =*/1,
-    /*.maxAtomicCounterBufferSize =*/16384,
-    /*.maxTransformFeedbackBuffers =*/4,
-    /*.maxTransformFeedbackInterleavedComponents =*/64,
-    /*.maxCullDistances =*/8,
-    /*.maxCombinedClipAndCullDistances =*/8,
-    /*.maxSamples =*/4,
-    /*.maxMeshOutputVerticesNV =*/256,
-    /*.maxMeshOutputPrimitivesNV =*/512,
-    /*.maxMeshWorkGroupSizeX_NV =*/32,
-    /*.maxMeshWorkGroupSizeY_NV =*/1,
-    /*.maxMeshWorkGroupSizeZ_NV =*/1,
-    /*.maxTaskWorkGroupSizeX_NV =*/32,
-    /*.maxTaskWorkGroupSizeY_NV =*/1,
-    /*.maxTaskWorkGroupSizeZ_NV =*/1,
-    /*.maxMeshViewCountNV =*/4,
-
-    /*.limits*/
-    {
-        /*.limits.nonInductiveForLoops =*/1,
-        /*.limits.whileLoops =*/1,
-        /*.limits.doWhileLoops =*/1,
-        /*.limits.generalUniformIndexing =*/1,
-        /*.limits.generalAttributeMatrixVectorIndexing =*/1,
-        /*.limits.generalVaryingIndexing =*/1,
-        /*.limits.generalSamplerIndexing =*/1,
-        /*.limits.generalVariableIndexing =*/1,
-        /*.limits.generalConstantMatrixVectorIndexing =*/1,
-    },
-};
-
-TBuiltInResource *GetDefaultResources()
-{
-  return &DefaultResources;
-}
-
-void InitSPIRVCompiler()
+void rdcspv::Init()
 {
   if(!glslang_inited)
   {
     glslang::InitializeProcess();
     glslang_inited = true;
 
-    allocatedPrograms = new std::vector<glslang::TProgram *>;
-    allocatedShaders = new std::vector<glslang::TShader *>;
+    allocatedPrograms = new rdcarray<glslang::TProgram *>;
+    allocatedShaders = new rdcarray<glslang::TShader *>;
   }
 }
 
-void ShutdownSPIRVCompiler()
+void rdcspv::Shutdown()
 {
   if(glslang_inited)
   {
@@ -181,8 +70,8 @@ void ShutdownSPIRVCompiler()
   }
 }
 
-glslang::TShader *CompileShaderForReflection(SPIRVShaderStage stage,
-                                             const std::vector<std::string> &sources)
+glslang::TShader *CompileShaderForReflection(rdcspv::ShaderStage stage,
+                                             const rdcarray<rdcstr> &sources)
 {
   EShLanguage lang = EShLanguage(stage);
 
@@ -195,7 +84,7 @@ glslang::TShader *CompileShaderForReflection(SPIRVShaderStage stage,
 
   shader->setStrings(strs, (int)sources.size());
 
-  bool success = shader->parse(&DefaultResources, 100, false, EShMsgRelaxedErrors);
+  bool success = shader->parse(GetDefaultResources(), 100, false, EShMsgRelaxedErrors);
 
   delete[] strs;
 
@@ -215,7 +104,7 @@ glslang::TShader *CompileShaderForReflection(SPIRVShaderStage stage,
   }
 }
 
-glslang::TProgram *LinkProgramForReflection(const std::vector<glslang::TShader *> &shaders)
+glslang::TProgram *LinkProgramForReflection(const rdcarray<glslang::TShader *> &shaders)
 {
   glslang::TProgram *program = new glslang::TProgram();
 
@@ -268,7 +157,7 @@ void glslangGetProgramInterfaceiv(glslang::TProgram *program, ReflectionInterfac
 }
 
 void glslangGetProgramResourceiv(glslang::TProgram *program, ReflectionInterface programInterface,
-                                 uint32_t index, const std::vector<ReflectionProperty> &props,
+                                 uint32_t index, const rdcarray<ReflectionProperty> &props,
                                  int32_t bufSize, int32_t *length, int32_t *params)
 {
   // all of our properties are single-element values, so we just loop up to buffer size or number of
@@ -283,12 +172,40 @@ void glslangGetProgramResourceiv(glslang::TProgram *program, ReflectionInterface
         break;
       case ReflectionProperty::BufferBinding:
       {
+        std::string name;
         if(programInterface == ReflectionInterface::UniformBlock)
+        {
           params[i] = program->getUniformBlock(index).getBinding();
+          name = program->getUniformBlock(index).name;
+        }
         else if(programInterface == ReflectionInterface::ShaderStorageBlock)
+        {
           params[i] = program->getBufferBlock(index).getBinding();
+          name = program->getBufferBlock(index).name;
+        }
         else
+        {
           RDCERR("Unsupported interface for BufferBinding query");
+        }
+
+        // add on the array index, if it exists, to the retrieved binding which is only for the base
+        // variable
+        size_t offs = name.find('[');
+        if(offs != std::string::npos)
+        {
+          char *nm = &name[offs + 1];
+
+          int32_t arrayIdx = 0;
+          while(*nm >= '0' && *nm <= '9')
+          {
+            arrayIdx *= 10;
+            arrayIdx += int(*nm) - int('0');
+            nm++;
+          }
+
+          params[i] += arrayIdx;
+        }
+
         break;
       }
       case ReflectionProperty::BlockIndex:
@@ -581,21 +498,59 @@ void glslangGetProgramResourceiv(glslang::TProgram *program, ReflectionInterface
   }
 }
 
-uint32_t glslangGetProgramResourceIndex(glslang::TProgram *program, const char *name)
+uint32_t glslangGetProgramResourceIndex(glslang::TProgram *program,
+                                        ReflectionInterface programInterface, const char *name)
 {
-  uint32_t idx = program->getReflectionIndex(name);
+  rdcstr n = name;
 
-  // Additionally, if <name> would exactly match the name string of an active
-  // resource if "[0]" were appended to <name>, the index of the matched
-  // resource is returned.
-  if(idx == ~0U)
+  for(int pass = 0; pass < 2; pass++)
   {
-    std::string arraysuffixed = name;
-    arraysuffixed += "[0]";
-    idx = program->getReflectionIndex(arraysuffixed.c_str());
+    // glslang namespaces aggregates that it blows up with our reflection settings, assuming we
+    // don't get an exact match for the name try with the appropriate prefix for this interface
+    if(pass == 1 && programInterface == ReflectionInterface::Input)
+      n = "in " + n;
+    else if(pass == 1 && programInterface == ReflectionInterface::Output)
+      n = "out " + n;
+    else if(pass == 1)
+      break;
+
+    uint32_t idx = program->getReflectionIndex(n.c_str());
+
+    // Additionally, if <name> would exactly match the name string of an active
+    // resource if "[0]" were appended to <name>, the index of the matched
+    // resource is returned.
+    if(idx == ~0U)
+    {
+      rdcstr arraysuffixed = n;
+      arraysuffixed += "[0]";
+      idx = program->getReflectionIndex(arraysuffixed.c_str());
+    }
+
+    // for I/O inputs, if the name ended in an array index, try and subtract that, query for the
+    // name with [0].
+    if((programInterface == ReflectionInterface::Input ||
+        programInterface == ReflectionInterface::Output) &&
+       idx == ~0U && n.back() == ']')
+    {
+      rdcstr unsuffixed = n;
+      unsuffixed.pop_back();
+
+      while(unsuffixed.back() >= '0' && unsuffixed.back() <= '9')
+        unsuffixed.pop_back();
+
+      if(unsuffixed.back() == '[')
+      {
+        unsuffixed.pop_back();
+        unsuffixed += "[0]";
+        idx = program->getReflectionIndex(unsuffixed.c_str());
+      }
+    }
+
+    if(idx != ~0U)
+      return idx;
   }
 
-  return idx;
+  return ~0U;
 }
 
 const char *glslangGetProgramResourceName(glslang::TProgram *program,

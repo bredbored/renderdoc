@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2017-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -24,20 +24,17 @@
 
 #pragma once
 
-#include <vector>
-#include "api/replay/renderdoc_replay.h"
+#include "api/replay/rdcarray.h"
+#include "api/replay/rdcstr.h"
+#include "api/replay/replay_enums.h"
 
-namespace DXBC
-{
-class DXBCFile;
-};
-
-struct SPVModule;
+struct DriverInformation;
 
 namespace GCNISA
 {
-void GetTargets(GraphicsAPI api, std::vector<std::string> &targets);
+void CacheSupport(GraphicsAPI api);
+void GetTargets(GraphicsAPI api, const DriverInformation &driver, rdcarray<rdcstr> &targets);
 
-std::string Disassemble(ShaderEncoding api, ShaderStage stage, const bytebuf &shaderBytes,
-                        const std::string &target);
+rdcstr Disassemble(ShaderEncoding api, ShaderStage stage, const bytebuf &shaderBytes,
+                   const rdcstr &target);
 };

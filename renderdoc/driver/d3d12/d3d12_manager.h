@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2016-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -24,11 +24,10 @@
 
 #pragma once
 
-#include <algorithm>
-#include "api/replay/renderdoc_replay.h"
 #include "common/wrapped_pool.h"
 #include "core/core.h"
 #include "core/resource_manager.h"
+#include "core/sparse_page_table.h"
 #include "driver/d3d12/d3d12_common.h"
 #include "serialise/serialiser.h"
 
@@ -49,6 +48,7 @@ enum D3D12ResourceType
   Resource_RootSignature,
   Resource_PipelineLibrary,
   Resource_ProtectedResourceSession,
+  Resource_ShaderCacheSession,
 };
 
 DECLARE_REFLECTION_ENUM(D3D12ResourceType);
@@ -215,6 +215,59 @@ struct PortableHandle
 
 DECLARE_REFLECTION_STRUCT(PortableHandle);
 
+struct D3D12_SAMPLER_DESC_SQUEEZED
+{
+  // this filter must be first and the same size, since we alias it for the descriptor type
+  D3D12_FILTER Filter;
+
+  // we just save the enums in a byte since they'll never be larger
+  uint8_t AddressU;
+  uint8_t AddressV;
+  uint8_t AddressW;
+  uint8_t ComparisonFunc;
+  FLOAT MipLODBias;
+  UINT MaxAnisotropy;
+  // just copy as uint
+  FLOAT UintBorderColor[4];
+  FLOAT MinLOD;
+  FLOAT MaxLOD;
+  D3D12_SAMPLER_FLAGS Flags;
+
+  void Init(const D3D12_SAMPLER_DESC2 &desc)
+  {
+    Filter = desc.Filter;
+    AddressU = uint8_t(desc.AddressU);
+    AddressV = uint8_t(desc.AddressV);
+    AddressW = uint8_t(desc.AddressW);
+    ComparisonFunc = uint8_t(desc.ComparisonFunc);
+    MipLODBias = desc.MipLODBias;
+    MaxAnisotropy = desc.MaxAnisotropy;
+    memcpy(UintBorderColor, desc.UintBorderColor, sizeof(UintBorderColor));
+    MinLOD = desc.MinLOD;
+    MaxLOD = desc.MaxLOD;
+    Flags = desc.Flags;
+  }
+
+  D3D12_SAMPLER_DESC2 AsDesc() const
+  {
+    D3D12_SAMPLER_DESC2 desc = {};
+
+    desc.Filter = Filter;
+    desc.AddressU = D3D12_TEXTURE_ADDRESS_MODE(AddressU);
+    desc.AddressV = D3D12_TEXTURE_ADDRESS_MODE(AddressV);
+    desc.AddressW = D3D12_TEXTURE_ADDRESS_MODE(AddressW);
+    desc.ComparisonFunc = D3D12_COMPARISON_FUNC(ComparisonFunc);
+    desc.MipLODBias = MipLODBias;
+    desc.MaxAnisotropy = MaxAnisotropy;
+    memcpy(desc.UintBorderColor, UintBorderColor, sizeof(UintBorderColor));
+    desc.MinLOD = MinLOD;
+    desc.MaxLOD = MaxLOD;
+    desc.Flags = Flags;
+
+    return desc;
+  }
+};
+
 // the heap pointer & index are inside the data structs, because in the sampler case we don't need
 // to pad up for any alignment, and in the non-sampler case we declare the type before uint64/ptr
 // aligned elements come, so we don't get any padding waste.
@@ -224,7 +277,7 @@ struct SamplerDescriptorData
   WrappedID3D12DescriptorHeap *heap;
   uint32_t idx;
 
-  D3D12_SAMPLER_DESC desc;
+  D3D12_SAMPLER_DESC_SQUEEZED desc;
 };
 
 struct NonSamplerDescriptorData
@@ -306,17 +359,18 @@ public:
   operator D3D12_CPU_DESCRIPTOR_HANDLE() const
   {
     D3D12_CPU_DESCRIPTOR_HANDLE handle;
-    handle.ptr = (SIZE_T) this;
+    handle.ptr = (SIZE_T)this;
     return handle;
   }
 
   operator D3D12_GPU_DESCRIPTOR_HANDLE() const
   {
     D3D12_GPU_DESCRIPTOR_HANDLE handle;
-    handle.ptr = (SIZE_T) this;
+    handle.ptr = (SIZE_T)this;
     return handle;
   }
 
+  void Init(const D3D12_SAMPLER_DESC2 *pDesc);
   void Init(const D3D12_SAMPLER_DESC *pDesc);
   void Init(const D3D12_CONSTANT_BUFFER_VIEW_DESC *pDesc);
   void Init(ID3D12Resource *pResource, const D3D12_SHADER_RESOURCE_VIEW_DESC *pDesc);
@@ -351,11 +405,11 @@ public:
 
   // Accessors for descriptor structs. The squeezed structs return only by value, others have const
   // reference returns
-  const D3D12_SAMPLER_DESC &GetSampler() const { return data.samp.desc; }
   const D3D12_RENDER_TARGET_VIEW_DESC &GetRTV() const { return data.nonsamp.rtv; }
   const D3D12_DEPTH_STENCIL_VIEW_DESC &GetDSV() const { return data.nonsamp.dsv; }
   const D3D12_CONSTANT_BUFFER_VIEW_DESC &GetCBV() const { return data.nonsamp.cbv; }
   // squeezed descriptors
+  D3D12_SAMPLER_DESC2 GetSampler() const { return data.samp.desc.AsDesc(); }
   D3D12_UNORDERED_ACCESS_VIEW_DESC GetUAV() const { return data.nonsamp.uav.AsDesc(); }
   D3D12_SHADER_RESOURCE_VIEW_DESC GetSRV() const { return data.nonsamp.srv.AsDesc(); }
 private:
@@ -420,7 +474,12 @@ struct D3D12ResourceRecord;
 
 struct CmdListRecordingInfo
 {
-  std::vector<D3D12_RESOURCE_BARRIER> barriers;
+  ChunkPagePool *allocPool = NULL;
+  ChunkAllocator *alloc = NULL;
+
+  D3D12ResourceRecord *allocRecord = NULL;
+
+  BarrierSet barriers;
 
   // a list of all resources dirtied by this command list
   std::set<ResourceId> dirtied;
@@ -428,21 +487,24 @@ struct CmdListRecordingInfo
   // a list of descriptors that are bound at any point in this command list
   // used to look up all the frame refs per-descriptor and apply them on queue
   // submit with latest binding refs.
+  // This stores the start of the range and the number of descriptors, and full
+  // traversal occurs during queue submit, to avoid perf issues during regular
+  // application operation.
   // We allow duplicates in here since it's a better tradeoff to let the vector
   // expand a bit more to contain duplicates and then deal with it during frame
   // capture, than to constantly be deduplicating during record (e.g. with a
   // set or sorted vector).
-  std::vector<D3D12Descriptor *> boundDescs;
+  rdcarray<rdcpair<D3D12Descriptor *, UINT>> boundDescs;
 
   // bundles executed
-  std::vector<D3D12ResourceRecord *> bundles;
+  rdcarray<D3D12ResourceRecord *> bundles;
 };
 
-class WrappedID3D12Resource1;
+class WrappedID3D12Resource;
 
 struct GPUAddressRange
 {
-  D3D12_GPU_VIRTUAL_ADDRESS start, end;
+  D3D12_GPU_VIRTUAL_ADDRESS start, realEnd, oobEnd;
   ResourceId id;
 
   bool operator<(const D3D12_GPU_VIRTUAL_ADDRESS &o) const
@@ -461,67 +523,13 @@ struct GPUAddressRangeTracker
   GPUAddressRangeTracker(const GPUAddressRangeTracker &);
   GPUAddressRangeTracker &operator=(const GPUAddressRangeTracker &);
 
-  std::vector<GPUAddressRange> addresses;
+  rdcarray<GPUAddressRange> addresses;
   Threading::RWLock addressLock;
 
-  void AddTo(const GPUAddressRange &range)
-  {
-    SCOPED_WRITELOCK(addressLock);
-    auto it = std::lower_bound(addresses.begin(), addresses.end(), range.start);
-
-    addresses.insert(it, range);
-  }
-
-  void RemoveFrom(const GPUAddressRange &range)
-  {
-    {
-      SCOPED_WRITELOCK(addressLock);
-      auto it = std::lower_bound(addresses.begin(), addresses.end(), range.start);
-
-      // there might be multiple buffers with the same range start, find the exact range for this
-      // buffer
-      while(it != addresses.end() && it->start == range.start)
-      {
-        if(it->id == range.id)
-        {
-          addresses.erase(it);
-          return;
-        }
-
-        ++it;
-      }
-    }
-
-    RDCERR("Couldn't find matching range to remove for %s", ToStr(range.id).c_str());
-  }
-
-  void GetResIDFromAddr(D3D12_GPU_VIRTUAL_ADDRESS addr, ResourceId &id, UINT64 &offs)
-  {
-    id = ResourceId();
-    offs = 0;
-
-    if(addr == 0)
-      return;
-
-    GPUAddressRange range;
-
-    // this should really be a read-write lock
-    {
-      SCOPED_READLOCK(addressLock);
-
-      auto it = std::lower_bound(addresses.begin(), addresses.end(), addr);
-      if(it == addresses.end())
-        return;
-
-      range = *it;
-    }
-
-    if(addr < range.start || addr >= range.end)
-      return;
-
-    id = range.id;
-    offs = addr - range.start;
-  }
+  void AddTo(const GPUAddressRange &range);
+  void RemoveFrom(const GPUAddressRange &range);
+  void GetResIDFromAddr(D3D12_GPU_VIRTUAL_ADDRESS addr, ResourceId &id, UINT64 &offs);
+  void GetResIDFromAddrAllowOutOfBounds(D3D12_GPU_VIRTUAL_ADDRESS addr, ResourceId &id, UINT64 &offs);
 };
 
 struct MapState
@@ -529,6 +537,8 @@ struct MapState
   ID3D12Resource *res;
   UINT subres;
   UINT64 totalSize;
+
+  bool operator==(const MapState &o) { return res == o.res && subres == o.subres; }
 };
 
 struct D3D12ResourceRecord : public ResourceRecord
@@ -543,6 +553,7 @@ struct D3D12ResourceRecord : public ResourceRecord
         type(Resource_Unknown),
         ContainsExecuteIndirect(false),
         cmdInfo(NULL),
+        sparseTable(NULL),
         m_Maps(NULL),
         m_MapsCount(0),
         bakedCommands(NULL)
@@ -550,7 +561,13 @@ struct D3D12ResourceRecord : public ResourceRecord
   }
   ~D3D12ResourceRecord()
   {
+    if(type == Resource_CommandAllocator)
+    {
+      SAFE_DELETE(cmdInfo->alloc);
+      SAFE_DELETE(cmdInfo->allocPool);
+    }
     SAFE_DELETE(cmdInfo);
+    SAFE_DELETE(sparseTable);
     SAFE_DELETE_ARRAY(m_Maps);
   }
   void Bake()
@@ -561,12 +578,15 @@ struct D3D12ResourceRecord : public ResourceRecord
     cmdInfo->dirtied.swap(bakedCommands->cmdInfo->dirtied);
     cmdInfo->boundDescs.swap(bakedCommands->cmdInfo->boundDescs);
     cmdInfo->bundles.swap(bakedCommands->cmdInfo->bundles);
+    bakedCommands->cmdInfo->alloc = cmdInfo->alloc;
+    bakedCommands->cmdInfo->allocRecord = cmdInfo->allocRecord;
   }
 
   D3D12ResourceType type;
   bool ContainsExecuteIndirect;
   D3D12ResourceRecord *bakedCommands;
   CmdListRecordingInfo *cmdInfo;
+  Sparse::PageTable *sparseTable;
 
   struct MapData
   {
@@ -581,7 +601,28 @@ struct D3D12ResourceRecord : public ResourceRecord
   Threading::CriticalSection m_MapLock;
 };
 
-typedef std::vector<D3D12_RESOURCE_STATES> SubresourceStateVector;
+struct SparseBinds
+{
+  SparseBinds(const Sparse::PageTable &table);
+  // tagged constructor meaning 'null binds everywhere'
+  SparseBinds(int);
+
+  void Apply(WrappedID3D12Device *device, ID3D12Resource *resource);
+
+private:
+  bool null = false;
+
+  struct Bind
+  {
+    ResourceId heap;
+    D3D12_TILED_RESOURCE_COORDINATE regionStart;
+    D3D12_TILE_REGION_SIZE regionSize;
+    D3D12_TILE_RANGE_FLAGS rangeFlag;
+    UINT rangeOffset;
+    UINT rangeCount;
+  };
+  rdcarray<Bind> binds;
+};
 
 struct D3D12InitialContents
 {
@@ -591,6 +632,8 @@ struct D3D12InitialContents
     // this is only valid during capture - it indicates we didn't create a staging texture, we're
     // going to read directly from the resource (only valid for resources that are already READBACK)
     MapDirect,
+    // for created initial states we always have an identical resource
+    ForceCopy,
   };
   D3D12InitialContents(D3D12Descriptor *d, uint32_t n)
       : tag(Copy),
@@ -599,7 +642,9 @@ struct D3D12InitialContents
         numDescriptors(n),
         resource(NULL),
         srcData(NULL),
-        dataSize(0)
+        dataSize(0),
+        sparseTable(NULL),
+        sparseBinds(NULL)
   {
   }
   D3D12InitialContents(ID3D12DescriptorHeap *r)
@@ -609,7 +654,9 @@ struct D3D12InitialContents
         numDescriptors(0),
         resource(r),
         srcData(NULL),
-        dataSize(0)
+        dataSize(0),
+        sparseTable(NULL),
+        sparseBinds(NULL)
   {
   }
   D3D12InitialContents(ID3D12Resource *r)
@@ -619,7 +666,9 @@ struct D3D12InitialContents
         numDescriptors(0),
         resource(r),
         srcData(NULL),
-        dataSize(0)
+        dataSize(0),
+        sparseTable(NULL),
+        sparseBinds(NULL)
   {
   }
   D3D12InitialContents(byte *data, size_t size)
@@ -629,7 +678,9 @@ struct D3D12InitialContents
         numDescriptors(0),
         resource(NULL),
         srcData(data),
-        dataSize(size)
+        dataSize(size),
+        sparseTable(NULL),
+        sparseBinds(NULL)
   {
   }
   D3D12InitialContents(Tag tg, D3D12ResourceType type)
@@ -639,7 +690,9 @@ struct D3D12InitialContents
         numDescriptors(0),
         resource(NULL),
         srcData(NULL),
-        dataSize(0)
+        dataSize(0),
+        sparseTable(NULL),
+        sparseBinds(NULL)
   {
   }
   D3D12InitialContents()
@@ -649,12 +702,16 @@ struct D3D12InitialContents
         numDescriptors(0),
         resource(NULL),
         srcData(NULL),
-        dataSize(0)
+        dataSize(0),
+        sparseTable(NULL),
+        sparseBinds(NULL)
   {
   }
   template <typename Configuration>
   void Free(ResourceManager<Configuration> *rm)
   {
+    SAFE_DELETE_ARRAY(descriptors);
+    SAFE_DELETE(sparseTable);
     SAFE_RELEASE(resource);
     FreeAlignedBuffer(srcData);
   }
@@ -666,6 +723,13 @@ struct D3D12InitialContents
   ID3D12DeviceChild *resource;
   byte *srcData;
   size_t dataSize;
+
+  rdcarray<uint32_t> subresources;
+
+  // only valid on capture - the snapshotted table at prepare time
+  Sparse::PageTable *sparseTable;
+  // only valid on replay, the table above converted into a set of binds
+  SparseBinds *sparseBinds;
 };
 
 struct D3D12ResourceManagerConfiguration
@@ -684,9 +748,9 @@ public:
   {
   }
   template <class T>
-  T *GetLiveAs(ResourceId id)
+  T *GetLiveAs(ResourceId id, bool optional = false)
   {
-    return (T *)GetLiveResource(id);
+    return (T *)GetLiveResource(id, optional);
   }
 
   template <class T>
@@ -695,12 +759,12 @@ public:
     return (T *)GetCurrentResource(id);
   }
 
-  void ApplyBarriers(std::vector<D3D12_RESOURCE_BARRIER> &barriers,
-                     std::map<ResourceId, SubresourceStateVector> &states);
+  void ApplyBarriers(BarrierSet &barriers, std::map<ResourceId, SubresourceStateVector> &states);
 
   template <typename SerialiserType>
-  void SerialiseResourceStates(SerialiserType &ser, std::vector<D3D12_RESOURCE_BARRIER> &barriers,
-                               std::map<ResourceId, SubresourceStateVector> &states);
+  void SerialiseResourceStates(SerialiserType &ser, BarrierSet &barriers,
+                               std::map<ResourceId, SubresourceStateVector> &states,
+                               const std::map<ResourceId, SubresourceStateVector> &initialStates);
 
   template <typename SerialiserType>
   bool Serialise_InitialState(SerialiserType &ser, ResourceId id, D3D12ResourceRecord *record,

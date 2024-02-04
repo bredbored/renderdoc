@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -52,7 +52,7 @@ COM_SMARTPTR(IMFByteStream);
 ///////////////////////////////////////////////////////////////////////////////////
 ///////////////////////////////////////////////////////////////////////////////////
 
-TEST(D3D11_Video_Textures, D3D11GraphicsTest), IMFMediaEngineNotify
+RD_TEST(D3D11_Video_Textures, D3D11GraphicsTest), IMFMediaEngineNotify
 {
   static constexpr const char *Description = "Tests of YUV textures";
 
@@ -187,8 +187,14 @@ float4 main(v2f IN) : SV_Target0
   bool video_loaded = false;
 
   // implement IUnknown
-  ULONG STDMETHODCALLTYPE AddRef() { return 1; }
-  ULONG STDMETHODCALLTYPE Release() { return 1; }
+  ULONG STDMETHODCALLTYPE AddRef()
+  {
+    return 1;
+  }
+  ULONG STDMETHODCALLTYPE Release()
+  {
+    return 1;
+  }
   HRESULT STDMETHODCALLTYPE QueryInterface(const IID &iid, void **obj)
   {
     if(iid == __uuidof(IUnknown))
@@ -755,7 +761,7 @@ float4 main(v2f IN) : SV_Target0
 
     while(Running())
     {
-      ClearRenderTargetView(bbRTV, {0.4f, 0.5f, 0.6f, 1.0f});
+      ClearRenderTargetView(bbRTV, {0.2f, 0.2f, 0.2f, 1.0f});
 
       IASetVertexBuffer(vb, sizeof(DefaultA2V), 0);
       ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
@@ -819,7 +825,8 @@ float4 main(v2f IN) : SV_Target0
         RSSetViewport({0.0f, 100.0f, 356.0f, 200.0f, 0.0f, 1.0f});
 
         Vec4i videoConfig[] = {
-            Vec4i(videoWidth, videoHeight, 2, 2), Vec4i(0, 4, 5, 1),
+            Vec4i(videoWidth, videoHeight, 2, 2),
+            Vec4i(0, 4, 5, 1),
         };
 
         if(annot)

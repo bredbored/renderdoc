@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2017-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -23,6 +23,9 @@
  ******************************************************************************/
 
 #include "SettingsDialog.h"
+#include <float.h>
+#include <math.h>
+#include <QFontDatabase>
 #include <QKeyEvent>
 #include <QTextEdit>
 #include <QToolButton>
@@ -30,13 +33,21 @@
 #include "Code/QRDUtils.h"
 #include "Styles/StyleData.h"
 #include "Widgets/OrderedListEditor.h"
+#include "Widgets/ReplayOptionsSelector.h"
 #include "CaptureDialog.h"
+#include "ConfigEditor.h"
 #include "ui_SettingsDialog.h"
 
 SettingsDialog::SettingsDialog(ICaptureContext &ctx, QWidget *parent)
     : QDialog(parent), ui(new Ui::SettingsDialog), m_Ctx(ctx)
 {
   ui->setupUi(this);
+
+  m_Init = true;
+
+  m_ReplayOptions = new ReplayOptionsSelector(m_Ctx, false, this);
+
+  ui->replayOptionsLayout->insertWidget(0, m_ReplayOptions);
 
   QString styleChooseTooltip = ui->UIStyle->toolTip();
 
@@ -49,6 +60,80 @@ SettingsDialog::SettingsDialog(ICaptureContext &ctx, QWidget *parent)
   for(int i = 0; i < StyleData::numAvailable; i++)
     ui->UIStyle->addItem(StyleData::availStyles[i].styleName);
 
+  QFontDatabase fontdb;
+
+  QStringList fontFamilies = fontdb.families();
+  fontFamilies.insert(0, tr("Default (%1)").arg(Formatter::DefaultFontFamily()));
+
+  ui->Font_Family->addItems(fontFamilies);
+
+  int curFontOption = -1;
+  for(int i = 0; i < ui->Font_Family->count(); i++)
+  {
+    if(ui->Font_Family->itemText(i) == m_Ctx.Config().Font_Family)
+    {
+      curFontOption = i;
+      break;
+    }
+  }
+
+  if(m_Ctx.Config().Font_Family.isEmpty() || curFontOption < 0)
+    curFontOption = 0;
+
+  ui->Font_Family->setCurrentIndex(curFontOption);
+
+  // remove the default again
+  fontFamilies.removeAt(0);
+
+  // remove any non-fixed width fonts
+  for(int i = 0; i < fontFamilies.count();)
+  {
+    if(!fontdb.isFixedPitch(fontFamilies[i]))
+    {
+      fontFamilies.removeAt(i);
+      // check i again
+      continue;
+    }
+
+    // move to the next
+    i++;
+  }
+
+  // re-add the default
+  fontFamilies.insert(0, tr("Default (%1)").arg(Formatter::DefaultMonoFontFamily()));
+
+  ui->Font_MonoFamily->addItems(fontFamilies);
+
+  curFontOption = -1;
+  for(int i = 0; i < ui->Font_MonoFamily->count(); i++)
+  {
+    if(ui->Font_MonoFamily->itemText(i) == m_Ctx.Config().Font_MonoFamily)
+    {
+      curFontOption = i;
+      break;
+    }
+  }
+
+  if(m_Ctx.Config().Font_MonoFamily.isEmpty() || curFontOption < 0)
+    curFontOption = 0;
+
+  ui->Font_MonoFamily->setCurrentIndex(curFontOption);
+
+  ui->Font_GlobalScale->addItems({lit("50%"), lit("75%"), lit("100%"), lit("125%"), lit("150%"),
+                                  lit("175%"), lit("200%"), lit("250%"), lit("300%"), lit("400%")});
+
+  ui->Font_GlobalScale->setCurrentText(
+      QString::number(ceil(m_Ctx.Config().Font_GlobalScale * 100)) + lit("%"));
+
+  for(int i = 0; i < ui->Font_GlobalScale->count(); i++)
+  {
+    if(ui->Font_GlobalScale->currentText() == ui->Font_GlobalScale->itemText(i))
+    {
+      ui->Font_GlobalScale->setCurrentIndex(i);
+      break;
+    }
+  }
+
   setWindowFlags(windowFlags() & ~Qt::WindowContextHelpButtonHint);
 
   ui->tabWidget->tabBar()->setVisible(false);
@@ -56,11 +141,14 @@ SettingsDialog::SettingsDialog(ICaptureContext &ctx, QWidget *parent)
   for(int i = 0; i < ui->tabWidget->count(); i++)
     ui->pages->addItem(ui->tabWidget->tabText(i));
 
-  m_Init = true;
-
   for(int i = 0; i < (int)TimeUnit::Count; i++)
   {
     ui->EventBrowser_TimeUnit->addItem(UnitSuffix((TimeUnit)i));
+  }
+
+  for(int i = 0; i < (int)OffsetSizeDisplayMode::Count; i++)
+  {
+    ui->Formatter_OffsetSizeDisplayMode->addItem((ToStr((OffsetSizeDisplayMode)i)));
   }
 
   ui->pages->clearSelection();
@@ -99,23 +187,72 @@ SettingsDialog::SettingsDialog(ICaptureContext &ctx, QWidget *parent)
   ui->deleteShaderTool->setEnabled(false);
   ui->editShaderTool->setEnabled(false);
 
-  ui->ExternalTool_RGPIntegration->setChecked(m_Ctx.Config().ExternalTool_RGPIntegration);
   ui->ExternalTool_RadeonGPUProfiler->setText(m_Ctx.Config().ExternalTool_RadeonGPUProfiler);
-
-  ui->Android_SDKPath->setText(m_Ctx.Config().Android_SDKPath);
-  ui->Android_JDKPath->setText(m_Ctx.Config().Android_JDKPath);
-  ui->Android_MaxConnectTimeout->setValue(m_Ctx.Config().Android_MaxConnectTimeout);
 
   ui->TextureViewer_ResetRange->setChecked(m_Ctx.Config().TextureViewer_ResetRange);
   ui->TextureViewer_PerTexSettings->setChecked(m_Ctx.Config().TextureViewer_PerTexSettings);
   ui->TextureViewer_PerTexYFlip->setChecked(m_Ctx.Config().TextureViewer_PerTexYFlip);
-  ui->ShaderViewer_FriendlyNaming->setChecked(m_Ctx.Config().ShaderViewer_FriendlyNaming);
   ui->CheckUpdate_AllowChecks->setChecked(m_Ctx.Config().CheckUpdate_AllowChecks);
   ui->Font_PreferMonospaced->setChecked(m_Ctx.Config().Font_PreferMonospaced);
 
   ui->TextureViewer_PerTexYFlip->setEnabled(ui->TextureViewer_PerTexSettings->isChecked());
 
   ui->AlwaysReplayLocally->setChecked(m_Ctx.Config().AlwaysReplayLocally);
+
+  {
+    const SDObject *getPaths = RENDERDOC_GetConfigSetting("DXBC.Debug.SearchDirPaths");
+    if(!getPaths)
+    {
+      ui->chooseSearchPaths->setEnabled(false);
+    }
+  }
+
+  if(const SDObject *setting = RENDERDOC_GetConfigSetting("DXBC.Disassembly.FriendlyNaming"))
+  {
+    ui->ShaderViewer_FriendlyNaming->setChecked(setting->AsBool());
+  }
+  else
+  {
+    ui->ShaderViewer_FriendlyNaming->setEnabled(false);
+  }
+
+  if(const SDObject *setting = RENDERDOC_GetConfigSetting("AMD.RGP.Enable"))
+  {
+    ui->ExternalTool_RGPIntegration->setChecked(setting->AsBool());
+  }
+  else
+  {
+    ui->ExternalTool_RGPIntegration->setEnabled(false);
+  }
+
+  if(const SDObject *setting = RENDERDOC_GetConfigSetting("Android.SDKDirPath"))
+  {
+    ui->Android_SDKPath->setText(setting->AsString());
+  }
+  else
+  {
+    ui->Android_SDKPath->setEnabled(false);
+    ui->browseAndroidSDKPath->setEnabled(false);
+  }
+
+  if(const SDObject *setting = RENDERDOC_GetConfigSetting("Android.JDKDirPath"))
+  {
+    ui->Android_JDKPath->setText(setting->AsString());
+  }
+  else
+  {
+    ui->Android_JDKPath->setEnabled(false);
+    ui->browseJDKPath->setEnabled(false);
+  }
+
+  if(const SDObject *setting = RENDERDOC_GetConfigSetting("Android.MaxConnectTimeout"))
+  {
+    ui->Android_MaxConnectTimeout->setValue(setting->AsUInt32());
+  }
+  else
+  {
+    ui->Android_MaxConnectTimeout->setEnabled(false);
+  }
 
 #if RENDERDOC_ANALYTICS_ENABLE
   if(m_Ctx.Config().Analytics_TotalOptOut)
@@ -149,16 +286,12 @@ SettingsDialog::SettingsDialog(ICaptureContext &ctx, QWidget *parent)
 #endif
 
   ui->AllowGlobalHook->setChecked(m_Ctx.Config().AllowGlobalHook);
+  ui->AllowProcessInject->setChecked(m_Ctx.Config().AllowProcessInject);
 
   ui->EventBrowser_TimeUnit->setCurrentIndex((int)m_Ctx.Config().EventBrowser_TimeUnit);
   ui->EventBrowser_AddFake->setChecked(m_Ctx.Config().EventBrowser_AddFake);
-  ui->EventBrowser_HideEmpty->setChecked(m_Ctx.Config().EventBrowser_HideEmpty);
-  ui->EventBrowser_HideAPICalls->setChecked(m_Ctx.Config().EventBrowser_HideAPICalls);
   ui->EventBrowser_ApplyColors->setChecked(m_Ctx.Config().EventBrowser_ApplyColors);
   ui->EventBrowser_ColorEventRow->setChecked(m_Ctx.Config().EventBrowser_ColorEventRow);
-
-  // disable sub-checkbox
-  ui->EventBrowser_ColorEventRow->setEnabled(ui->EventBrowser_ApplyColors->isChecked());
 
   ui->Comments_ShowOnLoad->setChecked(m_Ctx.Config().Comments_ShowOnLoad);
 
@@ -166,6 +299,8 @@ SettingsDialog::SettingsDialog(ICaptureContext &ctx, QWidget *parent)
   ui->Formatter_MaxFigures->setValue(m_Ctx.Config().Formatter_MaxFigures);
   ui->Formatter_NegExp->setValue(m_Ctx.Config().Formatter_NegExp);
   ui->Formatter_PosExp->setValue(m_Ctx.Config().Formatter_PosExp);
+  ui->Formatter_OffsetSizeDisplayMode->setCurrentIndex(
+      (int)m_Ctx.Config().Formatter_OffsetSizeDisplayMode);
 
   if(!RENDERDOC_CanGlobalHook())
   {
@@ -176,8 +311,16 @@ SettingsDialog::SettingsDialog(ICaptureContext &ctx, QWidget *parent)
     ui->globalHookLabel->setToolTip(disabledTooltip);
   }
 
+// process injection is not supported on non-Windows
+#if !defined(Q_OS_WIN32)
+  ui->injectProcLabel->setVisible(false);
+  ui->AllowProcessInject->setVisible(false);
+#endif
+
   m_Init = false;
 
+  QObject::connect(ui->Font_GlobalScale->lineEdit(), &QLineEdit::returnPressed, this,
+                   &SettingsDialog::Font_GlobalScale_returnPressed);
   QObject::connect(ui->shaderTools->verticalHeader(), &QHeaderView::sectionMoved, this,
                    &SettingsDialog::shaderTools_rowMoved);
   QObject::connect(ui->Formatter_MinFigures, OverloadedSlot<int>::of(&QSpinBox::valueChanged), this,
@@ -192,6 +335,12 @@ SettingsDialog::SettingsDialog(ICaptureContext &ctx, QWidget *parent)
 
 SettingsDialog::~SettingsDialog()
 {
+  m_Ctx.Config().DefaultReplayOptions = m_ReplayOptions->options();
+  m_Ctx.Config().Save();
+
+  if(m_NeedRefresh)
+    m_Ctx.RefreshStatus();
+
   delete ui;
 }
 
@@ -232,6 +381,61 @@ void SettingsDialog::on_okButton_accepted()
   accept();
 }
 
+void SettingsDialog::on_Font_Family_currentIndexChanged(int index)
+{
+  if(m_Init)
+    return;
+
+  if(index == 0)
+    m_Ctx.Config().Font_Family.clear();
+  else
+    m_Ctx.Config().Font_Family = ui->Font_Family->currentText();
+
+  m_Ctx.Config().SetupFormatting();
+
+  m_Ctx.Config().Save();
+}
+
+void SettingsDialog::on_Font_MonoFamily_currentIndexChanged(int index)
+{
+  if(m_Init)
+    return;
+
+  if(index == 0)
+    m_Ctx.Config().Font_MonoFamily.clear();
+  else
+    m_Ctx.Config().Font_MonoFamily = ui->Font_MonoFamily->currentText();
+
+  m_Ctx.Config().SetupFormatting();
+
+  m_Ctx.Config().Save();
+}
+
+void SettingsDialog::on_Font_GlobalScale_currentIndexChanged(int index)
+{
+  Font_GlobalScale_returnPressed();
+}
+
+void SettingsDialog::Font_GlobalScale_returnPressed()
+{
+  if(m_Init)
+    return;
+
+  QString scaleText = ui->Font_GlobalScale->currentText().replace(QLatin1Char('%'), QLatin1Char(' '));
+
+  bool ok = false;
+  int scale = scaleText.toInt(&ok);
+
+  if(!ok)
+    scale = 100;
+
+  m_Ctx.Config().Font_GlobalScale = (float)(scale) / 100.0f;
+
+  m_Ctx.Config().SetupFormatting();
+
+  m_Ctx.Config().Save();
+}
+
 // general
 void SettingsDialog::formatter_valueChanged(int val)
 {
@@ -243,6 +447,22 @@ void SettingsDialog::formatter_valueChanged(int val)
   m_Ctx.Config().SetupFormatting();
 
   m_Ctx.Config().Save();
+}
+
+void SettingsDialog::on_Formatter_OffsetSizeDisplayMode_currentIndexChanged(int index)
+{
+  if(m_Init)
+    return;
+
+  if(index < 0 || index >= (int)OffsetSizeDisplayMode::Count)
+    return;
+
+  m_Ctx.Config().Formatter_OffsetSizeDisplayMode =
+      (OffsetSizeDisplayMode)(ui->Formatter_OffsetSizeDisplayMode->currentIndex());
+
+  m_Ctx.Config().SetupFormatting();
+  m_Ctx.Config().Save();
+  m_NeedRefresh = true;
 }
 
 void SettingsDialog::on_tempDirectory_textEdited(const QString &dir)
@@ -281,6 +501,16 @@ void SettingsDialog::on_browseSaveCaptureDirectory_clicked()
 void SettingsDialog::on_AllowGlobalHook_toggled(bool checked)
 {
   m_Ctx.Config().AllowGlobalHook = ui->AllowGlobalHook->isChecked();
+
+  m_Ctx.Config().Save();
+
+  if(m_Ctx.HasCaptureDialog())
+    m_Ctx.GetCaptureDialog()->UpdateGlobalHook();
+}
+
+void SettingsDialog::on_AllowProcessInject_toggled(bool checked)
+{
+  m_Ctx.Config().AllowProcessInject = ui->AllowProcessInject->isChecked();
 
   m_Ctx.Config().Save();
 
@@ -359,6 +589,15 @@ void SettingsDialog::on_analyticsDescribeLabel_linkActivated(const QString &link
 }
 
 // core
+void SettingsDialog::on_configEditor_clicked()
+{
+  ConfigEditor editor;
+
+  RDDialog::show(&editor);
+
+  RENDERDOC_SaveConfigSettings();
+}
+
 void SettingsDialog::on_chooseSearchPaths_clicked()
 {
   QDialog listEditor;
@@ -379,22 +618,38 @@ void SettingsDialog::on_chooseSearchPaths_clicked()
 
   listEditor.setLayout(&layout);
 
-  QString setting = m_Ctx.Config().GetConfigSetting("shader.debug.searchPaths");
+  const SDObject *getPaths = RENDERDOC_GetConfigSetting("DXBC.Debug.SearchDirPaths");
 
-  list.setItems(setting.split(QLatin1Char(';'), QString::SkipEmptyParts));
+  QStringList items;
+
+  for(const SDObject *c : *getPaths)
+    items << c->data.str;
+
+  list.setItems(items);
 
   int res = RDDialog::show(&listEditor);
 
   if(res)
-    m_Ctx.Config().SetConfigSetting(lit("shader.debug.searchPaths"),
-                                    list.getItems().join(QLatin1Char(';')));
+  {
+    items = list.getItems();
+
+    SDObject *setPaths = RENDERDOC_SetConfigSetting("DXBC.Debug.SearchDirPaths");
+
+    setPaths->DeleteChildren();
+    setPaths->ReserveChildren(items.size());
+
+    for(int i = 0; i < items.size(); i++)
+      setPaths->AddAndOwnChild(makeSDString("$el"_lit, items[i]));
+
+    RENDERDOC_SaveConfigSettings();
+  }
 }
 
 void SettingsDialog::on_ExternalTool_RGPIntegration_toggled(bool checked)
 {
-  m_Ctx.Config().ExternalTool_RGPIntegration = checked;
+  RENDERDOC_SetConfigSetting("AMD.RGP.Enable")->data.basic.b = checked;
 
-  m_Ctx.Config().Save();
+  RENDERDOC_SaveConfigSettings();
 }
 
 void SettingsDialog::on_ExternalTool_RadeonGPUProfiler_textEdited(const QString &rgp)
@@ -437,6 +692,51 @@ void SettingsDialog::on_TextureViewer_PerTexYFlip_toggled(bool checked)
   m_Ctx.Config().Save();
 }
 
+void SettingsDialog::on_TextureViewer_ChooseShaderDirectories_clicked()
+{
+  QDialog listEditor;
+
+  listEditor.setWindowTitle(tr("Custom shaders search directories"));
+  listEditor.setWindowFlags(listEditor.windowFlags() & ~Qt::WindowContextHelpButtonHint);
+
+  OrderedListEditor list(tr("Shaders Directory"), BrowseMode::Folder);
+
+  QVBoxLayout layout;
+  QDialogButtonBox okCancel;
+  okCancel.setStandardButtons(QDialogButtonBox::Cancel | QDialogButtonBox::Ok);
+  layout.addWidget(&list);
+  layout.addWidget(&okCancel);
+
+  QObject::connect(&okCancel, &QDialogButtonBox::accepted, &listEditor, &QDialog::accept);
+  QObject::connect(&okCancel, &QDialogButtonBox::rejected, &listEditor, &QDialog::reject);
+
+  listEditor.setLayout(&layout);
+
+  QStringList items;
+  for(const rdcstr &dir : m_Ctx.Config().TextureViewer_ShaderDirs)
+  {
+    items.append(dir);
+  }
+
+  list.setItems(items);
+
+  int res = RDDialog::show(&listEditor);
+
+  if(res)
+  {
+    items = list.getItems();
+
+    rdcarray<rdcstr> newDirs;
+    newDirs.resize(items.size());
+    for(int i = 0; i < items.size(); i++)
+    {
+      newDirs[i] = items[i];
+    }
+
+    m_Ctx.Config().TextureViewer_ShaderDirs = newDirs;
+  }
+}
+
 void SettingsDialog::on_TextureViewer_ResetRange_toggled(bool checked)
 {
   m_Ctx.Config().TextureViewer_ResetRange = ui->TextureViewer_ResetRange->isChecked();
@@ -447,9 +747,9 @@ void SettingsDialog::on_TextureViewer_ResetRange_toggled(bool checked)
 // shader viewer
 void SettingsDialog::on_ShaderViewer_FriendlyNaming_toggled(bool checked)
 {
-  m_Ctx.Config().ShaderViewer_FriendlyNaming = ui->ShaderViewer_FriendlyNaming->isChecked();
+  RENDERDOC_SetConfigSetting("DXBC.Disassembly.FriendlyNaming")->data.basic.b = checked;
 
-  m_Ctx.Config().Save();
+  RENDERDOC_SaveConfigSettings();
 }
 
 void SettingsDialog::addProcessor(const ShaderProcessingTool &tool)
@@ -498,7 +798,7 @@ bool SettingsDialog::editTool(int existing, ShaderProcessingTool &tool)
   grid.addWidget(lab, 4, 0, 1, 1);
 
   QLineEdit nameEdit;
-  nameEdit.setPlaceholderText(lit("Tool Name"));
+  nameEdit.setPlaceholderText(tr("Tool Name"));
   nameEdit.setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
   nameEdit.setMinimumHeight(20);
 
@@ -583,6 +883,8 @@ bool SettingsDialog::editTool(int existing, ShaderProcessingTool &tool)
       executableEdit.setText(filename);
   });
 
+  QString customName;
+
   QObject::connect(&toolEdit, OverloadedSlot<int>::of(&QComboBox::currentIndexChanged),
                    [&](int index) {
                      if(index > 0)
@@ -592,12 +894,22 @@ bool SettingsDialog::editTool(int existing, ShaderProcessingTool &tool)
                        // -1 because we skip ShaderEncoding::Unknown
                        inputEdit.setCurrentIndex(int(ToolInput(tool)) - 1);
                        outputEdit.setCurrentIndex(int(ToolOutput(tool)) - 1);
+
+                       // save the current custom name if it was editable, in case the user
+                       // re-selects the custom tool entry
+                       if(nameEdit.isEnabled())
+                         customName = nameEdit.text();
+                       nameEdit.setEnabled(false);
+                       nameEdit.setText(ToQStr(tool));
+
                        argsEdit.setEnabled(false);
                        inputEdit.setEnabled(false);
                        outputEdit.setEnabled(false);
                      }
                      else
                      {
+                       nameEdit.setEnabled(true);
+                       nameEdit.setText(customName);
                        argsEdit.setEnabled(true);
                        inputEdit.setEnabled(true);
                        outputEdit.setEnabled(true);
@@ -631,6 +943,8 @@ bool SettingsDialog::editTool(int existing, ShaderProcessingTool &tool)
     tool.output = ShaderEncoding(outputEdit.currentIndex() + 1);
 
     QString message;
+
+    invalid = false;
 
     // ensure we don't have an invalid name
     if(tool.name == "Builtin")
@@ -674,8 +988,19 @@ bool SettingsDialog::editTool(int existing, ShaderProcessingTool &tool)
 
         if(tool.name == m_Ctx.Config().ShaderProcessors[i].name)
         {
+          if(tool.tool != KnownShaderTool::Unknown)
+          {
+            message = tr("The builtin tool '%1' already exists, "
+                         "please edit that entry directly if you wish to choose a custom path.")
+                          .arg(tool.name);
+          }
+          else
+          {
+            message = tr("There's already a tool named '%1', "
+                         "please select another name or edit that entry directly.")
+                          .arg(tool.name);
+          }
           invalid = true;
-          message = tr("There's already a tool named '%1', please select another.").arg(tool.name);
           break;
         }
       }
@@ -731,8 +1056,8 @@ void SettingsDialog::on_editShaderTool_clicked()
   {
     ui->shaderTools->setItem(row, 0, new QTableWidgetItem(tool.name));
     ui->shaderTools->setItem(
-        row, 1, new QTableWidgetItem(
-                    QFormatStr("%1 -> %2").arg(ToQStr(tool.input)).arg(ToQStr(tool.output))));
+        row, 1,
+        new QTableWidgetItem(QFormatStr("%1 -> %2").arg(ToQStr(tool.input)).arg(ToQStr(tool.output))));
     m_Ctx.Config().ShaderProcessors[row] = tool;
     m_Ctx.Config().Save();
   }
@@ -812,6 +1137,9 @@ void SettingsDialog::on_EventBrowser_TimeUnit_currentIndexChanged(int index)
   if(m_Ctx.HasEventBrowser())
     m_Ctx.GetEventBrowser()->UpdateDurationColumn();
 
+  if(m_Ctx.HasPerformanceCounterViewer())
+    m_Ctx.GetPerformanceCounterViewer()->UpdateDurationColumn();
+
   m_Ctx.Config().Save();
 }
 
@@ -822,23 +1150,12 @@ void SettingsDialog::on_EventBrowser_AddFake_toggled(bool checked)
   m_Ctx.Config().Save();
 }
 
-void SettingsDialog::on_EventBrowser_HideEmpty_toggled(bool checked)
-{
-  m_Ctx.Config().EventBrowser_HideEmpty = ui->EventBrowser_HideEmpty->isChecked();
-
-  m_Ctx.Config().Save();
-}
-
-void SettingsDialog::on_EventBrowser_HideAPICalls_toggled(bool checked)
-{
-  m_Ctx.Config().EventBrowser_HideAPICalls = ui->EventBrowser_HideAPICalls->isChecked();
-
-  m_Ctx.Config().Save();
-}
-
 void SettingsDialog::on_EventBrowser_ApplyColors_toggled(bool checked)
 {
   m_Ctx.Config().EventBrowser_ApplyColors = ui->EventBrowser_ApplyColors->isChecked();
+
+  // disable sub-checkbox
+  ui->EventBrowser_ColorEventRow->setEnabled(ui->EventBrowser_ApplyColors->isChecked());
 
   m_Ctx.Config().Save();
 }
@@ -874,55 +1191,60 @@ void SettingsDialog::on_browseTempCaptureDirectory_clicked()
 
 void SettingsDialog::on_browseAndroidSDKPath_clicked()
 {
-  QString adb = RDDialog::getExistingDirectory(
+  QString sdk = RDDialog::getExistingDirectory(
       this, tr("Locate SDK root folder (containing build-tools, platform-tools)"),
-      QFileInfo(m_Ctx.Config().Android_SDKPath).absoluteDir().path());
+      QFileInfo(RENDERDOC_GetConfigSetting("Android.SDKDirPath")->AsString()).absoluteDir().path());
 
-  if(!adb.isEmpty())
+  if(!sdk.isEmpty())
   {
-    ui->Android_SDKPath->setText(adb);
-    m_Ctx.Config().Android_SDKPath = adb;
-  }
+    ui->Android_SDKPath->setText(sdk);
+    RENDERDOC_SetConfigSetting("Android.SDKDirPath")->data.str = sdk;
 
-  m_Ctx.Config().Save();
+    RENDERDOC_SaveConfigSettings();
+  }
 }
 
-void SettingsDialog::on_Android_SDKPath_textEdited(const QString &adb)
+void SettingsDialog::on_Android_SDKPath_textEdited(const QString &sdk)
 {
-  if(QFileInfo::exists(adb) || adb.isEmpty())
-    m_Ctx.Config().Android_SDKPath = adb;
+  if(QFileInfo::exists(sdk) || sdk.isEmpty())
+  {
+    RENDERDOC_SetConfigSetting("Android.SDKDirPath")->data.str = sdk;
 
-  m_Ctx.Config().Save();
+    RENDERDOC_SaveConfigSettings();
+  }
 }
 
 void SettingsDialog::on_browseJDKPath_clicked()
 {
-  QString adb =
-      RDDialog::getExistingDirectory(this, tr("Locate JDK root folder (containing bin, jre, lib)"),
-                                     QFileInfo(m_Ctx.Config().Android_JDKPath).absoluteDir().path());
+  QString jdk = RDDialog::getExistingDirectory(
+      this, tr("Locate JDK root folder (containing bin, jre, lib)"),
+      QFileInfo(RENDERDOC_GetConfigSetting("Android.JDKDirPath")->AsString()).absoluteDir().path());
 
-  if(!adb.isEmpty())
+  if(!jdk.isEmpty())
   {
-    ui->Android_JDKPath->setText(adb);
-    m_Ctx.Config().Android_JDKPath = adb;
-  }
+    ui->Android_JDKPath->setText(jdk);
+    RENDERDOC_SetConfigSetting("Android.JDKDirPath")->data.str = jdk;
 
-  m_Ctx.Config().Save();
+    RENDERDOC_SaveConfigSettings();
+  }
 }
 
-void SettingsDialog::on_Android_JDKPath_textEdited(const QString &adb)
+void SettingsDialog::on_Android_JDKPath_textEdited(const QString &jdk)
 {
-  if(QFileInfo::exists(adb) || adb.isEmpty())
-    m_Ctx.Config().Android_JDKPath = adb;
+  if(QFileInfo::exists(jdk) || jdk.isEmpty())
+  {
+    RENDERDOC_SetConfigSetting("Android.JDKDirPath")->data.str = jdk;
 
-  m_Ctx.Config().Save();
+    RENDERDOC_SaveConfigSettings();
+  }
 }
 
 void SettingsDialog::on_Android_MaxConnectTimeout_valueChanged(double timeout)
 {
-  m_Ctx.Config().Android_MaxConnectTimeout = ui->Android_MaxConnectTimeout->value();
+  RENDERDOC_SetConfigSetting("Android.MaxConnectTimeout")->data.basic.u =
+      (uint32_t)ui->Android_MaxConnectTimeout->value();
 
-  m_Ctx.Config().Save();
+  RENDERDOC_SaveConfigSettings();
 }
 
 void SettingsDialog::on_UIStyle_currentIndexChanged(int index)

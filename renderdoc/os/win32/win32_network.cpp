@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  * Copyright (c) 2014 Crytek
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -25,6 +25,9 @@
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include "api/replay/stringise.h"
+#include "common/common.h"
+#include "common/formatting.h"
 #include "os/os_specific.h"
 
 #ifndef WSA_FLAG_NO_HANDLE_INHERIT
@@ -35,7 +38,7 @@
 #define WSA_FLAG_OVERLAPPED 0x01
 #endif
 
-static std::string wsaerr_string(int err)
+static rdcstr wsaerr_string(int err)
 {
   switch(err)
   {
@@ -106,7 +109,10 @@ void Init()
 
 void Shutdown()
 {
-  WSACleanup();
+  // we'd normally call WSACleanup() here but we can't - like many functions we call anyway it's not
+  // safe to call in DllMain when shutting down. Unlike other functions, it has minimal impact to
+  // just skip the call and 'leak' winsock since we're shutting down the process anyway.
+  // WSACleanup();
 }
 
 Socket::~Socket()
@@ -160,7 +166,8 @@ Socket *Socket::AcceptClient(uint32_t timeoutMilliseconds)
 
     if(err != WSAEWOULDBLOCK)
     {
-      RDCWARN("accept: %s", wsaerr_string(err).c_str());
+      SET_WARNING_RESULT(m_Error, ResultCode::NetworkIOFailed, "accept failed: %s",
+                         wsaerr_string(err).c_str());
       Shutdown();
     }
 
@@ -206,13 +213,14 @@ bool Socket::SendDataBlocking(const void *buf, uint32_t length)
 
       if(err == WSAEWOULDBLOCK || err == WSAETIMEDOUT)
       {
-        RDCWARN("Timeout in send");
+        SET_WARNING_RESULT(m_Error, ResultCode::NetworkIOFailed, "Timeout in send");
         Shutdown();
         return false;
       }
       else
       {
-        RDCWARN("send: %s", wsaerr_string(err).c_str());
+        SET_WARNING_RESULT(m_Error, ResultCode::NetworkIOFailed, "send failed: %s",
+                           wsaerr_string(err).c_str());
         Shutdown();
         return false;
       }
@@ -252,7 +260,8 @@ bool Socket::IsRecvDataWaiting()
     }
     else
     {
-      RDCWARN("recv: %s", wsaerr_string(err).c_str());
+      SET_WARNING_RESULT(m_Error, ResultCode::NetworkIOFailed, "recv peek failed: %s",
+                         wsaerr_string(err).c_str());
       Shutdown();
       return false;
     }
@@ -284,7 +293,8 @@ bool Socket::RecvDataNonBlocking(void *buf, uint32_t &length)
     }
     else
     {
-      RDCWARN("recv: %s", wsaerr_string(err).c_str());
+      SET_WARNING_RESULT(m_Error, ResultCode::NetworkIOFailed, "recv non blocking failed: %s",
+                         wsaerr_string(err).c_str());
       Shutdown();
       return false;
     }
@@ -327,13 +337,14 @@ bool Socket::RecvDataBlocking(void *buf, uint32_t length)
 
       if(err == WSAEWOULDBLOCK || err == WSAETIMEDOUT)
       {
-        RDCWARN("Timeout in recv");
+        SET_WARNING_RESULT(m_Error, ResultCode::NetworkIOFailed, "Timeout in recv");
         Shutdown();
         return false;
       }
       else
       {
-        RDCWARN("recv: %s", wsaerr_string(err).c_str());
+        SET_WARNING_RESULT(m_Error, ResultCode::NetworkIOFailed, "recv blocking failed: %s",
+                           wsaerr_string(err).c_str());
         Shutdown();
         return false;
       }
@@ -353,7 +364,7 @@ bool Socket::RecvDataBlocking(void *buf, uint32_t length)
   return true;
 }
 
-Socket *CreateServerSocket(const char *bindaddr, uint16_t port, int queuesize)
+Socket *CreateServerSocket(const rdcstr &bindaddr, uint16_t port, int queuesize)
 {
   SOCKET s = WSASocket(AF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, 0,
                        WSA_FLAG_NO_HANDLE_INHERIT | WSA_FLAG_OVERLAPPED);
@@ -365,13 +376,13 @@ Socket *CreateServerSocket(const char *bindaddr, uint16_t port, int queuesize)
   RDCEraseEl(addr);
 
   addr.sin_family = AF_INET;
-  inet_pton(AF_INET, bindaddr, &addr.sin_addr);
+  inet_pton(AF_INET, bindaddr.c_str(), &addr.sin_addr);
   addr.sin_port = htons(port);
 
   int result = bind(s, (SOCKADDR *)&addr, sizeof(addr));
   if(result == SOCKET_ERROR)
   {
-    RDCWARN("Failed to bind to %s:%d - %d", bindaddr, port, WSAGetLastError());
+    RDCWARN("Failed to bind to %s:%d - %d", bindaddr.c_str(), port, WSAGetLastError());
     closesocket(s);
     return NULL;
   }
@@ -379,7 +390,7 @@ Socket *CreateServerSocket(const char *bindaddr, uint16_t port, int queuesize)
   result = listen(s, queuesize);
   if(result == SOCKET_ERROR)
   {
-    RDCWARN("Failed to listen on %s:%d - %d", bindaddr, port, WSAGetLastError());
+    RDCWARN("Failed to listen on %s:%d - %d", bindaddr.c_str(), port, WSAGetLastError());
     closesocket(s);
     return NULL;
   }
@@ -390,14 +401,13 @@ Socket *CreateServerSocket(const char *bindaddr, uint16_t port, int queuesize)
   return new Socket((ptrdiff_t)s);
 }
 
-Socket *CreateClientSocket(const char *host, uint16_t port, int timeoutMS)
+Socket *CreateClientSocket(const rdcstr &host, uint16_t port, int timeoutMS)
 {
   wchar_t portwstr[7] = {0};
 
   {
-    char buf[7] = {0};
-    int n = StringFormat::snprintf(buf, 6, "%d", port);
-    for(int i = 0; i < n && i < 6; i++)
+    rdcstr buf = ToStr(port);
+    for(size_t i = 0; i < buf.size(); i++)
       portwstr[i] = (wchar_t)buf[i];
   }
 
@@ -407,7 +417,7 @@ Socket *CreateClientSocket(const char *host, uint16_t port, int timeoutMS)
   hints.ai_socktype = SOCK_STREAM;
   hints.ai_protocol = IPPROTO_TCP;
 
-  std::wstring whost = StringFormat::UTF82Wide(std::string(host));
+  rdcwstr whost = StringFormat::UTF82Wide(host);
 
   addrinfoW *addrResult = NULL;
   int res = GetAddrInfoW(whost.c_str(), portwstr, &hints, &addrResult);
@@ -485,35 +495,7 @@ Socket *CreateClientSocket(const char *host, uint16_t port, int timeoutMS)
 
   FreeAddrInfoW(addrResult);
 
-  RDCDEBUG("Failed to connect to %s:%d", host, port);
+  RDCDEBUG("Failed to connect to %s:%d", host.c_str(), port);
   return NULL;
-}
-
-bool ParseIPRangeCIDR(const char *str, uint32_t &ip, uint32_t &mask)
-{
-  uint32_t a = 0, b = 0, c = 0, d = 0, num = 0;
-
-  int ret = sscanf_s(str, "%u.%u.%u.%u/%u", &a, &b, &c, &d, &num);
-
-  if(ret != 5 || a > 255 || b > 255 || c > 255 || d > 255 || num > 32)
-  {
-    ip = 0;
-    mask = 0;
-    return false;
-  }
-
-  ip = MakeIP(a, b, c, d);
-
-  if(num == 0)
-  {
-    mask = 0;
-  }
-  else
-  {
-    num = 32 - num;
-    mask = ((~0U) >> num) << num;
-  }
-
-  return true;
 }
 };

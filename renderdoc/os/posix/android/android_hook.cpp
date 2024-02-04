@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2016-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -22,10 +22,10 @@
  * THE SOFTWARE.
  ******************************************************************************/
 
-#include "3rdparty/plthook/plthook.h"
 #include "common/common.h"
 #include "common/threading.h"
 #include "hooks/hooks.h"
+#include "plthook/plthook.h"
 
 #include <android/dlext.h>
 #include <dlfcn.h>
@@ -40,7 +40,7 @@
 #include <set>
 
 // uncomment the following to print (very verbose) debugging prints for the android PLT hooking
-//#define HOOK_DEBUG_PRINT(...) RDCLOG(__VA_ARGS__)
+// #define HOOK_DEBUG_PRINT(...) RDCLOG(__VA_ARGS__)
 
 #if !defined(HOOK_DEBUG_PRINT)
 #define HOOK_DEBUG_PRINT(...) \
@@ -86,20 +86,20 @@ public:
     funchook_map[hook.function] = hook;
   }
 
-  void AddLibHook(const std::string &name)
+  void AddLibHook(const rdcstr &name)
   {
     SCOPED_LOCK(lock);
-    if(std::find(libhooks.begin(), libhooks.end(), name) == libhooks.end())
+    if(!libhooks.contains(name))
       libhooks.push_back(name);
   }
 
-  void AddHookCallback(const std::string &name, FunctionLoadCallback callback)
+  void AddHookCallback(const rdcstr &name, FunctionLoadCallback callback)
   {
     SCOPED_LOCK(lock);
     hookcallbacks[name].push_back(callback);
   }
 
-  std::vector<FunctionHook> GetFunctionHooks()
+  rdcarray<FunctionHook> GetFunctionHooks()
   {
     SCOPED_LOCK(lock);
     return funchooks;
@@ -113,30 +113,30 @@ public:
     funchook_map.clear();
   }
 
-  std::vector<std::string> GetLibHooks()
+  rdcarray<rdcstr> GetLibHooks()
   {
     SCOPED_LOCK(lock);
     return libhooks;
   }
 
-  std::map<std::string, std::vector<FunctionLoadCallback>> GetHookCallbacks()
+  std::map<rdcstr, rdcarray<FunctionLoadCallback>> GetHookCallbacks()
   {
     SCOPED_LOCK(lock);
     return hookcallbacks;
   }
 
-  FunctionHook GetFunctionHook(const std::string &name)
+  FunctionHook GetFunctionHook(const rdcstr &name)
   {
     SCOPED_LOCK(lock);
     return funchook_map[name];
   }
 
-  bool IsLibHook(const std::string &path)
+  bool IsLibHook(const rdcstr &path)
   {
     SCOPED_LOCK(lock);
-    for(const std::string &filename : libhooks)
+    for(const rdcstr &filename : libhooks)
     {
-      if(path.find(filename) != std::string::npos)
+      if(path.contains(filename))
       {
         HOOK_DEBUG_PRINT("Intercepting and returning ourselves for %s (matches %s)", path.c_str(),
                          filename.c_str());
@@ -150,7 +150,7 @@ public:
   bool IsLibHook(void *handle)
   {
     SCOPED_LOCK(lock);
-    for(const std::string &lib : libhooks)
+    for(const rdcstr &lib : libhooks)
     {
       void *libHandle = dlopen(lib.c_str(), RTLD_NOLOAD);
       HOOK_DEBUG_PRINT("%s is %p", lib.c_str(), libHandle);
@@ -168,15 +168,15 @@ public:
     return ret;
   }
 
-  bool IsHooked(const std::string &soname)
+  bool IsHooked(const rdcstr &soname)
   {
     SCOPED_LOCK(lock);
     if(hooked_soname_already.find(soname) != hooked_soname_already.end())
       return true;
 
     // above will be absolute path, allow substring matches
-    for(const std::string &fn : hooked_soname_already)
-      if(soname.find(fn) != std::string::npos)
+    for(const rdcstr &fn : hooked_soname_already)
+      if(soname.contains(fn))
         return true;
 
     return false;
@@ -188,21 +188,21 @@ public:
     hooked_handle_already.insert(handle);
   }
 
-  void SetHooked(const std::string &soname)
+  void SetHooked(const rdcstr &soname)
   {
     SCOPED_LOCK(lock);
     hooked_soname_already.insert(soname);
   }
 
 private:
-  std::set<std::string> hooked_soname_already;
+  std::set<rdcstr> hooked_soname_already;
   std::set<void *> hooked_handle_already;
 
-  std::vector<FunctionHook> funchooks;
-  std::map<std::string, FunctionHook> funchook_map;
-  std::vector<std::string> libhooks;
+  rdcarray<FunctionHook> funchooks;
+  std::map<rdcstr, FunctionHook> funchook_map;
+  rdcarray<rdcstr> libhooks;
 
-  std::map<std::string, std::vector<FunctionLoadCallback>> hookcallbacks;
+  std::map<rdcstr, rdcarray<FunctionLoadCallback>> hookcallbacks;
 
   Threading::CriticalSection lock;
 };
@@ -222,7 +222,7 @@ void *intercept_dlopen(const char *filename, int flag)
     // We need to intercept requests for our own library, because the android loader makes the
     // completely ridiculous decision to load multiple copies of the same library into a process if
     // it's dlopen'd with different paths. This obviously breaks with our hook install.
-    if(strstr(filename, RENDERDOC_ANDROID_LIBRARY) || GetHookInfo().IsLibHook(std::string(filename)))
+    if(strstr(filename, RENDERDOC_ANDROID_LIBRARY) || GetHookInfo().IsLibHook(rdcstr(filename)))
     {
       HOOK_DEBUG_PRINT("Intercepting dlopen for %s", filename);
       return dlopen(RENDERDOC_ANDROID_LIBRARY, flag);
@@ -240,7 +240,7 @@ static int dl_iterate_callback(struct dl_phdr_info *info, size_t size, void *dat
     HOOK_DEBUG_PRINT("Skipping NULL entry!");
     return 0;
   }
-  std::string soname = info->dlpi_name;
+  rdcstr soname = info->dlpi_name;
 
   if(GetHookInfo().IsHooked(soname))
     return 0;
@@ -292,7 +292,7 @@ static int dl_iterate_callback(struct dl_phdr_info *info, size_t size, void *dat
     void **relro_end = NULL;
     bool relro_failed = false;
 
-    FILE *f = FileIO::fopen(info->dlpi_name, "r");
+    FILE *f = FileIO::fopen(info->dlpi_name, FileIO::ReadText);
 
     // read the file on disk to get the .relro section
     if(f)
@@ -432,7 +432,7 @@ uint64_t suppressTLS = 0;
 
 void process_dlopen(const char *filename, int flag)
 {
-  if(filename && !GetHookInfo().IsHooked(std::string(filename)))
+  if(filename && !GetHookInfo().IsHooked(rdcstr(filename)))
   {
     HOOK_DEBUG_PRINT("iterating after %s", filename);
     dl_iterate_phdr(dl_iterate_callback, NULL);
@@ -556,7 +556,7 @@ void intercept_error(void *, const char *error_msg)
   RDCERR("intercept_error: %s", error_msg);
 }
 
-#include "3rdparty/interceptor-lib/include/interceptor.h"
+#include "interceptor-lib/include/interceptor.h"
 
 void PatchHookedFunctions()
 {
@@ -569,20 +569,20 @@ void PatchHookedFunctions()
   LibraryHooks::RegisterLibraryHook("/system/lib/libhwgl.so", NULL);
 #endif
 
-  std::vector<std::string> libs = GetHookInfo().GetLibHooks();
-  std::vector<FunctionHook> funchooks = GetHookInfo().GetFunctionHooks();
+  rdcarray<rdcstr> libs = GetHookInfo().GetLibHooks();
+  rdcarray<FunctionHook> funchooks = GetHookInfo().GetFunctionHooks();
 
   // we just leak this
   void *intercept = InitializeInterceptor();
 
-  std::set<std::string> fallbacklibs;
+  std::set<rdcstr> fallbacklibs;
   std::set<FunctionHook> fallbackhooks;
 
-  for(const std::string &lib : libs)
+  for(const rdcstr &lib : libs)
   {
     void *handle = dlopen(lib.c_str(), RTLD_NOW);
 
-    bool huawei = lib.find("libhwgl.so") != std::string::npos;
+    bool huawei = lib.contains("libhwgl.so");
 
     if(!handle)
     {
@@ -653,7 +653,7 @@ void PatchHookedFunctions()
   // This is just a minimal setup to intercept that one function.
   GetHookInfo().ClearHooks();
 
-  for(const std::string &l : fallbacklibs)
+  for(const rdcstr &l : fallbacklibs)
   {
     RDCLOG("Falling back to PLT hooking for %s", l.c_str());
     GetHookInfo().AddLibHook(l);
@@ -677,12 +677,23 @@ void PatchHookedFunctions()
 
 bool LibraryHooks::Detect(const char *identifier)
 {
-  return dlsym(RTLD_DEFAULT, identifier) != NULL;
+  const bool symbol = (dlsym(RTLD_DEFAULT, identifier) != NULL);
+  const bool env = (getenv(identifier) != NULL);
+
+  RDCLOG("Detecting symbol %s by dlsym: %s", identifier, symbol ? "yes" : "no");
+  RDCLOG("Detecting symbol %s by getenv: %s", identifier, env ? "yes" : "no");
+
+  return symbol || env;
 }
 
 void LibraryHooks::RemoveHooks()
 {
   RDCERR("Removing hooks is not possible on this platform");
+}
+
+void LibraryHooks::ReplayInitialise()
+{
+  // nothing to do
 }
 
 void LibraryHooks::BeginHookRegistration()
@@ -721,11 +732,38 @@ void LibraryHooks::EndHookRegistration()
 
   // ensure we load all libraries we can immediately, so they are immediately hooked and don't get
   // loaded later.
-  std::vector<std::string> libs = GetHookInfo().GetLibHooks();
-  for(const std::string &lib : libs)
+  rdcarray<rdcstr> libs = GetHookInfo().GetLibHooks();
+  for(const rdcstr &lib : libs)
   {
     void *handle = dlopen(lib.c_str(), RTLD_GLOBAL);
     HOOK_DEBUG_PRINT("%s: %p", lib.c_str(), handle);
+  }
+
+  // try to prevent the library from being unloaded, increment our dlopen refcount (might not work
+  // on android, but we'll try!)
+  // we use RTLD_NOLOAD to prevent a second copy being loaded if this path doesn't refer to
+  // ourselves or otherwise breaks because of android's terrible library handling.
+  {
+    rdcstr selfLib;
+    FileIO::GetLibraryFilename(selfLib);
+    if(FileIO::exists(selfLib))
+    {
+      void *handle = dlopen(selfLib.c_str(), RTLD_NOW | RTLD_NOLOAD | RTLD_LOCAL);
+      if(handle)
+        RDCLOG("Dummy-loaded %s with dlopen to prevent library unload", selfLib.c_str());
+      else
+        RDCLOG("Failed to dummy-loaded %s with dlopen", selfLib.c_str());
+    }
+    else
+    {
+      RDCLOG("Couldn't dummy-load %s because it doesn't exist", selfLib.c_str());
+    }
+  }
+
+  if(libs.empty())
+  {
+    RDCLOG("No library hooks registered, not doing any hooking");
+    return;
   }
 
   PatchHookedFunctions();
@@ -739,8 +777,8 @@ void LibraryHooks::EndHookRegistration()
   // have. If we have interceptor-lib this will only be for functions that failed to generate a
   // trampoline and we're PLT hooking - without interceptor-lib this will be all functions, but it
   // will allow us to control the order/priority.
-  std::vector<std::string> libraryHooks = GetHookInfo().GetLibHooks();
-  std::vector<FunctionHook> functionHooks = GetHookInfo().GetFunctionHooks();
+  rdcarray<rdcstr> libraryHooks = GetHookInfo().GetLibHooks();
+  rdcarray<FunctionHook> functionHooks = GetHookInfo().GetFunctionHooks();
 
   RDCLOG("Fetching %zu original function pointers over %zu libraries", functionHooks.size(),
          libraryHooks.size());
@@ -763,15 +801,14 @@ void LibraryHooks::EndHookRegistration()
 
   // call the callbacks for any libraries that loaded now. If the library wasn't loaded above then
   // it can't be loaded, since we only hook system libraries.
-  std::map<std::string, std::vector<FunctionLoadCallback>> callbacks =
-      GetHookInfo().GetHookCallbacks();
-  for(const std::pair<std::string, std::vector<FunctionLoadCallback>> &cb : callbacks)
+  std::map<rdcstr, rdcarray<FunctionLoadCallback>> callbacks = GetHookInfo().GetHookCallbacks();
+  for(auto it = callbacks.begin(); it != callbacks.end(); ++it)
   {
-    void *handle = dlopen(cb.first.c_str(), RTLD_GLOBAL);
+    void *handle = dlopen(it->first.c_str(), RTLD_GLOBAL);
     if(handle)
     {
-      HOOK_DEBUG_PRINT("Calling callbacks for %s", cb.first.c_str());
-      for(FunctionLoadCallback callback : cb.second)
+      HOOK_DEBUG_PRINT("Calling callbacks for %s", it->first.c_str());
+      for(FunctionLoadCallback callback : it->second)
         if(callback)
           callback(handle);
     }
@@ -782,6 +819,12 @@ void LibraryHooks::EndHookRegistration()
 
 void LibraryHooks::Refresh()
 {
+  if(suppressTLS == 0)
+  {
+    RDCLOG("Not refreshing android hooks with no libraries registered");
+    return;
+  }
+
   RDCLOG("Refreshing android hooks...");
   dl_iterate_phdr(dl_iterate_callback, NULL);
   RDCLOG("Refreshed");
@@ -807,5 +850,8 @@ ScopedSuppressHooking::~ScopedSuppressHooking()
 
 bool hooks_suppressed()
 {
+  if(suppressTLS == 0)
+    return true;
+
   return (uintptr_t)Threading::GetTLSValue(suppressTLS) > 0;
 }

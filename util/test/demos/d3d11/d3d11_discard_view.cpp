@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -24,7 +24,7 @@
 
 #include "d3d11_test.h"
 
-TEST(D3D11_Discard_View, D3D11GraphicsTest)
+RD_TEST(D3D11_Discard_View, D3D11GraphicsTest)
 {
   static constexpr const char *Description = "Test that discards an RTV";
 
@@ -44,7 +44,7 @@ float4 main() : SV_Target0
 
   int main()
   {
-    d3d11_1 = true;
+    feature_level = D3D_FEATURE_LEVEL_11_1;
 
     // initialise, create window, create device, etc
     if(!Init())

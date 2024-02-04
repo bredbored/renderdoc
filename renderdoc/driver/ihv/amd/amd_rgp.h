@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2018-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -24,7 +24,7 @@
 
 #pragma once
 
-#include <string>
+#include "api/replay/rdcstr.h"
 
 typedef void *DevDriverAPIContext;
 
@@ -38,7 +38,7 @@ public:
 
   bool Initialised();
 
-  bool TriggerCapture(const std::string &path);
+  bool TriggerCapture(const rdcstr &path);
   bool HasCapture();
   bool DriverSupportsInterop();
 

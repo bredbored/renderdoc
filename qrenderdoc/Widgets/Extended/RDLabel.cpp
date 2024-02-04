@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2016-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -41,9 +41,12 @@ void RDLabel::modifySizeHint(QSize &sz) const
     sz.setWidth(sz.width() - contentsMargins().left() - contentsMargins().right());
 
   if(m_variant.isValid())
+  {
     sz.setWidth(qMax(RichResourceTextWidthHint(this, font(), m_variant) + contentsMargins().left() +
                          contentsMargins().right() + margin() * 2,
                      sz.width()));
+    sz.setHeight(qMax(RichResourceTextHeightHint(this, font(), m_variant), sz.height()));
+  }
 }
 
 QSize RDLabel::sizeHint() const
@@ -65,7 +68,7 @@ QSize RDLabel::minimumSizeHint() const
 void RDLabel::setText(const QString &text)
 {
   m_variant = text;
-  RichResourceTextInitialise(m_variant);
+  RichResourceTextInitialise(m_variant, getCaptureContext(this));
   if(RichResourceTextCheck(m_variant))
   {
     setMouseTracking(true);
@@ -184,6 +187,7 @@ void RDLabel::resizeEvent(QResizeEvent *event)
     }
   }
 
+  emit resized();
   QLabel::resizeEvent(event);
 }
 
@@ -209,6 +213,8 @@ void RDLabel::paintEvent(QPaintEvent *event)
     r.setLeft(r.left() + contentsMargins().left() + margin());
     r.setRight(r.right() - contentsMargins().right() - margin());
 
-    RichResourceTextPaint(this, &painter, r, font(), palette(), r.contains(pos), pos, m_variant);
+    RichResourceTextPaint(this, &painter, r, font(), palette(),
+                          r.contains(pos) ? QStyle::State_MouseOver : QStyle::State_None, pos,
+                          m_variant);
   }
 }

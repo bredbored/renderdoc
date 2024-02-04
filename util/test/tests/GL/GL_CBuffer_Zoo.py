@@ -6,16 +6,11 @@ class GL_CBuffer_Zoo(rdtest.TestCase):
     demos_test_name = 'GL_CBuffer_Zoo'
 
     def check_capture(self):
-        draw = self.find_draw("Draw")
+        action = self.find_action("Draw")
 
-        self.check(draw is not None)
+        self.check(action is not None)
 
-        self.controller.SetFrameEvent(draw.eventId, False)
-
-        # Make an output so we can pick pixels
-        out: rd.ReplayOutput = self.controller.CreateOutput(rd.CreateHeadlessWindowingData(100, 100), rd.ReplayOutputType.Texture)
-
-        self.check(out is not None)
+        self.controller.SetFrameEvent(action.eventId, False)
 
         pipe: rd.PipeState = self.controller.GetPipelineState()
 
@@ -23,9 +18,10 @@ class GL_CBuffer_Zoo(rdtest.TestCase):
         cbuf: rd.BoundCBuffer = pipe.GetConstantBuffer(stage, 0, 0)
 
         var_check = rdtest.ConstantBufferChecker(
-            self.controller.GetCBufferVariableContents(pipe.GetShader(stage),
+            self.controller.GetCBufferVariableContents(pipe.GetGraphicsPipelineObject(),
+                                                       pipe.GetShader(stage), stage,
                                                        pipe.GetShaderEntryPoint(stage), 0,
-                                                       cbuf.resourceId, cbuf.byteOffset))
+                                                       cbuf.resourceId, cbuf.byteOffset, cbuf.byteSize))
 
         # For more detailed reference for the below checks, see the commented definition of the cbuffer
         # in the shader source code in the demo itself
@@ -89,7 +85,8 @@ class GL_CBuffer_Zoo(rdtest.TestCase):
         # row_major vec4x4 r;
         var_check.check('r').cols(4).rows(4).row_major().value([92.0, 93.0, 94.0, 95.0,
                                                                 96.0, 97.0, 98.0, 99.0,
-                                                                100.0, 101.0, 102.0, 103.0])
+                                                                100.0, 101.0, 102.0, 103.0,
+                                                                104.0, 105.0, 106.0, 107.0])
 
         # column_major vec4x3 s;
         var_check.check('s').cols(4).rows(3).column_major().value([108.0, 112.0, 116.0, 120.0,
@@ -289,11 +286,81 @@ class GL_CBuffer_Zoo(rdtest.TestCase):
                                                                  433.0, 437.0]),
         })
 
-        # vec4 test;
-        var_check.check('test').rows(1).cols(4).value([440.0, 441.0, 442.0, 443.0])
+        # struct nested_with_padding
+        # {
+        #   float a; // vec3 padding
+        #   vec4 b;
+        #   float c; // vec3 padding
+        #   vec3 d[4]; // float padding after each one
+        # };
+        # nested_with_padding ak[2];
+        var_check.check('ak').rows(0).cols(0).arraySize(2).members({
+            # ak[0]
+            0: lambda s: s.rows(0).cols(0).structSize(4).members({
+                'a': lambda y: y.rows(1).cols(1).value([440.0]),
+                'b': lambda y: y.rows(1).cols(4).value([444.0, 445.0, 446.0, 447.0]),
+                'c': lambda y: y.rows(1).cols(1).value([448.0]),
+                'd': lambda x: x.rows(0).cols(0).arraySize(4).members({
+                    0: lambda z: z.rows(1).cols(3).value([452.0, 453.0, 454.0]),
+                    1: lambda z: z.rows(1).cols(3).value([456.0, 457.0, 458.0]),
+                    2: lambda z: z.rows(1).cols(3).value([460.0, 461.0, 462.0]),
+                    3: lambda z: z.rows(1).cols(3).value([464.0, 465.0, 466.0]),
+                }),
+            }),
+            # ak[1]
+            1: lambda s: s.rows(0).cols(0).structSize(4).members({
+                'a': lambda y: y.rows(1).cols(1).value([468.0]),
+                'b': lambda y: y.rows(1).cols(4).value([472.0, 473.0, 474.0, 475.0]),
+                'c': lambda y: y.rows(1).cols(1).value([476.0]),
+                'd': lambda x: x.rows(0).cols(0).arraySize(4).members({
+                    0: lambda z: z.rows(1).cols(3).value([480.0, 481.0, 482.0]),
+                    1: lambda z: z.rows(1).cols(3).value([484.0, 485.0, 486.0]),
+                    2: lambda z: z.rows(1).cols(3).value([488.0, 489.0, 490.0]),
+                    3: lambda z: z.rows(1).cols(3).value([492.0, 493.0, 494.0]),
+                }),
+            }),
+        })
+
+        # float2 dummy12;
+        var_check.check('dummy12')
+
+        # float al;
+        var_check.check('al').rows(1).cols(1).value([500.0])
+
+        # struct float2_struct
+        # {
+        #   float x, y;
+        # };
+        # float2_struct am;
+        var_check.check('am').rows(0).cols(0).members({
+            'x': lambda y: y.rows(1).cols(1).value([504.0]),
+            'y': lambda y: y.rows(1).cols(1).value([505.0]),
+        })
+
+        # float an;
+        var_check.check('an').rows(1).cols(1).value([508.0])
+
+        # float4 dummy13[2];
+        var_check.check('dummy13')
+
+        # misaligned_struct ao[2];
+        var_check.check('ao').rows(0).cols(0).arraySize(2).members({
+            # ao[0]
+            0: lambda s: s.rows(0).cols(0).structSize(2).members({
+                'a': lambda y: y.rows(1).cols(4).value([520.0, 521.0, 522.0, 523.0]),
+                'b': lambda y: y.rows(1).cols(2).value([524.0, 525.0]),
+            }),
+            1: lambda s: s.rows(0).cols(0).structSize(2).members({
+                'a': lambda y: y.rows(1).cols(4).value([528.0, 529.0, 530.0, 531.0]),
+                'b': lambda y: y.rows(1).cols(2).value([532.0, 533.0]),
+            }),
+        })
+
+        # float4 test;
+        var_check.check('test').rows(1).cols(4).value([536.0, 537.0, 538.0, 539.0])
 
         # to save duplicating if this array changes, we calculate out from the start, as the array is tightly packed
-        base = 444.0
+        base = 540.0
 
         exp_vals = lambda wi,yi,xi: [base + wi * 24.0 + yi * 8.0 + xi * 4.0 + c * 1.0 for c in range(0,4)]
 
@@ -361,26 +428,17 @@ class GL_CBuffer_Zoo(rdtest.TestCase):
 
         rdtest.log.success("CBuffer variables are as expected")
 
-        tex = rd.TextureDisplay()
-        tex.resourceId = pipe.GetOutputTargets()[0].resourceId
-        out.SetTextureDisplay(tex)
-
-        texdetails = self.get_texture(tex.resourceId)
-
-        picked: rd.PixelValue = out.PickPixel(tex.resourceId, False,
-                                              int(texdetails.width / 2), int(texdetails.height / 2), 0, 0, 0)
-
-        if not rdtest.value_compare(picked.floatValue, [440.1, 441.0, 442.0, 443.0]):
-            raise rdtest.TestFailureException("Picked value {} doesn't match expectation".format(picked.floatValue))
+        self.check_pixel_value(pipe.GetOutputTargets()[0].resourceId, 0.5, 0.5, [537.1, 538.0, 539.0, 540.0])
 
         rdtest.log.success("Picked value is as expected")
 
         cbuf: rd.BoundCBuffer = pipe.GetConstantBuffer(stage, 1, 0)
 
         var_check = rdtest.ConstantBufferChecker(
-            self.controller.GetCBufferVariableContents(pipe.GetShader(stage),
+            self.controller.GetCBufferVariableContents(pipe.GetGraphicsPipelineObject(),
+                                                       pipe.GetShader(stage), stage,
                                                        pipe.GetShaderEntryPoint(stage), 1,
-                                                       cbuf.resourceId, cbuf.byteOffset))
+                                                       cbuf.resourceId, cbuf.byteOffset, cbuf.byteSize))
 
         # For bare uniforms we have partial data - only values used in the shader need to get assigned locations and
         # some drivers are aggressive about stripping any others. Only uniforms with locations get upload values.
@@ -514,8 +572,17 @@ class GL_CBuffer_Zoo(rdtest.TestCase):
             }),
         })
 
+        var_check.check('H').cols(1).rows(1).value([14000])
+        var_check.check('I').cols(2).rows(1).value([15000, 16000])
+        var_check.check('J').cols(3).rows(1).value([17000, 18000, 19000])
+        var_check.check('K').cols(4).rows(1).value([20000, 21000, 22000, 23000])
+        var_check.check('L').cols(4).rows(1).value([-24000, -25000, -26000, -27000])
+        # float2_struct M[1];
+        var_check.check('M').cols(0).rows(0).arraySize(2).members({
+            0: lambda x: x.cols(1).rows(1).value([28001.0]),
+            1: lambda x: x.cols(1).rows(1).value([-28000.0]),
+        })
+
         var_check.done()
 
         rdtest.log.success("Bare uniform variables are as expected")
-
-        out.Shutdown()

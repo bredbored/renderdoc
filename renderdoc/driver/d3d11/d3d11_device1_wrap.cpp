@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  * Copyright (c) 2014 Crytek
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -72,8 +72,8 @@ bool WrappedID3D11Device::Serialise_CreateBlendState1(SerialiserType &ser,
                                                       const D3D11_BLEND_DESC1 *pBlendStateDesc,
                                                       ID3D11BlendState1 **ppBlendState)
 {
-  SERIALISE_ELEMENT_LOCAL(Descriptor, *pBlendStateDesc);
-  SERIALISE_ELEMENT_LOCAL(pState, GetIDForResource(*ppBlendState))
+  SERIALISE_ELEMENT_LOCAL(Descriptor, *pBlendStateDesc).Important();
+  SERIALISE_ELEMENT_LOCAL(pState, GetIDForDeviceChild(*ppBlendState))
       .TypedAs("ID3D11BlendState1 *"_lit);
 
   SERIALISE_CHECK_READ_ERRORS();
@@ -84,13 +84,20 @@ bool WrappedID3D11Device::Serialise_CreateBlendState1(SerialiserType &ser,
     HRESULT hr = E_NOINTERFACE;
 
     if(m_pDevice1)
+    {
       hr = m_pDevice1->CreateBlendState1(&Descriptor, &ret);
+    }
     else
-      RDCERR("Replaying a D3D11.1 device without D3D11.1 available");
+    {
+      SET_ERROR_RESULT(m_FailedReplayResult, ResultCode::APIHardwareUnsupported,
+                       "Replaying a D3D11.1 capture without D3D11.1 available");
+      return false;
+    }
 
     if(FAILED(hr))
     {
-      RDCERR("Failed on resource serialise-creation, HRESULT: %s", ToStr(hr).c_str());
+      SET_ERROR_RESULT(m_FailedReplayResult, ResultCode::APIReplayFailed,
+                       "Failed creating D3D11.1 blend state, HRESULT: %s", ToStr(hr).c_str());
       return false;
     }
     else
@@ -125,6 +132,8 @@ HRESULT WrappedID3D11Device::CreateBlendState1(const D3D11_BLEND_DESC1 *pBlendSt
   if(ppBlendState == NULL)
     return m_pDevice1->CreateBlendState1(pBlendStateDesc, NULL);
 
+  CachedObjectsGarbageCollect();
+
   ID3D11BlendState1 *real = NULL;
   HRESULT ret = m_pDevice1->CreateBlendState1(pBlendStateDesc, &real);
 
@@ -132,23 +141,24 @@ HRESULT WrappedID3D11Device::CreateBlendState1(const D3D11_BLEND_DESC1 *pBlendSt
   {
     SCOPED_LOCK(m_D3DLock);
 
+    // need to flush pending dead now so we don't find a 'dead' wrapper below
+    FlushPendingDead();
+
     // duplicate states can be returned, if Create is called with a previous descriptor
     if(GetResourceManager()->HasWrapper(real))
     {
       real->Release();
       *ppBlendState = (ID3D11BlendState1 *)GetResourceManager()->GetWrapper(real);
+      Resurrect(*ppBlendState);
       (*ppBlendState)->AddRef();
       return ret;
     }
 
     ID3D11BlendState1 *wrapped = new WrappedID3D11BlendState1(real, this);
 
-    CachedObjectsGarbageCollect();
-
     {
       RDCASSERT(m_CachedStateObjects.find(wrapped) == m_CachedStateObjects.end());
-      wrapped->AddRef();
-      InternalRef();
+      IntAddRef(wrapped);
       m_CachedStateObjects.insert(wrapped);
     }
 
@@ -164,7 +174,6 @@ HRESULT WrappedID3D11Device::CreateBlendState1(const D3D11_BLEND_DESC1 *pBlendSt
       RDCASSERT(GetResourceManager()->GetResourceRecord(id) == NULL);
 
       D3D11ResourceRecord *record = GetResourceManager()->AddResourceRecord(id);
-      record->ResType = IdentifyTypeByPtr(wrapped);
       record->Length = 0;
 
       record->AddChunk(scope.Get());
@@ -181,8 +190,8 @@ bool WrappedID3D11Device::Serialise_CreateRasterizerState1(
     SerialiserType &ser, const D3D11_RASTERIZER_DESC1 *pRasterizerDesc,
     ID3D11RasterizerState1 **ppRasterizerState)
 {
-  SERIALISE_ELEMENT_LOCAL(Descriptor, *pRasterizerDesc);
-  SERIALISE_ELEMENT_LOCAL(pState, GetIDForResource(*ppRasterizerState))
+  SERIALISE_ELEMENT_LOCAL(Descriptor, *pRasterizerDesc).Important();
+  SERIALISE_ELEMENT_LOCAL(pState, GetIDForDeviceChild(*ppRasterizerState))
       .TypedAs("ID3D11RasterizerState1 *"_lit);
 
   SERIALISE_CHECK_READ_ERRORS();
@@ -193,13 +202,20 @@ bool WrappedID3D11Device::Serialise_CreateRasterizerState1(
     HRESULT hr = E_NOINTERFACE;
 
     if(m_pDevice1)
+    {
       hr = m_pDevice1->CreateRasterizerState1(&Descriptor, &ret);
+    }
     else
-      RDCERR("Replaying a D3D11.1 device without D3D11.1 available");
+    {
+      SET_ERROR_RESULT(m_FailedReplayResult, ResultCode::APIHardwareUnsupported,
+                       "Replaying a D3D11.1 capture without D3D11.1 available");
+      return false;
+    }
 
     if(FAILED(hr))
     {
-      RDCERR("Failed on resource serialise-creation, HRESULT: %s", ToStr(hr).c_str());
+      SET_ERROR_RESULT(m_FailedReplayResult, ResultCode::APIReplayFailed,
+                       "Failed creating D3D11.1 rasterizer state, HRESULT: %s", ToStr(hr).c_str());
       return false;
     }
     else
@@ -234,6 +250,8 @@ HRESULT WrappedID3D11Device::CreateRasterizerState1(const D3D11_RASTERIZER_DESC1
   if(ppRasterizerState == NULL)
     return m_pDevice1->CreateRasterizerState1(pRasterizerDesc, NULL);
 
+  CachedObjectsGarbageCollect();
+
   ID3D11RasterizerState1 *real = NULL;
   HRESULT ret = m_pDevice1->CreateRasterizerState1(pRasterizerDesc, &real);
 
@@ -241,23 +259,24 @@ HRESULT WrappedID3D11Device::CreateRasterizerState1(const D3D11_RASTERIZER_DESC1
   {
     SCOPED_LOCK(m_D3DLock);
 
+    // need to flush pending dead now so we don't find a 'dead' wrapper below
+    FlushPendingDead();
+
     // duplicate states can be returned, if Create is called with a previous descriptor
     if(GetResourceManager()->HasWrapper(real))
     {
       real->Release();
       *ppRasterizerState = (ID3D11RasterizerState1 *)GetResourceManager()->GetWrapper(real);
+      Resurrect(*ppRasterizerState);
       (*ppRasterizerState)->AddRef();
       return ret;
     }
 
     ID3D11RasterizerState1 *wrapped = new WrappedID3D11RasterizerState2(real, this);
 
-    CachedObjectsGarbageCollect();
-
     {
       RDCASSERT(m_CachedStateObjects.find(wrapped) == m_CachedStateObjects.end());
-      wrapped->AddRef();
-      InternalRef();
+      IntAddRef(wrapped);
       m_CachedStateObjects.insert(wrapped);
     }
 
@@ -273,7 +292,7 @@ HRESULT WrappedID3D11Device::CreateRasterizerState1(const D3D11_RASTERIZER_DESC1
       RDCASSERT(GetResourceManager()->GetResourceRecord(id) == NULL);
 
       D3D11ResourceRecord *record = GetResourceManager()->AddResourceRecord(id);
-      record->ResType = IdentifyTypeByPtr(wrapped);
+
       record->Length = 0;
 
       record->AddChunk(scope.Get());
@@ -322,8 +341,22 @@ HRESULT WrappedID3D11Device::OpenSharedResource1(HANDLE hResource, REFIID return
 {
   if(m_pDevice1 == NULL)
     return E_NOINTERFACE;
-  RDCUNIMPLEMENTED("Not wrapping OpenSharedResource1");
-  return m_pDevice1->OpenSharedResource1(hResource, returnedInterface, ppResource);
+
+  if(ppResource == NULL)
+    return E_INVALIDARG;
+
+  HRESULT hr;
+
+  SERIALISE_TIME_CALL(hr = m_pDevice1->OpenSharedResource1(hResource, returnedInterface, ppResource));
+
+  if(FAILED(hr))
+  {
+    IUnknown *unk = (IUnknown *)*ppResource;
+    SAFE_RELEASE(unk);
+    return hr;
+  }
+
+  return OpenSharedResourceInternal(D3D11Chunk::OpenSharedResource1, returnedInterface, ppResource);
 }
 
 HRESULT WrappedID3D11Device::OpenSharedResourceByName(LPCWSTR lpName, DWORD dwDesiredAccess,
@@ -331,8 +364,24 @@ HRESULT WrappedID3D11Device::OpenSharedResourceByName(LPCWSTR lpName, DWORD dwDe
 {
   if(m_pDevice1 == NULL)
     return E_NOINTERFACE;
-  RDCUNIMPLEMENTED("Not wrapping OpenSharedResourceByName");
-  return m_pDevice1->OpenSharedResourceByName(lpName, dwDesiredAccess, returnedInterface, ppResource);
+
+  if(ppResource == NULL)
+    return E_INVALIDARG;
+
+  HRESULT hr;
+
+  SERIALISE_TIME_CALL(hr = m_pDevice1->OpenSharedResourceByName(lpName, dwDesiredAccess,
+                                                                returnedInterface, ppResource));
+
+  if(FAILED(hr))
+  {
+    IUnknown *unk = (IUnknown *)*ppResource;
+    SAFE_RELEASE(unk);
+    return hr;
+  }
+
+  return OpenSharedResourceInternal(D3D11Chunk::OpenSharedResourceByName, returnedInterface,
+                                    ppResource);
 }
 
 #undef IMPLEMENT_FUNCTION_SERIALISED

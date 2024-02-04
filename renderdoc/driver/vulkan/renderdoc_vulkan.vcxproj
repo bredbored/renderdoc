@@ -24,6 +24,7 @@
     <RootNamespace>renderdoc_vulkan</RootNamespace>
     <ProjectName>vulkan</ProjectName>
   </PropertyGroup>
+  <Import Project="$(SolutionDir)\util\WindowsSDKTarget.props" />
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Label="Configuration">
     <ConfigurationType>StaticLibrary</ConfigurationType>
@@ -61,6 +62,8 @@
   </ItemDefinitionGroup>
   <ItemDefinitionGroup>
     <ClCompile>
+      <BasicRuntimeChecks>Default</BasicRuntimeChecks>
+      <BufferSecurityCheck>false</BufferSecurityCheck>
       <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
       <RuntimeTypeInfo>false</RuntimeTypeInfo>
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
@@ -74,6 +77,7 @@
       <PrecompiledHeader>Use</PrecompiledHeader>
       <PrecompiledHeaderFile>precompiled.h</PrecompiledHeaderFile>
       <ForcedIncludeFiles>precompiled.h</ForcedIncludeFiles>
+      <AdditionalOptions>/w44062 /w44840 %(AdditionalOptions)</AdditionalOptions>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
@@ -88,10 +92,8 @@
   <ItemDefinitionGroup Condition="'$(Configuration)'=='Release'">
     <ClCompile>
       <Optimization>MaxSpeed</Optimization>
-      <BasicRuntimeChecks>Default</BasicRuntimeChecks>
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
-      <BufferSecurityCheck>false</BufferSecurityCheck>
     </ClCompile>
     <Link>
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
@@ -99,6 +101,7 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="imagestate_tests.cpp" />
     <ClCompile Include="imgrefs_tests.cpp" />
     <ClCompile Include="precompiled.cpp">
       <PrecompiledHeader>Create</PrecompiledHeader>
@@ -106,8 +109,9 @@
     <ClCompile Include="vk_apple.cpp">
       <ExcludedFromBuild>true</ExcludedFromBuild>
     </ClCompile>
-    <ClCompile Include="vk_bindless_feedback.cpp" />
-    <ClCompile Include="vk_msaa_array_conv.cpp" />
+    <ClCompile Include="vk_msaa_buffer_conv.cpp" />
+    <ClCompile Include="vk_shader_feedback.cpp" />
+    <ClCompile Include="vk_image_states.cpp" />
     <ClCompile Include="vk_next_chains.cpp" />
     <ClCompile Include="vk_outputwindow.cpp" />
     <ClCompile Include="vk_overlay.cpp" />
@@ -115,9 +119,11 @@
     <ClCompile Include="vk_rendermesh.cpp" />
     <ClCompile Include="vk_rendertext.cpp" />
     <ClCompile Include="vk_rendertexture.cpp" />
-    <ClCompile Include="vk_serialise.cpp" />
+    <ClCompile Include="vk_serialise.cpp">
+      <AdditionalOptions>/bigobj %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
+    <ClCompile Include="vk_shaderdebug.cpp" />
     <ClCompile Include="vk_shader_cache.cpp" />
-    <ClCompile Include="vk_sparse_initstate.cpp" />
     <ClCompile Include="vk_stringise.cpp" />
     <ClCompile Include="vk_counters.cpp" />
     <ClCompile Include="vk_dispatchtables.cpp" />
@@ -196,36 +202,8 @@
   </ItemGroup>
   <ItemGroup>
     <None Include="renderdoc.json" />
-    <None Include="vk_apple.mm" />
+    <None Include="vk_apple_helpers.mm" />
   </ItemGroup>
-  <Target Name="_jsonProcess" BeforeTargets="PrepareForBuild">
-    <!-- Read the version.h -->
-    <PropertyGroup>
-      <VersionFile>$([System.IO.File]::ReadAllText('$(SolutionDir)renderdoc/api/replay/version.h').Trim())</VersionFile>
-    </PropertyGroup>
-    <!-- Extract the major and minor lines -->
-    <PropertyGroup>
-      <!-- Find the start of the line -->
-      <MajorVersionStart>$(VersionFile.IndexOf('#define RENDERDOC_VERSION_MAJOR'))</MajorVersionStart>
-      <!-- Take the rest of the file and split it by newline to get an array of lines,
-           Take the first line and split it by space
-           Take the third item. This is #define MAJOR foo
-                                            0     1    2
-      -->
-      <MajorVersion>$(VersionFile.Substring($(MajorVersionStart)).Split('
-')[0].Split(' ')[2])</MajorVersion>
-      <MinorVersionStart>$(VersionFile.IndexOf('#define RENDERDOC_VERSION_MINOR'))</MinorVersionStart>
-      <MinorVersion>$(VersionFile.Substring($(MinorVersionStart)).Split('
-')[0].Split(' ')[2])</MinorVersion>
-    </PropertyGroup>
-    <Message Text="Processing layer JSON file for RenderDoc $(MajorVersion).$(MinorVersion)" Importance="High" />
-    <!-- Read the template json, replace the major/minor versions -->
-    <PropertyGroup>
-      <JSONContents>$([System.IO.File]::ReadAllText('$(ProjectDir)renderdoc.json').Replace('@RENDERDOC_VERSION_MAJOR@', '$(MajorVersion)').Replace('@RENDERDOC_VERSION_MINOR@', '$(MinorVersion)').Replace('@VULKAN_LAYER_MODULE_PATH@', '.\\renderdoc.dll'))</JSONContents>
-    </PropertyGroup>
-    <!-- Write it out to the output directory -->
-    <WriteLinesToFile File="$(OutDir)renderdoc.json" Lines="$(JSONContents)" Overwrite="true" />
-  </Target>
   <ItemGroup>
     <ProjectReference Include="..\shaders\spirv\renderdoc_spirv.vcxproj">
       <Project>{0aae0ad1-371b-4a36-9ed1-80e10e960605}</Project>

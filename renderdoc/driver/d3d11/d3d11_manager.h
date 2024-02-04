@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  * Copyright (c) 2014 Crytek
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -25,7 +25,6 @@
 
 #pragma once
 
-#include "api/replay/renderdoc_replay.h"
 #include "common/wrapped_pool.h"
 #include "core/core.h"
 #include "core/resource_manager.h"
@@ -71,7 +70,7 @@ struct D3D11ResourceRecord : public ResourceRecord
   };
 
   D3D11ResourceRecord(ResourceId id)
-      : ResourceRecord(id, true), ResType(Resource_Unknown), NumSubResources(0), SubResources(NULL)
+      : ResourceRecord(id, true), NumSubResources(0), SubResources(NULL)
   {
     RDCEraseEl(ImmediateShadow);
   }
@@ -97,7 +96,9 @@ struct D3D11ResourceRecord : public ResourceRecord
       return;
     }
 
-    DeferredShadow[ctx].Alloc(size);
+    SCOPED_READLOCK(DeferredShadowLock);
+
+    DeferredShadow[ctx - 1].Alloc(size);
   }
 
   bool VerifyShadowStorage(size_t ctx)
@@ -105,12 +106,16 @@ struct D3D11ResourceRecord : public ResourceRecord
     if(ctx == 0)
       return ImmediateShadow.Verify();
 
-    return DeferredShadow[ctx].Verify();
+    SCOPED_READLOCK(DeferredShadowLock);
+
+    return DeferredShadow[ctx - 1].Verify();
   }
 
   void FreeShadowStorage()
   {
     ImmediateShadow.Free();
+
+    SCOPED_READLOCK(DeferredShadowLock);
 
     for(size_t i = 0; i < DeferredShadow.size(); i++)
       DeferredShadow[i].Free();
@@ -121,16 +126,23 @@ struct D3D11ResourceRecord : public ResourceRecord
     if(ctx == 0)
       return ImmediateShadow.ptr[p];
 
+    SCOPED_READLOCK(DeferredShadowLock);
+
     return DeferredShadow[ctx - 1].ptr[p];
   }
 
   size_t GetContextID()
   {
-    SCOPED_LOCK(DeferredShadowLock);
+    SCOPED_WRITELOCK(DeferredShadowLock);
 
     for(size_t i = 0; i < DeferredShadow.size(); i++)
+    {
       if(!DeferredShadow[i].used)
+      {
+        DeferredShadow[i].used = true;
         return i + 1;
+      }
+    }
 
     ShadowPointerData data = {};
     data.used = true;
@@ -145,7 +157,7 @@ struct D3D11ResourceRecord : public ResourceRecord
       return;
 
     {
-      SCOPED_LOCK(DeferredShadowLock);
+      SCOPED_WRITELOCK(DeferredShadowLock);
       DeferredShadow[ctx - 1].used = false;
     }
   }
@@ -158,7 +170,7 @@ struct D3D11ResourceRecord : public ResourceRecord
       SubResources[i]->SetDataPtr(ptr);
   }
 
-  void Insert(std::map<int32_t, Chunk *> &recordlist)
+  void Insert(std::map<int64_t, Chunk *> &recordlist)
   {
     bool dataWritten = DataWritten;
 
@@ -175,14 +187,13 @@ struct D3D11ResourceRecord : public ResourceRecord
     if(!dataWritten)
     {
       for(auto it = m_Chunks.begin(); it != m_Chunks.end(); ++it)
-        recordlist[it->first] = it->second;
+        recordlist[it->id] = it->chunk;
 
       for(int i = 0; i < NumSubResources; i++)
         SubResources[i]->Insert(recordlist);
     }
   }
 
-  D3D11ResourceType ResType;
   int NumSubResources;
   D3D11ResourceRecord **SubResources;
 
@@ -211,10 +222,10 @@ private:
 
     bool Verify()
     {
-      if(ptr[0] && memcmp(ptr[0] + size, markerValue, sizeof(markerValue)))
+      if(ptr[0] && memcmp(ptr[0] + size, markerValue, sizeof(markerValue)) != 0)
         return false;
 
-      if(ptr[1] && memcmp(ptr[1] + size, markerValue, sizeof(markerValue)))
+      if(ptr[1] && memcmp(ptr[1] + size, markerValue, sizeof(markerValue)) != 0)
         return false;
 
       return true;
@@ -234,8 +245,8 @@ private:
 
   ShadowPointerData ImmediateShadow;
 
-  Threading::CriticalSection DeferredShadowLock;
-  std::vector<ShadowPointerData> DeferredShadow;
+  Threading::RWLock DeferredShadowLock;
+  rdcarray<ShadowPointerData> DeferredShadow;
 };
 
 struct D3D11InitialContents
@@ -296,11 +307,6 @@ public:
       : ResourceManager(state), m_Device(dev)
   {
   }
-  ID3D11DeviceChild *UnwrapResource(ID3D11DeviceChild *res);
-  ID3D11Resource *UnwrapResource(ID3D11Resource *res)
-  {
-    return (ID3D11Resource *)UnwrapResource((ID3D11DeviceChild *)res);
-  }
 
   void SetInternalResource(ID3D11DeviceChild *res);
   void FreeCaptureData();
@@ -321,10 +327,12 @@ private:
   WrappedID3D11Device *m_Device;
 };
 
+#define WRAPPING_DEBUG OPTION_OFF
+
 template <typename Dest>
 typename Dest::InnerType *Unwrap(typename Dest::InnerType *obj)
 {
-#if ENABLED(RDOC_DEVEL)
+#if ENABLED(WRAPPING_DEBUG)
   if(obj && !Dest::IsAlloc(obj))
   {
     RDCERR("Trying to unwrap invalid type");

@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -24,7 +24,7 @@
 
 #include "gl_test.h"
 
-TEST(GL_Unsized_MS_FBO_Attachment, OpenGLGraphicsTest)
+RD_TEST(GL_Unsized_MS_FBO_Attachment, OpenGLGraphicsTest)
 {
   static constexpr const char *Description =
       "Creates a MS FBO with one attachment created with an unsized internal format";
@@ -133,7 +133,7 @@ void main()
       GLenum bufs[] = {GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1};
       glDrawBuffers(2, bufs);
 
-      float col[] = {0.4f, 0.5f, 0.6f, 1.0f};
+      float col[] = {0.2f, 0.2f, 0.2f, 1.0f};
       glClearBufferfv(GL_COLOR, 0, col);
       glClearBufferfi(GL_DEPTH_STENCIL, 0, 1.0f, 0);
 

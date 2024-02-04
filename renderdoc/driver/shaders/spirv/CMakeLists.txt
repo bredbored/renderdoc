@@ -5,10 +5,13 @@ set(glslang_sources
     ${glslang_dir}/SPIRV/GlslangToSpv.cpp
     ${glslang_dir}/SPIRV/GlslangToSpv.h
     ${glslang_dir}/SPIRV/GLSL.std.450.h
+    ${glslang_dir}/SPIRV/GLSL.ext.ARM.h
     ${glslang_dir}/SPIRV/GLSL.ext.AMD.h
     ${glslang_dir}/SPIRV/GLSL.ext.EXT.h
     ${glslang_dir}/SPIRV/GLSL.ext.KHR.h
     ${glslang_dir}/SPIRV/GLSL.ext.NV.h
+    ${glslang_dir}/SPIRV/NonSemanticDebugPrintf.h
+    ${glslang_dir}/SPIRV/NonSemanticShaderDebugInfo100.h
     ${glslang_dir}/SPIRV/hex_float.h
     ${glslang_dir}/SPIRV/InReadableOrder.cpp
     ${glslang_dir}/SPIRV/Logger.cpp
@@ -30,6 +33,7 @@ set(glslang_sources
     ${glslang_dir}/glslang/Include/intermediate.h
     ${glslang_dir}/glslang/Include/PoolAlloc.h
     ${glslang_dir}/glslang/Include/ResourceLimits.h
+    ${glslang_dir}/glslang/Include/SpirvIntrinsics.h
     ${glslang_dir}/glslang/Include/revision.h
     ${glslang_dir}/glslang/Include/ShHandle.h
     ${glslang_dir}/glslang/Include/Types.h
@@ -72,6 +76,7 @@ set(glslang_sources
     ${glslang_dir}/glslang/MachineIndependent/Scan.cpp
     ${glslang_dir}/glslang/MachineIndependent/Scan.h
     ${glslang_dir}/glslang/MachineIndependent/ShaderLang.cpp
+    ${glslang_dir}/glslang/MachineIndependent/SpirvIntrinsics.cpp
     ${glslang_dir}/glslang/MachineIndependent/SymbolTable.cpp
     ${glslang_dir}/glslang/MachineIndependent/SymbolTable.h
     ${glslang_dir}/glslang/MachineIndependent/Versions.cpp
@@ -79,7 +84,9 @@ set(glslang_sources
     ${glslang_dir}/glslang/MachineIndependent/attribute.cpp
     ${glslang_dir}/glslang/MachineIndependent/attribute.h
     ${glslang_dir}/glslang/OSDependent/osinclude.h
-    ${glslang_dir}/glslang/Public/ShaderLang.h)
+    ${glslang_dir}/glslang/ResourceLimits/ResourceLimits.cpp
+    ${glslang_dir}/glslang/Public/ShaderLang.h
+    ${glslang_dir}/glslang/Public/ResourceLimits.h)
 
 if(UNIX)
     list(APPEND glslang_sources
@@ -93,46 +100,53 @@ set(sources
     spirv_common.h
     spirv_editor.cpp
     spirv_editor.h
+    spirv_gen.cpp
+    spirv_gen.h
+    spirv_op_helpers.h
     spirv_compile.cpp
     spirv_compile.h
+    spirv_debug_setup.cpp
+    spirv_debug_glsl450.cpp
+    spirv_debug.cpp
+    spirv_debug.h
     spirv_reflect.cpp
     spirv_reflect.h
+    spirv_processor.cpp
+    spirv_processor.h
     spirv_disassemble.cpp
     spirv_stringise.cpp
+    var_dispatch_helpers.h
     ${glslang_sources})
 
 add_definitions(-DAMD_EXTENSIONS)
 add_definitions(-DNV_EXTENSIONS)
 
 set_property(SOURCE ${glslang_sources}
-    PROPERTY COMPILE_FLAGS "-Wno-ignored-qualifiers -Wno-strict-aliasing")
+    PROPERTY COMPILE_FLAGS "-Wno-ignored-qualifiers -Wno-strict-aliasing -Wno-unreachable-code-break")
 
-# GCC 7.0 and above needs -Wno-implicit-fallthrough on these files
+# GCC 7.0 and above needs -Wno-implicit-fallthrough
 if(CMAKE_COMPILER_IS_GNUCXX AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER 6.9)
-    set_property(SOURCE
-        ${glslang_dir}/glslang/MachineIndependent/reflection.cpp
-        ${glslang_dir}/glslang/MachineIndependent/Intermediate.cpp
+    set_property(SOURCE ${glslang_sources}
         APPEND_STRING PROPERTY COMPILE_FLAGS " -Wno-implicit-fallthrough")
 endif()
 
-# GCC 9.0 and above needs -Wno-deprecated-copy on glslang files, but also on
-# spirv_compile.cpp since one of the issues is in the non-public header that
-# is used from GlslangToSpv.h
-if(CMAKE_COMPILER_IS_GNUCXX AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER 6.9)
-    set_property(SOURCE
-        ${glslang_sources}
-        spirv_compile.cpp
-        APPEND_STRING PROPERTY COMPILE_FLAGS " -Wno-deprecated-copy")
-endif()
-
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-    set_property(SOURCE "${glslang_sources}"
-        APPEND_STRING PROPERTY COMPILE_FLAGS " -Wno-unknown-warning-option -Wno-inconsistent-missing-override")
+    set_property(SOURCE ${glslang_sources}
+        APPEND_STRING PROPERTY COMPILE_FLAGS " -Wno-unknown-warning-option -Wno-shadow -Wno-shorten-64-to-32")
 
-    set_property(SOURCE ${glslang_dir}/SPIRV/GlslangToSpv.cpp
-        APPEND_STRING PROPERTY COMPILE_FLAGS " -Wno-tautological-constant-out-of-range-compare")
+    set_property(SOURCE 
+        spirv_debug.cpp
+        spirv_debug_glsl450.cpp
+        spirv_debug_setup.cpp
+        spirv_processor.cpp
+        APPEND_STRING PROPERTY COMPILE_FLAGS " -Wno-shadow -Wno-shorten-64-to-32")
+
+    if(CMAKE_CXX_COMPILER_VERSION VERSION_GREATER 9.9)
+        set_property(SOURCE ${glslang_dir}/glslang/MachineIndependent/iomapper.cpp
+            APPEND_STRING PROPERTY COMPILE_FLAGS " -Wno-deprecated-copy")
+    endif()
 endif()
 
 add_library(rdoc_spirv OBJECT ${sources})
 target_compile_definitions(rdoc_spirv ${RDOC_DEFINITIONS})
-target_include_directories(rdoc_spirv ${RDOC_INCLUDES})
+target_include_directories(rdoc_spirv ${RDOC_INCLUDES} ${glslang_dir})

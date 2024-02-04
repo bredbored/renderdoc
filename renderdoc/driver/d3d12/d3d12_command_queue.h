@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2016-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -24,7 +24,6 @@
 
 #pragma once
 
-#include <list>
 #include "common/wrapped_pool.h"
 #include "d3d12_commands.h"
 #include "d3d12_common.h"
@@ -33,12 +32,51 @@
 
 class WrappedID3D12CommandQueue;
 
-struct WrappedID3D12DebugCommandQueue : public ID3D12DebugCommandQueue
+// this aren't documented, they're defined in D3D12TranslationLayer in the d3d11on12 codebase
+MIDL_INTERFACE("7974c836-9520-4cda-8d43-d996622e8926")
+ID3D12CompatibilityQueue : public IUnknown
 {
-  WrappedID3D12CommandQueue *m_pQueue;
-  ID3D12DebugCommandQueue *m_pReal;
+public:
+  virtual HRESULT STDMETHODCALLTYPE AcquireKeyedMutex(
+      _In_ ID3D12Object * pHeapOrResourceWithKeyedMutex, UINT64 Key, DWORD dwTimeout,
+      _Reserved_ void *pReserved, _In_range_(0, 0) UINT Reserved) = 0;
 
-  WrappedID3D12DebugCommandQueue() : m_pQueue(NULL), m_pReal(NULL) {}
+  virtual HRESULT STDMETHODCALLTYPE ReleaseKeyedMutex(
+      _In_ ID3D12Object * pHeapOrResourceWithKeyedMutex, UINT64 Key, _Reserved_ void *pReserved,
+      _In_range_(0, 0) UINT Reserved) = 0;
+};
+
+struct WrappedID3D12CompatibilityQueue : public ID3D12CompatibilityQueue
+{
+  WrappedID3D12CommandQueue &m_pQueue;
+  ID3D12CompatibilityQueue *m_pReal = NULL;
+
+  WrappedID3D12CompatibilityQueue(WrappedID3D12CommandQueue &dev) : m_pQueue(dev) {}
+  //////////////////////////////
+  // implement IUnknown
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppvObject);
+  ULONG STDMETHODCALLTYPE AddRef();
+  ULONG STDMETHODCALLTYPE Release();
+
+  //////////////////////////////
+  // implement ID3D12CompatibilityQueue
+  virtual HRESULT STDMETHODCALLTYPE AcquireKeyedMutex(_In_ ID3D12Object *pHeapOrResourceWithKeyedMutex,
+                                                      UINT64 Key, DWORD dwTimeout,
+                                                      _Reserved_ void *pReserved,
+                                                      _In_range_(0, 0) UINT Reserved);
+
+  virtual HRESULT STDMETHODCALLTYPE ReleaseKeyedMutex(_In_ ID3D12Object *pHeapOrResourceWithKeyedMutex,
+                                                      UINT64 Key, _Reserved_ void *pReserved,
+                                                      _In_range_(0, 0) UINT Reserved);
+};
+
+struct WrappedID3D12DebugCommandQueue : public ID3D12DebugCommandQueue1
+{
+  WrappedID3D12CommandQueue *m_pQueue = NULL;
+  ID3D12DebugCommandQueue *m_pReal = NULL;
+  ID3D12DebugCommandQueue1 *m_pReal1 = NULL;
+
+  WrappedID3D12DebugCommandQueue() {}
   //////////////////////////////
   // implement IUnknown
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppvObject)
@@ -46,6 +84,12 @@ struct WrappedID3D12DebugCommandQueue : public ID3D12DebugCommandQueue
     if(riid == __uuidof(ID3D12DebugCommandQueue))
     {
       *ppvObject = (ID3D12DebugCommandQueue *)this;
+      AddRef();
+      return S_OK;
+    }
+    else if(riid == __uuidof(ID3D12DebugCommandQueue1))
+    {
+      *ppvObject = (ID3D12DebugCommandQueue1 *)this;
       AddRef();
       return S_OK;
     }
@@ -63,60 +107,104 @@ struct WrappedID3D12DebugCommandQueue : public ID3D12DebugCommandQueue
                                                      UINT State)
   {
     if(m_pReal)
-      m_pReal->AssertResourceState(pResource, Subresource, State);
+      return m_pReal->AssertResourceState(Unwrap(pResource), Subresource, State);
     return TRUE;
   }
+
+  //////////////////////////////
+  // implement ID3D12DebugCommandQueue1
+
+  virtual void STDMETHODCALLTYPE AssertResourceAccess(ID3D12Resource *pResource, UINT Subresource,
+                                                      D3D12_BARRIER_ACCESS Access)
+  {
+    if(m_pReal1)
+      m_pReal1->AssertResourceAccess(Unwrap(pResource), Subresource, Access);
+  }
+
+  virtual void STDMETHODCALLTYPE AssertTextureLayout(ID3D12Resource *pResource, UINT Subresource,
+                                                     D3D12_BARRIER_LAYOUT Layout)
+  {
+    if(m_pReal1)
+      m_pReal1->AssertTextureLayout(Unwrap(pResource), Subresource, Layout);
+  }
+};
+
+struct WrappedDownlevelQueue : public ID3D12CommandQueueDownlevel
+{
+  WrappedID3D12CommandQueue &m_pQueue;
+
+  WrappedDownlevelQueue(WrappedID3D12CommandQueue &q) : m_pQueue(q) {}
+  //////////////////////////////
+  // implement IUnknown
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppvObject);
+  ULONG STDMETHODCALLTYPE AddRef();
+  ULONG STDMETHODCALLTYPE Release();
+  //////////////////////////////
+  // implement ID3D12CommandQueueDownlevel
+  virtual HRESULT STDMETHODCALLTYPE Present(ID3D12GraphicsCommandList *pOpenCommandList,
+                                            ID3D12Resource *pSourceTex2D, HWND hWindow,
+                                            D3D12_DOWNLEVEL_PRESENT_FLAGS Flags);
 };
 
 class WrappedID3D12GraphicsCommandList;
 
 class WrappedID3D12CommandQueue : public ID3D12CommandQueue,
                                   public RefCounter12<ID3D12CommandQueue>,
-                                  public ID3DDevice
+                                  public ID3DDevice,
+                                  public IDXGISwapper
 {
   friend class WrappedID3D12GraphicsCommandList;
+
+  ID3D12CommandQueueDownlevel *m_pDownlevel;
+
+  WrappedDownlevelQueue m_WrappedDownlevel;
 
   WrappedID3D12Device *m_pDevice;
 
   WrappedID3D12GraphicsCommandList *m_ReplayList;
 
+  ID3D12Resource *m_pPresentSource = NULL;
+  HWND m_pPresentHWND = NULL;
+
   ResourceId m_ResourceID;
-  D3D12ResourceRecord *m_QueueRecord;
+  D3D12ResourceRecord *m_QueueRecord, *m_CreationRecord;
 
   CaptureState &m_State;
 
   bool m_MarkedActive = false;
 
-  ReplayStatus m_FailedReplayStatus = ReplayStatus::APIReplayFailed;
-
   WrappedID3D12DebugCommandQueue m_WrappedDebug;
+  WrappedID3D12CompatibilityQueue m_WrappedCompat;
 
-  std::vector<D3D12ResourceRecord *> m_CmdListRecords;
+  rdcarray<D3D12ResourceRecord *> m_CmdListRecords;
+  rdcarray<D3D12ResourceRecord *> m_CmdListAllocators;
+
+  std::unordered_set<ResourceId> m_SparseBindResources;
 
   // D3D12 guarantees that queues are thread-safe
   Threading::CriticalSection m_Lock;
 
-  std::set<std::string> m_StringDB;
+  std::set<rdcstr> m_StringDB;
 
   WriteSerialiser &GetThreadSerialiser();
 
   StreamReader *m_FrameReader = NULL;
 
+  uint64_t m_TimeBase = 0;
+  double m_TimeFrequency = 1.0f;
   SDFile *m_StructuredFile = NULL;
 
   // command recording/replay data shared between queues and lists
   D3D12CommandData m_Cmd;
 
   ResourceId m_PrevQueueId;
-  ResourceId m_BackbufferID;
 
   bool ProcessChunk(ReadSerialiser &ser, D3D12Chunk context);
 
-  static std::string GetChunkName(uint32_t idx);
+  static rdcstr GetChunkName(uint32_t idx);
   D3D12ResourceManager *GetResourceManager() { return m_pDevice->GetResourceManager(); }
 public:
-  static const int AllocPoolCount = 16;
-  ALLOCATE_WITH_WRAPPED_POOL(WrappedID3D12CommandQueue, AllocPoolCount);
+  ALLOCATE_WITH_WRAPPED_POOL(WrappedID3D12CommandQueue);
 
   WrappedID3D12CommandQueue(ID3D12CommandQueue *real, WrappedID3D12Device *device,
                             CaptureState &state);
@@ -125,19 +213,23 @@ public:
   ResourceId GetResourceID() { return m_ResourceID; }
   ID3D12CommandQueue *GetReal() { return m_pReal; }
   D3D12ResourceRecord *GetResourceRecord() { return m_QueueRecord; }
+  D3D12ResourceRecord *GetCreationRecord() { return m_CreationRecord; }
   WrappedID3D12Device *GetWrappedDevice() { return m_pDevice; }
-  const std::vector<D3D12ResourceRecord *> &GetCmdLists() { return m_CmdListRecords; }
-  D3D12DrawcallTreeNode &GetParentDrawcall() { return m_Cmd.m_ParentDrawcall; }
+  const rdcarray<D3D12ResourceRecord *> &GetCmdLists() { return m_CmdListRecords; }
+  D3D12ActionTreeNode &GetParentAction() { return m_Cmd.m_ParentAction; }
   const APIEvent &GetEvent(uint32_t eventId);
   uint32_t GetMaxEID() { return m_Cmd.m_Events.back().eventId; }
-  ResourceId GetBackbufferResourceID() { return m_BackbufferID; }
   void ClearAfterCapture();
 
-  ReplayStatus ReplayLog(CaptureState readType, uint32_t startEventID, uint32_t endEventID,
-                         bool partial);
+  bool IsSparseUpdatedResource(ResourceId id) const
+  {
+    return m_SparseBindResources.find(id) != m_SparseBindResources.end();
+  }
+
+  RDResult ReplayLog(CaptureState readType, uint32_t startEventID, uint32_t endEventID, bool partial);
   void SetFrameReader(StreamReader *reader) { m_FrameReader = reader; }
   D3D12CommandData *GetCommandData() { return &m_Cmd; }
-  const std::vector<EventUsage> &GetUsage(ResourceId id) { return m_Cmd.m_ResourceUses[id]; }
+  const rdcarray<EventUsage> &GetUsage(ResourceId id) { return m_Cmd.m_ResourceUses[id]; }
   // interface for DXGI
   virtual IUnknown *GetRealIUnknown() { return GetReal(); }
   virtual IID GetBackbufferUUID() { return __uuidof(ID3D12Resource); }
@@ -155,27 +247,54 @@ public:
     return NULL;
   }
   // the rest forward to the device
-  virtual void FirstFrame(WrappedIDXGISwapChain4 *swapChain) { m_pDevice->FirstFrame(swapChain); }
+  virtual void *GetFrameCapturerDevice() { return m_pDevice->GetFrameCapturerDevice(); }
+  virtual IFrameCapturer *GetFrameCapturer() { return m_pDevice->GetFrameCapturer(); }
+  virtual void FirstFrame(IDXGISwapper *swapper) { m_pDevice->FirstFrame(swapper); }
   virtual void NewSwapchainBuffer(IUnknown *backbuffer)
   {
     m_pDevice->NewSwapchainBuffer(backbuffer);
   }
-  virtual void ReleaseSwapchainResources(WrappedIDXGISwapChain4 *swapChain, UINT QueueCount,
+  virtual void ReleaseSwapchainResources(IDXGISwapper *swapper, UINT QueueCount,
                                          IUnknown *const *ppPresentQueue, IUnknown **unwrappedQueues)
   {
-    m_pDevice->ReleaseSwapchainResources(swapChain, QueueCount, ppPresentQueue, unwrappedQueues);
+    m_pDevice->ReleaseSwapchainResources(swapper, QueueCount, ppPresentQueue, unwrappedQueues);
   }
-  virtual IUnknown *WrapSwapchainBuffer(WrappedIDXGISwapChain4 *swap, DXGI_SWAP_CHAIN_DESC *swapDesc,
+  virtual IUnknown *WrapSwapchainBuffer(IDXGISwapper *swapper, DXGI_FORMAT bufferFormat,
                                         UINT buffer, IUnknown *realSurface)
   {
-    return m_pDevice->WrapSwapchainBuffer(swap, swapDesc, buffer, realSurface);
+    return m_pDevice->WrapSwapchainBuffer(swapper, bufferFormat, buffer, realSurface);
   }
-
-  virtual HRESULT Present(WrappedIDXGISwapChain4 *swapChain, UINT SyncInterval, UINT Flags)
+  virtual IDXGIResource *WrapExternalDXGIResource(IDXGIResource *res)
   {
-    return m_pDevice->Present(swapChain, SyncInterval, Flags);
+    return m_pDevice->WrapExternalDXGIResource(res);
   }
 
+  virtual HRESULT Present(IDXGISwapper *swapper, UINT SyncInterval, UINT Flags)
+  {
+    return m_pDevice->Present(swapper, SyncInterval, Flags);
+  }
+
+  // fake pretending to be a swapchain for when we're doing downlevel mega-hacky presents
+  virtual ID3DDevice *GetD3DDevice() { return this; }
+  virtual int GetNumBackbuffers() { return 1; }
+  virtual IUnknown **GetBackbuffers() { return (IUnknown **)&m_pPresentSource; }
+  virtual int GetLastPresentedBuffer() { return 0; }
+  virtual UINT GetWidth()
+  {
+    D3D12_RESOURCE_DESC desc = m_pPresentSource->GetDesc();
+    return (UINT)desc.Width;
+  }
+  virtual UINT GetHeight()
+  {
+    D3D12_RESOURCE_DESC desc = m_pPresentSource->GetDesc();
+    return desc.Height;
+  }
+  virtual DXGI_FORMAT GetFormat()
+  {
+    D3D12_RESOURCE_DESC desc = m_pPresentSource->GetDesc();
+    return desc.Format;
+  }
+  virtual HWND GetHWND() { return m_pPresentHWND; }
   //////////////////////////////
   // implement IUnknown
 
@@ -199,8 +318,8 @@ public:
     }
     else if(guid == WKPDID_D3DDebugObjectNameW)
     {
-      std::wstring wName((const wchar_t *)pData, DataSize / 2);
-      std::string sName = StringFormat::Wide2UTF8(wName);
+      rdcwstr wName((const wchar_t *)pData, DataSize / 2);
+      rdcstr sName = StringFormat::Wide2UTF8(wName);
       m_pDevice->SetName(this, sName.c_str());
     }
 
@@ -214,7 +333,7 @@ public:
 
   HRESULT STDMETHODCALLTYPE SetName(LPCWSTR Name)
   {
-    std::string utf8 = StringFormat::Wide2UTF8(Name);
+    rdcstr utf8 = StringFormat::Wide2UTF8(Name);
     m_pDevice->SetName(this, utf8.c_str());
 
     return m_pReal->SetName(Name);
@@ -252,7 +371,7 @@ public:
 
   virtual void ExecuteCommandListsInternal(UINT NumCommandLists,
                                            ID3D12CommandList *const *ppCommandLists,
-                                           bool InFrameCaptureBoundary);
+                                           bool InFrameCaptureBoundary, bool SkipRealExecute);
 
   IMPLEMENT_FUNCTION_SERIALISED(virtual void STDMETHODCALLTYPE, SetMarker, UINT Metadata,
                                 const void *pData, UINT Size);
@@ -275,6 +394,11 @@ public:
                                 UINT64 *pGpuTimestamp, UINT64 *pCpuTimestamp);
 
   virtual D3D12_COMMAND_QUEUE_DESC STDMETHODCALLTYPE GetDesc() { return m_pReal->GetDesc(); }
+  //////////////////////////////
+  // implement ID3D12CommandQueueDownlevel
+  virtual HRESULT STDMETHODCALLTYPE Present(ID3D12GraphicsCommandList *pOpenCommandList,
+                                            ID3D12Resource *pSourceTex2D, HWND hWindow,
+                                            D3D12_DOWNLEVEL_PRESENT_FLAGS Flags);
 };
 
 template <>

@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  * Copyright (c) 2014 Crytek
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -218,6 +218,28 @@ void WrappedOpenGL::glGetIntegerv(GLenum pname, GLint *params)
       *params = (GLint)GetCtxData().glExts.size();
     return;
   }
+#if ENABLED(RDOC_ANDROID)
+  else if(pname == eGL_NUM_PROGRAM_BINARY_FORMATS)
+  {
+    // This is not spec-compliant. The spec is written in a convoluted way but has a self-consistent
+    // loop requiring this to be non-zero:
+    //
+    // - The program binary format list must include the binaryFormat returned by glGetProgramBinary
+    // - glGetProgramBinary is always valid to call on a linked program.
+    // - The original extension says that calling glGetProgramBinary is illegal when
+    //   GL_NUM_PROGRAM_BINARY_FORMATS is 0, which would potentially allow a weird but valid reading
+    // where either the list could be empty because "the binaryFormat returned by
+    // glGetProgramBinary" does not exist because there's no valid way to call the function.
+    //
+    // The short answer is that doing this is invalid and so we only do it on Android where the
+    // OPERATING SYSTEM ships a buggy library where this is the only feasible workaround, short of
+    // implementing our own program binary format that contains the original source and
+    // reconstructing shaders out of it.
+    if(params)
+      *params = 0;
+    return;
+  }
+#endif
   else if(pname == eGL_DEBUG_TOOL_PURPOSE_EXT)
   {
     if(params)
@@ -706,14 +728,9 @@ void WrappedOpenGL::glGetBufferSubData(GLenum target, GLintptr offset, GLsizeipt
   GL.glGetBufferSubData(target, offset, size, data);
 }
 
-void WrappedOpenGL::glGetQueryObjectuiv(GLuint id, GLenum pname, GLuint *params)
+void WrappedOpenGL::glGetQueryiv(GLenum target, GLenum pname, GLint *params)
 {
-  GL.glGetQueryObjectuiv(id, pname, params);
-}
-
-void WrappedOpenGL::glGetQueryObjectui64v(GLuint id, GLenum pname, GLuint64 *params)
-{
-  GL.glGetQueryObjectui64v(id, pname, params);
+  GL.glGetQueryiv(target, pname, params);
 }
 
 void WrappedOpenGL::glGetQueryIndexediv(GLenum target, GLuint index, GLenum pname, GLint *params)
@@ -721,40 +738,60 @@ void WrappedOpenGL::glGetQueryIndexediv(GLenum target, GLuint index, GLenum pnam
   GL.glGetQueryIndexediv(target, index, pname, params);
 }
 
+void WrappedOpenGL::glGetQueryObjectuiv(GLuint id, GLenum pname, GLuint *params)
+{
+  if(HasExt[ARB_query_buffer_object])
+  {
+    GLuint buf = 0;
+    GL.glGetIntegerv(eGL_QUERY_BUFFER_BINDING, (GLint *)&buf);
+
+    if(buf != 0)
+      return glGetQueryBufferObjectuiv(id, buf, pname, (GLintptr)params);
+  }
+
+  GL.glGetQueryObjectuiv(id, pname, params);
+}
+
+void WrappedOpenGL::glGetQueryObjectui64v(GLuint id, GLenum pname, GLuint64 *params)
+{
+  if(HasExt[ARB_query_buffer_object])
+  {
+    GLuint buf = 0;
+    GL.glGetIntegerv(eGL_QUERY_BUFFER_BINDING, (GLint *)&buf);
+
+    if(buf != 0)
+      return glGetQueryBufferObjectui64v(id, buf, pname, (GLintptr)params);
+  }
+
+  GL.glGetQueryObjectui64v(id, pname, params);
+}
+
 void WrappedOpenGL::glGetQueryObjecti64v(GLuint id, GLenum pname, GLint64 *params)
 {
+  if(HasExt[ARB_query_buffer_object])
+  {
+    GLuint buf = 0;
+    GL.glGetIntegerv(eGL_QUERY_BUFFER_BINDING, (GLint *)&buf);
+
+    if(buf != 0)
+      return glGetQueryBufferObjecti64v(id, buf, pname, (GLintptr)params);
+  }
+
   GL.glGetQueryObjecti64v(id, pname, params);
 }
 
 void WrappedOpenGL::glGetQueryObjectiv(GLuint id, GLenum pname, GLint *params)
 {
+  if(HasExt[ARB_query_buffer_object])
+  {
+    GLuint buf = 0;
+    GL.glGetIntegerv(eGL_QUERY_BUFFER_BINDING, (GLint *)&buf);
+
+    if(buf != 0)
+      return glGetQueryBufferObjectiv(id, buf, pname, (GLintptr)params);
+  }
+
   GL.glGetQueryObjectiv(id, pname, params);
-}
-
-void WrappedOpenGL::glGetQueryiv(GLenum target, GLenum pname, GLint *params)
-{
-  GL.glGetQueryiv(target, pname, params);
-}
-
-void WrappedOpenGL::glGetQueryBufferObjectui64v(GLuint id, GLuint buffer, GLenum pname,
-                                                GLintptr offset)
-{
-  GL.glGetQueryBufferObjectui64v(id, buffer, pname, offset);
-}
-
-void WrappedOpenGL::glGetQueryBufferObjectuiv(GLuint id, GLuint buffer, GLenum pname, GLintptr offset)
-{
-  GL.glGetQueryBufferObjectuiv(id, buffer, pname, offset);
-}
-
-void WrappedOpenGL::glGetQueryBufferObjecti64v(GLuint id, GLuint buffer, GLenum pname, GLintptr offset)
-{
-  GL.glGetQueryBufferObjecti64v(id, buffer, pname, offset);
-}
-
-void WrappedOpenGL::glGetQueryBufferObjectiv(GLuint id, GLuint buffer, GLenum pname, GLintptr offset)
-{
-  GL.glGetQueryBufferObjectiv(id, buffer, pname, offset);
 }
 
 void WrappedOpenGL::glGetSynciv(GLsync sync, GLenum pname, GLsizei bufSize, GLsizei *length,

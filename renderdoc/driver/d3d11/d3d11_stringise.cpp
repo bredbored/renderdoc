@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2017-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -59,11 +59,11 @@ rdcstr DoStringise(const D3D11ResourceType &el)
 template <>
 rdcstr DoStringise(const D3D11Chunk &el)
 {
-  RDCCOMPILE_ASSERT((uint32_t)D3D11Chunk::Max == 1127, "Chunks changed without updating names");
+  RDCCOMPILE_ASSERT((uint32_t)D3D11Chunk::Max == 1131, "Chunks changed without updating names");
 
   BEGIN_ENUM_STRINGISE(D3D11Chunk)
   {
-    STRINGISE_ENUM_CLASS_NAMED(DeviceInitialisation, "Internal: Device Initialisation");
+    STRINGISE_ENUM_CLASS_NAMED(DeviceInitialisation, "Internal::DeviceInitialisation");
     STRINGISE_ENUM_CLASS_NAMED(SetResourceName, "ID3D11Resource::SetDebugName");
     STRINGISE_ENUM_CLASS_NAMED(CreateSwapBuffer, "IDXGISwapChain::GetBuffer");
     STRINGISE_ENUM_CLASS_NAMED(CreateTexture1D, "ID3D11Device::CreateTexture1D");
@@ -157,7 +157,7 @@ rdcstr DoStringise(const D3D11Chunk &el)
     STRINGISE_ENUM_CLASS_NAMED(ClearDepthStencilView, "ID3D11DeviceContext::ClearDepthStencilView");
     STRINGISE_ENUM_CLASS_NAMED(ClearRenderTargetView, "ID3D11DeviceContext::ClearRenderTargetView");
     STRINGISE_ENUM_CLASS_NAMED(ClearUnorderedAccessViewUint,
-                               "ID3D11DeviceContext::ClearUnorderedAccessViewInt");
+                               "ID3D11DeviceContext::ClearUnorderedAccessViewUint");
     STRINGISE_ENUM_CLASS_NAMED(ClearUnorderedAccessViewFloat,
                                "ID3D11DeviceContext::ClearUnorderedAccessViewFloat");
     STRINGISE_ENUM_CLASS_NAMED(ClearState, "ID3D11DeviceContext::ClearState");
@@ -188,10 +188,10 @@ rdcstr DoStringise(const D3D11Chunk &el)
                                "ID3D11DeviceContext1::PSSetConstantBuffers1");
     STRINGISE_ENUM_CLASS_NAMED(CSSetConstantBuffers1,
                                "ID3D11DeviceContext1::CSSetConstantBuffers1");
-    STRINGISE_ENUM_CLASS_NAMED(PushMarker, "Push Debug Region");
-    STRINGISE_ENUM_CLASS_NAMED(SetMarker, "Set Marker");
-    STRINGISE_ENUM_CLASS_NAMED(PopMarker, "Pop Debug Region");
-    STRINGISE_ENUM_CLASS_NAMED(SetShaderDebugPath, "Internal: SetShaderDebugPath");
+    STRINGISE_ENUM_CLASS_NAMED(PushMarker, "ID3DUserDefinedAnnotation::BeginEvent");
+    STRINGISE_ENUM_CLASS_NAMED(SetMarker, "ID3DUserDefinedAnnotation::SetMarker");
+    STRINGISE_ENUM_CLASS_NAMED(PopMarker, "ID3DUserDefinedAnnotation::EndEvent");
+    STRINGISE_ENUM_CLASS_NAMED(SetShaderDebugPath, "Internal::SetShaderDebugPath");
     STRINGISE_ENUM_CLASS_NAMED(DiscardResource, "ID3D11DeviceContext1::DiscardResource");
     STRINGISE_ENUM_CLASS_NAMED(DiscardView, "ID3D11DeviceContext1::DiscardView");
     STRINGISE_ENUM_CLASS_NAMED(DiscardView1, "ID3D11DeviceContext1::DiscardView1");
@@ -209,6 +209,10 @@ rdcstr DoStringise(const D3D11Chunk &el)
     STRINGISE_ENUM_CLASS_NAMED(PostFinishCommandListSet, "ID3D11DeviceContext::FinishCommandList");
     STRINGISE_ENUM_CLASS_NAMED(SwapDeviceContextState,
                                "ID3D11DeviceContext1::SwapDeviceContextState");
+    STRINGISE_ENUM_CLASS_NAMED(ExternalDXGIResource, "External DXGI Resource import");
+    STRINGISE_ENUM_CLASS_NAMED(OpenSharedResource1, "ID3D11Device1::OpenSharedResource1");
+    STRINGISE_ENUM_CLASS_NAMED(OpenSharedResourceByName, "ID3D11Device1::OpenSharedResourceByName");
+    STRINGISE_ENUM_CLASS_NAMED(SetShaderExtUAV, "VendorExtension::SetExtensionUAVSlot");
     STRINGISE_ENUM_CLASS_NAMED(Max, "Max Chunk");
   }
   END_ENUM_STRINGISE()
@@ -672,9 +676,9 @@ rdcstr DoStringise(const D3D11_MAP &el)
 }
 
 template <>
-rdcstr DoStringise(const D3D11_PRIMITIVE_TOPOLOGY &el)
+rdcstr DoStringise(const D3D_PRIMITIVE_TOPOLOGY &el)
 {
-  BEGIN_ENUM_STRINGISE(D3D11_PRIMITIVE_TOPOLOGY);
+  BEGIN_ENUM_STRINGISE(D3D_PRIMITIVE_TOPOLOGY);
   {
     STRINGISE_ENUM(D3D_PRIMITIVE_TOPOLOGY_UNDEFINED);
     STRINGISE_ENUM(D3D_PRIMITIVE_TOPOLOGY_POINTLIST);
@@ -682,6 +686,7 @@ rdcstr DoStringise(const D3D11_PRIMITIVE_TOPOLOGY &el)
     STRINGISE_ENUM(D3D_PRIMITIVE_TOPOLOGY_LINESTRIP);
     STRINGISE_ENUM(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     STRINGISE_ENUM(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+    STRINGISE_ENUM(D3D_PRIMITIVE_TOPOLOGY_TRIANGLEFAN);
     STRINGISE_ENUM(D3D_PRIMITIVE_TOPOLOGY_LINELIST_ADJ);
     STRINGISE_ENUM(D3D_PRIMITIVE_TOPOLOGY_LINESTRIP_ADJ);
     STRINGISE_ENUM(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST_ADJ);
@@ -772,7 +777,7 @@ rdcstr DoStringise(const D3D11_LOGIC_OP &el)
 }
 
 #if ENABLED(ENABLE_UNIT_TESTS)
-#include "3rdparty/catch/catch.hpp"
+#include "catch/catch.hpp"
 
 TEST_CASE("D3D11 ToStr", "[tostr][d3d]")
 {

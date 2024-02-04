@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2017-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -45,6 +45,9 @@ class CrashDialog : public QDialog
 public:
   explicit CrashDialog(PersistantConfig &cfg, QVariantMap crashReportJSON, QWidget *parent = 0);
   ~CrashDialog();
+
+  static bool HasCaptureReady(PersistantConfig &cfg);
+  static bool CaptureTooLarge(PersistantConfig &cfg);
 
 private slots:
   // automatic slots

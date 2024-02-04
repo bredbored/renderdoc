@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  * Copyright (c) 2014 Crytek
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -24,6 +24,9 @@
  ******************************************************************************/
 
 #pragma once
+
+#include "apidefs.h"
+#include "stringise.h"
 
 DOCUMENT(R"(The types of several pre-defined and known sections. This allows consumers of the API
 to recognise and understand the contents of the section.
@@ -83,6 +86,30 @@ version of RenderDoc that addes a new section type. They should be considered eq
   lossless.
 
   The name for this section will be "renderdoc/internal/exthumb".
+
+.. data:: EmbeddedLogfile
+
+  This section contains the log file at the time of capture, for debugging.
+
+  The name for this section will be "renderdoc/internal/logfile".
+
+.. data:: EditedShaders
+
+  This section contains any edited shaders.
+
+  The name for this section will be "renderdoc/ui/edits".
+
+.. data:: D3D12Core
+
+  This section contains an internal copy of D3D12Core for replaying.
+
+  The name for this section will be "renderdoc/internal/d3d12core".
+
+.. data:: D3D12SDKLayers
+
+  This section contains an internal copy of D3D12SDKLayers for replaying.
+
+  The name for this section will be "renderdoc/internal/d3d12sdklayers".
 )");
 enum class SectionType : uint32_t
 {
@@ -95,46 +122,58 @@ enum class SectionType : uint32_t
   ResourceRenames,
   AMDRGPProfile,
   ExtendedThumbnail,
+  EmbeddedLogfile,
+  EditedShaders,
+  D3D12Core,
+  D3D12SDKLayers,
   Count,
 };
 
 ITERABLE_OPERATORS(SectionType);
 DECLARE_REFLECTION_ENUM(SectionType);
 
-// replay_shader.h
-
-DOCUMENT(R"(Represents the type of register a local variable maps to.
+DOCUMENT(R"(Represents the category of debugging variable that a source variable maps to.
 
 .. data:: Undefined
 
-  No defined register.
+  Undefined type.
 
 .. data:: Input
 
-  An input register.
+  A constant input value, stored globally.
 
-.. data:: Temporary
+.. data:: Constant
 
-  A normal temporary register.
+  A constant buffer value, stored globally.
 
-.. data:: IndexedTemporary
+.. data:: Sampler
 
-  An indexed temporary register.
+  A sampler, stored globally.
 
-.. data:: Output
+.. data:: ReadOnlyResource
 
-  An output register.
+  A read-only resource, stored globally.
+
+.. data:: ReadWriteResource
+
+  A read-write resource, stored globally.
+
+.. data:: Variable
+
+  A mutable variable, stored per state.
 )");
-enum class RegisterType : uint32_t
+enum class DebugVariableType : uint8_t
 {
   Undefined,
   Input,
-  Temporary,
-  IndexedTemporary,
-  Output,
+  Constant,
+  Sampler,
+  ReadOnlyResource,
+  ReadWriteResource,
+  Variable,
 };
 
-DECLARE_REFLECTION_ENUM(RegisterType);
+DECLARE_REFLECTION_ENUM(DebugVariableType);
 
 DOCUMENT(R"(Represents the base type of a shader variable in debugging or constant blocks.
 
@@ -182,11 +221,48 @@ DOCUMENT(R"(Represents the base type of a shader variable in debugging or consta
 
   An unsigned 8-bit integer value.
 
+.. data:: Bool
+
+  A boolean value.
+
+.. data:: Enum
+
+  An enum - each member gives a named value, and the type itself is stored as an integer.
+
+.. data:: Struct
+
+  A structure with some number of members.
+
+.. data:: GPUPointer
+
+  A 64-bit pointer into GPU-addressable memory. Variables with this type are stored with opaque
+  contents and should be decoded with :meth:`ShaderVariable.GetPointer`.
+
+.. data:: ConstantBlock
+
+  A reference to a constant block bound to the shader. Variables with this type are stored with
+  opaque contents and should be decoded with :meth:`ShaderVariable.GetBinding`.
+
+.. data:: ReadOnlyResource
+
+  A reference to a read only resource bound to the shader. Variables with this type are stored with
+  opaque contents and should be decoded with :meth:`ShaderVariable.GetBinding`.
+
+.. data:: ReadWriteResource
+
+  A reference to a read/write resource bound to the shader. Variables with this type are stored with
+  opaque contents and should be decoded with :meth:`ShaderVariable.GetBinding`.
+
+.. data:: Sampler
+
+  A reference to a sampler bound to the shader. Variables with this type are stored with opaque
+  contents and should be decoded with :meth:`ShaderVariable.GetBinding`.
+
 .. data:: Unknown
 
   An unknown type.
 )");
-enum class VarType : uint32_t
+enum class VarType : uint8_t
 {
   Float = 0,
   Double,
@@ -199,10 +275,41 @@ enum class VarType : uint32_t
   ULong,
   SByte,
   UByte,
-  Unknown = ~0U,
+  Bool,
+  Enum,
+  Struct,
+  GPUPointer,
+  ConstantBlock,
+  ReadOnlyResource,
+  ReadWriteResource,
+  Sampler,
+  Unknown = 0xFF,
 };
 
 DECLARE_REFLECTION_ENUM(VarType);
+
+DOCUMENT(R"(Get the byte size of a variable type.
+
+:param VarType type: The variable type
+:return: The size in bytes of this type
+:rtype: int
+)");
+constexpr uint32_t VarTypeByteSize(VarType type)
+{
+  return (type == VarType::UByte || type == VarType::SByte) ? 1
+
+         : (type == VarType::Half || type == VarType::UShort || type == VarType::SShort) ? 2
+
+         : (type == VarType::Float || type == VarType::UInt || type == VarType::SInt ||
+            type == VarType::Bool || type == VarType::Enum)
+             ? 4
+
+         : (type == VarType::Double || type == VarType::ULong || type == VarType::SLong ||
+            type == VarType::GPUPointer)
+             ? 8
+
+             : 0;
+}
 
 DOCUMENT(R"(Represents the component type of a channel in a texture or element in a structure.
 
@@ -212,8 +319,7 @@ DOCUMENT(R"(Represents the component type of a channel in a texture or element i
 
 .. data:: Float
 
-  A single-precision (32-bit) floating point value. This is an IEEE float with 1 sign bit,
-  8 bits of exponent and 23 bits of mantissa.
+  An IEEE floating point value of 64-bit, 32-bit or 16-bit size.
 
 .. data:: UNorm
 
@@ -254,12 +360,8 @@ DOCUMENT(R"(Represents the component type of a channel in a texture or element i
 
 .. data:: Depth
 
-  An opaque value storing depth information, either :data:`unsigned normalised <UNorm>` or
-  :data:`floating point <float>`.
-
-.. data:: Double
-
-  A double-precision (64-bit) floating point value.
+  An opaque value storing depth information, either :data:`floating point <float>` for 32-bit depth
+  values or else :data:`unsigned normalised <UNorm>` for other bit sizes.
 
 .. data:: UNormSRGB
 
@@ -277,11 +379,33 @@ enum class CompType : uint8_t
   UScaled,
   SScaled,
   Depth,
-  Double,
   UNormSRGB,
 };
 
 DECLARE_REFLECTION_ENUM(CompType);
+
+DOCUMENT(R"(Get the component type of a variable type.
+
+:param VarType type: The variable type
+:return: The base component type of this variable type
+:rtype: CompType
+)");
+constexpr CompType VarTypeCompType(VarType type)
+{
+  return (type == VarType::Double || type == VarType::Float || type == VarType::Half)
+             ? CompType::Float
+
+         : (type == VarType::ULong || type == VarType::UInt || type == VarType::UShort ||
+            type == VarType::UByte || type == VarType::Bool || type == VarType::Enum ||
+            type == VarType::GPUPointer)
+             ? CompType::UInt
+
+         : (type == VarType::SLong || type == VarType::SInt || type == VarType::SShort ||
+            type == VarType::SByte)
+             ? CompType::SInt
+
+             : CompType::Typeless;
+}
 
 DOCUMENT(R"(A single source component for a destination texture swizzle.
 
@@ -309,7 +433,7 @@ DOCUMENT(R"(A single source component for a destination texture swizzle.
 
   The fixed value ``1``.
 )");
-enum class TextureSwizzle : uint32_t
+enum class TextureSwizzle : uint8_t
 {
   Red,
   Green,
@@ -371,7 +495,29 @@ enum class AddressMode : uint32_t
 
 DECLARE_REFLECTION_ENUM(AddressMode);
 
-enum YcbcrConversion
+DOCUMENT(R"(The color model conversion that a YCbCr sampler uses to convert from YCbCr to RGB.
+
+.. data:: Raw
+
+  The input values are not converted at all.
+
+.. data:: RangeOnly
+
+  There is no model conversion but the inputs are range expanded as for YCbCr.
+
+.. data:: BT709
+
+  The conversion uses the BT.709 color model conversion.
+
+.. data:: BT601
+
+  The conversion uses the BT.601 color model conversion.
+
+.. data:: BT2020
+
+  The conversion uses the BT.2020 color model conversion.
+)");
+enum class YcbcrConversion
 {
   Raw,
   RangeOnly,
@@ -382,7 +528,18 @@ enum YcbcrConversion
 
 DECLARE_REFLECTION_ENUM(YcbcrConversion);
 
-enum YcbcrRange
+DOCUMENT(R"(Specifies the range of encoded values and their interpretation.
+
+.. data:: ITUFull
+
+  The full range of input values are valid and interpreted according to ITU "full range" rules.
+
+.. data:: ITUNarrow
+
+  A head and foot are reserved in the encoded values, and the remaining values are expanded
+  according to "narrow range" rules.
+)");
+enum class YcbcrRange
 {
   ITUFull,
   ITUNarrow,
@@ -390,7 +547,18 @@ enum YcbcrRange
 
 DECLARE_REFLECTION_ENUM(YcbcrRange);
 
-enum ChromaSampleLocation
+DOCUMENT(R"(Determines where in the pixel downsampled chrome samples are positioned.
+
+.. data:: CositedEven
+
+  The chroma samples are positioned exactly in the same place as the even luma co-ordinates.
+
+.. data:: Midpoint
+
+  The chrome samples are positioned half way between each even luma sample and the next highest odd
+  luma sample.
+)");
+enum class ChromaSampleLocation
 {
   CositedEven,
   Midpoint,
@@ -569,7 +737,7 @@ DOCUMENT(R"(The dimensionality of a texture binding.
 
   A Cubemap texture array.
 )");
-enum class TextureType : uint32_t
+enum class TextureType : uint16_t
 {
   Unknown,
   First = Unknown,
@@ -632,6 +800,14 @@ DOCUMENT(R"(The type of a shader resource bind.
 
   A buffer that can be read from and written to arbitrarily.
 
+.. data:: ReadOnlyResource
+
+  A resource that can only be read from
+
+.. data:: ReadWriteResource
+
+  A resource that can be read from and written to arbitrarily.
+
 .. data:: InputAttachment
 
   An input attachment for reading from the target currently being written.
@@ -648,12 +824,14 @@ enum class BindType : uint32_t
   ReadWriteTBuffer,
   ReadOnlyBuffer,
   ReadWriteBuffer,
+  ReadOnlyResource,
+  ReadWriteResource,
   InputAttachment,
 };
 
 DECLARE_REFLECTION_ENUM(BindType);
 
-DOCUMENT2(R"(Annotates a particular built-in input or output from a shader with a special meaning to
+DOCUMENT3(R"(Annotates a particular built-in input or output from a shader with a special meaning to
 the hardware or API.
 
 Some of the built-in inputs or outputs can be declared multiple times in arrays or otherwise indexed
@@ -731,6 +909,10 @@ to apply to multiple related things - see :data:`ClipDistance`, :data:`CullDista
 
   This is related to :data:`GroupThreadIndex` and :data:`DispatchThreadIndex`.
 
+.. data:: GroupSize
+
+  The size of a workgroup, giving the number of threads in each dimension.
+
 .. data:: GroupFlatIndex
 
   An input in compute shaders giving a flat 1D index of the thread within the current workgroup.
@@ -747,6 +929,8 @@ to apply to multiple related things - see :data:`ClipDistance`, :data:`CullDista
 
   This is related to :data:`GroupIndex` and :data:`DispatchThreadIndex`.
 
+)",
+          R"(
 .. data:: GSInstanceIndex
 
   An input to the geometry shader giving the instance being run, if the geometry shader was setup to
@@ -779,8 +963,6 @@ to apply to multiple related things - see :data:`ClipDistance`, :data:`CullDista
   An input to the pixel shader that contains the location of the current sample relative to the
   pixel, when running the pixel shader at sample frequency.
 
-)",
-          R"(
 .. data:: MSAASampleIndex
 
   An input to the pixel shader that indicates which sample in the range ``0 .. N-1`` is currently
@@ -844,6 +1026,89 @@ to apply to multiple related things - see :data:`ClipDistance`, :data:`CullDista
 
   The stencil reference to be used for stenciling operations on this fragment.
 
+.. data:: PointCoord
+
+  The fragments co-ordinates within a point primitive being rasterized.
+
+.. data:: IsHelper
+
+  Indicates if the current invocation is a helper invocation.
+
+)",
+          R"(
+.. data:: SubgroupSize
+
+  The number of invocations in a subgroup.
+
+.. data:: NumSubgroups
+
+  The number of subgroups in the local workgroup.
+
+.. data:: SubgroupIndexInWorkgroup
+
+  The index of the current subgroup within all subgroups in the workgroup, up to
+  :data:`NumSubgroups` - 1.
+
+.. data:: IndexInSubgroup
+
+  The index of the current thread in the current subgroup, up to :data:`SubgroupSize` - 1.
+
+.. data:: SubgroupEqualMask
+
+  A bitmask where the bit corresponding to :data:`IndexInSubgroup` is set.
+
+.. data:: SubgroupGreaterEqualMask
+
+  A bitmask where all bits greater or equal to the one corresponding to :data:`IndexInSubgroup` are
+  set.
+
+.. data:: SubgroupGreaterMask
+
+  A bitmask where all bits greater than the one corresponding to :data:`IndexInSubgroup` are set.
+
+.. data:: SubgroupLessEqualMask
+
+  A bitmask where all bits less or equal to the one corresponding to :data:`IndexInSubgroup` are
+  set.
+
+.. data:: SubgroupLessMask
+
+  A bitmask where all bits less than the one corresponding to :data:`IndexInSubgroup` are set.
+
+.. data:: DeviceIndex
+
+  The device index executing the shader, relative to the current device group.
+
+.. data:: IsFullyCovered
+
+  Indicates if the current fragment area is fully covered by the generating primitive.
+
+.. data:: FragAreaSize
+
+  Gives the dimensions of the area that the fragment covers.
+
+.. data:: FragInvocationCount
+
+  Gives the maximum number of invocations for the fragment being covered.
+
+.. data:: PackedFragRate
+
+  Contains the packed shading rate, with an API specific packing of X and Y. For example:
+
+  1x being 0, 2x being 1, 4x being 2. Then the lower two bits being the Y rate and the next 2 bits
+  being the X rate.
+
+.. data:: Barycentrics
+
+  Contains the barycentric co-ordinates.
+
+.. data:: CullPrimitive
+
+  An output to indicate whether or not a primitive should be culled.
+
+.. data:: OutputIndices
+
+  An output containing the indices for a meshlet.
 )");
 enum class ShaderBuiltin : uint32_t
 {
@@ -861,6 +1126,7 @@ enum class ShaderBuiltin : uint32_t
   DispatchSize,
   DispatchThreadIndex,
   GroupIndex,
+  GroupSize,
   GroupFlatIndex,
   GroupThreadIndex,
   GSInstanceIndex,
@@ -881,13 +1147,30 @@ enum class ShaderBuiltin : uint32_t
   BaseInstance,
   DrawIndex,
   StencilReference,
+  PointCoord,
+  IsHelper,
+  SubgroupSize,
+  NumSubgroups,
+  SubgroupIndexInWorkgroup,
+  IndexInSubgroup,
+  SubgroupEqualMask,
+  SubgroupGreaterEqualMask,
+  SubgroupGreaterMask,
+  SubgroupLessEqualMask,
+  SubgroupLessMask,
+  DeviceIndex,
+  IsFullyCovered,
+  FragAreaSize,
+  FragInvocationCount,
+  PackedFragRate,
+  Barycentrics,
+  CullPrimitive,
+  OutputIndices,
   Count,
 };
 
 ITERABLE_OPERATORS(ShaderBuiltin);
 DECLARE_REFLECTION_ENUM(ShaderBuiltin);
-
-// replay_render.h
 
 DOCUMENT(R"(The type of :class:`ReplayOutput` to create
 
@@ -915,10 +1198,6 @@ DECLARE_REFLECTION_ENUM(ReplayOutputType);
 
 DOCUMENT(R"(Describes a particular stage in the geometry transformation pipeline.
 
-.. data:: Unknown
-
-  Unknown or invalid stage.
-
 .. data:: VSIn
 
   The inputs to the vertex shader described by the explicit API vertex input bindings.
@@ -932,13 +1211,29 @@ DOCUMENT(R"(Describes a particular stage in the geometry transformation pipeline
   The final output from the last stage in the pipeline, be that tessellation or geometry shader.
 
   This has possibly been expanded/multiplied from the inputs
+
+.. data:: TaskOut
+
+  Data from a task/amplification shader.
+
+.. data:: AmpOut
+
+  Data from an amplification shader (alias for :data:`TaskOut`).
+
+.. data:: MeshOut
+
+  Data from a mesh shader.
 )");
 enum class MeshDataStage : uint32_t
 {
-  Unknown = 0,
-  VSIn,
+  VSIn = 0,
+  First = VSIn,
   VSOut,
   GSOut,
+  TaskOut,
+  AmpOut = TaskOut,
+  MeshOut,
+  Count,
 };
 
 DECLARE_REFLECTION_ENUM(MeshDataStage);
@@ -1101,7 +1396,7 @@ DOCUMENT(R"(The format of an image file
 
   An EXR file
 
-.. data:: RAW
+.. data:: Raw
 
   Raw data, just the bytes of the image tightly packed with no metadata or compression/encoding
 )");
@@ -1126,7 +1421,7 @@ DOCUMENT(R"(What to do with the alpha channel from a texture while saving out to
 
 .. data:: Discard
 
-  Completely discard the alpha channel and only write RGB t othe file.
+  Completely discard the alpha channel and only write RGB to the file.
 
 .. data:: BlendToColor
 
@@ -1155,7 +1450,7 @@ enum class AlphaMapping : uint32_t
 ITERABLE_OPERATORS(AlphaMapping);
 DECLARE_REFLECTION_ENUM(AlphaMapping);
 
-DOCUMENT(R"(A resource format's particular type. This accounts for either block-compressed textures
+DOCUMENT2(R"(A resource format's particular type. This accounts for either block-compressed textures
 or formats that don't have equal byte-multiple sizes for each channel.
 
 .. data:: Regular
@@ -1216,11 +1511,21 @@ or formats that don't have equal byte-multiple sizes for each channel.
 
   Commonly used on mobile or embedded platforms.
 
+  Note that the mode added in ``EAC`` with 1 byte per pixel and full 8-bit alpha is
+  grouped as ``EAC``, with a component count of 4. See :data:`EAC`.
+)",
+          R"(
 .. data:: EAC
 
-  A block-compressed texture in ``EAC`` format (Single channel 11-bit or RGBA, 0.5 bytes per pixel)
+  A block-compressed texture in ``EAC`` format, expanded from ``ETC2``.
 
   Commonly used on mobile or embedded platforms.
+
+  The single and dual channel formats encode 11-bit data with 0.5 bytes per channel (so
+  the single channel format is 0.5 bytes per pixel total, and the dual channel format is 1 byte per
+  pixel total). The four channel format is encoded similarly to ETC2 for the base RGB data and
+  similarly to the single channel format for the alpha, giving 1 byte per pixel total.
+  See :data:`ETC2`.
 
 .. data:: ASTC
 
@@ -1418,6 +1723,10 @@ DOCUMENT(R"(Identifies a GPU vendor.
 .. data:: Software
 
   A software-rendering emulated GPU
+
+.. data:: Samsung
+
+  A Samsung GPU
 )");
 enum class GPUVendor : uint32_t
 {
@@ -1431,6 +1740,7 @@ enum class GPUVendor : uint32_t
   Qualcomm,
   Verisilicon,
   Software,
+  Samsung,
 };
 
 DECLARE_REFLECTION_ENUM(GPUVendor);
@@ -1443,17 +1753,16 @@ DOCUMENT(R"(Get the GPUVendor for a given PCI Vendor ID.
 )");
 constexpr GPUVendor GPUVendorFromPCIVendor(uint32_t vendorID)
 {
-  // temporarily disable clang-format to make this more readable.
-  // Ideally we'd use a simple switch() but VS2015 doesn't support that :(.
-  // clang-format off
-  return vendorID == 0x13B5 ? GPUVendor::ARM
-       : vendorID == 0x1002 ? GPUVendor::AMD
-       : vendorID == 0x1010 ? GPUVendor::Imagination
-       : vendorID == 0x8086 ? GPUVendor::Intel
-       : vendorID == 0x10DE ? GPUVendor::nVidia
-       : vendorID == 0x5143 ? GPUVendor::Qualcomm
-       : GPUVendor::Unknown;
-  // clang-format on
+  return vendorID == 0x13B5   ? GPUVendor::ARM
+         : vendorID == 0x1002 ? GPUVendor::AMD
+         : vendorID == 0x1010 ? GPUVendor::Imagination
+         : vendorID == 0x8086 ? GPUVendor::Intel
+         : vendorID == 0x10DE ? GPUVendor::nVidia
+         : vendorID == 0x5143 ? GPUVendor::Qualcomm
+         : vendorID == 0x1AE0 ? GPUVendor::Software    // Google Swiftshader
+         : vendorID == 0x1414 ? GPUVendor::Software    // Microsoft WARP
+         : vendorID == 0x144D ? GPUVendor::Samsung     // Xclipse GPU
+                              : GPUVendor::Unknown;
 }
 
 DOCUMENT(R"(Identifies a Graphics API.
@@ -1489,6 +1798,7 @@ DOCUMENT(R"(Check if an API is D3D or not
 
 :param GraphicsAPI api: The graphics API in question
 :return: ``True`` if api is a D3D-based API, ``False`` otherwise
+:rtype: bool
 )");
 constexpr inline bool IsD3D(GraphicsAPI api)
 {
@@ -1511,16 +1821,34 @@ DOCUMENT(R"(Identifies a shader encoding used to pass shader code to an API.
 
 .. data:: SPIRV
 
-  SPIR-V binary shader, used by Vulkan and with an extension by OpenGL.
+  SPIR-V binary shader, as used by Vulkan. This format is technically not distinct from
+  :data:`OpenGLSPIRV` but is considered unique here since it really *should* have been a different
+  format, and introducing a separation allows better selection of tools automatically.
 
 .. data:: SPIRVAsm
 
-  Canonical SPIR-V assembly form, used (indirectly via :data:`SPIRV`) by Vulkan and with an
-  extension by OpenGL.
+  Canonical SPIR-V assembly form, used (indirectly via :data:`SPIRV`) by Vulkan. See :data:`SPIRV`.
+
+.. data:: OpenGLSPIRV
+
+  SPIR-V binary shader, as used by OpenGL. This format is technically not distinct from
+  :data:`VulkanSPIRV` but is considered unique here since it really *should* have been a different
+  format, and introducing a separation allows better selection of tools automatically.
+
+.. data:: OpenGLSPIRVAsm
+
+  Canonical SPIR-V assembly form, used (indirectly via :data:`OpenGLSPIRV`) by OpenGL. See
+  :data:`OpenGLSPIRV` and note that it's artificially differentiated from :data:`SPIRVAsm`.
 
 .. data:: HLSL
 
   HLSL in string format, used by D3D11, D3D12, and Vulkan/GL via compilation to SPIR-V.
+
+.. data:: DXIL
+
+  DXIL binary shader, used by D3D12. Note that although the container is still DXBC format this is
+  used to distinguish from :data:`DXBC` for compiler I/O matching.
+
 )");
 enum class ShaderEncoding : uint32_t
 {
@@ -1531,22 +1859,188 @@ enum class ShaderEncoding : uint32_t
   SPIRV,
   SPIRVAsm,
   HLSL,
+  DXIL,
+  OpenGLSPIRV,
+  OpenGLSPIRVAsm,
   Count,
 };
 
 ITERABLE_OPERATORS(ShaderEncoding);
 DECLARE_REFLECTION_ENUM(ShaderEncoding);
 
+DOCUMENT(R"(Identifies a particular known tool used for shader processing.
+
+.. data:: Unknown
+
+  Corresponds to no known tool.
+
+.. data:: SPIRV_Cross
+
+  `SPIRV-Cross <https://github.com/KhronosGroup/SPIRV-Cross>`_
+   targetting normal Vulkan flavoured SPIR-V.
+
+.. data:: SPIRV_Cross_OpenGL
+
+  `SPIRV-Cross <https://github.com/KhronosGroup/SPIRV-Cross>`_
+   targetting OpenGL extension flavoured SPIR-V.
+
+.. data:: spirv_dis
+
+  `spirv-dis from SPIRV-Tools <https://github.com/KhronosGroup/SPIRV-Tools>`_
+   targetting normal Vulkan flavoured SPIR-V.
+
+.. data:: spirv_dis_OpenGL
+
+  `spirv-dis from SPIRV-Tools <https://github.com/KhronosGroup/SPIRV-Tools>`_
+   targetting OpenGL extension flavoured SPIR-V.
+
+.. data:: glslangValidatorGLSL
+
+  `glslang compiler (GLSL) <https://github.com/KhronosGroup/glslang>`_
+   targetting normal Vulkan flavoured SPIR-V.
+
+.. data:: glslangValidatorGLSL_OpenGL
+
+  `glslang compiler (GLSL) <https://github.com/KhronosGroup/glslang>`_
+   targetting OpenGL extension flavoured SPIR-V.
+
+.. data:: glslangValidatorHLSL
+
+  `glslang compiler (HLSL) <https://github.com/KhronosGroup/glslang>`_.
+
+.. data:: spirv_as
+
+  `spirv-as from SPIRV-Tools <https://github.com/KhronosGroup/SPIRV-Tools>`_
+   targetting normal Vulkan flavoured SPIR-V.
+
+.. data:: spirv_as_OpenGL
+
+  `spirv-as from SPIRV-Tools <https://github.com/KhronosGroup/SPIRV-Tools>`_
+   targetting OpenGL extension flavoured SPIR-V.
+
+.. data:: dxcSPIRV
+
+  `DirectX Shader Compiler <https://github.com/microsoft/DirectXShaderCompiler>`_ with Vulkan SPIR-V
+   output.
+
+.. data:: dxcDXIL
+
+  `DirectX Shader Compiler <https://github.com/microsoft/DirectXShaderCompiler>`_ with DXIL output.
+
+.. data:: fxc
+
+  fxc Shader Compiler with DXBC output.
+
+)");
+enum class KnownShaderTool : uint32_t
+{
+  Unknown,
+  First = Unknown,
+  SPIRV_Cross,
+  spirv_dis,
+  glslangValidatorGLSL,
+  glslangValidatorHLSL,
+  spirv_as,
+  dxcSPIRV,
+  dxcDXIL,
+  fxc,
+  glslangValidatorGLSL_OpenGL,
+  SPIRV_Cross_OpenGL,
+  spirv_as_OpenGL,
+  spirv_dis_OpenGL,
+  Count,
+};
+
+ITERABLE_OPERATORS(KnownShaderTool);
+DECLARE_REFLECTION_ENUM(KnownShaderTool);
+
+DOCUMENT(R"(Returns the default executable name with no suffix for a given :class:`KnownShaderTool`.
+
+.. note::
+  The executable name is returned with no suffix, e.g. ``foobar`` which may need a platform specific
+  suffix like ``.exe`` appended.
+
+:param KnownShaderTool tool: The tool to get the executable name for.
+:return: The default executable name for this tool, or an empty string if the tool is unrecognised.
+:rtype: str
+)");
+constexpr inline const char *ToolExecutable(KnownShaderTool tool)
+{
+  return tool == KnownShaderTool::SPIRV_Cross                   ? "spirv-cross"
+         : tool == KnownShaderTool::SPIRV_Cross_OpenGL          ? "spirv-cross"
+         : tool == KnownShaderTool::spirv_dis                   ? "spirv-dis"
+         : tool == KnownShaderTool::spirv_dis_OpenGL            ? "spirv-dis"
+         : tool == KnownShaderTool::glslangValidatorGLSL        ? "glslangValidator"
+         : tool == KnownShaderTool::glslangValidatorGLSL_OpenGL ? "glslangValidator"
+         : tool == KnownShaderTool::glslangValidatorHLSL        ? "glslangValidator"
+         : tool == KnownShaderTool::spirv_as                    ? "spirv-as"
+         : tool == KnownShaderTool::spirv_as_OpenGL             ? "spirv-as"
+         : tool == KnownShaderTool::dxcSPIRV                    ? "dxc"
+         : tool == KnownShaderTool::dxcDXIL                     ? "dxc"
+         : tool == KnownShaderTool::fxc                         ? "fxc"
+                                                                : "";
+}
+
+DOCUMENT(R"(Returns the expected default input :class:`~renderdoc.ShaderEncoding` that a
+:class:`KnownShaderTool` expects. This may not be accurate and may be configurable depending on the
+tool.
+
+:param KnownShaderTool tool: The tool to get the input encoding for.
+:return: The encoding that this tool expects as an input by default.
+:rtype: renderdoc.ShaderEncoding
+)");
+constexpr inline ShaderEncoding ToolInput(KnownShaderTool tool)
+{
+  return tool == KnownShaderTool::SPIRV_Cross                   ? ShaderEncoding::SPIRV
+         : tool == KnownShaderTool::SPIRV_Cross_OpenGL          ? ShaderEncoding::OpenGLSPIRV
+         : tool == KnownShaderTool::spirv_dis                   ? ShaderEncoding::SPIRV
+         : tool == KnownShaderTool::spirv_dis_OpenGL            ? ShaderEncoding::OpenGLSPIRV
+         : tool == KnownShaderTool::glslangValidatorGLSL        ? ShaderEncoding::GLSL
+         : tool == KnownShaderTool::glslangValidatorGLSL_OpenGL ? ShaderEncoding::GLSL
+         : tool == KnownShaderTool::glslangValidatorHLSL        ? ShaderEncoding::HLSL
+         : tool == KnownShaderTool::spirv_as                    ? ShaderEncoding::SPIRVAsm
+         : tool == KnownShaderTool::spirv_as_OpenGL             ? ShaderEncoding::OpenGLSPIRVAsm
+         : tool == KnownShaderTool::dxcSPIRV                    ? ShaderEncoding::HLSL
+         : tool == KnownShaderTool::dxcDXIL                     ? ShaderEncoding::HLSL
+         : tool == KnownShaderTool::fxc                         ? ShaderEncoding::HLSL
+                                                                : ShaderEncoding::Unknown;
+}
+
+DOCUMENT(R"(Returns the expected default output :class:`~renderdoc.ShaderEncoding` that a
+:class:`KnownShaderTool` produces. This may not be accurate and may be configurable depending on the
+tool.
+
+:param KnownShaderTool tool: The tool to get the output encoding for.
+:return: The encoding that this tool produces as an output by default.
+:rtype: renderdoc.ShaderEncoding
+)");
+constexpr inline ShaderEncoding ToolOutput(KnownShaderTool tool)
+{
+  return tool == KnownShaderTool::SPIRV_Cross                   ? ShaderEncoding::GLSL
+         : tool == KnownShaderTool::SPIRV_Cross_OpenGL          ? ShaderEncoding::GLSL
+         : tool == KnownShaderTool::spirv_dis                   ? ShaderEncoding::SPIRVAsm
+         : tool == KnownShaderTool::spirv_dis_OpenGL            ? ShaderEncoding::OpenGLSPIRVAsm
+         : tool == KnownShaderTool::glslangValidatorGLSL        ? ShaderEncoding::SPIRV
+         : tool == KnownShaderTool::glslangValidatorGLSL_OpenGL ? ShaderEncoding::OpenGLSPIRV
+         : tool == KnownShaderTool::glslangValidatorHLSL        ? ShaderEncoding::SPIRV
+         : tool == KnownShaderTool::spirv_as                    ? ShaderEncoding::SPIRV
+         : tool == KnownShaderTool::spirv_as_OpenGL             ? ShaderEncoding::OpenGLSPIRV
+         : tool == KnownShaderTool::dxcSPIRV                    ? ShaderEncoding::SPIRV
+         : tool == KnownShaderTool::dxcDXIL                     ? ShaderEncoding::DXIL
+         : tool == KnownShaderTool::fxc                         ? ShaderEncoding::DXBC
+                                                                : ShaderEncoding::Unknown;
+}
+
 DOCUMENT(R"(Check whether or not this is a human readable text representation.
 
-:param ShaderEncoding e: The encoding to check.
+:param ShaderEncoding encoding: The encoding to check.
 :return: ``True`` if it describes a text representation, ``False`` for a bytecode representation.
-:rtype: ``bool``
+:rtype: bool
 )");
 constexpr inline bool IsTextRepresentation(ShaderEncoding encoding)
 {
   return encoding == ShaderEncoding::HLSL || encoding == ShaderEncoding::GLSL ||
-         encoding == ShaderEncoding::SPIRVAsm;
+         encoding == ShaderEncoding::SPIRVAsm || encoding == ShaderEncoding::OpenGLSPIRVAsm;
 }
 
 DOCUMENT(R"(A primitive topology used for processing vertex data.
@@ -1801,9 +2295,9 @@ DOCUMENT(R"(Return the number of control points in a patch list ``Topology``
 
 ``t`` must be a patch list topology, the return value will be between 1 and 32 inclusive
 
-:param Topology t: The patch list topology
+:param Topology topology: The patch list topology
 :return: The number of control points in the specified topology
-:rtype: ``int``
+:rtype: int
 )");
 constexpr inline uint32_t PatchList_Count(Topology topology)
 {
@@ -1814,9 +2308,9 @@ constexpr inline uint32_t PatchList_Count(Topology topology)
 
 DOCUMENT(R"(Check whether or not this is a strip-type topology.
 
-:param Topology t: The topology to check.
+:param Topology topology: The topology to check.
 :return: ``True`` if it describes a strip topology, ``False`` for a list.
-:rtype: ``bool``
+:rtype: bool
 )");
 constexpr inline bool IsStrip(Topology topology)
 {
@@ -1861,6 +2355,18 @@ DOCUMENT(R"(The stage in a pipeline where a shader runs
 .. data:: Compute
 
   The compute shader.
+
+.. data:: Amplification
+
+  The amplification shader. See also :data:`Task`.
+
+.. data:: Task
+
+  The task shader. See also :data:`Amplification`.
+
+.. data:: Mesh
+
+  The mesh shader.
 )");
 enum class ShaderStage : uint32_t
 {
@@ -1880,11 +2386,18 @@ enum class ShaderStage : uint32_t
 
   Compute,
 
+  Task,
+  Amplification = Task,
+
+  Mesh,
+
   Count,
 };
 
 ITERABLE_OPERATORS(ShaderStage);
 DECLARE_REFLECTION_ENUM(ShaderStage);
+
+#define NumShaderStages arraydim<ShaderStage>()
 
 template <typename integer>
 constexpr inline ShaderStage StageFromIndex(integer stage)
@@ -2053,7 +2566,7 @@ enum class MessageSource : uint32_t
 
 DECLARE_REFLECTION_ENUM(MessageSource);
 
-DOCUMENT(R"(How a resource is being used in the pipeline at a particular point.
+DOCUMENT2(R"(How a resource is being used in the pipeline at a particular point.
 
 Note that a resource may be used for more than one thing in one event, see :class:`EventUsage`.
 
@@ -2095,6 +2608,15 @@ Note that a resource may be used for more than one thing in one event, see :clas
 
   The resource is being used for constants in the :data:`compute shader <ShaderStage.Compute>`.
 
+.. data:: TS_Constants
+
+  The resource is being used as a constants in the amplification or
+  :data:`task shader <ShaderStage.Task>`.
+
+.. data:: MS_Constants
+
+  The resource is being used as a constants in the :data:`mesh shader <ShaderStage.Mesh>`.
+
 .. data:: All_Constants
 
   The resource is being used for constants in all shader stages.
@@ -2133,10 +2655,22 @@ Note that a resource may be used for more than one thing in one event, see :clas
   The resource is being used as a read-only resource in the
   :data:`compute shader <ShaderStage.Compute>`.
 
+.. data:: TS_Resource
+
+  The resource is being used as a read-only resource in the amplification or
+  :data:`task shader <ShaderStage.Task>`.
+
+.. data:: MS_Resource
+
+  The resource is being used as a read-only resource in the
+  :data:`mesh shader <ShaderStage.Mesh>`.
+
 .. data:: All_Resource
 
   The resource is being used as a read-only resource in all shader stages.
 
+)",
+          R"(
 .. data:: VS_RWResource
 
   The resource is being used as a read-write resource in the
@@ -2167,6 +2701,16 @@ Note that a resource may be used for more than one thing in one event, see :clas
   The resource is being used as a read-write resource in the
   :data:`compute shader <ShaderStage.Compute>`.
 
+.. data:: TS_RWResource
+
+  The resource is being used as a read-write resource in the amplification or
+  :data:`task shader <ShaderStage.Task>`.
+
+.. data:: MS_RWResource
+
+  The resource is being used as a read-write resource in the
+  :data:`mesh shader <ShaderStage.Mesh>`.
+
 .. data:: All_RWResource
 
   The resource is being used as a read-write resource in all shader stages.
@@ -2189,7 +2733,11 @@ Note that a resource may be used for more than one thing in one event, see :clas
 
 .. data:: Clear
 
-  The resource is being cleared
+  The resource is being cleared.
+
+.. data:: Discard
+
+  The resource contents are discarded explicitly or implicitly.
 
 .. data:: GenMips
 
@@ -2222,6 +2770,11 @@ Note that a resource may be used for more than one thing in one event, see :clas
 .. data:: Barrier
 
   The resource is being specified in a barrier, as defined in Vulkan or Direct3D 12.
+
+.. data:: CPUWrite
+
+  The resource is written from the CPU, either directly as mapped memory or indirectly via a
+  synchronous update.
 )");
 enum class ResourceUsage : uint32_t
 {
@@ -2236,6 +2789,8 @@ enum class ResourceUsage : uint32_t
   GS_Constants,
   PS_Constants,
   CS_Constants,
+  TS_Constants,
+  MS_Constants,
 
   All_Constants,
 
@@ -2247,6 +2802,8 @@ enum class ResourceUsage : uint32_t
   GS_Resource,
   PS_Resource,
   CS_Resource,
+  TS_Resource,
+  MS_Resource,
 
   All_Resource,
 
@@ -2256,6 +2813,8 @@ enum class ResourceUsage : uint32_t
   GS_RWResource,
   PS_RWResource,
   CS_RWResource,
+  TS_RWResource,
+  MS_RWResource,
 
   All_RWResource,
 
@@ -2266,6 +2825,7 @@ enum class ResourceUsage : uint32_t
   Indirect,
 
   Clear,
+  Discard,
 
   GenMips,
   Resolve,
@@ -2276,6 +2836,8 @@ enum class ResourceUsage : uint32_t
   CopyDst,
 
   Barrier,
+
+  CPUWrite,
 };
 
 DECLARE_REFLECTION_ENUM(ResourceUsage);
@@ -2333,7 +2895,7 @@ constexpr inline ResourceUsage RWResUsage(ShaderStage stage)
   return RWResUsage(uint32_t(stage));
 }
 
-DOCUMENT(R"(What kind of solid shading to use when rendering a mesh.
+DOCUMENT(R"(What kind of visualisation to use when rendering a mesh.
 
 .. data:: NoSolid
 
@@ -2351,17 +2913,27 @@ DOCUMENT(R"(What kind of solid shading to use when rendering a mesh.
 
   The mesh should be rendered using the secondary element as color.
 
+.. data:: Explode
+
+  The mesh should be rendered with vertices displaced and coloured by vertex ID.
+
+.. data:: Meshlet
+
+  The mesh should be rendered colorising each meshlet differently.
+
 )");
-enum class SolidShade : uint32_t
+enum class Visualisation : uint32_t
 {
   NoSolid = 0,
   Solid,
   Lit,
   Secondary,
+  Explode,
+  Meshlet,
   Count,
 };
 
-DECLARE_REFLECTION_ENUM(SolidShade);
+DECLARE_REFLECTION_ENUM(Visualisation);
 
 DOCUMENT(R"(The fill mode for polygons.
 
@@ -2438,6 +3010,85 @@ enum class ConservativeRaster : uint32_t
 };
 
 DECLARE_REFLECTION_ENUM(ConservativeRaster);
+
+DOCUMENT(R"(A combiner to apply when determining a pixel shading rate.
+
+.. data:: Keep
+
+  Keep the first input to the combiner.
+
+.. data:: Passthrough
+
+  Keep the first input to the combiner. Alias for :data:`Keep`, for D3D terminology.
+
+.. data:: Replace
+
+  Replace with the second input to the combiner.
+
+.. data:: Override
+
+  Replace with the second input to the combiner. Alias for :data:`Replace`, for D3D terminology.
+
+.. data:: Min
+
+  Use the minimum (finest rate) of the two inputs.
+
+.. data:: Max
+
+  Use the maximum (coarsest rate) of the two inputs.
+
+.. data:: Multiply
+
+  Multiply the two rates together (e.g. 1x1 and 1x2 = 1x2, 2x2 and 2x2 = 4x4). Note that D3D names
+  this 'sum' misleadingly.
+)");
+enum class ShadingRateCombiner : uint32_t
+{
+  Keep,
+  Passthrough = Keep,
+  Replace,
+  Override = Replace,
+  Min,
+  Max,
+  Multiply,
+};
+
+DECLARE_REFLECTION_ENUM(ShadingRateCombiner);
+
+DOCUMENT(R"(The line rasterization mode.
+
+.. data:: Default
+
+  Default line rasterization mode as defined by the API specification.
+
+.. data:: Rectangular
+
+  Lines are rasterized as rectangles extruded from the line.
+
+.. data:: Bresenham
+
+  Lines are rasterized according to the bresenham line algorithm.
+
+.. data:: RectangularSmooth
+
+  Lines are rasterized as rectangles extruded from the line with coverage falloff being
+  implementation independent.
+
+.. data:: RectangularD3D
+
+  Lines are rasterized as rectangles extruded from the line, but with a width of 1.4 according to
+  legacy D3D behaviour
+)");
+enum class LineRaster : uint32_t
+{
+  Default = 0,
+  Rectangular,
+  Bresenham,
+  RectangularSmooth,
+  RectangularD3D,
+};
+
+DECLARE_REFLECTION_ENUM(LineRaster);
 
 DOCUMENT(R"(The texture filtering mode for a given direction (minification, magnification, or
 between mips).
@@ -2929,6 +3580,18 @@ enumerated with IDs in the appropriate ranges.
 
   Number of times a :data:`compute shader <ShaderStage.Compute>` was invoked.
 
+.. data:: TSInvocations
+
+  Number of times a :data:`task shader <ShaderStage.Task>` was invoked.
+
+.. data:: ASInvocations
+
+  Number of times a :data:`amplification shader <ShaderStage.Amplification>` was invoked.
+
+.. data:: MSInvocations
+
+  Number of times a :data:`mesh shader <ShaderStage.Mesh>` was invoked.
+
 .. data:: FirstAMD
 
   The AMD-specific counter IDs start from this value.
@@ -2952,6 +3615,22 @@ enumerated with IDs in the appropriate ranges.
 .. data:: LastNvidia
 
   The nVidia-specific counter IDs end with this value.
+
+.. data:: FirstVulkanExtended
+
+  The Vulkan extended counter IDs start from this value.
+
+.. data:: LastVulkanExtended
+
+  The Vulkan extended counter IDs end with this value.
+
+.. data:: FirstARM
+
+  The ARM-specific counter IDs start from this value.
+
+.. data:: LastARM
+
+  The ARM-specific counter IDs end with this value.
 )");
 enum class GPUCounter : uint32_t
 {
@@ -2972,6 +3651,9 @@ enum class GPUCounter : uint32_t
   PSInvocations,
   FSInvocations = PSInvocations,
   CSInvocations,
+  ASInvocations,
+  TSInvocations = ASInvocations,
+  MSInvocations,
   Count,
 
   // IHV specific counters can be set above this point
@@ -2984,7 +3666,13 @@ enum class GPUCounter : uint32_t
   FirstNvidia = 3000000,
   LastIntel = FirstNvidia - 1,
 
-  LastNvidia = 4000000,
+  FirstVulkanExtended = 4000000,
+  LastNvidia = FirstVulkanExtended - 1,
+
+  FirstARM = 5000000,
+  LastVulkanExtended = FirstARM - 1,
+
+  LastARM = 6000000,
 };
 
 ITERABLE_OPERATORS(GPUCounter);
@@ -2994,7 +3682,7 @@ DOCUMENT(R"(Check whether or not this is a Generic counter.
 
 :param GPUCounter c: The counter.
 :return: ``True`` if it is a generic counter, ``False`` if it's not.
-:rtype: ``bool``
+:rtype: bool
 )");
 inline constexpr bool IsGenericCounter(GPUCounter c)
 {
@@ -3005,7 +3693,7 @@ DOCUMENT(R"(Check whether or not this is an AMD private counter.
 
 :param GPUCounter c: The counter.
 :return: ``True`` if it is an AMD private counter, ``False`` if it's not.
-:rtype: ``bool``
+:rtype: bool
 )");
 inline constexpr bool IsAMDCounter(GPUCounter c)
 {
@@ -3016,7 +3704,7 @@ DOCUMENT(R"(Check whether or not this is an Intel private counter.
 
 :param GPUCounter c: The counter.
 :return: ``True`` if it is an Intel private counter, ``False`` if it's not.
-:rtype: ``bool``
+:rtype: bool
 )");
 inline constexpr bool IsIntelCounter(GPUCounter c)
 {
@@ -3027,11 +3715,33 @@ DOCUMENT(R"(Check whether or not this is an Nvidia private counter.
 
 :param GPUCounter c: The counter.
 :return: ``True`` if it is an Nvidia private counter, ``False`` if it's not.
-:rtype: ``bool``
+:rtype: bool
 )");
 inline constexpr bool IsNvidiaCounter(GPUCounter c)
 {
   return c >= GPUCounter::FirstNvidia && c <= GPUCounter::LastNvidia;
+}
+
+DOCUMENT(R"(Check whether or not this is a KHR counter.
+
+:param GPUCounter c: The counter.
+:return: ``True`` if it is a Vulkan counter reported through the VK_KHR_performance_query extension, ``False`` if it's not.
+:rtype: bool
+)");
+inline constexpr bool IsVulkanExtendedCounter(GPUCounter c)
+{
+  return c >= GPUCounter::FirstVulkanExtended && c <= GPUCounter::LastVulkanExtended;
+}
+
+DOCUMENT(R"(Check whether or not this is an ARM private counter.
+
+:param GPUCounter c: The counter.
+:return: ``True`` if it is an ARM private counter, ``False`` if it's not.
+:rtype: bool
+)");
+inline constexpr bool IsARMCounter(GPUCounter c)
+{
+  return c >= GPUCounter::FirstARM && c <= GPUCounter::LastARM;
 }
 
 DOCUMENT(R"(The unit that GPU counter data is returned in.
@@ -3059,6 +3769,18 @@ DOCUMENT(R"(The unit that GPU counter data is returned in.
 .. data:: Cycles
 
   The value is a duration in clock cycles.
+
+.. data:: Hertz
+
+  The value is a value in Hertz (cycles per second).
+
+.. data:: Volt
+
+  The value is a value in Volts.
+
+.. data:: Celsius
+
+  The value is a value in Celsius.
 )");
 enum class CounterUnit : uint32_t
 {
@@ -3068,6 +3790,9 @@ enum class CounterUnit : uint32_t
   Ratio,
   Bytes,
   Cycles,
+  Hertz,
+  Volt,
+  Celsius
 };
 
 DECLARE_REFLECTION_ENUM(CounterUnit);
@@ -3114,7 +3839,7 @@ enum class ReplaySupport : uint32_t
 
 DECLARE_REFLECTION_ENUM(ReplaySupport);
 
-DOCUMENT(R"(The status of a high-level replay operation such as opening a capture or connecting to
+DOCUMENT(R"(The result from a replay operation such as opening a capture or connecting to
 a remote server.
 
 .. data:: Succeeded
@@ -3165,9 +3890,13 @@ a remote server.
 
   The capture file is corrupted or otherwise unrecognisable.
 
+.. data:: FileUnrecognised
+
+  The file was not recognised as any supported file type.
+
 .. data:: ImageUnsupported
 
-  The image file is recognised but the format is unsupported.
+  The image file or format is unrecognised or not supported in this form.
 
 .. data:: APIUnsupported
 
@@ -3183,7 +3912,7 @@ a remote server.
 
 .. data:: APIHardwareUnsupported
 
-  The API is not supported on the currently available hardware.
+  Current replaying hardware unsupported or incompatible with captured hardware.
 
 .. data:: APIDataCorrupted
 
@@ -3193,6 +3922,11 @@ a remote server.
 
   The API failed to replay the capture, with some runtime error that couldn't be determined until
   the replay began.
+
+.. data:: JDWPFailure
+
+  Use of JDWP to launch and inject into the application failed, this most often indicates that some
+  other JDWP-using program such as Android Studio is interfering.
 
 .. data:: AndroidGrantPermissionsFailed
 
@@ -3213,8 +3947,32 @@ a remote server.
 .. data:: AndroidAPKVerifyFailed
 
   Failed to install Android remote server.
+
+.. data:: RemoteServerConnectionLost
+
+  While replaying on a remote server, the connection was lost.
+
+.. data:: OutOfMemory
+
+  An out of memory error was encountered.
+
+.. data:: DeviceLost
+
+  A device lost fatal error was encountered.
+
+.. data:: DataNotAvailable
+
+  Data was requested through RenderDoc's API which is not available.
+
+.. data:: InvalidParameter
+
+  An invalid parameter was passed to RenderDoc's API.
+
+.. data:: CompressionFailed
+
+  Compression or decompression failed.
 )");
-enum class ReplayStatus : uint32_t
+enum class ResultCode : uint32_t
 {
   Succeeded = 0,
   UnknownError,
@@ -3228,6 +3986,7 @@ enum class ReplayStatus : uint32_t
   FileIOFailed,
   FileIncompatibleVersion,
   FileCorrupted,
+  FileUnrecognised,
   ImageUnsupported,
   APIUnsupported,
   APIInitFailed,
@@ -3241,9 +4000,19 @@ enum class ReplayStatus : uint32_t
   AndroidAPKFolderNotFound,
   AndroidAPKInstallFailed,
   AndroidAPKVerifyFailed,
+  RemoteServerConnectionLost,
+  OutOfMemory,
+  DeviceLost,
+  DataNotAvailable,
+  InvalidParameter,
+  CompressionFailed,
 };
 
-DECLARE_REFLECTION_ENUM(ReplayStatus);
+DECLARE_REFLECTION_ENUM(ResultCode);
+// need to forward declare this explicitly since ResultCode can be instantiated early in places
+// where we're going to later explicitly instantiate it to define it
+template <>
+rdcstr DoStringise(const ResultCode &el);
 
 DOCUMENT(R"(The type of message received from or sent to an application target control connection.
 
@@ -3282,6 +4051,14 @@ DOCUMENT(R"(The type of message received from or sent to an application target c
 .. data:: CaptureProgress
 
   Progress update on an on-going frame capture.
+
+.. data:: CapturableWindowCount
+
+  The number of capturable windows has changed.
+
+.. data:: RequestShow
+
+  The client has requested that the controller show itself (raise its window to the top).
 )");
 enum class TargetControlMessageType : uint32_t
 {
@@ -3294,7 +4071,8 @@ enum class TargetControlMessageType : uint32_t
   RegisterAPI,
   NewChild,
   CaptureProgress,
-  CapturableWindowCount
+  CapturableWindowCount,
+  RequestShow,
 };
 
 DECLARE_REFLECTION_ENUM(TargetControlMessageType);
@@ -3353,6 +4131,11 @@ enum class EnvSep : uint32_t
 
 DECLARE_REFLECTION_ENUM(EnvSep);
 
+// see comment in common.h
+#if !defined(LOGTYPE_DEFINED)
+
+#define LOGTYPE_DEFINED
+
 DOCUMENT(R"(The type of a log message
 
 .. data:: Debug
@@ -3375,7 +4158,7 @@ DOCUMENT(R"(The type of a log message
 
   The log message indicates a fatal error occurred which is impossible to recover from.
 )");
-enum class LogType : int32_t
+enum class LogType : uint32_t
 {
   Debug,
   First = Debug,
@@ -3386,9 +4169,104 @@ enum class LogType : int32_t
   Count,
 };
 
+#endif
+
+// this is OUTSIDE the #endif because we don't declare these in common.h, so in case they're needed
+// we define them here
 DECLARE_REFLECTION_ENUM(LogType);
 
 ITERABLE_OPERATORS(LogType);
+
+DOCUMENT(R"(The level of optimisation used in
+
+.. data:: NoOptimisation
+
+  Completely disabled, no optimisation will be used at all.
+
+.. data:: Conservative
+
+  Optimisation is used when it doesn't interfere with replay correctness.
+
+.. data:: Balanced
+
+  Optimisation is used when it has minimal impact on replay correctness. This could include e.g.
+  resources appearing cleared instead of containing contents from prior frames where those resources
+  are written to before being read.
+
+.. data:: Fastest
+
+  All possible optimisations are enabled as long as they do not cause invalid/incorrect replay.
+  This could result in side-effects like data from one replay being visible early in another replay,
+  if it's known that the data will be overwritten before being used.
+)");
+enum class ReplayOptimisationLevel : uint32_t
+{
+  NoOptimisation,
+  First = NoOptimisation,
+  Conservative,
+  Balanced,
+  Fastest,
+  Count,
+};
+
+DECLARE_REFLECTION_ENUM(ReplayOptimisationLevel);
+ITERABLE_OPERATORS(ReplayOptimisationLevel);
+
+DOCUMENT(R"(Specifies a windowing system to use for creating an output window.
+
+.. data:: Unknown
+
+  Unknown window type, no windowing data is passed and no native window is described.
+
+.. data:: Headless
+
+  The windowing data doesn't describe a real window but a virtual area, allowing all normal output
+  rendering to happen off-screen.
+  See :func:`CreateHeadlessWindowingData`.
+
+.. data:: Win32
+
+  The windowing data refers to a Win32 window. See :func:`CreateWin32WindowingData`.
+
+.. data:: Xlib
+
+  The windowing data refers to an Xlib window. See :func:`CreateXLibWindowingData`.
+
+.. data:: XCB
+
+  The windowing data refers to an XCB window. See :func:`CreateXCBWindowingData`.
+
+.. data:: Android
+
+  The windowing data refers to an Android window. See :func:`CreateAndroidWindowingData`.
+
+.. data:: MacOS
+
+  The windowing data refers to a MacOS / OS X NSView & CALayer that is Metal/GL compatible.
+  See :func:`CreateMacOSWindowingData`.
+
+.. data:: GGP
+
+  The windowing data refers to an GGP surface. See :func:`CreateGgpWindowingData`.
+
+.. data:: Wayland
+
+  The windowing data refers to an Wayland window. See :func:`CreateWaylandWindowingData`.
+)");
+enum class WindowingSystem : uint32_t
+{
+  Unknown,
+  Headless,
+  Win32,
+  Xlib,
+  XCB,
+  Android,
+  MacOS,
+  GGP,
+  Wayland,
+};
+
+DECLARE_REFLECTION_ENUM(WindowingSystem);
 
 #if defined(ENABLE_PYTHON_FLAG_ENUMS)
 
@@ -3497,7 +4375,7 @@ DOCUMENT(R"(A set of flags describing how this buffer may be used
 
 .. data:: Indirect
 
-  The buffer will be used to provide indirect parameters for launching GPU-based drawcalls.
+  The buffer will be used to provide indirect parameters for launching GPU-based actions.
 )");
 enum class BufferCategory : uint32_t
 {
@@ -3530,7 +4408,7 @@ DOCUMENT(R"(A set of flags for D3D buffer view properties.
 
   The buffer is used with a structured buffer with associated hidden counter.
 )");
-enum class D3DBufferViewFlags : uint32_t
+enum class D3DBufferViewFlags : uint8_t
 {
   NoFlags = 0x0,
   Raw = 0x1,
@@ -3622,6 +4500,18 @@ DOCUMENT(R"(A set of flags for ``ShaderStage`` stages
 
   The flag for :data:`ShaderStage.Compute`.
 
+.. data:: Task
+
+  The flag for :data:`ShaderStage.Task`.
+
+.. data:: Amplification
+
+  The flag for :data:`ShaderStage.Amplification`.
+
+.. data:: Mesh
+
+  The flag for :data:`ShaderStage.Mesh`.
+
 .. data:: All
 
   A shorthand version with flags set for all stages together.
@@ -3638,7 +4528,10 @@ enum class ShaderStageMask : uint32_t
   Pixel = 1 << uint32_t(ShaderStage::Pixel),
   Fragment = Pixel,
   Compute = 1 << uint32_t(ShaderStage::Compute),
-  All = Vertex | Hull | Domain | Geometry | Pixel | Compute,
+  Task = 1 << uint32_t(ShaderStage::Task),
+  Amplification = Task,
+  Mesh = 1 << uint32_t(ShaderStage::Mesh),
+  All = Vertex | Hull | Domain | Geometry | Pixel | Compute | Task | Mesh,
 };
 
 BITMASK_OPERATORS(ShaderStageMask);
@@ -3679,111 +4572,175 @@ enum class ShaderEvents : uint32_t
 BITMASK_OPERATORS(ShaderEvents);
 DECLARE_REFLECTION_ENUM(ShaderEvents);
 
-DOCUMENT(R"(A set of flags describing the properties of a particular drawcall.
+DOCUMENT(R"(A set of flags for events that control how a shader/buffer value is interpreted and
+displayed
 
 .. data:: NoFlags
 
-  The drawcall has no special properties.
+  No flags are specified.
+
+.. data:: RowMajorMatrix
+
+  This matrix is stored in row-major order in memory, instead of column-major. In RenderDoc values
+  are always provided row-major regardless, for consistency of access, but if this flag is not
+  present then the original values were in column order in memory, so the data has been transposed.
+
+.. data:: HexDisplay
+
+  This value should be displayed using hexadecimal where possible.
+
+.. data:: BinaryDisplay
+
+  This value should be displayed using binary where possible.
+
+.. data:: RGBDisplay
+
+  This value should be interpreted as an RGB colour for display where possible.
+
+.. data:: R11G11B10
+
+  This value should be decoded from a 32-bit integer in R11G11B10 packing format.
+
+.. data:: R10G10B10A2
+
+  This value should be decoded from a 32-bit integer in R10G10B10A2 packing format.
+
+.. data:: UNorm
+
+  This value should be treated as unsigned normalised floating point values when interpreting.
+
+.. data:: SNorm
+
+  This value should be treated as signed normalised floating point values when interpreting.
+
+.. data:: Truncated
+
+  This value was truncated when reading - the available range was exhausted.
+)");
+enum class ShaderVariableFlags : uint32_t
+{
+  NoFlags = 0x0000,
+  RowMajorMatrix = 0x0001,
+  HexDisplay = 0x0002,
+  BinaryDisplay = 0x0004,
+  RGBDisplay = 0x0008,
+  R11G11B10 = 0x0010,
+  R10G10B10A2 = 0x0020,
+  UNorm = 0x0040,
+  SNorm = 0x0080,
+  Truncated = 0x0100,
+};
+
+BITMASK_OPERATORS(ShaderVariableFlags);
+DECLARE_REFLECTION_ENUM(ShaderVariableFlags);
+
+DOCUMENT(R"(A set of flags describing the properties of a particular action. An action is a call
+such as a draw, a compute dispatch, clears, copies, resolves, etc. Any GPU event which may have
+deliberate visible side-effects to application-visible memory, typically resources such as textures
+and buffers. It also includes markers, which provide a user-generated annotation of events and
+actions.
+
+.. data:: NoFlags
+
+  The action has no special properties.
 
 .. data:: Clear
 
-  The drawcall is a clear call. See :data:`ClearColor` and :data:`ClearDepthStencil`.
+  The action is a clear call. See :data:`ClearColor` and :data:`ClearDepthStencil`.
 
 .. data:: Drawcall
 
-  The drawcall renders primitives using the graphics pipeline.
+  The action renders primitives using the graphics pipeline.
 
 .. data:: Dispatch
 
-  The drawcall issues a number of compute workgroups.
+  The action issues a number of compute workgroups.
+
+.. data:: MeshDispatch
+
+  The action issues a number of mesh groups for a draw.
 
 .. data:: CmdList
 
-  The drawcall calls into a previously recorded child command list.
+  The action calls into a previously recorded child command list.
 
 .. data:: SetMarker
 
-  The drawcall inserts a single debugging marker.
+  The action inserts a single debugging marker.
 
 .. data:: PushMarker
 
-  The drawcall begins a debugging marker region that has children.
+  The action begins a debugging marker region that has children.
 
 .. data:: PopMarker
 
-  The drawcall ends a debugging marker region.
-
-  .. note::
-
-    Drawcalls with this flag will not be exposed and it is only used internally for tracking
-    markers.
+  The action ends a debugging marker region.
 
 .. data:: Present
 
-  The drawcall is a presentation call that hands a swapchain image to the presentation engine.
+  The action is a presentation call that hands a swapchain image to the presentation engine.
 
-.. data:: MultiDraw
+.. data:: MultiAction
 
-  The drawcall is a multi-draw that contains several specified child draws.
+  The action is a multi-action that contains several specified child actions. Typically a MultiDraw
+  or ExecuteIndirect on D3D12.
 
 .. data:: Copy
 
-  The drawcall performs a resource copy operation.
+  The action performs a resource copy operation.
 
 .. data:: Resolve
 
-  The drawcall performs a resource resolve or blit operation.
+  The action performs a resource resolve or blit operation.
 
 .. data:: GenMips
 
-  The drawcall performs a resource mip-generation operation.
+  The action performs a resource mip-generation operation.
 
 .. data:: PassBoundary
 
-  The drawcall marks the beginning or end of a render pass. See :data:`BeginPass` and
+  The action marks the beginning or end of a render pass. See :data:`BeginPass` and
   :data:`EndPass`.
 
-.. data:: UseIBuffer
+.. data:: Indexed
 
-  The drawcall uses an index buffer.
+  The action uses an index buffer.
 
 .. data:: Instanced
 
-  The drawcall uses instancing. This does not mean it renders more than one instanced, simply that
+  The action uses instancing. This does not mean it renders more than one instanced, simply that
   it uses the instancing feature.
 
 .. data:: Auto
 
-  The drawcall interacts with stream-out to render all vertices previously written. This is a
+  The action interacts with stream-out to render all vertices previously written. This is a
   Direct3D 11 specific feature.
 
 .. data:: Indirect
 
-  The drawcall uses a buffer on the GPU to source some or all of its parameters in an indirect way.
+  The action uses a buffer on the GPU to source some or all of its parameters in an indirect way.
 
 .. data:: ClearColor
 
-  The drawcall clears a color target.
+  The action clears a color target.
 
 .. data:: ClearDepthStencil
 
-  The drawcall clears a depth-stencil target.
+  The action clears a depth-stencil target.
 
 .. data:: BeginPass
 
-  The drawcall marks the beginning of a render pass.
+  The action marks the beginning of a render pass.
 
 .. data:: EndPass
 
-  The drawcall marks the end of a render pass.
+  The action marks the end of a render pass.
 
-.. data:: APICalls
+.. data:: CommandBufferBoundary
 
-  The drawcall does not contain any work directly, but is a 'virtual' draw inserted to encompass
-  non-draw API calls that happened within a region, so they are included within the region where
-  they occurred and not grouped into the next drawcall outside that region.
+  The action is a virtual marker added to show command buffer boundaries.
 )");
-enum class DrawFlags : uint32_t
+enum class ActionFlags : uint32_t
 {
   NoFlags = 0x0000,
 
@@ -3791,16 +4748,17 @@ enum class DrawFlags : uint32_t
   Clear = 0x0001,
   Drawcall = 0x0002,
   Dispatch = 0x0004,
-  CmdList = 0x0008,
-  SetMarker = 0x0010,
-  PushMarker = 0x0020,
-  PopMarker = 0x0040,    // this is only for internal tracking use
-  Present = 0x0080,
-  MultiDraw = 0x0100,
-  Copy = 0x0200,
-  Resolve = 0x0400,
-  GenMips = 0x0800,
-  PassBoundary = 0x1000,
+  MeshDispatch = 0x0008,
+  CmdList = 0x0010,
+  SetMarker = 0x0020,
+  PushMarker = 0x0040,
+  PopMarker = 0x0080,
+  Present = 0x0100,
+  MultiAction = 0x0200,
+  Copy = 0x0400,
+  Resolve = 0x0800,
+  GenMips = 0x1000,
+  PassBoundary = 0x2000,
 
   // flags
   Indexed = 0x010000,
@@ -3811,13 +4769,14 @@ enum class DrawFlags : uint32_t
   ClearDepthStencil = 0x200000,
   BeginPass = 0x400000,
   EndPass = 0x800000,
-  APICalls = 0x1000000,
+  CommandBufferBoundary = 0x1000000,
 };
 
-BITMASK_OPERATORS(DrawFlags);
-DECLARE_REFLECTION_ENUM(DrawFlags);
+BITMASK_OPERATORS(ActionFlags);
+DECLARE_REFLECTION_ENUM(ActionFlags);
 
-DOCUMENT(R"(A set of flags giving details of the current status of vulkan layer registration.
+DOCUMENT(R"(INTERNAL: A set of flags giving details of the current status of vulkan layer
+registration.
 
 .. data:: NoFlags
 
@@ -3835,10 +4794,18 @@ DOCUMENT(R"(A set of flags giving details of the current status of vulkan layer 
 
   Fixing any issues will require elevation to system administrator privileges.
 
-.. data:: CouldElevate
+.. data:: UserRegisterable
 
-  Fixing issues could be done purely as a user, but can optionally be done at system level with
-  system administrator privileges.
+  This layer can be registered as user-local, as well as system-wide. If :data:`NeedElevation` isn't
+  also set then the entire process can be done un-elevated if user-local is desired.
+
+  .. note::
+
+    If the :data:`NeedElevation` flag is set then elevation is required to fix the layer
+    registration, even if a user-local registration is desired.
+
+    Most commonly this situation arises if there is no other registration, or the existing one is
+    already user-local.
 
 .. data:: RegisterAll
 
@@ -3853,6 +4820,10 @@ DOCUMENT(R"(A set of flags giving details of the current status of vulkan layer 
 .. data:: Unfixable
 
   The current situation is not fixable automatically and requires user intervention/disambiguation.
+
+.. data:: Unsupported
+
+  Vulkan is not supported by this build of RenderDoc and the layer cannot be registered.
 )");
 enum class VulkanLayerFlags : uint32_t
 {
@@ -3860,16 +4831,17 @@ enum class VulkanLayerFlags : uint32_t
   OtherInstallsRegistered = 0x1,
   ThisInstallRegistered = 0x2,
   NeedElevation = 0x4,
-  CouldElevate = 0x8,
+  UserRegisterable = 0x8,
   RegisterAll = 0x10,
   UpdateAllowed = 0x20,
   Unfixable = 0x40,
+  Unsupported = 0x80,
 };
 
 BITMASK_OPERATORS(VulkanLayerFlags);
 DECLARE_REFLECTION_ENUM(VulkanLayerFlags);
 
-DOCUMENT(R"(A set of flags giving details of the current status of Android tracability.
+DOCUMENT(R"(INTERNAL: A set of flags giving details of the current status of Android tracability.
 
 .. data:: NoFlags
 
@@ -3882,27 +4854,12 @@ DOCUMENT(R"(A set of flags giving details of the current status of Android traca
 .. data:: RootAccess
 
    The device being targeted has root access.
-
-.. data:: MissingTools
-
-   When patching, some necessary tools were not found.
-
-.. data:: ManifestPatchFailure
-
-   When patching, modifying the manifest file to include the debuggable flag failed.
-
-.. data:: RepackagingAPKFailure
-
-   When patching, repackaging, signing and installing the new package failed.
 )");
 enum class AndroidFlags : uint32_t
 {
   NoFlags = 0x0,
   Debuggable = 0x1,
   RootAccess = 0x2,
-  MissingTools = 0x1000,
-  ManifestPatchFailure = 0x2000,
-  RepackagingAPKFailure = 0x4000,
 };
 
 BITMASK_OPERATORS(AndroidFlags);

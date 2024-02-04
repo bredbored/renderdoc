@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2016-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -78,22 +78,24 @@ public:
     m_italic = italic;
     dataChanged(0, Qt::FontRole);
   }
-  inline void setTreeColor(QColor col, float pixels)
-  {
-    m_treeCol = col;
-    m_treeColWidth = pixels;
-  }
+  inline void setTreeColor(QColor col) { m_treeCol = col; }
   inline void setBackgroundColor(QColor background) { setBackground(QBrush(background)); }
   inline void setForegroundColor(QColor foreground) { setForeground(QBrush(foreground)); }
   inline void setBackground(QBrush background)
   {
-    m_back = background;
-    dataChanged(0, Qt::BackgroundRole);
+    if(m_back != background)
+    {
+      m_back = background;
+      dataChanged(0, Qt::BackgroundRole);
+    }
   }
   inline void setForeground(QBrush foreground)
   {
-    m_fore = foreground;
-    dataChanged(0, Qt::ForegroundRole);
+    if(m_fore != foreground)
+    {
+      m_fore = foreground;
+      dataChanged(0, Qt::ForegroundRole);
+    }
   }
   inline QBrush background() { return m_back; }
   inline QBrush foreground() { return m_fore; }
@@ -115,14 +117,29 @@ public:
     m_tooltip = value;
     dataChanged(0, Qt::ToolTipRole);
   }
+  inline void setToolTip(int column, const QString &value)
+  {
+    setData(column, Qt::ToolTipRole, value);
+    dataChanged(0, Qt::ToolTipRole);
+  }
+  inline bool editable(int column) const { return m_editable & (1U << column); }
+  inline void setEditable(int column, bool edit)
+  {
+    uint32_t mask = 1U << column;
+
+    if(edit)
+      m_editable |= mask;
+    else
+      m_editable &= ~mask;
+  }
 
   inline Qt::CheckState checkState(int column) const
   {
-    return static_cast<Qt::CheckState>(data(column, Qt::CheckStateRole).toInt());
+    return (Qt::CheckState)data(column, Qt::CheckStateRole).toInt();
   }
   inline void setCheckState(int column, Qt::CheckState state)
   {
-    setData(column, Qt::CheckStateRole, static_cast<int>(state));
+    setData(column, Qt::CheckStateRole, int(state));
     dataChanged(column, Qt::CheckStateRole);
   }
 
@@ -133,7 +150,6 @@ private:
 
   friend class RDTreeWidget;
   friend class RDTreeWidgetModel;
-  friend class RDTreeWidgetDelegate;
 
   void setWidget(RDTreeWidget *widget);
   RDTreeWidget *m_widget = NULL;
@@ -158,12 +174,14 @@ private:
   // we allocate this lazily only if it's really needed
   QVector<QVector<RoleData>> *m_data = NULL;
 
+  // bitfield of editable columns
+  uint32_t m_editable = 0;
+
   // per-item properties
   QString m_tooltip;
   bool m_bold = false;
   bool m_italic = false;
   QColor m_treeCol;
-  float m_treeColWidth = 0.0f;
   QBrush m_back;
   QBrush m_fore;
   QVariant m_tag;
@@ -198,14 +216,10 @@ private:
   RDTreeWidgetItem *m_Current;
 };
 
-class RichTextViewDelegate;
-
 class RDTreeWidget : public RDTreeView
 {
   Q_OBJECT
 
-  Q_PROPERTY(bool instantTooltips READ instantTooltips WRITE setInstantTooltips)
-  Q_PROPERTY(bool customCopyPasteHandler READ customCopyPasteHandler WRITE setCustomCopyPasteHandler)
 public:
   explicit RDTreeWidget(QWidget *parent = 0);
   ~RDTreeWidget();
@@ -221,12 +235,9 @@ public:
   void setHoverHandCursor(bool hand) { m_hoverHandCursor = hand; }
   void setHoverClickActivate(bool click) { m_activateOnClick = click; }
   void setClearSelectionOnFocusLoss(bool clear) { m_clearSelectionOnFocusLoss = clear; }
-  bool instantTooltips() { return m_instantTooltips; }
-  void setInstantTooltips(bool instant) { m_instantTooltips = instant; }
-  bool customCopyPasteHandler() { return m_customCopyPaste; }
-  void setCustomCopyPasteHandler(bool custom) { m_customCopyPaste = custom; }
   RDTreeWidgetItem *invisibleRootItem() { return m_root; }
   void addTopLevelItem(RDTreeWidgetItem *item) { m_root->addChild(item); }
+  void insertTopLevelItem(int idx, RDTreeWidgetItem *item) { m_root->insertChild(idx, item); }
   RDTreeWidgetItem *topLevelItem(int index) const { return m_root->child(index); }
   int indexOfTopLevelItem(RDTreeWidgetItem *item) const { return m_root->indexOfChild(item); }
   RDTreeWidgetItem *takeTopLevelItem(int index) { return m_root->takeChild(index); }
@@ -235,10 +246,16 @@ public:
   void endUpdate();
   void setColumnAlignment(int column, Qt::Alignment align);
 
-  void setItemDelegate(QAbstractItemDelegate *delegate);
-  QAbstractItemDelegate *itemDelegate() const;
+  RDTreeWidgetItem *itemForIndex(QModelIndex idx) const;
 
+  void copyItem(QPoint pos, RDTreeWidgetItem *item);
+
+  typedef std::function<bool(int, Qt::SortOrder, const RDTreeWidgetItem *, const RDTreeWidgetItem *)>
+      ComparisonFunction;
+
+  void setSortComparison(ComparisonFunction comparison) { m_SortComparison = comparison; }
   void setColumns(const QStringList &columns);
+  const QStringList &getHeaders() const { return m_headers; }
   QString headerText(int column) const { return m_headers[column]; }
   void setHeaderText(int column, const QString &text);
   RDTreeWidgetItem *selectedItem() const;
@@ -252,9 +269,8 @@ public:
   void expandAllItems(RDTreeWidgetItem *item);
   void collapseItem(RDTreeWidgetItem *item);
   void collapseAllItems(RDTreeWidgetItem *item);
-  void scrollToItem(RDTreeWidgetItem *node);
-
-  void copySelection();
+  void scrollToItem(RDTreeWidgetItem *item);
+  void editItem(RDTreeWidgetItem *item);
 
   void clear();
 
@@ -265,6 +281,7 @@ signals:
   void itemDoubleClicked(RDTreeWidgetItem *item, int column);
   void itemActivated(RDTreeWidgetItem *item, int column);
   void currentItemChanged(RDTreeWidgetItem *current, RDTreeWidgetItem *previous);
+  void hoverItemChanged(RDTreeWidgetItem *item);
   void itemSelectionChanged();
 
 public slots:
@@ -274,8 +291,6 @@ private:
   void mouseReleaseEvent(QMouseEvent *e) override;
   void leaveEvent(QEvent *e) override;
   void focusOutEvent(QFocusEvent *event) override;
-  void keyPressEvent(QKeyEvent *e) override;
-  void drawBranches(QPainter *painter, const QRect &rect, const QModelIndex &index) const override;
 
   void selectionChanged(const QItemSelection &selected, const QItemSelection &deselected) override;
   void currentChanged(const QModelIndex &current, const QModelIndex &previous) override;
@@ -287,19 +302,17 @@ private:
 
   friend class RDTreeWidgetModel;
   friend class RDTreeWidgetItem;
-  friend class RDTreeWidgetDelegate;
 
   // invisible root item, used to simplify recursion by even top-level items having a parent
   RDTreeWidgetItem *m_root;
 
   RDTreeWidgetModel *m_model;
 
-  QAbstractItemDelegate *m_userDelegate = NULL;
-  RichTextViewDelegate *m_delegate;
-
   bool m_clearing = false;
 
   QStringList m_headers;
+
+  ComparisonFunction m_SortComparison;
 
   bool m_queueUpdates = false;
 
@@ -311,8 +324,6 @@ private:
 
   QVector<Qt::Alignment> m_alignments;
 
-  bool m_instantTooltips = false;
-  bool m_customCopyPaste = false;
   int m_hoverColumn = -1;
   QIcon m_normalHoverIcon;
   QIcon m_activeHoverIcon;

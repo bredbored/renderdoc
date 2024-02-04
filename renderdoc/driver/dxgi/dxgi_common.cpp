@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2016-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -23,6 +23,7 @@
  ******************************************************************************/
 
 #include "dxgi_common.h"
+#include "api/replay/control_types.h"
 #include "common/common.h"
 #include "common/threading.h"
 #include "serialise/serialiser.h"
@@ -146,6 +147,7 @@ UINT GetByteSize(int Width, int Height, int Depth, DXGI_FORMAT Format, int mip)
       ret *= 1;
       break;
     case DXGI_FORMAT_B4G4R4A4_UNORM:
+    case DXGI_FORMAT_A4B4G4R4_UNORM:
       ret *= 2;    // 4 channels, half a byte each
       break;
     /*
@@ -243,8 +245,8 @@ UINT GetByteSize(int Width, int Height, int Depth, DXGI_FORMAT Format, int mip)
       ret = ret + ret / 2;
       break;
     case DXGI_FORMAT_P010:
-    // 10-bit formats are stored identically to 16-bit formats
-    // deliberate fallthrough
+      // 10-bit formats are stored identically to 16-bit formats
+      DELIBERATE_FALLTHROUGH();
     case DXGI_FORMAT_P016:
       // 4:2:0 planar but 16-bit, so pixelCount*2 + (pixelCount*2) / 2
       ret *= 2;
@@ -260,8 +262,8 @@ UINT GetByteSize(int Width, int Height, int Depth, DXGI_FORMAT Format, int mip)
       ret *= 2;
       break;
     case DXGI_FORMAT_Y210:
-    // 10-bit formats are stored identically to 16-bit formats
-    // deliberate fallthrough
+      // 10-bit formats are stored identically to 16-bit formats
+      DELIBERATE_FALLTHROUGH();
     case DXGI_FORMAT_Y216:
       // 4:2:2 packed 16-bit
       ret *= 4;
@@ -272,9 +274,9 @@ UINT GetByteSize(int Width, int Height, int Depth, DXGI_FORMAT Format, int mip)
       ret = ret + ret / 2;
       break;
     case DXGI_FORMAT_AI44:
-    // special format, 1 byte per pixel, palletised values in 4 most significant bits, alpha in 4
-    // least significant bits.
-    // deliberate fallthrough
+      // special format, 1 byte per pixel, palletised values in 4 most significant bits, alpha in 4
+      // least significant bits.
+      DELIBERATE_FALLTHROUGH();
     case DXGI_FORMAT_IA44:
       // same as above but swapped MSB/LSB
       break;
@@ -339,8 +341,8 @@ UINT GetRowPitch(int Width, DXGI_FORMAT Format, int mip)
       // pixel - 1 byte luma each, and half subsampled chroma U/V in 1 byte total per pixel.
       break;
     case DXGI_FORMAT_P010:
-    // 10-bit formats are stored identically to 16-bit formats
-    // deliberate fallthrough
+      // 10-bit formats are stored identically to 16-bit formats
+      DELIBERATE_FALLTHROUGH();
     case DXGI_FORMAT_P016:
       // Similar to NV12 but 16-bit elements
       ret *= 2;
@@ -354,8 +356,8 @@ UINT GetRowPitch(int Width, DXGI_FORMAT Format, int mip)
       ret *= 2;
       break;
     case DXGI_FORMAT_Y210:
-    // 10-bit formats are stored identically to 16-bit formats
-    // deliberate fallthrough
+      // 10-bit formats are stored identically to 16-bit formats
+      DELIBERATE_FALLTHROUGH();
     case DXGI_FORMAT_Y216:
       // 4:2:2 packed 16-bit
       ret *= 4;
@@ -363,12 +365,11 @@ UINT GetRowPitch(int Width, DXGI_FORMAT Format, int mip)
     case DXGI_FORMAT_NV11:
       // similar to NV12 - planar 4:1:1 4 horizontal downsampling but no vertical downsampling. For
       // row pitch calculation amounts to the same result.
-      ret = ret;
       break;
     case DXGI_FORMAT_AI44:
-    // special format, 1 byte per pixel, palletised values in 4 most significant bits, alpha in 4
-    // least significant bits.
-    // deliberate fallthrough
+      // special format, 1 byte per pixel, palletised values in 4 most significant bits, alpha in 4
+      // least significant bits.
+      DELIBERATE_FALLTHROUGH();
     case DXGI_FORMAT_IA44:
       // same as above but swapped MSB/LSB
       break;
@@ -451,6 +452,7 @@ bool IsDepthFormat(DXGI_FORMAT f)
 
     case DXGI_FORMAT_D32_FLOAT:
     case DXGI_FORMAT_D16_UNORM: return true;
+    default: break;
   }
 
   return false;
@@ -469,6 +471,7 @@ bool IsDepthAndStencilFormat(DXGI_FORMAT f)
     case DXGI_FORMAT_R24_UNORM_X8_TYPELESS:
     case DXGI_FORMAT_X24_TYPELESS_G8_UINT:
     case DXGI_FORMAT_R24G8_TYPELESS: return true;
+    default: break;
   }
 
   return false;
@@ -504,6 +507,7 @@ bool IsTypelessFormat(DXGI_FORMAT f)
     case DXGI_FORMAT_B8G8R8X8_TYPELESS:
     case DXGI_FORMAT_BC6H_TYPELESS:
     case DXGI_FORMAT_BC7_TYPELESS: return true;
+    default: break;
   }
 
   return false;
@@ -524,6 +528,7 @@ bool IsUIntFormat(DXGI_FORMAT f)
     case DXGI_FORMAT_R8G8_UINT:
     case DXGI_FORMAT_R16_UINT:
     case DXGI_FORMAT_R8_UINT: return true;
+    default: break;
   }
 
   return false;
@@ -543,6 +548,7 @@ bool IsIntFormat(DXGI_FORMAT f)
     case DXGI_FORMAT_R8G8_SINT:
     case DXGI_FORMAT_R16_SINT:
     case DXGI_FORMAT_R8_SINT: return true;
+    default: break;
   }
 
   return false;
@@ -647,10 +653,66 @@ DXGI_FORMAT GetDepthTypedFormat(DXGI_FORMAT f)
     case DXGI_FORMAT_X24_TYPELESS_G8_UINT: return DXGI_FORMAT_D24_UNORM_S8_UINT;
 
     case DXGI_FORMAT_R16_FLOAT:
+    case DXGI_FORMAT_R16_UNORM:
     case DXGI_FORMAT_R16_TYPELESS: return DXGI_FORMAT_D16_UNORM;
 
     default: break;
   }
+  return f;
+}
+
+DXGI_FORMAT GetDepthSRVFormat(DXGI_FORMAT f, UINT planeSlice)
+{
+  // The view format rules for planar depth/stencil formats are outlined here:
+  // https://microsoft.github.io/DirectX-Specs/d3d/PlanarDepthStencilDDISpec.html
+  if(planeSlice == 0)
+  {
+    switch(f)
+    {
+      // Depth only, 32 bit float depth
+      case DXGI_FORMAT_D32_FLOAT:
+      case DXGI_FORMAT_R32_FLOAT:
+      case DXGI_FORMAT_R32_TYPELESS: return DXGI_FORMAT_R32_FLOAT;
+
+      // Depth/stencil, 32 bit float depth
+      case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+      case DXGI_FORMAT_R32G8X24_TYPELESS:
+      case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS:
+      case DXGI_FORMAT_X32_TYPELESS_G8X24_UINT: return DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+
+      // Depth/stencil, 24 bit unorm depth
+      case DXGI_FORMAT_D24_UNORM_S8_UINT:
+      case DXGI_FORMAT_R24G8_TYPELESS:
+      case DXGI_FORMAT_R24_UNORM_X8_TYPELESS:
+      case DXGI_FORMAT_X24_TYPELESS_G8_UINT: return DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+
+      // Depth only, 16 bit unorm depth
+      case DXGI_FORMAT_D16_UNORM:
+      case DXGI_FORMAT_R16_UNORM: return DXGI_FORMAT_R16_UNORM;
+
+      default: break;
+    }
+  }
+  else if(planeSlice == 1)
+  {
+    switch(f)
+    {
+      // Depth/stencil, 8 bit uint stencil
+      case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+      case DXGI_FORMAT_R32G8X24_TYPELESS:
+      case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS:
+      case DXGI_FORMAT_X32_TYPELESS_G8X24_UINT: return DXGI_FORMAT_X32_TYPELESS_G8X24_UINT;
+
+      // Depth/stencil, 8 bit uint stencil
+      case DXGI_FORMAT_D24_UNORM_S8_UINT:
+      case DXGI_FORMAT_R24G8_TYPELESS:
+      case DXGI_FORMAT_R24_UNORM_X8_TYPELESS:
+      case DXGI_FORMAT_X24_TYPELESS_G8_UINT: return DXGI_FORMAT_X24_TYPELESS_G8_UINT;
+
+      default: break;
+    }
+  }
+
   return f;
 }
 
@@ -1022,6 +1084,8 @@ DXGI_FORMAT GetFloatTypedFormat(DXGI_FORMAT f)
     case DXGI_FORMAT_R8_UNORM:
     case DXGI_FORMAT_R8_UINT:
     case DXGI_FORMAT_R8_SNORM: return DXGI_FORMAT_R8_UNORM;
+
+    default: break;
   }
 
   return GetTypedFormat(f);
@@ -1047,8 +1111,7 @@ DXGI_FORMAT GetTypedFormat(DXGI_FORMAT f)
 
     case DXGI_FORMAT_R16G16_TYPELESS: return DXGI_FORMAT_R16G16_FLOAT;
 
-    case DXGI_FORMAT_R32_TYPELESS:
-      return DXGI_FORMAT_R32_FLOAT;
+    case DXGI_FORMAT_R32_TYPELESS: return DXGI_FORMAT_R32_FLOAT;
 
     // maybe not valid casts?
     case DXGI_FORMAT_R24G8_TYPELESS: return DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
@@ -1083,165 +1146,181 @@ DXGI_FORMAT GetTypedFormat(DXGI_FORMAT f)
   return f;
 }
 
-DXGI_FORMAT GetTypedFormat(DXGI_FORMAT f, CompType typeHint)
+DXGI_FORMAT GetTypedFormat(DXGI_FORMAT f, CompType typeCast)
 {
   switch(f)
   {
-    // these formats have multiple typed formats - use the hint to decide which to use
+      // these formats have multiple typed formats - use the hint to decide which to use
 
     case DXGI_FORMAT_R8_TYPELESS:
     {
-      if(typeHint == CompType::UInt)
+      if(typeCast == CompType::UInt)
         return DXGI_FORMAT_R8_UINT;
-      if(typeHint == CompType::SInt)
+      if(typeCast == CompType::SInt)
         return DXGI_FORMAT_R8_SINT;
-      if(typeHint == CompType::SNorm)
+      if(typeCast == CompType::SNorm)
         return DXGI_FORMAT_R8_SNORM;
       return DXGI_FORMAT_R8_UNORM;
     }
 
     case DXGI_FORMAT_R8G8_TYPELESS:
     {
-      if(typeHint == CompType::UInt)
+      if(typeCast == CompType::UInt)
         return DXGI_FORMAT_R8G8_UINT;
-      if(typeHint == CompType::SInt)
+      if(typeCast == CompType::SInt)
         return DXGI_FORMAT_R8G8_SINT;
-      if(typeHint == CompType::SNorm)
+      if(typeCast == CompType::SNorm)
         return DXGI_FORMAT_R8G8_SNORM;
       return DXGI_FORMAT_R8G8_UNORM;
     }
 
     case DXGI_FORMAT_R8G8B8A8_TYPELESS:
     {
-      if(typeHint == CompType::UInt)
+      if(typeCast == CompType::UInt)
         return DXGI_FORMAT_R8G8B8A8_UINT;
-      if(typeHint == CompType::SInt)
+      if(typeCast == CompType::SInt)
         return DXGI_FORMAT_R8G8B8A8_SINT;
-      if(typeHint == CompType::SNorm)
+      if(typeCast == CompType::SNorm)
         return DXGI_FORMAT_R8G8B8A8_SNORM;
+      if(typeCast == CompType::UNormSRGB)
+        return DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
       return DXGI_FORMAT_R8G8B8A8_UNORM;
     }
 
     case DXGI_FORMAT_R16_TYPELESS:
     {
-      if(typeHint == CompType::UInt)
+      if(typeCast == CompType::UInt)
         return DXGI_FORMAT_R16_UINT;
-      if(typeHint == CompType::SInt)
+      if(typeCast == CompType::SInt)
         return DXGI_FORMAT_R16_SINT;
-      if(typeHint == CompType::SNorm)
+      if(typeCast == CompType::SNorm)
         return DXGI_FORMAT_R16_SNORM;
-      if(typeHint == CompType::Float)
+      if(typeCast == CompType::Float)
         return DXGI_FORMAT_R16_FLOAT;
-      if(typeHint == CompType::Depth)
+      if(typeCast == CompType::Depth)
         return DXGI_FORMAT_D16_UNORM;
-      return DXGI_FORMAT_R16_UNORM;
+      if(typeCast == CompType::UNorm)
+        return DXGI_FORMAT_R16_UNORM;
+      return DXGI_FORMAT_R16_FLOAT;
     }
 
     case DXGI_FORMAT_R16G16_TYPELESS:
     {
-      if(typeHint == CompType::UInt)
+      if(typeCast == CompType::UInt)
         return DXGI_FORMAT_R16G16_UINT;
-      if(typeHint == CompType::SInt)
+      if(typeCast == CompType::SInt)
         return DXGI_FORMAT_R16G16_SINT;
-      if(typeHint == CompType::SNorm)
+      if(typeCast == CompType::SNorm)
         return DXGI_FORMAT_R16G16_SNORM;
-      if(typeHint == CompType::Float)
+      if(typeCast == CompType::Float)
         return DXGI_FORMAT_R16G16_FLOAT;
-      return DXGI_FORMAT_R16G16_UNORM;
+      if(typeCast == CompType::UNorm)
+        return DXGI_FORMAT_R16G16_UNORM;
+      return DXGI_FORMAT_R16G16_FLOAT;
     }
 
     case DXGI_FORMAT_R16G16B16A16_TYPELESS:
     {
-      if(typeHint == CompType::UInt)
+      if(typeCast == CompType::UInt)
         return DXGI_FORMAT_R16G16B16A16_UINT;
-      if(typeHint == CompType::SInt)
+      if(typeCast == CompType::SInt)
         return DXGI_FORMAT_R16G16B16A16_SINT;
-      if(typeHint == CompType::SNorm)
+      if(typeCast == CompType::SNorm)
         return DXGI_FORMAT_R16G16B16A16_SNORM;
-      if(typeHint == CompType::Float)
+      if(typeCast == CompType::Float)
         return DXGI_FORMAT_R16G16B16A16_FLOAT;
-      return DXGI_FORMAT_R16G16B16A16_UNORM;
+      if(typeCast == CompType::UNorm)
+        return DXGI_FORMAT_R16G16B16A16_UNORM;
+      return DXGI_FORMAT_R16G16B16A16_FLOAT;
     }
 
     case DXGI_FORMAT_R32_TYPELESS:
     {
-      if(typeHint == CompType::UInt)
+      if(typeCast == CompType::UInt)
         return DXGI_FORMAT_R32_UINT;
-      if(typeHint == CompType::SInt)
+      if(typeCast == CompType::SInt)
         return DXGI_FORMAT_R32_SINT;
-      if(typeHint == CompType::Depth)
+      if(typeCast == CompType::Depth)
         return DXGI_FORMAT_D32_FLOAT;
       return DXGI_FORMAT_R32_FLOAT;
     }
 
     case DXGI_FORMAT_R32G32_TYPELESS:
     {
-      if(typeHint == CompType::UInt)
+      if(typeCast == CompType::UInt)
         return DXGI_FORMAT_R32G32_UINT;
-      if(typeHint == CompType::SInt)
+      if(typeCast == CompType::SInt)
         return DXGI_FORMAT_R32G32_SINT;
       return DXGI_FORMAT_R32G32_FLOAT;
     }
 
     case DXGI_FORMAT_R32G32B32_TYPELESS:
     {
-      if(typeHint == CompType::UInt)
+      if(typeCast == CompType::UInt)
         return DXGI_FORMAT_R32G32B32_UINT;
-      if(typeHint == CompType::SInt)
+      if(typeCast == CompType::SInt)
         return DXGI_FORMAT_R32G32B32_SINT;
       return DXGI_FORMAT_R32G32B32_FLOAT;
     }
 
     case DXGI_FORMAT_R32G32B32A32_TYPELESS:
     {
-      if(typeHint == CompType::UInt)
+      if(typeCast == CompType::UInt)
         return DXGI_FORMAT_R32G32B32A32_UINT;
-      if(typeHint == CompType::SInt)
+      if(typeCast == CompType::SInt)
         return DXGI_FORMAT_R32G32B32A32_SINT;
       return DXGI_FORMAT_R32G32B32A32_FLOAT;
     }
 
     case DXGI_FORMAT_R32G8X24_TYPELESS:
     {
-      if(typeHint == CompType::UInt)
+      if(typeCast == CompType::UInt)
         return DXGI_FORMAT_X32_TYPELESS_G8X24_UINT;
-      if(typeHint == CompType::Depth)
+      if(typeCast == CompType::Depth)
         return DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
       return DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
     }
 
     case DXGI_FORMAT_R24G8_TYPELESS:
     {
-      if(typeHint == CompType::UInt)
+      if(typeCast == CompType::UInt)
         return DXGI_FORMAT_X24_TYPELESS_G8_UINT;
-      if(typeHint == CompType::Depth)
+      if(typeCast == CompType::Depth)
         return DXGI_FORMAT_D24_UNORM_S8_UINT;
       return DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
     }
 
     case DXGI_FORMAT_R10G10B10A2_TYPELESS:
     {
-      if(typeHint == CompType::UInt)
+      if(typeCast == CompType::UInt)
         return DXGI_FORMAT_R10G10B10A2_UINT;
       return DXGI_FORMAT_R10G10B10A2_UNORM;
     }
 
     case DXGI_FORMAT_BC4_TYPELESS:
-      return typeHint == CompType::SNorm ? DXGI_FORMAT_BC4_SNORM : DXGI_FORMAT_BC4_UNORM;
+      return typeCast == CompType::SNorm ? DXGI_FORMAT_BC4_SNORM : DXGI_FORMAT_BC4_UNORM;
 
     case DXGI_FORMAT_BC5_TYPELESS:
-      return typeHint == CompType::SNorm ? DXGI_FORMAT_BC5_SNORM : DXGI_FORMAT_BC5_UNORM;
+      return typeCast == CompType::SNorm ? DXGI_FORMAT_BC5_SNORM : DXGI_FORMAT_BC5_UNORM;
 
     case DXGI_FORMAT_BC6H_TYPELESS:
-      return typeHint == CompType::SNorm ? DXGI_FORMAT_BC6H_SF16 : DXGI_FORMAT_BC6H_UF16;
+      return typeCast == CompType::SNorm ? DXGI_FORMAT_BC6H_SF16 : DXGI_FORMAT_BC6H_UF16;
 
     // these formats have only one valid non-typeless format (ignoring SRGB)
-    case DXGI_FORMAT_B8G8R8A8_TYPELESS: return DXGI_FORMAT_B8G8R8A8_UNORM;
-    case DXGI_FORMAT_B8G8R8X8_TYPELESS: return DXGI_FORMAT_B8G8R8X8_UNORM;
-    case DXGI_FORMAT_BC1_TYPELESS: return DXGI_FORMAT_BC1_UNORM;
-    case DXGI_FORMAT_BC2_TYPELESS: return DXGI_FORMAT_BC2_UNORM;
-    case DXGI_FORMAT_BC3_TYPELESS: return DXGI_FORMAT_BC3_UNORM;
-    case DXGI_FORMAT_BC7_TYPELESS: return DXGI_FORMAT_BC7_UNORM;
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+      return typeCast == CompType::UNormSRGB ? DXGI_FORMAT_B8G8R8A8_UNORM_SRGB
+                                             : DXGI_FORMAT_B8G8R8A8_UNORM;
+    case DXGI_FORMAT_B8G8R8X8_TYPELESS:
+      return typeCast == CompType::UNormSRGB ? DXGI_FORMAT_B8G8R8X8_UNORM_SRGB
+                                             : DXGI_FORMAT_B8G8R8X8_UNORM;
+    case DXGI_FORMAT_BC1_TYPELESS:
+      return typeCast == CompType::UNormSRGB ? DXGI_FORMAT_BC1_UNORM_SRGB : DXGI_FORMAT_BC1_UNORM;
+    case DXGI_FORMAT_BC2_TYPELESS:
+      return typeCast == CompType::UNormSRGB ? DXGI_FORMAT_BC2_UNORM_SRGB : DXGI_FORMAT_BC2_UNORM;
+    case DXGI_FORMAT_BC3_TYPELESS:
+      return typeCast == CompType::UNormSRGB ? DXGI_FORMAT_BC3_UNORM_SRGB : DXGI_FORMAT_BC3_UNORM;
+    case DXGI_FORMAT_BC7_TYPELESS:
+      return typeCast == CompType::UNormSRGB ? DXGI_FORMAT_BC7_UNORM_SRGB : DXGI_FORMAT_BC7_UNORM;
 
     default: break;
   }
@@ -1304,8 +1383,7 @@ DXGI_FORMAT GetTypelessFormat(DXGI_FORMAT f)
     case DXGI_FORMAT_D32_FLOAT:    // maybe not valid cast?
     case DXGI_FORMAT_R32_FLOAT:
     case DXGI_FORMAT_R32_UINT:
-    case DXGI_FORMAT_R32_SINT:
-      return DXGI_FORMAT_R32_TYPELESS;
+    case DXGI_FORMAT_R32_SINT: return DXGI_FORMAT_R32_TYPELESS;
 
     // maybe not valid casts?
     case DXGI_FORMAT_R24G8_TYPELESS:
@@ -1396,7 +1474,8 @@ DXGI_FORMAT GetTypelessFormat(DXGI_FORMAT f)
     case DXGI_FORMAT_P208:
     case DXGI_FORMAT_V208:
     case DXGI_FORMAT_V408:
-    case DXGI_FORMAT_B4G4R4A4_UNORM: return f;
+    case DXGI_FORMAT_B4G4R4A4_UNORM:
+    case DXGI_FORMAT_A4B4G4R4_UNORM: return f;
 
     case DXGI_FORMAT_UNKNOWN: return DXGI_FORMAT_UNKNOWN;
 
@@ -1541,8 +1620,7 @@ D3D_PRIMITIVE_TOPOLOGY MakeD3DPrimitiveTopology(Topology Topo)
 {
   switch(Topo)
   {
-    case Topology::LineLoop:
-    case Topology::TriangleFan: RDCWARN("Unsupported primitive topology on D3D: %x", Topo); break;
+    case Topology::LineLoop: RDCWARN("Unsupported primitive topology on D3D: %x", Topo); break;
     default:
     case Topology::Unknown: return D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
     case Topology::PointList: return D3D_PRIMITIVE_TOPOLOGY_POINTLIST;
@@ -1550,6 +1628,7 @@ D3D_PRIMITIVE_TOPOLOGY MakeD3DPrimitiveTopology(Topology Topo)
     case Topology::LineStrip: return D3D_PRIMITIVE_TOPOLOGY_LINESTRIP;
     case Topology::TriangleList: return D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
     case Topology::TriangleStrip: return D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP;
+    case Topology::TriangleFan: return D3D_PRIMITIVE_TOPOLOGY_TRIANGLEFAN;
     case Topology::LineList_Adj: return D3D_PRIMITIVE_TOPOLOGY_LINELIST_ADJ;
     case Topology::LineStrip_Adj: return D3D_PRIMITIVE_TOPOLOGY_LINESTRIP_ADJ;
     case Topology::TriangleList_Adj: return D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST_ADJ;
@@ -1595,10 +1674,26 @@ D3D_PRIMITIVE_TOPOLOGY MakeD3DPrimitiveTopology(Topology Topo)
 
 void WarnUnknownGUID(const char *name, REFIID riid)
 {
+  // unknown/undocumented internal interface
+  // {7abb6563-02bc-47c4-8ef9-acc4795edbcf}
+  static const GUID IDXGIAdapterInternal2_uuid = {
+      0x7abb6563, 0x02bc, 0x47c4, {0x8e, 0xf9, 0xac, 0xc4, 0x79, 0x5e, 0xdb, 0xcf}};
+
+  if(riid == IDXGIAdapterInternal2_uuid)
+  {
+    static bool printed = false;
+    if(!printed)
+    {
+      printed = true;
+      RDCWARN("Querying %s for unsupported/undocumented interface: IDXGIAdapterInternal2", name);
+    }
+    return;
+  }
+
   static Threading::CriticalSection lock;
   // we use a vector here, because the number of *distinct* unknown GUIDs encountered is likely to
   // be low (e.g. less than 10).
-  static std::vector<rdcpair<IID, int> > warned;
+  static rdcarray<rdcpair<IID, int> > warned;
 
   {
     SCOPED_LOCK(lock);
@@ -1611,17 +1706,99 @@ void WarnUnknownGUID(const char *name, REFIID riid)
         if(w.second > 5)
           return;
 
-        RDCWARN("Querying %s for interface: %s", name, ToStr(riid).c_str());
+        RDCWARN("Querying %s for unknown/unhandled interface: %s", name, ToStr(riid).c_str());
         return;
       }
     }
 
-    RDCWARN("Querying %s for interface: %s", name, ToStr(riid).c_str());
+    RDCWARN("Querying %s for unknown/unhandled interface: %s", name, ToStr(riid).c_str());
     warned.push_back(make_rdcpair(riid, 1));
   }
 }
 
-static std::string GetDeviceProperty(HDEVINFO devs, PSP_DEVINFO_DATA data, const DEVPROPKEY *key)
+HRESULT STDMETHODCALLTYPE EmbeddedD3DIncluder::Open(D3D_INCLUDE_TYPE IncludeType, LPCSTR pFileName,
+                                                    LPCVOID pParentData, LPCVOID *ppData,
+                                                    UINT *pBytes)
+{
+  const rdcstr *str = NULL;
+
+  rdcstr filename = pFileName;
+
+  for(const rdcpair<rdcstr, rdcstr> &f : m_FixedFiles)
+  {
+    if(filename == f.first)
+    {
+      str = &f.second;
+      break;
+    }
+  }
+
+  auto readFile = [this](rdcstr filename) {
+    rdcstr *filestr = new rdcstr;
+    FileIO::ReadAll(filename, *filestr);
+    m_FileStrings.push_back(filestr);
+
+    // this will be used to look up by pParentData later
+    m_StringPaths[filestr->c_str()] = get_dirname(filename);
+
+    return filestr;
+  };
+
+  // if it's an absolute path that exists, read it
+  if(!str && !FileIO::IsRelativePath(filename) && FileIO::exists(filename))
+  {
+    str = readFile(filename);
+  }
+
+  // if it's relative and we have a parent, check relative to the parent's file
+  if(!str && IncludeType == D3D_INCLUDE_LOCAL && pParentData)
+  {
+    auto it = m_StringPaths.find(pParentData);
+    if(it != m_StringPaths.end())
+    {
+      rdcstr base = it->second;
+      filename = base + "/" + filename;
+
+      if(FileIO::exists(filename))
+        str = readFile(filename);
+
+      // don't need to handle the else here, it becomes E_FAIL below which the compiler then throws
+      // an error for
+    }
+    else
+    {
+      RDCERR("Unrecognised parent file when opening %s", filename.c_str());
+    }
+  }
+
+  // if it's a system include, check relative to the include dirs
+  if(IncludeType == D3D_INCLUDE_SYSTEM && !m_IncludeDirs.empty())
+  {
+    rdcstr fn = filename;
+    for(rdcstr base : m_IncludeDirs)
+    {
+      filename = base + "/" + fn;
+
+      if(FileIO::exists(filename))
+      {
+        str = readFile(filename);
+        break;
+      }
+    }
+  }
+
+  if(!str)
+    return E_FAIL;
+
+  if(ppData)
+    *ppData = str->c_str();
+  if(pBytes)
+    *pBytes = (uint32_t)str->size();
+
+  return S_OK;
+}
+
+static rdcstr GetDeviceProperty(HDEVINFO devs, PSP_DEVINFO_DATA data, const DEVPROPKEY *key)
 {
   DEVPROPTYPE type = {};
   DWORD bufSize = 0;
@@ -1634,8 +1811,7 @@ static std::string GetDeviceProperty(HDEVINFO devs, PSP_DEVINFO_DATA data, const
 
   RDCASSERTEQUAL((uint32_t)type, DEVPROP_TYPE_STRING);
 
-  std::wstring string;
-  string.resize(bufSize);
+  rdcwstr string(bufSize);
   BOOL success =
       SetupDiGetDevicePropertyW(devs, data, key, &type, (PBYTE)string.data(), bufSize, &bufSize, 0);
 
@@ -1657,9 +1833,9 @@ static uint32_t HexToInt(char hex)
   return 0;
 }
 
-std::string GetDriverVersion(DXGI_ADAPTER_DESC &desc)
+rdcstr GetDriverVersion(DXGI_ADAPTER_DESC &desc)
 {
-  std::string device = StringFormat::Wide2UTF8(desc.Description);
+  rdcstr device = StringFormat::Wide2UTF8(rdcwstr(desc.Description));
 
   // fixed GUID for graphics drivers, from
   // https://msdn.microsoft.com/en-us/library/windows/hardware/ff553426%28v=vs.85%29.aspx
@@ -1673,14 +1849,14 @@ std::string GetDriverVersion(DXGI_ADAPTER_DESC &desc)
     return device;
   }
 
-  std::string driverVersion = "";
+  rdcstr driverVersion = "";
 
   DWORD idx = 0;
   SP_DEVINFO_DATA data = {};
   data.cbSize = sizeof(data);
   while(SetupDiEnumDeviceInfo(devs, idx, &data))
   {
-    std::string version = GetDeviceProperty(devs, &data, &DEVPKEY_Device_DriverVersion);
+    rdcstr version = GetDeviceProperty(devs, &data, &DEVPKEY_Device_DriverVersion);
 
     if(version.empty())
     {
@@ -1692,7 +1868,7 @@ std::string GetDriverVersion(DXGI_ADAPTER_DESC &desc)
     if(driverVersion.empty())
       driverVersion = version;
 
-    std::string pciid = GetDeviceProperty(devs, &data, &DEVPKEY_Device_MatchingDeviceId);
+    rdcstr pciid = GetDeviceProperty(devs, &data, &DEVPKEY_Device_MatchingDeviceId);
 
     if(pciid.empty())
     {
@@ -1736,6 +1912,188 @@ std::string GetDriverVersion(DXGI_ADAPTER_DESC &desc)
   return device + " " + driverVersion;
 }
 
+IDXGIAdapter *EnumBestAdapter(IDXGIFactory *factory, GPUVendor vendor, uint32_t deviceId)
+{
+  IDXGIAdapter *ret = NULL;
+  DXGI_ADAPTER_DESC retDesc = {};
+
+  for(UINT i = 0; i < 10; i++)
+  {
+    IDXGIAdapter *ad = NULL;
+    HRESULT hr = factory->EnumAdapters(i, &ad);
+    if(hr == S_OK && ad)
+    {
+      DXGI_ADAPTER_DESC desc;
+      ad->GetDesc(&desc);
+
+      // if it's a better vendor match than the adapter we have, choose it
+      GPUVendor adVendor = GPUVendorFromPCIVendor(desc.VendorId);
+      if(adVendor == vendor && GPUVendorFromPCIVendor(retDesc.VendorId) != vendor)
+      {
+        ret = ad;
+        retDesc = desc;
+        continue;
+      }
+      else if(adVendor != vendor)
+      {
+        ad->Release();
+        continue;
+      }
+
+      // if they're the same vendor but this is a better device match, choose it
+      if(desc.DeviceId == deviceId && retDesc.DeviceId != deviceId)
+      {
+        ret = ad;
+        retDesc = desc;
+        continue;
+      }
+
+      ad->Release();
+    }
+    else
+    {
+      break;
+    }
+  }
+
+  return ret;
+}
+
+void ChooseBestMatchingAdapter(GraphicsAPI api, IDXGIFactory *factory,
+                               const DXGI_ADAPTER_DESC &AdapterDesc, const ReplayOptions &opts,
+                               bool *useWarp, IDXGIAdapter **adapter)
+{
+  bool retWarp = false;
+  IDXGIAdapter *ret = NULL;
+
+  bool warpAvailable = false;
+  IDXGIAdapter *warpAdapter = NULL;
+
+  if(api == GraphicsAPI::D3D11)
+  {
+    // D3D11 WARP is always available, we assume.
+    warpAvailable = true;
+  }
+  else
+  {
+    // on D3D12 we don't have WARP when we're on 12On7. The easy way to check this is to try and
+    // fetch a IDXGIFactory4, which we want to do anyway to get the warp adapter.
+    IDXGIFactory4 *factory4 = NULL;
+    HRESULT hr = factory->QueryInterface(__uuidof(IDXGIFactory4), (void **)&factory4);
+    if(SUCCEEDED(hr) && factory4)
+    {
+      hr = factory4->EnumWarpAdapter(__uuidof(IDXGIAdapter), (void **)&warpAdapter);
+
+      if(FAILED(hr) || !warpAdapter)
+      {
+        RDCWARN("Couldn't enumerate WARP adapter from IDXGIFactory4");
+      }
+    }
+
+    warpAvailable = warpAdapter != NULL;
+
+    SAFE_RELEASE(factory4);
+  }
+
+  // if we're forcing WARP, try that first
+  if(opts.forceGPUVendor == GPUVendor::Software)
+  {
+    if(warpAvailable)
+    {
+      if(useWarp)
+        *useWarp = true;
+      if(adapter)
+        *adapter = warpAdapter;
+      return;
+    }
+    else
+    {
+      RDCWARN("WARP is not available to replay on. Falling back to default adapter selection.");
+    }
+  }
+  else if(opts.forceGPUVendor != GPUVendor::Unknown)
+  {
+    // otherwise we're trying to force a device, see if we can get it
+    ret = EnumBestAdapter(factory, opts.forceGPUVendor, opts.forceGPUDeviceID);
+
+    if(ret == NULL)
+    {
+      RDCLOG(
+          "Couldn't find specified adapter to replay on, falling back to default adapter "
+          "selection");
+    }
+    else
+    {
+      DXGI_ADAPTER_DESC retDesc = {};
+      ret->GetDesc(&retDesc);
+      RDCLOG("Forcing use of %s / %ls adapter for replay",
+             ToStr(GPUVendorFromPCIVendor(retDesc.VendorId)).c_str(), retDesc.Description);
+
+      if(useWarp)
+        *useWarp = false;
+      if(adapter)
+        *adapter = ret;
+      return;
+    }
+  }
+
+  // default selection algorithm
+
+  GPUVendor vendor = GPUVendorFromPCIVendor(AdapterDesc.VendorId);
+
+  // D3D11 WARP doesn't provide a VendorId, need to look for the name
+  if(!wcscmp(AdapterDesc.Description, L"Software Adapter"))
+    vendor = GPUVendor::Software;
+
+  // if we're forcing WARP, try that first we should try to use WARP
+  if(vendor == GPUVendor::Software)
+  {
+    if(warpAvailable)
+    {
+      ret = warpAdapter;
+      warpAdapter = NULL;
+      retWarp = true;
+    }
+    else
+    {
+      RDCWARN(
+          "WARP would be the selected adapter, but is not available. Falling back to default "
+          "adapter selection.");
+
+      retWarp = false;
+      ret = NULL;
+    }
+  }
+
+  // we're not using WARP, don't have an adapter yet, and have something to search on (old captures
+  // have nothing to match against so we just return the default NULL). Try to find the closest
+  // matching adapter
+  if(retWarp == false && ret == NULL && AdapterDesc.Description[0])
+  {
+    ret =
+        EnumBestAdapter(factory, GPUVendorFromPCIVendor(AdapterDesc.VendorId), AdapterDesc.DeviceId);
+
+    if(ret == NULL)
+    {
+      RDCLOG("Couldn't find similar adapter to replay on, using default adapter");
+    }
+    else
+    {
+      DXGI_ADAPTER_DESC retDesc = {};
+      ret->GetDesc(&retDesc);
+      RDCLOG("Selected %s / %ls adapter for replay",
+             ToStr(GPUVendorFromPCIVendor(retDesc.VendorId)).c_str(), retDesc.Description);
+    }
+  }
+
+  SAFE_RELEASE(warpAdapter);
+
+  if(useWarp)
+    *useWarp = retWarp;
+  if(adapter)
+    *adapter = ret;
+}
+
 Topology MakePrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY Topo)
 {
   switch(Topo)
@@ -1747,6 +2105,7 @@ Topology MakePrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY Topo)
     case D3D_PRIMITIVE_TOPOLOGY_LINESTRIP: return Topology::LineStrip;
     case D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST: return Topology::TriangleList;
     case D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP: return Topology::TriangleStrip;
+    case D3D_PRIMITIVE_TOPOLOGY_TRIANGLEFAN: return Topology::TriangleFan;
     case D3D_PRIMITIVE_TOPOLOGY_LINELIST_ADJ: return Topology::LineList_Adj;
     case D3D_PRIMITIVE_TOPOLOGY_LINESTRIP_ADJ: return Topology::LineStrip_Adj;
     case D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST_ADJ: return Topology::TriangleList_Adj;
@@ -1805,6 +2164,9 @@ DXGI_FORMAT MakeDXGIFormat(ResourceFormat fmt)
       case ResourceFormatType::BC6: ret = DXGI_FORMAT_BC6H_UF16; break;
       case ResourceFormatType::BC7: ret = DXGI_FORMAT_BC7_UNORM; break;
       case ResourceFormatType::R10G10B10A2:
+        // only support rgba order
+        if(fmt.BGRAOrder())
+          return DXGI_FORMAT_UNKNOWN;
         if(fmt.compType == CompType::UNorm)
           ret = DXGI_FORMAT_R10G10B10A2_UNORM;
         else if(fmt.compType == CompType::Float)
@@ -1827,10 +2189,10 @@ DXGI_FORMAT MakeDXGIFormat(ResourceFormat fmt)
         break;
       case ResourceFormatType::R9G9B9E5: ret = DXGI_FORMAT_R9G9B9E5_SHAREDEXP; break;
       case ResourceFormatType::R4G4B4A4:
-        // only support bgra order
-        if(!fmt.BGRAOrder())
-          return DXGI_FORMAT_UNKNOWN;
-        ret = DXGI_FORMAT_B4G4R4A4_UNORM;
+        if(fmt.BGRAOrder())
+          ret = DXGI_FORMAT_B4G4R4A4_UNORM;
+        else
+          ret = DXGI_FORMAT_A4B4G4R4_UNORM;
         break;
       case ResourceFormatType::D24S8: ret = DXGI_FORMAT_R24G8_TYPELESS; break;
       case ResourceFormatType::D32S8: ret = DXGI_FORMAT_R32G8X24_TYPELESS; break;
@@ -1961,14 +2323,28 @@ DXGI_FORMAT MakeDXGIFormat(ResourceFormat fmt)
     else
       return DXGI_FORMAT_UNKNOWN;
 
+    // only support 8-bit UNORM for BGRA order
     if(fmt.BGRAOrder())
-      ret = DXGI_FORMAT_B8G8R8A8_UNORM;
+    {
+      if(fmt.compByteWidth == 1 && fmt.compType == CompType::UNorm)
+        return DXGI_FORMAT_B8G8R8A8_UNORM;
+      else if(fmt.compByteWidth == 1 && fmt.compType == CompType::UNormSRGB)
+        return DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+      else if(fmt.compByteWidth == 1 && fmt.compType == CompType::Typeless)
+        return DXGI_FORMAT_B8G8R8A8_TYPELESS;
+      else
+        return DXGI_FORMAT_UNKNOWN;
+    }
   }
   else if(fmt.compCount == 3)
   {
     if(fmt.compByteWidth == 4)
       ret = DXGI_FORMAT_R32G32B32_TYPELESS;
     else
+      return DXGI_FORMAT_UNKNOWN;
+
+    // only support RGBA order
+    if(fmt.BGRAOrder())
       return DXGI_FORMAT_UNKNOWN;
   }
   else if(fmt.compCount == 2)
@@ -1981,6 +2357,10 @@ DXGI_FORMAT MakeDXGIFormat(ResourceFormat fmt)
       ret = DXGI_FORMAT_R8G8_TYPELESS;
     else
       return DXGI_FORMAT_UNKNOWN;
+
+    // only support RGBA order
+    if(fmt.BGRAOrder())
+      return DXGI_FORMAT_UNKNOWN;
   }
   else if(fmt.compCount == 1)
   {
@@ -1991,6 +2371,10 @@ DXGI_FORMAT MakeDXGIFormat(ResourceFormat fmt)
     else if(fmt.compByteWidth == 1)
       ret = DXGI_FORMAT_R8_TYPELESS;
     else
+      return DXGI_FORMAT_UNKNOWN;
+
+    // only support RGBA order
+    if(fmt.BGRAOrder())
       return DXGI_FORMAT_UNKNOWN;
   }
   else
@@ -2064,7 +2448,8 @@ ResourceFormat MakeResourceFormat(DXGI_FORMAT fmt)
     case DXGI_FORMAT_R8G8B8A8_UINT:
     case DXGI_FORMAT_R8G8B8A8_SNORM:
     case DXGI_FORMAT_R8G8B8A8_SINT:
-    case DXGI_FORMAT_B4G4R4A4_UNORM: ret.compCount = 4; break;
+    case DXGI_FORMAT_B4G4R4A4_UNORM:
+    case DXGI_FORMAT_A4B4G4R4_UNORM: ret.compCount = 4; break;
     case DXGI_FORMAT_R32G32B32_TYPELESS:
     case DXGI_FORMAT_R32G32B32_FLOAT:
     case DXGI_FORMAT_R32G32B32_UINT:
@@ -2177,6 +2562,8 @@ ResourceFormat MakeResourceFormat(DXGI_FORMAT fmt)
     case DXGI_FORMAT_A8P8: ret.compCount = 2; break;
 
     case DXGI_FORMAT_UNKNOWN:
+    case DXGI_FORMAT_SAMPLER_FEEDBACK_MIN_MIP_OPAQUE:
+    case DXGI_FORMAT_SAMPLER_FEEDBACK_MIP_REGION_USED_OPAQUE:
     case DXGI_FORMAT_FORCE_UINT: ret.compCount = 0; break;
   }
 
@@ -2237,6 +2624,7 @@ ResourceFormat MakeResourceFormat(DXGI_FORMAT fmt)
     case DXGI_FORMAT_A8_UNORM: ret.compByteWidth = 1; break;
 
     case DXGI_FORMAT_B8G8R8A8_UNORM:
+    case DXGI_FORMAT_B8G8R8X8_UNORM:
     case DXGI_FORMAT_B8G8R8A8_TYPELESS:
     case DXGI_FORMAT_B8G8R8X8_TYPELESS:
     case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
@@ -2333,6 +2721,7 @@ ResourceFormat MakeResourceFormat(DXGI_FORMAT fmt)
     case DXGI_FORMAT_R8G8_B8G8_UNORM:
     case DXGI_FORMAT_G8R8_G8B8_UNORM:
     case DXGI_FORMAT_B4G4R4A4_UNORM:
+    case DXGI_FORMAT_A4B4G4R4_UNORM:
     case DXGI_FORMAT_B5G6R5_UNORM:
     case DXGI_FORMAT_B5G5R5A1_UNORM:
     case DXGI_FORMAT_B8G8R8A8_UNORM:
@@ -2354,6 +2743,8 @@ ResourceFormat MakeResourceFormat(DXGI_FORMAT fmt)
     case DXGI_FORMAT_BC7_UNORM_SRGB: ret.compType = CompType::UNormSRGB; break;
 
     case DXGI_FORMAT_UNKNOWN:
+    case DXGI_FORMAT_SAMPLER_FEEDBACK_MIN_MIP_OPAQUE:
+    case DXGI_FORMAT_SAMPLER_FEEDBACK_MIP_REGION_USED_OPAQUE:
     case DXGI_FORMAT_FORCE_UINT: ret.compType = CompType::Typeless; break;
 
     case DXGI_FORMAT_AYUV:
@@ -2501,6 +2892,7 @@ ResourceFormat MakeResourceFormat(DXGI_FORMAT fmt)
         case DXGI_FORMAT_P010:
         case DXGI_FORMAT_P016:
         case DXGI_FORMAT_P208: ret.SetYUVPlaneCount(2);
+        default: break;
       }
 
       break;
@@ -2518,9 +2910,7 @@ ResourceFormat MakeResourceFormat(DXGI_FORMAT fmt)
       break;
 
     case DXGI_FORMAT_B4G4R4A4_UNORM:
-      ret.type = ResourceFormatType::R4G4B4A4;
-      ret.SetBGRAOrder(true);
-      break;
+    case DXGI_FORMAT_A4B4G4R4_UNORM: ret.type = ResourceFormatType::R4G4B4A4; break;
 
     case DXGI_FORMAT_UNKNOWN: ret.type = ResourceFormatType::Undefined; break;
 
@@ -2535,10 +2925,10 @@ template <class SerialiserType>
 void DoSerialise(SerialiserType &ser, RECT &el)
 {
   // avoid serialising 'long' directly as we pretend it's only used for HRESULT
-  SERIALISE_MEMBER_TYPED(int32_t, left);
-  SERIALISE_MEMBER_TYPED(int32_t, top);
-  SERIALISE_MEMBER_TYPED(int32_t, right);
-  SERIALISE_MEMBER_TYPED(int32_t, bottom);
+  SERIALISE_MEMBER_TYPED(int32_t, left).Important();
+  SERIALISE_MEMBER_TYPED(int32_t, top).Important();
+  SERIALISE_MEMBER_TYPED(int32_t, right).Important();
+  SERIALISE_MEMBER_TYPED(int32_t, bottom).Important();
 }
 
 INSTANTIATE_SERIALISE_TYPE(RECT);
@@ -2563,25 +2953,85 @@ void DoSerialise(SerialiserType &ser, DXGI_SAMPLE_DESC &el)
 
 INSTANTIATE_SERIALISE_TYPE(DXGI_SAMPLE_DESC);
 
+template <class SerialiserType>
+void DoSerialise(SerialiserType &ser, LUID &el)
+{
+  RDCCOMPILE_ASSERT(sizeof(uint32_t) == sizeof(el.LowPart), "LowPart is unexpected size");
+  RDCCOMPILE_ASSERT(sizeof(int32_t) == sizeof(el.HighPart), "HighPart is unexpected size");
+
+  SERIALISE_MEMBER_TYPED(uint32_t, LowPart);
+  SERIALISE_MEMBER_TYPED(int32_t, HighPart);
+}
+
+template <class SerialiserType>
+void DoSerialise(SerialiserType &ser, DXGI_ADAPTER_DESC &el)
+{
+  // serialise the string as UTF-8
+  {
+    rdcstr Description = StringFormat::Wide2UTF8(el.Description);
+
+    ser.Serialise("Description"_lit, Description);
+
+    if(ser.IsReading())
+    {
+      rdcwstr wdesc = StringFormat::UTF82Wide(Description);
+      RDCEraseEl(el.Description);
+      memcpy(el.Description, wdesc.c_str(),
+             RDCMIN(wdesc.length(), ARRAY_COUNT(el.Description) - 1) * sizeof(WCHAR));
+    }
+  }
+
+  SERIALISE_MEMBER(VendorId);
+  SERIALISE_MEMBER(DeviceId);
+  SERIALISE_MEMBER(SubSysId);
+  SERIALISE_MEMBER(Revision);
+
+  // don't serialise SIZE_T, cast to uint64_t
+  {
+    uint64_t DedicatedVideoMemory = el.DedicatedVideoMemory;
+    uint64_t DedicatedSystemMemory = el.DedicatedSystemMemory;
+    uint64_t SharedSystemMemory = el.SharedSystemMemory;
+
+    ser.Serialise("DedicatedVideoMemory"_lit, DedicatedVideoMemory);
+    ser.Serialise("DedicatedSystemMemory"_lit, DedicatedSystemMemory);
+    ser.Serialise("SharedSystemMemory"_lit, SharedSystemMemory);
+
+    if(ser.IsReading())
+    {
+      el.DedicatedVideoMemory = (SIZE_T)DedicatedVideoMemory;
+      el.DedicatedSystemMemory = (SIZE_T)DedicatedSystemMemory;
+      el.SharedSystemMemory = (SIZE_T)SharedSystemMemory;
+    }
+  }
+
+  SERIALISE_MEMBER(AdapterLuid);
+}
+
+INSTANTIATE_SERIALISE_TYPE(DXGI_ADAPTER_DESC);
+
 #if ENABLED(ENABLE_UNIT_TESTS)
-#include "3rdparty/catch/catch.hpp"
+#include "catch/catch.hpp"
 
 TEST_CASE("DXGI formats", "[format][d3d]")
 {
   // must be updated by hand
-  DXGI_FORMAT maxFormat = DXGI_FORMAT_V408;
+  DXGI_FORMAT maxFormat = DXGI_FORMAT_A4B4G4R4_UNORM;
 
   // we want to skip formats that we deliberately don't represent or handle.
   auto isUnsupportedFormat = [](DXGI_FORMAT f) {
-    // gap in DXGI_FORMAT enum
+    // gaps in DXGI_FORMAT enum
     if(f > DXGI_FORMAT_B4G4R4A4_UNORM && f < DXGI_FORMAT_P208)
+      return true;
+    if(f > DXGI_FORMAT_V408 && f < DXGI_FORMAT_SAMPLER_FEEDBACK_MIN_MIP_OPAQUE)
       return true;
     return (f == DXGI_FORMAT_R1_UNORM || f == DXGI_FORMAT_R8G8_B8G8_UNORM ||
             f == DXGI_FORMAT_G8R8_G8B8_UNORM || f == DXGI_FORMAT_B8G8R8X8_TYPELESS ||
             f == DXGI_FORMAT_B8G8R8X8_UNORM || f == DXGI_FORMAT_B8G8R8X8_UNORM_SRGB ||
             f == DXGI_FORMAT_NV11 || f == DXGI_FORMAT_AI44 || f == DXGI_FORMAT_IA44 ||
             f == DXGI_FORMAT_P8 || f == DXGI_FORMAT_A8P8 || f == DXGI_FORMAT_P208 ||
-            f == DXGI_FORMAT_V208 || f == DXGI_FORMAT_V408 || f == DXGI_FORMAT_420_OPAQUE);
+            f == DXGI_FORMAT_V208 || f == DXGI_FORMAT_V408 || f == DXGI_FORMAT_420_OPAQUE ||
+            f == DXGI_FORMAT_SAMPLER_FEEDBACK_MIN_MIP_OPAQUE ||
+            f == DXGI_FORMAT_SAMPLER_FEEDBACK_MIP_REGION_USED_OPAQUE);
   };
 
   SECTION("Only DXGI_FORMAT_UNKNOWN is ResourceFormatType::Undefined")
@@ -2727,10 +3177,10 @@ TEST_CASE("DXGI formats", "[format][d3d]")
       {
         // this format has special handling, so we skip it from the below Typeless/Typed check
 
-        CompType typeHint = fmt.compType;
+        CompType typeCast = fmt.compType;
 
         DXGI_FORMAT typeless = GetTypelessFormat(f);
-        DXGI_FORMAT typed = GetTypedFormat(typeless, typeHint);
+        DXGI_FORMAT typed = GetTypedFormat(typeless, typeCast);
 
         CHECK(typed == DXGI_FORMAT_R10G10B10A2_UNORM);
 
@@ -2739,11 +3189,11 @@ TEST_CASE("DXGI formats", "[format][d3d]")
 
       if(!IsTypelessFormat(f))
       {
-        CompType typeHint = fmt.compType;
+        CompType typeCast = fmt.compType;
 
         DXGI_FORMAT original = f;
         DXGI_FORMAT typeless = GetTypelessFormat(f);
-        DXGI_FORMAT typed = GetTypedFormat(typeless, typeHint);
+        DXGI_FORMAT typed = GetTypedFormat(typeless, typeCast);
 
         if(fmt.SRGBCorrected())
           typed = GetSRGBFormat(typed);
@@ -2844,8 +3294,16 @@ TEST_CASE("DXGI formats", "[format][d3d]")
 
     int i = 0;
     for(DXGI_FORMAT f : {
-            DXGI_FORMAT_AYUV, DXGI_FORMAT_Y410, DXGI_FORMAT_Y416, DXGI_FORMAT_NV12, DXGI_FORMAT_P010,
-            DXGI_FORMAT_P016, DXGI_FORMAT_YUY2, DXGI_FORMAT_Y210, DXGI_FORMAT_Y216, DXGI_FORMAT_P208,
+            DXGI_FORMAT_AYUV,
+            DXGI_FORMAT_Y410,
+            DXGI_FORMAT_Y416,
+            DXGI_FORMAT_NV12,
+            DXGI_FORMAT_P010,
+            DXGI_FORMAT_P016,
+            DXGI_FORMAT_YUY2,
+            DXGI_FORMAT_Y210,
+            DXGI_FORMAT_Y216,
+            DXGI_FORMAT_P208,
         })
     {
       if(isUnsupportedFormat(f))

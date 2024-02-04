@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2016-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -23,6 +23,8 @@
  ******************************************************************************/
 
 #include <unistd.h>
+#include "common/common.h"
+#include "common/formatting.h"
 #include "os/os_specific.h"
 #include "strings/string_utils.h"
 
@@ -37,7 +39,7 @@ int GetIdentPort(pid_t childPid)
 {
   int ret = 0;
 
-  std::string procfile = StringFormat::Fmt("/proc/%d/net/unix", (int)childPid);
+  rdcstr procfile = StringFormat::Fmt("/proc/%d/net/unix", (int)childPid);
 
   // try for a little while for the /proc entry to appear
   for(int retry = 0; retry < 10; retry++)
@@ -45,7 +47,7 @@ int GetIdentPort(pid_t childPid)
     // back-off for each retry
     usleep(1000 + 500 * retry);
 
-    FILE *f = FileIO::fopen(procfile.c_str(), "r");
+    FILE *f = FileIO::fopen(procfile, FileIO::ReadText);
 
     if(f == NULL)
     {
@@ -96,6 +98,19 @@ int GetIdentPort(pid_t childPid)
   return ret;
 }
 
+void StopAtMainInChild()
+{
+}
+
+bool StopChildAtMain(pid_t childPid, bool *exitWithNoExec)
+{
+  return false;
+}
+
+void ResumeProcess(pid_t childPid, uint32_t delay)
+{
+}
+
 // because OSUtility::DebuggerPresent is called often we want it to be
 // cheap. Opening and parsing a file would cause high overhead on each
 // call, so instead we just cache it at startup. This fails in the case
@@ -104,7 +119,7 @@ bool debuggerPresent = false;
 
 void CacheDebuggerPresent()
 {
-  FILE *f = FileIO::fopen("/proc/self/status", "r");
+  FILE *f = FileIO::fopen("/proc/self/status", FileIO::ReadText);
   int ret = 0;
 
   if(f == NULL)
@@ -140,27 +155,27 @@ bool OSUtility::DebuggerPresent()
   return debuggerPresent;
 }
 
-const char *Process::GetEnvVariable(const char *name)
+rdcstr Process::GetEnvVariable(const rdcstr &name)
 {
   // we fake environment variables with properties
   Process::ProcessResult result;
   Process::LaunchProcess("getprop", ".",
-                         StringFormat::Fmt("debug.rdoc.%s variable_is_not_set", name).c_str(), true,
+                         StringFormat::Fmt("debug.rdoc.%s variable_is_not_set", name.c_str()), true,
                          &result);
 
-  static std::string settingsOutput;
+  rdcstr settingsOutput;
 
-  settingsOutput = trim(result.strStdout);
+  settingsOutput = result.strStdout.trimmed();
 
   if(settingsOutput == "variable_is_not_set")
-    return NULL;
+    return rdcstr();
 
-  return settingsOutput.c_str();
+  return settingsOutput;
 }
 
 uint64_t Process::GetMemoryUsage()
 {
-  FILE *f = FileIO::fopen("/proc/self/statm", "r");
+  FILE *f = FileIO::fopen("/proc/self/statm", FileIO::ReadText);
 
   if(f == NULL)
   {
@@ -170,6 +185,8 @@ uint64_t Process::GetMemoryUsage()
 
   char line[512] = {};
   fgets(line, 511, f);
+
+  FileIO::fclose(f);
 
   uint32_t vmPages = 0;
   int num = sscanf(line, "%u", &vmPages);

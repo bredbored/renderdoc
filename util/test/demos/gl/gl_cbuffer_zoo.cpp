@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -24,7 +24,7 @@
 
 #include "gl_test.h"
 
-TEST(GL_CBuffer_Zoo, OpenGLGraphicsTest)
+RD_TEST(GL_CBuffer_Zoo, OpenGLGraphicsTest)
 {
   static constexpr const char *Description =
       "Tests every kind of constant that can be in a cbuffer to make sure it's decoded "
@@ -56,7 +56,7 @@ void main()
 	vertOut.pos = vec4(Position.xyz, 1);
 	gl_Position = vertOut.pos;
 	vertOut.col = Color;
-	vertOut.uv = vec4(UV.xy, 0, 1);
+	vertOut.uv = vec4(UV.xy, 1e-12f, 1);
 }
 
 )EOSHADER";
@@ -70,6 +70,25 @@ layout(location = 0, index = 0) out vec4 Color;
 struct vec3_1 { vec3 a; float b; };
 
 struct nested { vec3_1 a; vec4 b[4]; vec3_1 c[4]; };
+
+struct float2_struct { float x; float y; };
+
+struct nested_with_padding
+{
+  float a;                              // 0, <1, 2, 3>
+  vec4 b;                               // {4, 5, 6, 7}
+  float c;                              // 8, <9, 10, 11>
+  vec3 d[4];                            // [0]: {12, 13, 14}, <15>
+                                        // [1]: {16, 17, 18}, <19>
+                                        // [2]: {20, 21, 22}, <23>
+                                        // [3]: {24, 25, 26}, <27>
+};
+
+struct misaligned_struct
+{
+  vec4 a;
+  vec2 b;
+};
 
 layout(binding = 0, std140) uniform constsbuf
 {
@@ -257,14 +276,37 @@ layout(binding = 0, std140) uniform constsbuf
                                           //         <435, 439>
                                           // }
 
-  vec4 test;                              // {440, 441, 442, 443}
+  nested_with_padding ak[2];              // 440 - 467, 468 - 495
+
+  vec4 dummy12;                           // forces no trailing overlap with ak
+
+  float al;                               // {500}, <501, 502, 503>
+
+  // struct is always float4 aligned, can't be packed with al
+  float2_struct am;                       // {504, 505}, <506, 507>
+
+  // struct doesn't allow trailing things into padding
+  float an;                               // {506}
+
+  vec4 dummy13[2];                        // empty structs on D3D
+
+  misaligned_struct ao[2];                // [0] = {
+                                          //   .a = { 520, 521, 522, 523 }
+                                          //   .b = { 524, 525 } <526, 527>
+                                          // }
+                                          // [1] = {
+                                          //   .a = { 528, 529, 530, 531 }
+                                          //   .b = { 532, 533 } <534, 535>
+                                          // }
+
+  vec4 test;                              // {536, 537, 538, 539}
 
   // because GL has worse handling of multidimensional arrays than other APIs, we add an extra test
   // here with more than 2 dimensions
 
-  vec4 multiarray2[4][3][2];              // [0][0][0] = {444, 445, 446, 447}
-                                          // [0][0][1] = {448, 449, 450, 451}
-                                          // [0][1][0] = {452, ..., ..., ...}
+  vec4 multiarray2[4][3][2];              // [0][0][0] = {540, 541, 542, ...}
+                                          // [0][0][1] = {..., ..., ..., ...}
+                                          // [0][1][0] = {..., ..., ..., ...}
                                           // [0][1][1] = {..., ..., ..., ...}
                                           // [0][2][0] = {..., ..., ..., ...}
                                           // [0][2][1] = {..., ..., ..., ...}
@@ -295,6 +337,12 @@ uniform mat2x3 D;
 uniform float E[3];
 uniform vec4 F[3][2][2];
 uniform nested G[2];
+uniform uint H;
+uniform uvec2 I;
+uniform uvec3 J;
+uniform uvec4 K;
+uniform ivec4 L;
+uniform float2_struct M[1];
 
 void main()
 {
@@ -306,6 +354,9 @@ void main()
   blah += A.z + B.x + C.y + D[0][1] + E[2] + F[1][0][0].y + F[1][0][1].y;
   blah += G[0].a.b + G[1].a.b + G[1].b[3].w + G[1].c[3].a.y;
   blah *= vertIn.uv.z;
+  if(H < 1 || I.x < 1 || J.x < 1 || K.x < 1) blah *= 0.1f;
+  if(L.x > 1) blah *= 0.1f;
+  blah += M[0].x + M[0].y;
   Color = blah + test + vec4(0.1f, 0.0f, 0.0f, 0.0f);
 }
 
@@ -335,10 +386,16 @@ void main()
 
     GLuint program = MakeProgram(common + vertex, common + pixel);
 
-    Vec4f cbufferdata[684];
+    const size_t bindOffset = 16;
 
-    for(int i = 0; i < 684; i++)
-      cbufferdata[i] = Vec4f(float(i * 4 + 0), float(i * 4 + 1), float(i * 4 + 2), float(i * 4 + 3));
+    Vec4f cbufferdata[1024 + bindOffset];
+
+    for(int i = 0; i < bindOffset; i++)
+      cbufferdata[i] = Vec4f(-99.9f, -88.8f, -77.7f, -66.6f);
+
+    for(int i = 0; i < 1024; i++)
+      cbufferdata[bindOffset + i] =
+          Vec4f(float(i * 4 + 0), float(i * 4 + 1), float(i * 4 + 2), float(i * 4 + 3));
 
     GLuint cb = MakeBuffer();
     glBindBuffer(GL_UNIFORM_BUFFER, cb);
@@ -356,15 +413,13 @@ void main()
 
     while(Running())
     {
-      glBindFramebuffer(GL_FRAMEBUFFER, 0);
-
-      float col[] = {0.4f, 0.5f, 0.6f, 1.0f};
-      glClearBufferfv(GL_COLOR, 0, col);
-
       glBindFramebuffer(GL_FRAMEBUFFER, fbo);
       glBindVertexArray(vao);
 
-      glBindBufferBase(GL_UNIFORM_BUFFER, 0, cb);
+      float col[] = {0.2f, 0.2f, 0.2f, 1.0f};
+      glClearBufferfv(GL_COLOR, 0, col);
+
+      glBindBufferRange(GL_UNIFORM_BUFFER, 0, cb, bindOffset * sizeof(Vec4f), 1024 * sizeof(Vec4f));
 
       glUseProgram(program);
 
@@ -449,13 +504,25 @@ void main()
 
       float vals[] = {
           // b[0]
-          720.0f, 730.0f, 740.0f, 750.0f,
+          720.0f,
+          730.0f,
+          740.0f,
+          750.0f,
           // b[1]
-          760.0f, 770.0f, 780.0f, 790.0f,
+          760.0f,
+          770.0f,
+          780.0f,
+          790.0f,
           // b[2]
-          800.0f, 810.0f, 820.0f, 830.0f,
+          800.0f,
+          810.0f,
+          820.0f,
+          830.0f,
           // b[3]
-          840.0f, 850.0f, 860.0f, 870.0f,
+          840.0f,
+          850.0f,
+          860.0f,
+          870.0f,
       };
 
       location = glGetUniformLocation(program, "G[0].b");
@@ -504,13 +571,25 @@ void main()
 
       float vals2[] = {
           // b[0]
-          1080.0f, 1090.0f, 1100.0f, 1110.0f,
+          1080.0f,
+          1090.0f,
+          1100.0f,
+          1110.0f,
           // b[1]
-          1120.0f, 1130.0f, 1140.0f, 1150.0f,
+          1120.0f,
+          1130.0f,
+          1140.0f,
+          1150.0f,
           // b[2]
-          1160.0f, 1170.0f, 1180.0f, 1190.0f,
+          1160.0f,
+          1170.0f,
+          1180.0f,
+          1190.0f,
           // b[3]
-          1200.0f, 1210.0f, 1220.0f, 1230.0f,
+          1200.0f,
+          1210.0f,
+          1220.0f,
+          1230.0f,
       };
 
       location = glGetUniformLocation(program, "G[1].b");
@@ -549,9 +628,38 @@ void main()
       if(location != -1)
         glUniform1f(location, 1390.0f);
 
+      location = glGetUniformLocation(program, "H");
+      if(location != -1)
+        glUniform1ui(location, 14000);
+
+      location = glGetUniformLocation(program, "I");
+      if(location != -1)
+        glUniform2ui(location, 15000, 16000);
+
+      location = glGetUniformLocation(program, "J");
+      if(location != -1)
+        glUniform3ui(location, 17000, 18000, 19000);
+
+      location = glGetUniformLocation(program, "K");
+      if(location != -1)
+        glUniform4ui(location, 20000, 21000, 22000, 23000);
+
+      location = glGetUniformLocation(program, "L");
+      if(location != -1)
+        glUniform4i(location, -24000, -25000, -26000, -27000);
+
+      location = glGetUniformLocation(program, "M[0].x");
+      if(location != -1)
+        glUniform1f(location, 28001.0);
+      location = glGetUniformLocation(program, "M[0].y");
+      if(location != -1)
+        glUniform1f(location, -28000.0);
+
       glViewport(0, 0, GLsizei(screenWidth), GLsizei(screenHeight));
 
       glDrawArrays(GL_TRIANGLES, 0, 3);
+
+      blitToSwap(colattach);
 
       Present();
     }

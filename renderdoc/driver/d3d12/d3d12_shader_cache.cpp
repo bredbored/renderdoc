@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2018-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -24,11 +24,226 @@
 
 #include "d3d12_shader_cache.h"
 #include "common/shader_cache.h"
+#include "core/plugins.h"
 #include "driver/dx/official/d3dcompiler.h"
-#include "driver/shaders/dxbc/dxbc_inspect.h"
+#include "driver/dx/official/dxcapi.h"
+#include "driver/dxgi/dxgi_common.h"
+#include "driver/shaders/dxbc/dxbc_container.h"
 #include "strings/string_utils.h"
+#include "d3d12_device.h"
+
+static HMODULE GetDXC()
+{
+  static bool searched = false;
+  static HMODULE ret = NULL;
+  if(searched)
+    return ret;
+
+  searched = true;
+
+  // we need to load dxil.dll first before dxcompiler.dll, because if dxil.dll can't be loaded when
+  // dxcompiler.dll is loaded then validation is disabled and we might not be able to run
+  // non-validated shaders (blehchh)
+
+  // do two passes. First we try and find dxil.dll and dxcompiler.dll both together.
+  // In the second pass we just look for dxcompiler.dll. Hence a higher priority dxcompiler.dll
+  // without a dxil.dll will be less preferred than a lower priority dxcompiler.dll that does have a
+  // dxil.dll
+  for(int sdkPass = 0; sdkPass < 2; sdkPass++)
+  {
+    HMODULE dxilHandle = NULL;
+
+    // first try normal plugin search path. This will prioritise any one placed locally with
+    // RenderDoc, otherwise it will try just the unadorned dll in case it's in the PATH somewhere.
+    {
+      dxilHandle = (HMODULE)Process::LoadModule(LocatePluginFile("d3d12", "dxil.dll"));
+
+      // dxc is very particular/brittle, so if we get dxil try to locate a dxcompiler right next to
+      // it. Loading a different dxcompiler might produce a non-working compiler setup. If we can't,
+      // we'll fall back to finding the next best dxcompiler we can
+      if(dxilHandle)
+      {
+        wchar_t dxilPath[MAX_PATH + 1] = {};
+        GetModuleFileNameW(dxilHandle, dxilPath, MAX_PATH);
+
+        rdcstr path = StringFormat::Wide2UTF8(dxilPath);
+        HMODULE dxcompiler = (HMODULE)Process::LoadModule(get_dirname(path) + "/dxcompiler.dll");
+        if(dxcompiler)
+        {
+          ret = dxcompiler;
+          return ret;
+        }
+      }
+
+      // don't try to load dxcompiler.dll until we've got dxil.dll successfully, or if we're not
+      // trying to get dxil. Otherwise we could load dxcompiler (to check for its existence) and
+      // then find we can't get dxil and be stuck on pass 0.
+      if(dxilHandle || sdkPass == 1)
+      {
+        HMODULE dxcompiler =
+            (HMODULE)Process::LoadModule(LocatePluginFile("d3d12", "dxcompiler.dll"));
+        if(dxcompiler)
+        {
+          ret = dxcompiler;
+          return ret;
+        }
+      }
+
+      // if we didn't find dxcompiler but did find dxil, somehow, then unload it
+      if(dxilHandle)
+        FreeLibrary(dxilHandle);
+      dxilHandle = NULL;
+    }
+
+    // otherwise search windows SDK folders.
+    // First use the registry to locate the SDK
+    for(int wow64Pass = 0; wow64Pass < 2; wow64Pass++)
+    {
+      rdcstr regpath = "SOFTWARE\\";
+      if(wow64Pass == 1)
+        regpath += "Wow6432Node\\";
+      regpath += "Microsoft\\Microsoft SDKs\\Windows\\v10.0";
+
+      HKEY key = NULL;
+      LSTATUS regret = RegOpenKeyExA(HKEY_LOCAL_MACHINE, regpath.c_str(), 0, KEY_READ, &key);
+
+      if(regret != ERROR_SUCCESS)
+      {
+        if(key)
+          RegCloseKey(key);
+        continue;
+      }
+
+      DWORD dataSize = 0;
+      regret = RegGetValueW(key, NULL, L"InstallationFolder", RRF_RT_ANY, NULL, NULL, &dataSize);
+
+      if(regret == ERROR_SUCCESS)
+      {
+        // this is the size in bytes
+        wchar_t *data = new wchar_t[dataSize / sizeof(wchar_t)];
+        RegGetValueW(key, NULL, L"InstallationFolder", RRF_RT_ANY, NULL, data, &dataSize);
+
+        rdcstr path = StringFormat::Wide2UTF8(data);
+
+        RegCloseKey(key);
+
+        delete[] data;
+
+        if(path.back() != '\\')
+          path.push_back('\\');
+
+        // next search the versioned bin folders, from newest to oldest
+        path += "bin\\";
+
+        // sort by name
+        rdcarray<PathEntry> entries;
+        FileIO::GetFilesInDirectory(path, entries);
+        std::sort(entries.begin(), entries.end());
+
+        // do a reverse iteration so we get the latest SDK first
+        for(size_t i = 0; i < entries.size(); i++)
+        {
+          const PathEntry &e = entries[entries.size() - 1 - i];
+
+          // skip any files
+          if(!(e.flags & PathProperty::Directory))
+            continue;
+
+          // we've found an SDK! check to see if it contains dxcompiler.dll
+          if(e.filename.beginsWith("10.0."))
+          {
+            rdcstr dxilPath = path + e.filename + "\\x64\\dxil.dll";
+            rdcstr dxcompilerPath = path + e.filename + "\\x64\\dxcompiler.dll";
+
+            bool dxil = FileIO::exists(dxilPath);
+            bool dxcompiler = FileIO::exists(dxcompilerPath);
+
+            // if we have both, or we're on the second pass (given up on dxil.dll) and have
+            // dxcompiler, then load this.
+            if((dxil && dxcompiler) || (sdkPass == 1 && dxcompiler))
+            {
+              if(dxil)
+                dxilHandle = (HMODULE)Process::LoadModule(dxilPath);
+              ret = (HMODULE)Process::LoadModule(dxcompilerPath);
+            }
+
+            if(ret)
+              return ret;
+
+            // if we didn't find dxcompiler but did find dxil, somehow, then unload it
+            if(dxilHandle)
+              FreeLibrary(dxilHandle);
+            dxilHandle = NULL;
+          }
+        }
+
+        // try in the Redist folder
+        {
+          rdcstr dxilPath = path + "..\\Redist\\D3D\\x64\\dxil.dll";
+          rdcstr dxcompilerPath = path + "..\\Redist\\D3D\\x64\\dxcompiler.dll";
+
+          bool dxil = FileIO::exists(dxilPath);
+          bool dxcompiler = FileIO::exists(dxcompilerPath);
+
+          // if we have both, or we're on the second pass (given up on dxil.dll) and have
+          // dxcompiler, then load this.
+          if((dxil && dxcompiler) || (sdkPass == 1 && dxcompiler))
+          {
+            if(dxil)
+              dxilHandle = (HMODULE)Process::LoadModule(dxilPath);
+            ret = (HMODULE)Process::LoadModule(dxcompilerPath);
+          }
+
+          if(ret)
+            return ret;
+
+          // if we didn't find dxcompiler but did find dxil, somehow, then unload it
+          if(dxilHandle)
+            FreeLibrary(dxilHandle);
+          dxilHandle = NULL;
+        }
+
+        // if we've gotten here and haven't returned anything, then try just the base x64 folder
+        {
+          rdcstr dxilPath = path + "x64\\dxil.dll";
+          rdcstr dxcompilerPath = path + "x64\\dxcompiler.dll";
+
+          bool dxil = FileIO::exists(dxilPath);
+          bool dxcompiler = FileIO::exists(dxcompilerPath);
+
+          // if we have both, or we're on the second pass (given up on dxil.dll) and have
+          // dxcompiler, then load this.
+          if((dxil && dxcompiler) || (sdkPass == 1 && dxcompiler))
+          {
+            if(dxil)
+              dxilHandle = (HMODULE)Process::LoadModule(dxilPath);
+            ret = (HMODULE)Process::LoadModule(dxcompilerPath);
+          }
+
+          if(ret)
+            return ret;
+
+          // if we didn't find dxcompiler but did find dxil, somehow, then unload it
+          if(dxilHandle)
+            FreeLibrary(dxilHandle);
+          dxilHandle = NULL;
+        }
+
+        continue;
+      }
+
+      RegCloseKey(key);
+    }
+  }
+
+  RDCERR("Couldn't find dxcompiler.dll in any path.");
+
+  return ret;
+}
 
 typedef HRESULT(WINAPI *pD3DCreateBlob)(SIZE_T Size, ID3DBlob **ppBlob);
+typedef DXC_API_IMPORT HRESULT(__stdcall *pDxcCreateInstance)(REFCLSID rclsid, REFIID riid,
+                                                              LPVOID *ppv);
 
 struct D3D12BlobShaderCallbacks
 {
@@ -52,7 +267,7 @@ struct D3D12BlobShaderCallbacks
     return blobCreate;
   }
 
-  bool Create(uint32_t size, byte *data, ID3DBlob **ret) const
+  bool Create(uint32_t size, const void *data, ID3DBlob **ret) const
   {
     RDCASSERT(ret);
 
@@ -78,40 +293,29 @@ struct D3D12BlobShaderCallbacks
   const byte *GetData(ID3DBlob *blob) const { return (const byte *)blob->GetBufferPointer(); }
 } D3D12ShaderCacheCallbacks;
 
-struct EmbeddedD3D12Includer : public ID3DInclude
-{
-  std::string texsample = GetEmbeddedResource(hlsl_texsample_h);
-  std::string cbuffers = GetEmbeddedResource(hlsl_cbuffers_h);
-
-  virtual HRESULT STDMETHODCALLTYPE Open(D3D_INCLUDE_TYPE IncludeType, LPCSTR pFileName,
-                                         LPCVOID pParentData, LPCVOID *ppData, UINT *pBytes) override
-  {
-    std::string *str;
-
-    if(!strcmp(pFileName, "hlsl_texsample.h"))
-      str = &texsample;
-    else if(!strcmp(pFileName, "hlsl_cbuffers.h"))
-      str = &cbuffers;
-    else
-      return E_FAIL;
-
-    if(ppData)
-      *ppData = str->c_str();
-    if(pBytes)
-      *pBytes = (uint32_t)str->size();
-
-    return S_OK;
-  }
-  virtual HRESULT STDMETHODCALLTYPE Close(LPCVOID pData) override { return S_OK; }
-};
-
-D3D12ShaderCache::D3D12ShaderCache()
+D3D12ShaderCache::D3D12ShaderCache(WrappedID3D12Device *device)
 {
   bool success = LoadShaderCache("d3dshaders.cache", m_ShaderCacheMagic, m_ShaderCacheVersion,
                                  m_ShaderCache, D3D12ShaderCacheCallbacks);
 
   // if we failed to load from the cache
   m_ShaderCacheDirty = !success;
+
+  static const GUID IRenderDoc_uuid = {
+      0xa7aa6116, 0x9c8d, 0x4bba, {0x90, 0x83, 0xb4, 0xd8, 0x16, 0xb7, 0x1b, 0x78}};
+
+  // if we're being self-captured, the 'real' device will respond to renderdoc's UUID. Enable debug
+  // shaders
+  IUnknown *dummy = NULL;
+  if(device->GetReal())
+    device->GetReal()->QueryInterface(IRenderDoc_uuid, (void **)&dummy);
+
+  if(dummy)
+  {
+    m_CompileFlags |=
+        D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION | D3DCOMPILE_OPTIMIZATION_LEVEL0;
+    SAFE_RELEASE(dummy);
+  }
 }
 
 D3D12ShaderCache::~D3D12ShaderCache()
@@ -128,18 +332,29 @@ D3D12ShaderCache::~D3D12ShaderCache()
   }
 }
 
-std::string D3D12ShaderCache::GetShaderBlob(const char *source, const char *entry,
-                                            const uint32_t compileFlags, const char *profile,
-                                            ID3DBlob **srcblob)
+rdcstr D3D12ShaderCache::GetShaderBlob(const char *source, const char *entry,
+                                       const ShaderCompileFlags &compileFlags,
+                                       const rdcarray<rdcstr> &includeDirs, const char *profile,
+                                       ID3DBlob **srcblob)
 {
-  EmbeddedD3D12Includer includer;
+  rdcstr cbuffers = GetEmbeddedResource(hlsl_cbuffers_h);
+  rdcstr texsample = GetEmbeddedResource(hlsl_texsample_h);
+
+  EmbeddedD3DIncluder includer(includeDirs, {
+                                                {"hlsl_texsample.h", texsample},
+                                                {"hlsl_cbuffers.h", cbuffers},
+                                            });
 
   uint32_t hash = strhash(source);
   hash = strhash(entry, hash);
   hash = strhash(profile, hash);
-  hash = strhash(includer.cbuffers.c_str(), hash);
-  hash = strhash(includer.texsample.c_str(), hash);
-  hash ^= compileFlags;
+  hash = strhash(cbuffers.c_str(), hash);
+  hash = strhash(texsample.c_str(), hash);
+  for(const ShaderCompileFlag &f : compileFlags.flags)
+  {
+    hash = strhash(f.name.c_str(), hash);
+    hash = strhash(f.value.c_str(), hash);
+  }
 
   if(m_ShaderCache.find(hash) != m_ShaderCache.end())
   {
@@ -153,32 +368,141 @@ std::string D3D12ShaderCache::GetShaderBlob(const char *source, const char *entr
   ID3DBlob *byteBlob = NULL;
   ID3DBlob *errBlob = NULL;
 
-  HMODULE d3dcompiler = GetD3DCompiler();
-
-  if(d3dcompiler == NULL)
+  if(profile[3] >= '6')
   {
-    RDCFATAL("Can't get handle to d3dcompiler_??.dll");
+    // compile as DXIL
+
+    UINT prevErrorMode = GetErrorMode();
+    SetErrorMode(prevErrorMode | SEM_FAILCRITICALERRORS);
+
+    HMODULE dxc = GetDXC();
+
+    SetErrorMode(prevErrorMode);
+
+    if(dxc == NULL)
+    {
+      return "Couldn't locate dxcompiler.dll. Ensure you have a Windows 10 SDK installed or place "
+             "dxcompiler.dll in RenderDoc's plugins/d3d12 folder.";
+    }
+    else
+    {
+      pDxcCreateInstance dxcCreate = (pDxcCreateInstance)GetProcAddress(dxc, "DxcCreateInstance");
+
+      IDxcLibrary *library = NULL;
+      hr = dxcCreate(CLSID_DxcLibrary, __uuidof(IDxcLibrary), (void **)&library);
+
+      if(FAILED(hr))
+      {
+        SAFE_RELEASE(library);
+        return "Couldn't create DXC library";
+      }
+
+      IDxcCompiler *compiler = NULL;
+      hr = dxcCreate(CLSID_DxcCompiler, __uuidof(IDxcCompiler), (void **)&compiler);
+
+      if(FAILED(hr))
+      {
+        SAFE_RELEASE(library);
+        SAFE_RELEASE(compiler);
+        return "Couldn't create DXC compiler";
+      }
+
+      IDxcBlobEncoding *sourceBlob = NULL;
+      hr = library->CreateBlobWithEncodingFromPinned(source, (UINT)strlen(source), CP_UTF8,
+                                                     &sourceBlob);
+
+      if(FAILED(hr))
+      {
+        SAFE_RELEASE(library);
+        SAFE_RELEASE(compiler);
+        SAFE_RELEASE(sourceBlob);
+        return "Couldn't create DXC blob";
+      }
+
+      rdcarray<const wchar_t *> args;
+      rdcarray<rdcwstr> argStorage;
+
+      IDxcOperationResult *result = NULL;
+      hr = compiler->Compile(sourceBlob, StringFormat::UTF82Wide(entry).c_str(),
+                             StringFormat::UTF82Wide(entry).c_str(),
+                             StringFormat::UTF82Wide(profile).c_str(), args.data(),
+                             (UINT)args.size(), NULL, 0, NULL, &result);
+
+      SAFE_RELEASE(sourceBlob);
+
+      if(SUCCEEDED(hr) && result)
+        result->GetStatus(&hr);
+
+      if(SUCCEEDED(hr))
+      {
+        IDxcBlob *code = NULL;
+        result->GetResult(&code);
+
+        D3D12ShaderCacheCallbacks.Create((uint32_t)code->GetBufferSize(), code->GetBufferPointer(),
+                                         &byteBlob);
+
+        if(!DXBC::DXBCContainer::IsHashedContainer(byteBlob->GetBufferPointer(),
+                                                   byteBlob->GetBufferSize()))
+          DXBC::DXBCContainer::HashContainer(byteBlob->GetBufferPointer(), byteBlob->GetBufferSize());
+
+        SAFE_RELEASE(code);
+      }
+      else
+      {
+        if(result)
+        {
+          IDxcBlobEncoding *dxcErrors = NULL;
+          hr = result->GetErrorBuffer(&dxcErrors);
+          if(SUCCEEDED(hr) && dxcErrors)
+          {
+            D3D12ShaderCacheCallbacks.Create((uint32_t)dxcErrors->GetBufferSize(),
+                                             dxcErrors->GetBufferPointer(), &errBlob);
+          }
+
+          SAFE_RELEASE(dxcErrors);
+        }
+
+        if(!errBlob)
+        {
+          rdcstr err = "No compilation result found from DXC compile";
+          D3D12ShaderCacheCallbacks.Create((uint32_t)err.size(), err.c_str(), &errBlob);
+        }
+      }
+
+      SAFE_RELEASE(library);
+      SAFE_RELEASE(compiler);
+      SAFE_RELEASE(result);
+    }
+  }
+  else
+  {
+    HMODULE d3dcompiler = GetD3DCompiler();
+
+    if(d3dcompiler == NULL)
+    {
+      RDCFATAL("Can't get handle to d3dcompiler_??.dll");
+    }
+
+    pD3DCompile compileFunc = (pD3DCompile)GetProcAddress(d3dcompiler, "D3DCompile");
+
+    if(compileFunc == NULL)
+    {
+      RDCFATAL("Can't get D3DCompile from d3dcompiler_??.dll");
+    }
+
+    uint32_t flags = DXBC::DecodeFlags(compileFlags) & ~D3DCOMPILE_NO_PRESHADER;
+
+    hr = compileFunc(source, strlen(source), entry, NULL, &includer, entry, profile, flags, 0,
+                     &byteBlob, &errBlob);
   }
 
-  pD3DCompile compileFunc = (pD3DCompile)GetProcAddress(d3dcompiler, "D3DCompile");
-
-  if(compileFunc == NULL)
-  {
-    RDCFATAL("Can't get D3DCompile from d3dcompiler_??.dll");
-  }
-
-  uint32_t flags = compileFlags & ~D3DCOMPILE_NO_PRESHADER;
-
-  hr = compileFunc(source, strlen(source), entry, NULL, &includer, entry, profile, flags, 0,
-                   &byteBlob, &errBlob);
-
-  std::string errors = "";
+  rdcstr errors = "";
 
   if(errBlob)
   {
     errors = (char *)errBlob->GetBufferPointer();
 
-    std::string logerror = errors;
+    rdcstr logerror = errors;
     if(logerror.length() > 1024)
       logerror = logerror.substr(0, 1024) + "...";
 
@@ -193,7 +517,7 @@ std::string D3D12ShaderCache::GetShaderBlob(const char *source, const char *entr
     }
   }
 
-  if(m_CacheShaders)
+  if(m_CacheShaders && byteBlob)
   {
     m_ShaderCache[hash] = byteBlob;
     byteBlob->AddRef();
@@ -204,6 +528,14 @@ std::string D3D12ShaderCache::GetShaderBlob(const char *source, const char *entr
 
   *srcblob = byteBlob;
   return errors;
+}
+
+rdcstr D3D12ShaderCache::GetShaderBlob(const char *source, const char *entry, uint32_t compileFlags,
+                                       const rdcarray<rdcstr> &includeDirs, const char *profile,
+                                       ID3DBlob **srcblob)
+{
+  return GetShaderBlob(source, entry, DXBC::EncodeFlags(compileFlags | m_CompileFlags, profile),
+                       includeDirs, profile, srcblob);
 }
 
 D3D12RootSignature D3D12ShaderCache::GetRootSig(const void *data, size_t dataSize)
@@ -249,13 +581,13 @@ D3D12RootSignature D3D12ShaderCache::GetRootSig(const void *data, size_t dataSiz
 
     ret.Flags = desc->Flags;
 
-    ret.params.resize(desc->NumParameters);
+    ret.Parameters.resize(desc->NumParameters);
 
     ret.dwordLength = 0;
 
-    for(size_t i = 0; i < ret.params.size(); i++)
+    for(size_t i = 0; i < ret.Parameters.size(); i++)
     {
-      ret.params[i].MakeFrom(desc->pParameters[i], ret.maxSpaceIndex);
+      ret.Parameters[i].MakeFrom(desc->pParameters[i], ret.maxSpaceIndex);
 
       // Descriptor tables cost 1 DWORD each.
       // Root constants cost 1 DWORD each, since they are 32-bit values.
@@ -270,10 +602,13 @@ D3D12RootSignature D3D12ShaderCache::GetRootSig(const void *data, size_t dataSiz
 
     if(desc->NumStaticSamplers > 0)
     {
-      ret.samplers.assign(desc->pStaticSamplers, desc->pStaticSamplers + desc->NumStaticSamplers);
+      ret.StaticSamplers.resize(desc->NumStaticSamplers);
 
-      for(size_t i = 0; i < ret.samplers.size(); i++)
-        ret.maxSpaceIndex = RDCMAX(ret.maxSpaceIndex, ret.samplers[i].RegisterSpace + 1);
+      for(size_t i = 0; i < ret.StaticSamplers.size(); i++)
+      {
+        ret.StaticSamplers[i] = Upconvert(desc->pStaticSamplers[i]);
+        ret.maxSpaceIndex = RDCMAX(ret.maxSpaceIndex, ret.StaticSamplers[i].RegisterSpace + 1);
+      }
     }
 
     SAFE_RELEASE(deser);
@@ -294,8 +629,15 @@ D3D12RootSignature D3D12ShaderCache::GetRootSig(const void *data, size_t dataSiz
 
   D3D12RootSignature ret;
 
+  uint32_t version = 12;
   const D3D12_VERSIONED_ROOT_SIGNATURE_DESC *verdesc = NULL;
-  hr = deser->GetRootSignatureDescAtVersion(D3D_ROOT_SIGNATURE_VERSION_1_1, &verdesc);
+  hr = deser->GetRootSignatureDescAtVersion(D3D_ROOT_SIGNATURE_VERSION_1_2, &verdesc);
+  if(FAILED(hr))
+  {
+    version = 11;
+    hr = deser->GetRootSignatureDescAtVersion(D3D_ROOT_SIGNATURE_VERSION_1_1, &verdesc);
+  }
+
   if(FAILED(hr))
   {
     SAFE_RELEASE(deser);
@@ -307,13 +649,13 @@ D3D12RootSignature D3D12ShaderCache::GetRootSig(const void *data, size_t dataSiz
 
   ret.Flags = desc->Flags;
 
-  ret.params.resize(desc->NumParameters);
+  ret.Parameters.resize(desc->NumParameters);
 
   ret.dwordLength = 0;
 
-  for(size_t i = 0; i < ret.params.size(); i++)
+  for(size_t i = 0; i < ret.Parameters.size(); i++)
   {
-    ret.params[i].MakeFrom(desc->pParameters[i], ret.maxSpaceIndex);
+    ret.Parameters[i].MakeFrom(desc->pParameters[i], ret.maxSpaceIndex);
 
     // Descriptor tables cost 1 DWORD each.
     // Root constants cost 1 DWORD each, since they are 32-bit values.
@@ -328,10 +670,24 @@ D3D12RootSignature D3D12ShaderCache::GetRootSig(const void *data, size_t dataSiz
 
   if(desc->NumStaticSamplers > 0)
   {
-    ret.samplers.assign(desc->pStaticSamplers, desc->pStaticSamplers + desc->NumStaticSamplers);
+    if(version >= 12)
+    {
+      ret.StaticSamplers.assign(verdesc->Desc_1_2.pStaticSamplers,
+                                verdesc->Desc_1_2.NumStaticSamplers);
 
-    for(size_t i = 0; i < ret.samplers.size(); i++)
-      ret.maxSpaceIndex = RDCMAX(ret.maxSpaceIndex, ret.samplers[i].RegisterSpace + 1);
+      for(size_t i = 0; i < ret.StaticSamplers.size(); i++)
+        ret.maxSpaceIndex = RDCMAX(ret.maxSpaceIndex, ret.StaticSamplers[i].RegisterSpace + 1);
+    }
+    else
+    {
+      ret.StaticSamplers.resize(desc->NumStaticSamplers);
+
+      for(size_t i = 0; i < ret.StaticSamplers.size(); i++)
+      {
+        ret.StaticSamplers[i] = Upconvert(desc->pStaticSamplers[i]);
+        ret.maxSpaceIndex = RDCMAX(ret.maxSpaceIndex, ret.StaticSamplers[i].RegisterSpace + 1);
+      }
+    }
   }
 
   SAFE_RELEASE(deser);
@@ -339,9 +695,9 @@ D3D12RootSignature D3D12ShaderCache::GetRootSig(const void *data, size_t dataSiz
   return ret;
 }
 
-ID3DBlob *D3D12ShaderCache::MakeRootSig(const std::vector<D3D12_ROOT_PARAMETER1> &params,
+ID3DBlob *D3D12ShaderCache::MakeRootSig(const rdcarray<D3D12_ROOT_PARAMETER1> &params,
                                         D3D12_ROOT_SIGNATURE_FLAGS Flags, UINT NumStaticSamplers,
-                                        const D3D12_STATIC_SAMPLER_DESC *StaticSamplers)
+                                        const D3D12_STATIC_SAMPLER_DESC1 *StaticSamplers)
 {
   PFN_D3D12_SERIALIZE_VERSIONED_ROOT_SIGNATURE serializeRootSig =
       (PFN_D3D12_SERIALIZE_VERSIONED_ROOT_SIGNATURE)GetProcAddress(
@@ -361,13 +717,18 @@ ID3DBlob *D3D12ShaderCache::MakeRootSig(const std::vector<D3D12_ROOT_PARAMETER1>
       return NULL;
     }
 
+    rdcarray<D3D12_STATIC_SAMPLER_DESC> oldSamplers;
+    oldSamplers.resize(NumStaticSamplers);
+    for(size_t i = 0; i < oldSamplers.size(); i++)
+      oldSamplers[i] = Downconvert(StaticSamplers[i]);
+
     D3D12_ROOT_SIGNATURE_DESC desc;
     desc.Flags = Flags;
     desc.NumStaticSamplers = NumStaticSamplers;
-    desc.pStaticSamplers = StaticSamplers;
+    desc.pStaticSamplers = oldSamplers.data();
     desc.NumParameters = (UINT)params.size();
 
-    std::vector<D3D12_ROOT_PARAMETER> params_1_0;
+    rdcarray<D3D12_ROOT_PARAMETER> params_1_0;
     params_1_0.resize(params.size());
     for(size_t i = 0; i < params.size(); i++)
     {
@@ -425,9 +786,9 @@ ID3DBlob *D3D12ShaderCache::MakeRootSig(const std::vector<D3D12_ROOT_PARAMETER1>
 
     if(FAILED(hr))
     {
-      std::string errors = (char *)errBlob->GetBufferPointer();
+      rdcstr errors = (char *)errBlob->GetBufferPointer();
 
-      std::string logerror = errors;
+      rdcstr logerror = errors;
       if(logerror.length() > 1024)
         logerror = logerror.substr(0, 1024) + "...";
 
@@ -444,24 +805,39 @@ ID3DBlob *D3D12ShaderCache::MakeRootSig(const std::vector<D3D12_ROOT_PARAMETER1>
   }
 
   D3D12_VERSIONED_ROOT_SIGNATURE_DESC verdesc;
-  verdesc.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
+  verdesc.Version = D3D_ROOT_SIGNATURE_VERSION_1_2;
 
-  D3D12_ROOT_SIGNATURE_DESC1 &desc = verdesc.Desc_1_1;
-  desc.Flags = Flags;
-  desc.NumStaticSamplers = NumStaticSamplers;
-  desc.pStaticSamplers = StaticSamplers;
-  desc.NumParameters = (UINT)params.size();
-  desc.pParameters = &params[0];
+  D3D12_ROOT_SIGNATURE_DESC2 &desc12 = verdesc.Desc_1_2;
+  desc12.Flags = Flags;
+  desc12.NumStaticSamplers = NumStaticSamplers;
+  desc12.pStaticSamplers = StaticSamplers;
+  desc12.NumParameters = (UINT)params.size();
+  desc12.pParameters = &params[0];
 
   ID3DBlob *ret = NULL;
   ID3DBlob *errBlob = NULL;
   HRESULT hr = serializeRootSig(&verdesc, &ret, &errBlob);
+  SAFE_RELEASE(errBlob);
+
+  if(SUCCEEDED(hr))
+    return ret;
+
+  // if it failed, try again at version 1.1
+  verdesc.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
+  D3D12_ROOT_SIGNATURE_DESC1 &desc11 = verdesc.Desc_1_1;
+  rdcarray<D3D12_STATIC_SAMPLER_DESC> oldSamplers;
+  oldSamplers.resize(NumStaticSamplers);
+  for(size_t i = 0; i < oldSamplers.size(); i++)
+    oldSamplers[i] = Downconvert(StaticSamplers[i]);
+  desc11.pStaticSamplers = oldSamplers.data();
+
+  hr = serializeRootSig(&verdesc, &ret, &errBlob);
 
   if(FAILED(hr))
   {
-    std::string errors = (char *)errBlob->GetBufferPointer();
+    rdcstr errors = (char *)errBlob->GetBufferPointer();
 
-    std::string logerror = errors;
+    rdcstr logerror = errors;
     if(logerror.length() > 1024)
       logerror = logerror.substr(0, 1024) + "...";
 
@@ -479,21 +855,74 @@ ID3DBlob *D3D12ShaderCache::MakeRootSig(const std::vector<D3D12_ROOT_PARAMETER1>
 
 ID3DBlob *D3D12ShaderCache::MakeRootSig(const D3D12RootSignature &rootsig)
 {
-  std::vector<D3D12_ROOT_PARAMETER1> params;
-  params.resize(rootsig.params.size());
+  rdcarray<D3D12_ROOT_PARAMETER1> params;
+  params.resize(rootsig.Parameters.size());
   for(size_t i = 0; i < params.size(); i++)
-    params[i] = rootsig.params[i];
+    params[i] = rootsig.Parameters[i];
 
-  return MakeRootSig(params, rootsig.Flags, (UINT)rootsig.samplers.size(),
-                     rootsig.samplers.empty() ? NULL : &rootsig.samplers[0]);
+  return MakeRootSig(params, rootsig.Flags, (UINT)rootsig.StaticSamplers.size(),
+                     rootsig.StaticSamplers.empty() ? NULL : &rootsig.StaticSamplers[0]);
 }
 
-ID3DBlob *D3D12ShaderCache::MakeFixedColShader(float overlayConsts[4])
+ID3DBlob *D3D12ShaderCache::MakeFixedColShader(FixedColVariant variant, bool dxil)
 {
   ID3DBlob *ret = NULL;
-  std::string hlsl =
-      StringFormat::Fmt("float4 main() : SV_Target0 { return float4(%f, %f, %f, %f); }\n",
-                        overlayConsts[0], overlayConsts[1], overlayConsts[2], overlayConsts[3]);
-  GetShaderBlob(hlsl.c_str(), "main", D3DCOMPILE_WARNINGS_ARE_ERRORS, "ps_5_0", &ret);
+  rdcstr hlsl =
+      StringFormat::Fmt("#define VARIANT %u\n\n", variant) + GetEmbeddedResource(fixedcol_hlsl);
+  bool wasCaching = m_CacheShaders;
+  m_CacheShaders = true;
+  GetShaderBlob(hlsl.c_str(), "main", ShaderCompileFlags(), {}, dxil ? "ps_6_0" : "ps_5_0", &ret);
+  m_CacheShaders = wasCaching;
+
+  if(!ret)
+  {
+    const rdcstr embedded[] = {
+        GetEmbeddedResource(fixedcol_0_dxbc),
+        GetEmbeddedResource(fixedcol_1_dxbc),
+        GetEmbeddedResource(fixedcol_2_dxbc),
+        GetEmbeddedResource(fixedcol_3_dxbc),
+    };
+
+    D3D12ShaderCacheCallbacks.Create((uint32_t)embedded[variant].size(), embedded[variant].data(),
+                                     &ret);
+  }
+
+  return ret;
+}
+
+ID3DBlob *D3D12ShaderCache::GetQuadShaderDXILBlob()
+{
+  rdcstr embedded = GetEmbeddedResource(quadwrite_dxbc);
+  if(embedded.empty() || !embedded.beginsWith("DXBC"))
+    return NULL;
+
+  ID3DBlob *ret = NULL;
+  D3D12ShaderCacheCallbacks.Create((uint32_t)embedded.size(), embedded.data(), &ret);
+  return ret;
+}
+
+void D3D12ShaderCache::LoadDXC()
+{
+  GetDXC();
+}
+
+D3D12_STATIC_SAMPLER_DESC1 D3D12ShaderCache::Upconvert(const D3D12_STATIC_SAMPLER_DESC &StaticSampler)
+{
+  D3D12_STATIC_SAMPLER_DESC1 ret;
+  memcpy(&ret, &StaticSampler, sizeof(StaticSampler));
+  ret.Flags = D3D12_SAMPLER_FLAG_NONE;
+  return ret;
+}
+
+D3D12_STATIC_SAMPLER_DESC D3D12ShaderCache::Downconvert(const D3D12_STATIC_SAMPLER_DESC1 &StaticSampler)
+{
+  D3D12_STATIC_SAMPLER_DESC ret;
+  memcpy(&ret, &StaticSampler, sizeof(ret));
+  if(StaticSampler.Flags != 0)
+    RDCWARN("Downconverting sampler with advanced features set");
+  if(ret.BorderColor == D3D12_STATIC_BORDER_COLOR_OPAQUE_BLACK_UINT)
+    ret.BorderColor = D3D12_STATIC_BORDER_COLOR_OPAQUE_BLACK_UINT;
+  else if(ret.BorderColor == D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE_UINT)
+    ret.BorderColor = D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE_UINT;
   return ret;
 }

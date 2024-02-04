@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2016-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -24,7 +24,6 @@
 
 #pragma once
 
-#include <vector>
 #include "d3d12_common.h"
 #include "d3d12_manager.h"
 
@@ -44,27 +43,45 @@ enum SignatureElementType
 struct D3D12RenderState
 {
   D3D12RenderState() = default;
-  D3D12RenderState &operator=(const D3D12RenderState &o);
+  D3D12RenderState(const D3D12RenderState &o) = default;
+  D3D12RenderState &operator=(const D3D12RenderState &o) = default;
 
-  void ApplyState(WrappedID3D12Device *dev, ID3D12GraphicsCommandList4 *list) const;
-  void ApplyComputeRootElements(ID3D12GraphicsCommandList4 *cmd) const;
-  void ApplyGraphicsRootElements(ID3D12GraphicsCommandList4 *cmd) const;
+  void ApplyState(WrappedID3D12Device *dev, ID3D12GraphicsCommandListX *list) const;
+  void ApplyDescriptorHeaps(ID3D12GraphicsCommandListX *list) const;
+  void ApplyComputeRootElements(ID3D12GraphicsCommandListX *cmd) const;
+  void ApplyGraphicsRootElements(ID3D12GraphicsCommandListX *cmd) const;
 
-  std::vector<D3D12_VIEWPORT> views;
-  std::vector<D3D12_RECT> scissors;
+  rdcarray<D3D12_VIEWPORT> views;
+  rdcarray<D3D12_RECT> scissors;
 
   // these are D3D12Descriptor copies since the values of the descriptors are read during
   // OMSetRenderTargets and may not exist anywhere after that if they are immediately overwritten.
-  std::vector<D3D12Descriptor> rts;
+  rdcarray<D3D12Descriptor> rts;
   D3D12Descriptor dsv;
 
-  std::vector<ResourceId> GetRTVIDs() const;
+  bool renderpass = false;
+  rdcarray<D3D12_RENDER_PASS_ENDING_ACCESS_RESOLVE_SUBRESOURCE_PARAMETERS> rpResolves;
+  rdcarray<D3D12_RENDER_PASS_RENDER_TARGET_DESC> rpRTs;
+  D3D12_RENDER_PASS_DEPTH_STENCIL_DESC rpDSV;
+  D3D12_RENDER_PASS_FLAGS rpFlags;
+
+  rdcarray<ResourceId> GetRTVIDs() const;
   ResourceId GetDSVID() const;
+
+  float depthBias = 0.0f, depthBiasClamp = 0.0f, slopeScaledDepthBias = 0.0f;
+  D3D12_INDEX_BUFFER_STRIP_CUT_VALUE cutValue = D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED;
+
+  ResourceId shadingRateImage;
+  D3D12_SHADING_RATE shadingRate;
+  D3D12_SHADING_RATE_COMBINER shadingRateCombiners[2];
 
   struct SignatureElement
   {
     SignatureElement() : type(eRootUnknown), offset(0) {}
     SignatureElement(SignatureElementType t, ResourceId i, UINT64 o) : type(t), id(i), offset(o) {}
+    SignatureElement(SignatureElementType t, D3D12_GPU_VIRTUAL_ADDRESS addr);
+    SignatureElement(SignatureElementType t, D3D12_CPU_DESCRIPTOR_HANDLE handle);
+
     void SetConstant(UINT offs, UINT val) { SetConstants(1, &val, offs); }
     void SetConstants(UINT numVals, const void *vals, UINT offs)
     {
@@ -140,10 +157,10 @@ struct D3D12RenderState
 
     ResourceId id;
     UINT64 offset;
-    std::vector<UINT> constants;
+    rdcarray<UINT> constants;
   };
 
-  std::vector<ResourceId> heaps;
+  rdcarray<ResourceId> heaps;
 
   struct StreamOut
   {
@@ -154,13 +171,13 @@ struct D3D12RenderState
     ResourceId countbuf;
     UINT64 countoffs;
   };
-  std::vector<StreamOut> streamouts;
+  rdcarray<StreamOut> streamouts;
 
   struct RootSignature
   {
     ResourceId rootsig;
 
-    std::vector<SignatureElement> sigelems;
+    rdcarray<SignatureElement> sigelems;
   } compute, graphics;
 
   ResourceId pipe;
@@ -170,11 +187,11 @@ struct D3D12RenderState
   struct SamplePositions
   {
     UINT NumSamplesPerPixel, NumPixels;
-    std::vector<D3D12_SAMPLE_POSITION> Positions;
+    rdcarray<D3D12_SAMPLE_POSITION> Positions;
   } samplePos;
 
   D3D12_PRIMITIVE_TOPOLOGY topo = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
-  UINT stencilRef = 0;
+  UINT stencilRefFront = 0, stencilRefBack = 0;
   float blendFactor[4] = {};
 
   float depthBoundsMin = 0.0f, depthBoundsMax = 1.0f;
@@ -194,11 +211,20 @@ struct D3D12RenderState
     UINT stride;
     UINT size;
   };
-  std::vector<VertBuffer> vbuffers;
+  rdcarray<VertBuffer> vbuffers;
 
   D3D12ResourceManager *GetResourceManager() const { return m_ResourceManager; }
   D3D12ResourceManager *m_ResourceManager = NULL;
 
   D3D12DebugManager *GetDebugManager() const { return m_DebugManager; }
   D3D12DebugManager *m_DebugManager = NULL;
+
+  struct IndirectPendingState
+  {
+    ID3D12Resource *argsBuf = NULL;
+    uint64_t argsOffs = 0;
+    ID3D12CommandSignature *comSig = NULL;
+    uint32_t argsToProcess = 0;
+  } indirectState;
+  void ResolvePendingIndirectState(WrappedID3D12Device *device);
 };

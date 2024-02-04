@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2016-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -65,7 +65,11 @@ TextureSaveDialog::TextureSaveDialog(const TextureDescription &t, bool enableOve
 
   strs.clear();
   for(AlphaMapping i : values<AlphaMapping>())
+  {
+    if(i == AlphaMapping::Preserve)
+      break;
     strs << ToQStr(i);
+  }
 
   ui->alphaMap->addItems(strs);
 
@@ -74,7 +78,10 @@ TextureSaveDialog::TextureSaveDialog(const TextureDescription &t, bool enableOve
 
   ui->jpegCompression->setValue(saveData.jpegQuality);
 
-  ui->alphaMap->setCurrentIndex((int)saveData.alpha);
+  if(saveData.alpha == AlphaMapping::Preserve)
+    ui->alphaMap->setCurrentIndex((int)AlphaMapping::BlendToCheckerboard);
+  else
+    ui->alphaMap->setCurrentIndex((int)saveData.alpha);
 
   ui->blackPoint->setText(Formatter::Format(saveData.comp.blackPoint));
   ui->whitePoint->setText(Formatter::Format(saveData.comp.whitePoint));
@@ -661,6 +668,15 @@ void TextureSaveDialog::on_saveCancelButtons_accepted()
     saveData.comp.whitePoint = d;
 
   QFileInfo fi(filename());
+
+  if(!fi.isAbsolute())
+  {
+    RDDialog::critical(
+        this, tr("Save Texture"),
+        tr("%1\nIs not an absolute path.\nCheck the path and try again.").arg(filename()));
+
+    return;
+  }
 
   QDir dir = fi.dir();
 

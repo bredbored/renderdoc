@@ -1,26 +1,26 @@
 /******************************************************************************
-* The MIT License (MIT)
-*
-* Copyright (c) 2018-2019 Baldur Karlsson
-*
-* Permission is hereby granted, free of charge, to any person obtaining a copy
-* of this software and associated documentation files (the "Software"), to deal
-* in the Software without restriction, including without limitation the rights
-* to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-* copies of the Software, and to permit persons to whom the Software is
-* furnished to do so, subject to the following conditions:
-*
-* The above copyright notice and this permission notice shall be included in
-* all copies or substantial portions of the Software.
-*
-* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-* AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-* OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-* THE SOFTWARE.
-******************************************************************************/
+ * The MIT License (MIT)
+ *
+ * Copyright (c) 2019-2023 Baldur Karlsson
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ ******************************************************************************/
 
 #pragma once
 
@@ -30,6 +30,13 @@
 
 #include <algorithm>
 #include <vector>
+
+// nvidia uses its own version packing:
+//   10 |  8  |        8       |       6
+// major|minor|secondary_branch|tertiary_branch
+#define VK_MAKE_VERSION_NV(major, minor, secondary_branch, tertiary_branch)        \
+  (((major) << (8 + 8 + 6)) | ((minor) << (8 + 6)) | ((secondary_branch) << (6)) | \
+   ((tertiary_branch) << (0)))
 
 namespace vkh
 {
@@ -151,13 +158,26 @@ void cmdPipelineBarrier(VkCommandBuffer cmd, const std::vector<VkImageMemoryBarr
                         VkPipelineStageFlags dstStageMask = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                         VkDependencyFlags dependencyFlags = 0);
 
+struct ClearColorValue;
+struct ClearDepthStencilValue;
+void cmdClearImage(VkCommandBuffer cmd, VkImage img, const ClearColorValue &col,
+                   VkImageLayout layout = VK_IMAGE_LAYOUT_GENERAL);
+void cmdClearImage(VkCommandBuffer cmd, VkImage img, const ClearDepthStencilValue &ds,
+                   VkImageLayout layout = VK_IMAGE_LAYOUT_GENERAL);
+
 void cmdBindVertexBuffers(VkCommandBuffer cmd, uint32_t firstBinding,
                           std::initializer_list<VkBuffer> bufs,
-                          std::initializer_list<VkDeviceSize> offsets);
+                          std::initializer_list<VkDeviceSize> offsets = {});
+
+void cmdBindVertexBuffers(VkCommandBuffer cmd, std::initializer_list<VkBuffer> bufs);
 
 void cmdBindDescriptorSets(VkCommandBuffer cmd, VkPipelineBindPoint pipelineBindPoint,
                            VkPipelineLayout layout, uint32_t firstSet,
-                           std::vector<VkDescriptorSet> bufs, std::vector<uint32_t> dynamicOffsets);
+                           std::vector<VkDescriptorSet> sets, std::vector<uint32_t> dynamicOffsets);
+
+void cmdPushDescriptorSets(VkCommandBuffer cmd, VkPipelineBindPoint pipelineBindPoint,
+                           VkPipelineLayout layout, uint32_t set,
+                           std::vector<VkWriteDescriptorSet> writes);
 
 struct ApplicationInfo : public VkApplicationInfo
 {
@@ -189,6 +209,12 @@ struct InstanceCreateInfo : public VkInstanceCreateInfo
     ppEnabledLayerNames = layers.data();
     enabledExtensionCount = uint32_t(exts.size());
     ppEnabledExtensionNames = exts.data();
+  }
+
+  InstanceCreateInfo &next(const void *next)
+  {
+    this->pNext = next;
+    return *this;
   }
 
   operator const VkInstanceCreateInfo *() const { return this; }
@@ -239,8 +265,22 @@ struct DeviceQueueCreateInfo : public VkDeviceQueueCreateInfo
   DeviceQueueCreateInfo(uint32_t queueFamilyIndex, uint32_t queueCount,
                         const std::vector<float> &priorities =
                             {
-                                1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
-                                1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
+                                1.0f,
+                                1.0f,
+                                1.0f,
+                                1.0f,
+                                1.0f,
+                                1.0f,
+                                1.0f,
+                                1.0f,
+                                1.0f,
+                                1.0f,
+                                1.0f,
+                                1.0f,
+                                1.0f,
+                                1.0f,
+                                1.0f,
+                                1.0f,
                             })
       : VkDeviceQueueCreateInfo()
   {
@@ -330,19 +370,37 @@ struct SemaphoreCreateInfo : public VkSemaphoreCreateInfo
     flags = 0;
   }
 
+  SemaphoreCreateInfo &next(const void *next)
+  {
+    this->pNext = next;
+    return *this;
+  }
+
   operator const VkSemaphoreCreateInfo *() const { return this; }
 };
 
 struct FenceCreateInfo : public VkFenceCreateInfo
 {
-  FenceCreateInfo() : VkFenceCreateInfo()
+  FenceCreateInfo(VkFenceCreateFlags flags = 0) : VkFenceCreateInfo()
   {
     sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
     pNext = NULL;
-    flags = 0;
+    this->flags = flags;
   }
 
   operator const VkFenceCreateInfo *() const { return this; }
+};
+
+struct EventCreateInfo : public VkEventCreateInfo
+{
+  EventCreateInfo(VkEventCreateFlags flags = 0) : VkEventCreateInfo()
+  {
+    sType = VK_STRUCTURE_TYPE_EVENT_CREATE_INFO;
+    pNext = NULL;
+    this->flags = flags;
+  }
+
+  operator const VkEventCreateInfo *() const { return this; }
 };
 
 struct CommandPoolCreateInfo : public VkCommandPoolCreateInfo
@@ -481,19 +539,85 @@ struct ImageCreateInfo : public VkImageCreateInfo
       imageType = VK_IMAGE_TYPE_1D;
   }
 
+  VkImageCreateInfo &next(const void *next)
+  {
+    this->pNext = next;
+    return *this;
+  }
+
   operator const VkImageCreateInfo *() const { return this; }
+};
+
+struct SamplerCreateInfo : public VkSamplerCreateInfo
+{
+  // simplified constructor, filter and address mode identical in all directions
+  SamplerCreateInfo(VkFilter filter,
+                    VkSamplerAddressMode addressMode = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+                    float maxAnisotropy = 0.0f,
+                    VkBorderColor borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK,
+                    float mipLodBias = 0.0f, float minLod = 0.0f, float maxLod = 0.0f,
+                    VkCompareOp compareOp = VK_COMPARE_OP_NEVER,
+                    VkBool32 unnormalizedCoordinates = VK_FALSE, VkSamplerCreateFlags flags = 0)
+      : SamplerCreateInfo(filter, filter,
+                          filter == VK_FILTER_NEAREST ? VK_SAMPLER_MIPMAP_MODE_NEAREST
+                                                      : VK_SAMPLER_MIPMAP_MODE_LINEAR,
+                          addressMode, addressMode, addressMode, maxAnisotropy, borderColor,
+                          mipLodBias, minLod, maxLod, compareOp, unnormalizedCoordinates, flags)
+  {
+  }
+
+  SamplerCreateInfo(VkFilter minFilter, VkFilter magFilter,
+                    VkSamplerMipmapMode mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR,
+                    VkSamplerAddressMode addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+                    VkSamplerAddressMode addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+                    VkSamplerAddressMode addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+                    float maxAnisotropy = 0.0f,
+                    VkBorderColor borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK,
+                    float mipLodBias = 0.0f, float minLod = 0.0f, float maxLod = 0.0f,
+                    VkCompareOp compareOp = VK_COMPARE_OP_NEVER,
+                    VkBool32 unnormalizedCoordinates = VK_FALSE, VkSamplerCreateFlags flags = 0)
+  {
+    sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    pNext = NULL;
+
+    this->flags = flags;
+    this->magFilter = magFilter;
+    this->minFilter = minFilter;
+    this->mipmapMode = mipmapMode;
+    this->addressModeU = addressModeU;
+    this->addressModeV = addressModeV;
+    this->addressModeW = addressModeW;
+
+    this->mipLodBias = mipLodBias;
+
+    this->anisotropyEnable = (maxAnisotropy > 1.0f);
+    this->maxAnisotropy = maxAnisotropy;
+
+    this->compareEnable = compareOp != VK_COMPARE_OP_NEVER;
+    this->compareOp = compareOp;
+    this->minLod = minLod;
+    this->maxLod = maxLod;
+    this->borderColor = borderColor;
+    this->unnormalizedCoordinates = unnormalizedCoordinates;
+  }
+
+  SamplerCreateInfo &next(const void *next)
+  {
+    this->pNext = next;
+    return *this;
+  }
+
+  operator const VkSamplerCreateInfo *() const { return this; }
 };
 
 struct ImageViewCreateInfo : public VkImageViewCreateInfo
 {
-  ImageViewCreateInfo(VkImage image, VkImageViewType viewType, VkFormat format,
-                      VkComponentMapping components = {VK_COMPONENT_SWIZZLE_IDENTITY,
-                                                       VK_COMPONENT_SWIZZLE_IDENTITY,
-                                                       VK_COMPONENT_SWIZZLE_IDENTITY,
-                                                       VK_COMPONENT_SWIZZLE_IDENTITY},
-                      VkImageSubresourceRange subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0,
-                                                                  VK_REMAINING_MIP_LEVELS, 0,
-                                                                  VK_REMAINING_ARRAY_LAYERS})
+  ImageViewCreateInfo(
+      VkImage image, VkImageViewType viewType, VkFormat format,
+      VkComponentMapping components = {VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
+                                       VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY},
+      VkImageSubresourceRange subresourceRange = {
+          VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS})
   {
     sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
     pNext = NULL;
@@ -578,6 +702,12 @@ struct DescriptorPoolCreateInfo : public VkDescriptorPoolCreateInfo
     this->pPoolSizes = poolSizes.data();
   }
 
+  DescriptorPoolCreateInfo &next(const void *next)
+  {
+    this->pNext = next;
+    return *this;
+  }
+
   operator const VkDescriptorPoolCreateInfo *() const { return this; }
 };
 
@@ -611,11 +741,12 @@ struct PushConstantRange : public VkPushConstantRange
 struct PipelineLayoutCreateInfo : public VkPipelineLayoutCreateInfo
 {
   PipelineLayoutCreateInfo(const std::vector<VkDescriptorSetLayout> &setLayouts = {},
-                           const std::vector<VkPushConstantRange> &pushConstantRanges = {})
+                           const std::vector<VkPushConstantRange> &pushConstantRanges = {},
+                           VkPipelineLayoutCreateFlags flags = 0)
   {
     sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
     pNext = NULL;
-    this->flags = 0;
+    this->flags = flags;
     this->setLayoutCount = (uint32_t)setLayouts.size();
     this->pSetLayouts = setLayouts.data();
     this->pushConstantRangeCount = (uint32_t)pushConstantRanges.size();
@@ -654,20 +785,80 @@ struct AttachmentDescription : public VkAttachmentDescription
   }
 };
 
+struct AttachmentDescription2KHR : public VkAttachmentDescription2KHR
+{
+  AttachmentDescription2KHR(VkFormat format, VkImageLayout initialLayout, VkImageLayout finalLayout,
+                            VkAttachmentLoadOp loadOp = VK_ATTACHMENT_LOAD_OP_MAX_ENUM,
+                            VkAttachmentStoreOp storeOp = VK_ATTACHMENT_STORE_OP_MAX_ENUM,
+                            VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT,
+                            VkAttachmentLoadOp stencilLoadOp = VK_ATTACHMENT_LOAD_OP_MAX_ENUM,
+                            VkAttachmentStoreOp stencilStoreOp = VK_ATTACHMENT_STORE_OP_MAX_ENUM,
+                            VkAttachmentDescriptionFlags flags = 0)
+  {
+    this->sType = VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_2_KHR;
+    this->pNext = NULL;
+    this->format = format;
+    this->initialLayout = initialLayout;
+    this->finalLayout = finalLayout;
+    this->samples = samples;
+    this->flags = flags;
+
+    // if un-set, default loadOp/storeOp to load/store
+    this->loadOp = loadOp != VK_ATTACHMENT_LOAD_OP_MAX_ENUM ? loadOp : VK_ATTACHMENT_LOAD_OP_LOAD;
+    this->storeOp =
+        storeOp != VK_ATTACHMENT_STORE_OP_MAX_ENUM ? storeOp : VK_ATTACHMENT_STORE_OP_STORE;
+
+    // if un-set, default stencilLoadOp/StoreOp to the same as loadOp/storeOp
+    this->stencilLoadOp =
+        stencilLoadOp != VK_ATTACHMENT_LOAD_OP_MAX_ENUM ? stencilLoadOp : this->loadOp;
+    this->stencilStoreOp =
+        stencilStoreOp != VK_ATTACHMENT_STORE_OP_MAX_ENUM ? stencilStoreOp : this->storeOp;
+  }
+
+  AttachmentDescription2KHR &next(const void *next)
+  {
+    this->pNext = next;
+    return *this;
+  }
+};
+
+struct AttachmentDescriptionStencilLayoutKHR : public VkAttachmentDescriptionStencilLayoutKHR
+{
+  AttachmentDescriptionStencilLayoutKHR(VkImageLayout stencilInitialLayout,
+                                        VkImageLayout stencilFinalLayout)
+  {
+    this->sType = VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_STENCIL_LAYOUT_KHR;
+    this->pNext = NULL;
+    this->stencilInitialLayout = stencilInitialLayout;
+    this->stencilFinalLayout = stencilFinalLayout;
+  }
+  AttachmentDescriptionStencilLayoutKHR &next(void *next)
+  {
+    this->pNext = next;
+    return *this;
+  }
+};
+
 struct FramebufferCreateInfo : public VkFramebufferCreateInfo
 {
   FramebufferCreateInfo(VkRenderPass renderPass, const std::vector<VkImageView> &attachments,
-                        VkExtent2D extent, uint32_t layers = 1)
+                        VkExtent2D extent, uint32_t layers = 1, VkFramebufferCreateFlags flags = 0)
   {
     sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
     pNext = NULL;
-    this->flags = 0;
+    this->flags = flags;
     this->renderPass = renderPass;
     this->attachmentCount = (uint32_t)attachments.size();
     this->pAttachments = attachments.data();
     this->width = extent.width;
     this->height = extent.height;
     this->layers = layers;
+  }
+
+  FramebufferCreateInfo &next(const void *next)
+  {
+    this->pNext = next;
+    return *this;
   }
 
   operator const VkFramebufferCreateInfo *() const { return this; }
@@ -749,6 +940,22 @@ struct WriteDescriptorSet : public VkWriteDescriptorSet
     this->pTexelBufferView = NULL;
   }
 
+  WriteDescriptorSet(VkDescriptorSet dstSet, uint32_t dstBinding,
+                     const VkWriteDescriptorSetInlineUniformBlockEXT &inlineWrite,
+                     const VkDescriptorBufferInfo &bufferInfo)
+  {
+    sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    pNext = &inlineWrite;
+    this->dstSet = dstSet;
+    this->dstBinding = dstBinding;
+    this->dstArrayElement = 0;
+    this->descriptorCount = inlineWrite.dataSize;
+    this->descriptorType = VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK_EXT;
+    this->pImageInfo = NULL;
+    this->pBufferInfo = &bufferInfo;
+    this->pTexelBufferView = NULL;
+  }
+
   WriteDescriptorSet(VkDescriptorSet dstSet, uint32_t dstBinding, VkDescriptorType descriptorType,
                      const std::vector<VkDescriptorBufferInfo> &bufferInfo)
       : WriteDescriptorSet(dstSet, dstBinding, 0, descriptorType, bufferInfo)
@@ -797,6 +1004,12 @@ struct WriteDescriptorSet : public VkWriteDescriptorSet
                      const std::vector<VkBufferView> &texelBufferView)
       : WriteDescriptorSet(dstSet, dstBinding, 0, descriptorType, texelBufferView)
   {
+  }
+
+  WriteDescriptorSet &next(const void *next)
+  {
+    this->pNext = next;
+    return *this;
   }
 
   operator const VkWriteDescriptorSet *() const { return this; }
@@ -915,6 +1128,34 @@ struct SubpassDependency : public VkSubpassDependency
   operator const VkSubpassDependency *() const { return this; }
 };
 
+struct SubpassDependency2KHR : public VkSubpassDependency2KHR
+{
+  SubpassDependency2KHR(uint32_t srcSubpass, uint32_t dstSubpass, VkPipelineStageFlags srcStageMask,
+                        VkPipelineStageFlags dstStageMask, VkAccessFlags srcAccessMask,
+                        VkAccessFlags dstAccessMask, VkDependencyFlags dependencyFlags = 0,
+                        uint32_t viewOffset = 0)
+  {
+    this->sType = VK_STRUCTURE_TYPE_SUBPASS_DEPENDENCY_2_KHR;
+    this->pNext = NULL;
+    this->srcSubpass = srcSubpass;
+    this->dstSubpass = dstSubpass;
+    this->srcStageMask = srcStageMask;
+    this->dstStageMask = dstStageMask;
+    this->srcAccessMask = srcAccessMask;
+    this->dstAccessMask = dstAccessMask;
+    this->dependencyFlags = dependencyFlags;
+    this->viewOffset = viewOffset;
+  }
+
+  SubpassDependency2KHR &next(const void *next)
+  {
+    this->pNext = next;
+    return *this;
+  }
+
+  operator const VkSubpassDependency2KHR *() const { return this; }
+};
+
 struct ClearColorValue
 {
   ClearColorValue(float r, float g, float b, float a)
@@ -925,6 +1166,14 @@ struct ClearColorValue
     float32[3] = a;
   }
 
+  ClearColorValue(uint32_t r, uint32_t g, uint32_t b, uint32_t a)
+  {
+    uint32[0] = r;
+    uint32[1] = g;
+    uint32[2] = b;
+    uint32[3] = a;
+  }
+
   union
   {
     float float32[4];
@@ -933,6 +1182,14 @@ struct ClearColorValue
   };
 
   operator const VkClearColorValue *() const { return (VkClearColorValue *)this; }
+};
+
+struct ClearDepthStencilValue
+{
+  float depth;
+  uint32_t stencil;
+
+  operator const VkClearDepthStencilValue *() const { return (VkClearDepthStencilValue *)this; }
 };
 
 struct ClearValue
@@ -1020,6 +1277,8 @@ struct ComputePipelineCreateInfo : public VkComputePipelineCreateInfo
 struct GraphicsPipelineCreateInfo : private VkGraphicsPipelineCreateInfo
 {
   GraphicsPipelineCreateInfo();
+  GraphicsPipelineCreateInfo(const GraphicsPipelineCreateInfo &other) { *this = other; }
+  const GraphicsPipelineCreateInfo &operator=(const GraphicsPipelineCreateInfo &other);
 
   using VkGraphicsPipelineCreateInfo::pNext;
   using VkGraphicsPipelineCreateInfo::flags;
@@ -1132,6 +1391,12 @@ struct GraphicsPipelineCreateInfo : private VkGraphicsPipelineCreateInfo
     return (const VkGraphicsPipelineCreateInfo *)this;
   }
 
+  operator VkGraphicsPipelineCreateInfo *()
+  {
+    bake();
+    return (VkGraphicsPipelineCreateInfo *)this;
+  }
+
 private:
   void bake();
 };
@@ -1188,17 +1453,21 @@ struct RenderPassCreator : private VkRenderPassCreateInfo
 
     subpasses.push_back({
         // flags
-        0, VK_PIPELINE_BIND_POINT_GRAPHICS,
+        0,
+        VK_PIPELINE_BIND_POINT_GRAPHICS,
         // input attachments
-        (uint32_t)inputAttachments.size(), input,
+        (uint32_t)inputAttachments.size(),
+        input,
         // color attachments
-        (uint32_t)colorAttachments.size(), color,
+        (uint32_t)colorAttachments.size(),
+        color,
         // resolve attachments
         resolve,
         // depth stencil attachment
         depth,
         // preserve attachments
-        0, NULL,
+        0,
+        NULL,
     });
   }
 
@@ -1238,9 +1507,168 @@ private:
   }
   const VkAttachmentReference *MakeRealPtr(const VkAttachmentReference *ptr)
   {
-    return ptr + ptrdiff_t(attrefs.data()) / sizeof(VkAttachmentReference) - 1;
+    return attrefs.data() + ptrdiff_t(ptr) / sizeof(VkAttachmentReference) - 1;
   }
 
   std::vector<VkAttachmentReference> attrefs;
 };
+
+struct AttachmentReference2KHR : public VkAttachmentReference2KHR
+{
+  AttachmentReference2KHR()
+  {
+    this->sType = VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2_KHR;
+    this->pNext = NULL;
+    this->attachment = VK_ATTACHMENT_UNUSED;
+    this->layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    this->aspectMask = 0;
+  }
+  AttachmentReference2KHR(uint32_t attachment, VkImageLayout layout, VkImageAspectFlags aspectMask = 0)
+  {
+    this->sType = VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2_KHR;
+    this->pNext = NULL;
+    this->attachment = attachment;
+    this->layout = layout;
+    this->aspectMask = aspectMask;
+  }
+
+  AttachmentReference2KHR &next(const void *next)
+  {
+    this->pNext = next;
+    return *this;
+  }
 };
+
+struct AttachmentReferenceStencilLayoutKHR : public VkAttachmentReferenceStencilLayoutKHR
+{
+  AttachmentReferenceStencilLayoutKHR(VkImageLayout stencilLayout)
+  {
+    this->sType = VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_STENCIL_LAYOUT_KHR;
+    this->pNext = NULL;
+    this->stencilLayout = stencilLayout;
+  }
+
+  AttachmentReferenceStencilLayoutKHR &next(void *next)
+  {
+    this->pNext = next;
+    return *this;
+  }
+};
+
+struct RenderPassCreator2 : private VkRenderPassCreateInfo2KHR
+{
+  RenderPassCreator2()
+  {
+    sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO_2_KHR;
+    pNext = NULL;
+    flags = 0;
+  }
+
+  using VkRenderPassCreateInfo2KHR::flags;
+  using VkRenderPassCreateInfo2KHR::pNext;
+
+  std::vector<VkAttachmentDescription2KHR> attachments;
+  std::vector<VkSubpassDescription2KHR> subpasses;
+  std::vector<VkSubpassDependency2KHR> dependencies;
+  std::vector<uint32_t> correlatedViewMasks;
+
+  void addSubpass(const std::vector<VkAttachmentReference2KHR> &colorAttachments,
+                  const VkAttachmentReference2KHR &depthStencilAttachment,
+                  const std::vector<VkAttachmentReference2KHR> &resolveAttachments = {},
+                  const std::vector<VkAttachmentReference2KHR> &inputAttachments = {})
+  {
+    const VkAttachmentReference2KHR *color = NULL;
+    if(!colorAttachments.empty())
+    {
+      color = MakeTempPtr();
+      attrefs.insert(attrefs.end(), colorAttachments.begin(), colorAttachments.end());
+    }
+
+    const VkAttachmentReference2KHR *depth = NULL;
+    depth = MakeTempPtr();
+    attrefs.push_back(depthStencilAttachment);
+
+    const VkAttachmentReference2KHR *resolve = NULL;
+    if(!resolveAttachments.empty())
+    {
+      resolve = MakeTempPtr();
+      attrefs.insert(attrefs.end(), resolveAttachments.begin(), resolveAttachments.end());
+    }
+
+    const VkAttachmentReference2KHR *input = NULL;
+    if(!inputAttachments.empty())
+    {
+      input = MakeTempPtr();
+      attrefs.insert(attrefs.end(), inputAttachments.begin(), inputAttachments.end());
+    }
+
+    subpasses.push_back({
+        VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_2_KHR,
+        NULL,
+        // flags
+        0,
+        // pipelineBindPoint
+        VK_PIPELINE_BIND_POINT_GRAPHICS,
+        // viewMask
+        0,
+        // input attachments
+        (uint32_t)inputAttachments.size(),
+        input,
+        // color attachments
+        (uint32_t)colorAttachments.size(),
+        color,
+        // resolve attachments
+        resolve,
+        // depth stencil attachment
+        depth,
+        // preserve attachments
+        0,
+        NULL,
+    });
+  }
+
+  operator const VkRenderPassCreateInfo2KHR *()
+  {
+    bake();
+    return (const VkRenderPassCreateInfo2KHR *)this;
+  }
+
+private:
+  void bake()
+  {
+    const VkAttachmentReference2KHR *invalid = MakeTempPtr();
+    for(VkSubpassDescription2KHR &sub : subpasses)
+    {
+      if(sub.pInputAttachments && sub.pInputAttachments <= invalid)
+        sub.pInputAttachments = MakeRealPtr(sub.pInputAttachments);
+      if(sub.pColorAttachments && sub.pColorAttachments <= invalid)
+        sub.pColorAttachments = MakeRealPtr(sub.pColorAttachments);
+      if(sub.pResolveAttachments && sub.pResolveAttachments <= invalid)
+        sub.pResolveAttachments = MakeRealPtr(sub.pResolveAttachments);
+      if(sub.pDepthStencilAttachment && sub.pDepthStencilAttachment <= invalid)
+        sub.pDepthStencilAttachment = MakeRealPtr(sub.pDepthStencilAttachment);
+    }
+
+    attachmentCount = (uint32_t)attachments.size();
+    pAttachments = attachments.data();
+    subpassCount = (uint32_t)subpasses.size();
+    pSubpasses = subpasses.data();
+    dependencyCount = (uint32_t)dependencies.size();
+    pDependencies = dependencies.data();
+    correlatedViewMaskCount = (uint32_t)correlatedViewMasks.size();
+    pCorrelatedViewMasks = correlatedViewMasks.data();
+  }
+
+  const VkAttachmentReference2KHR *MakeTempPtr()
+  {
+    return (const VkAttachmentReference2KHR *)((attrefs.size() + 1) *
+                                               sizeof(VkAttachmentReference2KHR));
+  }
+  const VkAttachmentReference2KHR *MakeRealPtr(const VkAttachmentReference2KHR *ptr)
+  {
+    return attrefs.data() + ptrdiff_t(ptr) / sizeof(VkAttachmentReference2KHR) - 1;
+  }
+
+  std::vector<VkAttachmentReference2KHR> attrefs;
+};
+};    // namespace vkh

@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -23,8 +23,10 @@
  ******************************************************************************/
 
 #include "../vk_core.h"
+#include "../vk_debug.h"
+#include "api/replay/version.h"
 
-static char fakeRenderDocUUID[VK_UUID_SIZE + 1] = {};
+static char fakeRenderDocUUID[VK_UUID_SIZE] = {};
 
 void MakeFakeUUID()
 {
@@ -36,7 +38,48 @@ void MakeFakeUUID()
     // rdocyymmddHHMMSS
     // we pass size+1 so that there's room for a null terminator (the UUID doesn't
     // need a null terminator as it's a fixed size non-string array)
-    StringFormat::sntimef(fakeRenderDocUUID, VK_UUID_SIZE + 1, "rdoc%y%m%d%H%M%S");
+    rdcstr uuid = StringFormat::sntimef(Timing::GetUTCTime(), "rdoc%y%m%d%H%M%S");
+    RDCASSERT(uuid.size() == sizeof(fakeRenderDocUUID));
+    memcpy(fakeRenderDocUUID, uuid.c_str(), RDCMIN((size_t)VK_UUID_SIZE, uuid.size()));
+  }
+}
+
+void ClampPhysDevAPIVersion(VkPhysicalDeviceProperties *pProperties, VkPhysicalDevice physicalDevice)
+{
+  // for Vulkan 1.3 bufferDeviceAddress is core. If the bufferDeviceAddressCaptureReplay feature is
+  // not available, we can't support it so we must clamp to version 1.2 for that physical device.
+  if(pProperties->apiVersion >= VK_API_VERSION_1_3)
+  {
+    // for 1.1 this is core so we should definitely have this function.
+    if(ObjDisp(physicalDevice)->GetPhysicalDeviceFeatures2 != NULL)
+    {
+      VkPhysicalDeviceFeatures2 features = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+
+      // similarly this struct must be valid if the device is 1.3
+      VkPhysicalDeviceVulkan12Features vk12 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+
+      features.pNext = &vk12;
+
+      ObjDisp(physicalDevice)->GetPhysicalDeviceFeatures2(Unwrap(physicalDevice), &features);
+
+      if(vk12.bufferDeviceAddressCaptureReplay == VK_FALSE)
+      {
+        RDCWARN(
+            "Vulkan feature bufferDeviceAddressCaptureReplay is not available. Clamping physical "
+            "device %s from reported version %d.%d to 1.2",
+            pProperties->deviceName, VK_VERSION_MAJOR(pProperties->apiVersion),
+            VK_VERSION_MINOR(pProperties->apiVersion));
+
+        pProperties->apiVersion = VK_API_VERSION_1_2;
+      }
+    }
+    else
+    {
+      // if we don't have GPDP2 the application has not initialised the instance at 1.3+
+      // let's clamp the version just to be safe since we can't check, and this will help protect
+      // against buggy applications
+      pProperties->apiVersion = VK_API_VERSION_1_2;
+    }
   }
 }
 
@@ -190,6 +233,8 @@ void WrappedVulkan::vkGetPhysicalDeviceProperties(VkPhysicalDevice physicalDevic
   MakeFakeUUID();
 
   memcpy(pProperties->pipelineCacheUUID, fakeRenderDocUUID, VK_UUID_SIZE);
+
+  ClampPhysDevAPIVersion(pProperties, physicalDevice);
 }
 
 void WrappedVulkan::vkGetPhysicalDeviceQueueFamilyProperties(
@@ -211,12 +256,6 @@ void WrappedVulkan::vkGetPhysicalDeviceQueueFamilyProperties(
 void WrappedVulkan::vkGetPhysicalDeviceMemoryProperties(
     VkPhysicalDevice physicalDevice, VkPhysicalDeviceMemoryProperties *pMemoryProperties)
 {
-  if(pMemoryProperties)
-  {
-    *pMemoryProperties = *GetRecord(physicalDevice)->memProps;
-    return;
-  }
-
   ObjDisp(physicalDevice)->GetPhysicalDeviceMemoryProperties(Unwrap(physicalDevice), pMemoryProperties);
 }
 
@@ -237,21 +276,6 @@ void WrappedVulkan::vkGetBufferMemoryRequirements(VkDevice device, VkBuffer buff
     *pMemoryRequirements = GetRecord(buffer)->resInfo->memreqs;
   else
     ObjDisp(device)->GetBufferMemoryRequirements(Unwrap(device), Unwrap(buffer), pMemoryRequirements);
-
-  // don't do remapping here on replay.
-  if(IsReplayMode(m_State))
-    return;
-
-  uint32_t bits = pMemoryRequirements->memoryTypeBits;
-  uint32_t *memIdxMap = GetRecord(device)->memIdxMap;
-
-  pMemoryRequirements->memoryTypeBits = 0;
-
-  // for each of our fake memory indices, check if the real
-  // memory type it points to is set - if so, set our fake bit
-  for(uint32_t i = 0; i < VK_MAX_MEMORY_TYPES; i++)
-    if(memIdxMap[i] < 32U && (bits & (1U << memIdxMap[i])))
-      pMemoryRequirements->memoryTypeBits |= (1U << i);
 }
 
 void WrappedVulkan::vkGetImageMemoryRequirements(VkDevice device, VkImage image,
@@ -265,26 +289,11 @@ void WrappedVulkan::vkGetImageMemoryRequirements(VkDevice device, VkImage image,
   else
     ObjDisp(device)->GetImageMemoryRequirements(Unwrap(device), Unwrap(image), pMemoryRequirements);
 
-  // don't do remapping here on replay.
-  if(IsReplayMode(m_State))
-    return;
-
-  uint32_t bits = pMemoryRequirements->memoryTypeBits;
-  uint32_t *memIdxMap = GetRecord(device)->memIdxMap;
-
-  pMemoryRequirements->memoryTypeBits = 0;
-
-  // for each of our fake memory indices, check if the real
-  // memory type it points to is set - if so, set our fake bit
-  for(uint32_t i = 0; i < VK_MAX_MEMORY_TYPES; i++)
-    if(memIdxMap[i] < 32U && (bits & (1U << memIdxMap[i])))
-      pMemoryRequirements->memoryTypeBits |= (1U << i);
-
   // AMD can have some variability in the returned size, so we need to pad the reported size to
   // allow for this. The variability isn't quite clear, but for now we assume aligning size to
   // alignment * 4 should be sufficient (adding on a fixed padding won't help the problem as it
   // won't remove the variability, nor will adding then aligning for the same reason).
-  if(GetDriverInfo().UnreliableImageMemoryRequirements() && pMemoryRequirements->size > 0)
+  if(GetDriverInfo().AMDUnreliableImageMemoryRequirements() && pMemoryRequirements->size > 0)
   {
     VkMemoryRequirements &memreq = *pMemoryRequirements;
 
@@ -313,6 +322,234 @@ void WrappedVulkan::vkGetImageSparseMemoryRequirements(
                                                     pSparseMemoryRequirements);
 }
 
+void WrappedVulkan::vkGetDeviceBufferMemoryRequirements(VkDevice device,
+                                                        const VkDeviceBufferMemoryRequirements *pInfo,
+                                                        VkMemoryRequirements2 *pMemoryRequirements)
+{
+  byte *tempMem = GetTempMemory(GetNextPatchSize(pInfo));
+  VkDeviceBufferMemoryRequirements *unwrappedInfo = UnwrapStructAndChain(m_State, tempMem, pInfo);
+
+  VkBufferCreateInfo *info = (VkBufferCreateInfo *)unwrappedInfo->pCreateInfo;
+
+  // patch the create info the same as we would for vkCreateBuffer
+  info->usage |= VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+  info->usage |= VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+
+  if(IsCaptureMode(m_State) && (info->usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT))
+    info->flags |= VK_BUFFER_CREATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT;
+
+  ObjDisp(device)->GetDeviceBufferMemoryRequirements(Unwrap(device), unwrappedInfo,
+                                                     pMemoryRequirements);
+
+  // if the buffer is external, create a non-external and return the worst case memory requirements
+  // so that the memory allocated is sufficient for us on replay when the buffer is non-external
+  bool isExternal = FindNextStruct(unwrappedInfo->pCreateInfo,
+                                   VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO) != NULL;
+
+  if(isExternal)
+  {
+    bool removed =
+        RemoveNextStruct(unwrappedInfo, VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO);
+
+    RDCASSERTMSG("Couldn't find next struct indicating external memory", removed);
+
+    VkMemoryRequirements2 nonExternalReq = {};
+    nonExternalReq.sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2;
+
+    ObjDisp(device)->GetDeviceBufferMemoryRequirements(Unwrap(device), unwrappedInfo,
+                                                       &nonExternalReq);
+
+    pMemoryRequirements->memoryRequirements.size =
+        RDCMAX(pMemoryRequirements->memoryRequirements.size, nonExternalReq.memoryRequirements.size);
+    pMemoryRequirements->memoryRequirements.alignment =
+        RDCMAX(pMemoryRequirements->memoryRequirements.alignment,
+               nonExternalReq.memoryRequirements.alignment);
+
+    if((pMemoryRequirements->memoryRequirements.memoryTypeBits &
+        nonExternalReq.memoryRequirements.memoryTypeBits) == 0)
+    {
+      RDCWARN(
+          "External buffer shares no memory types with non-external buffer. This buffer "
+          "will not be replayable.");
+    }
+    else
+    {
+      pMemoryRequirements->memoryRequirements.memoryTypeBits &=
+          nonExternalReq.memoryRequirements.memoryTypeBits;
+    }
+  }
+}
+
+void WrappedVulkan::vkGetDeviceImageMemoryRequirements(VkDevice device,
+                                                       const VkDeviceImageMemoryRequirements *pInfo,
+                                                       VkMemoryRequirements2 *pMemoryRequirements)
+{
+  size_t tempMemSize = GetNextPatchSize(pInfo);
+
+  // reserve space for a patched view format list if necessary
+  if(pInfo->pCreateInfo->samples != VK_SAMPLE_COUNT_1_BIT)
+  {
+    const VkImageFormatListCreateInfo *formatListInfo =
+        (const VkImageFormatListCreateInfo *)FindNextStruct(
+            pInfo->pCreateInfo, VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO);
+
+    if(formatListInfo)
+      tempMemSize += sizeof(VkFormat) * (formatListInfo->viewFormatCount + 1);
+  }
+
+  byte *tempMem = GetTempMemory(tempMemSize);
+  VkDeviceImageMemoryRequirements *unwrappedInfo = UnwrapStructAndChain(m_State, tempMem, pInfo);
+
+  VkImageCreateInfo *info = (VkImageCreateInfo *)unwrappedInfo->pCreateInfo;
+
+  info->usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+
+  if(IsCaptureMode(m_State))
+  {
+    info->usage |= VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    info->usage &= ~VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT;
+  }
+
+  if(IsYUVFormat(info->format))
+    info->flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+
+  if(info->samples != VK_SAMPLE_COUNT_1_BIT)
+  {
+    info->usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
+    info->flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+
+    if(IsCaptureMode(m_State))
+    {
+      if(!IsDepthOrStencilFormat(info->format))
+      {
+        if(GetDebugManager() && GetShaderCache()->IsBuffer2MSSupported())
+          info->usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+      }
+      else
+      {
+        info->usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+      }
+    }
+  }
+
+  info->flags &= ~VK_IMAGE_CREATE_SUBSAMPLED_BIT_EXT;
+
+  VkImageStencilUsageCreateInfo *separateStencilUsage =
+      (VkImageStencilUsageCreateInfo *)FindNextStruct(
+          info, VK_STRUCTURE_TYPE_IMAGE_STENCIL_USAGE_CREATE_INFO);
+  if(separateStencilUsage)
+  {
+    separateStencilUsage->stencilUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+
+    if(IsCaptureMode(m_State))
+    {
+      info->usage |= VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+      info->usage &= ~VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT;
+    }
+
+    if(info->samples != VK_SAMPLE_COUNT_1_BIT)
+    {
+      separateStencilUsage->stencilUsage |=
+          VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+    }
+  }
+
+  // similarly for the image format list for MSAA textures, add the UINT cast format we will need
+  if(info->samples != VK_SAMPLE_COUNT_1_BIT)
+  {
+    VkImageFormatListCreateInfo *formatListInfo = (VkImageFormatListCreateInfo *)FindNextStruct(
+        info, VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO);
+
+    if(formatListInfo)
+    {
+      uint32_t bs = GetByteSize(1, 1, 1, info->format, 0);
+
+      VkFormat msaaCopyFormat = VK_FORMAT_UNDEFINED;
+      if(bs == 1)
+        msaaCopyFormat = VK_FORMAT_R8_UINT;
+      else if(bs == 2)
+        msaaCopyFormat = VK_FORMAT_R16_UINT;
+      else if(bs == 4)
+        msaaCopyFormat = VK_FORMAT_R32_UINT;
+      else if(bs == 8)
+        msaaCopyFormat = VK_FORMAT_R32G32_UINT;
+      else if(bs == 16)
+        msaaCopyFormat = VK_FORMAT_R32G32B32A32_UINT;
+
+      const VkFormat *oldFmts = formatListInfo->pViewFormats;
+      VkFormat *newFmts = (VkFormat *)tempMem;
+      formatListInfo->pViewFormats = newFmts;
+
+      bool needAdded = true;
+      uint32_t i = 0;
+      for(; i < formatListInfo->viewFormatCount; i++)
+      {
+        newFmts[i] = oldFmts[i];
+        if(newFmts[i] == msaaCopyFormat)
+          needAdded = false;
+      }
+
+      if(needAdded)
+      {
+        newFmts[i] = msaaCopyFormat;
+        formatListInfo->viewFormatCount++;
+      }
+    }
+  }
+
+  ObjDisp(device)->GetDeviceImageMemoryRequirements(Unwrap(device), unwrappedInfo,
+                                                    pMemoryRequirements);
+
+  // if the image is external, create a non-external and return the worst case memory requirements
+  // so that the memory allocated is sufficient for us on replay when the image is non-external
+  bool isExternal = FindNextStruct(unwrappedInfo->pCreateInfo,
+                                   VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO) != NULL;
+
+  if(isExternal)
+  {
+    bool removed =
+        RemoveNextStruct(unwrappedInfo, VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO);
+
+    RDCASSERTMSG("Couldn't find next struct indicating external memory", removed);
+
+    VkMemoryRequirements2 nonExternalReq = {};
+    nonExternalReq.sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2;
+
+    ObjDisp(device)->GetDeviceImageMemoryRequirements(Unwrap(device), unwrappedInfo, &nonExternalReq);
+
+    pMemoryRequirements->memoryRequirements.size =
+        RDCMAX(pMemoryRequirements->memoryRequirements.size, nonExternalReq.memoryRequirements.size);
+    pMemoryRequirements->memoryRequirements.alignment =
+        RDCMAX(pMemoryRequirements->memoryRequirements.alignment,
+               nonExternalReq.memoryRequirements.alignment);
+
+    if((pMemoryRequirements->memoryRequirements.memoryTypeBits &
+        nonExternalReq.memoryRequirements.memoryTypeBits) == 0)
+    {
+      RDCWARN(
+          "External image shares no memory types with non-external image. This image "
+          "will not be replayable.");
+    }
+    else
+    {
+      pMemoryRequirements->memoryRequirements.memoryTypeBits &=
+          nonExternalReq.memoryRequirements.memoryTypeBits;
+    }
+  }
+}
+
+void WrappedVulkan::vkGetDeviceImageSparseMemoryRequirements(
+    VkDevice device, const VkDeviceImageMemoryRequirements *pInfo,
+    uint32_t *pSparseMemoryRequirementCount,
+    VkSparseImageMemoryRequirements2 *pSparseMemoryRequirements)
+{
+  byte *tempMem = GetTempMemory(GetNextPatchSize(pInfo));
+  VkDeviceImageMemoryRequirements *unwrappedInfo = UnwrapStructAndChain(m_State, tempMem, pInfo);
+
+  ObjDisp(device)->GetDeviceImageSparseMemoryRequirements(
+      Unwrap(device), unwrappedInfo, pSparseMemoryRequirementCount, pSparseMemoryRequirements);
+}
+
 void WrappedVulkan::vkGetBufferMemoryRequirements2(VkDevice device,
                                                    const VkBufferMemoryRequirementsInfo2 *pInfo,
                                                    VkMemoryRequirements2 *pMemoryRequirements)
@@ -326,21 +563,6 @@ void WrappedVulkan::vkGetBufferMemoryRequirements2(VkDevice device,
   // pessimistic for the case of external memory bound resources. See vkCreateBuffer/vkCreateImage
   if(IsCaptureMode(m_State) && GetRecord(pInfo->buffer)->resInfo)
     pMemoryRequirements->memoryRequirements = GetRecord(pInfo->buffer)->resInfo->memreqs;
-
-  // don't do remapping here on replay.
-  if(IsReplayMode(m_State))
-    return;
-
-  uint32_t bits = pMemoryRequirements->memoryRequirements.memoryTypeBits;
-  uint32_t *memIdxMap = GetRecord(device)->memIdxMap;
-
-  pMemoryRequirements->memoryRequirements.memoryTypeBits = 0;
-
-  // for each of our fake memory indices, check if the real
-  // memory type it points to is set - if so, set our fake bit
-  for(uint32_t i = 0; i < VK_MAX_MEMORY_TYPES; i++)
-    if(memIdxMap[i] < 32U && (bits & (1U << memIdxMap[i])))
-      pMemoryRequirements->memoryRequirements.memoryTypeBits |= (1U << i);
 }
 
 void WrappedVulkan::vkGetImageMemoryRequirements2(VkDevice device,
@@ -361,22 +583,11 @@ void WrappedVulkan::vkGetImageMemoryRequirements2(VkDevice device,
   if(IsReplayMode(m_State))
     return;
 
-  uint32_t bits = pMemoryRequirements->memoryRequirements.memoryTypeBits;
-  uint32_t *memIdxMap = GetRecord(device)->memIdxMap;
-
-  pMemoryRequirements->memoryRequirements.memoryTypeBits = 0;
-
-  // for each of our fake memory indices, check if the real
-  // memory type it points to is set - if so, set our fake bit
-  for(uint32_t i = 0; i < VK_MAX_MEMORY_TYPES; i++)
-    if(memIdxMap[i] < 32U && (bits & (1U << memIdxMap[i])))
-      pMemoryRequirements->memoryRequirements.memoryTypeBits |= (1U << i);
-
   // AMD can have some variability in the returned size, so we need to pad the reported size to
   // allow for this. The variability isn't quite clear, but for now we assume aligning size to
   // alignment * 4 should be sufficient (adding on a fixed padding won't help the problem as it
   // won't remove the variability, nor will adding then aligning for the same reason).
-  if(GetDriverInfo().UnreliableImageMemoryRequirements() &&
+  if(GetDriverInfo().AMDUnreliableImageMemoryRequirements() &&
      pMemoryRequirements->memoryRequirements.size > 0)
   {
     VkMemoryRequirements &memreq = pMemoryRequirements->memoryRequirements;
@@ -424,7 +635,8 @@ void WrappedVulkan::vkGetRenderAreaGranularity(VkDevice device, VkRenderPass ren
 VkResult WrappedVulkan::vkGetPipelineCacheData(VkDevice device, VkPipelineCache pipelineCache,
                                                size_t *pDataSize, void *pData)
 {
-  size_t totalSize = 16 + VK_UUID_SIZE + 4;    // required header (16+UUID) and 4 0 bytes
+  // required header and 4 NULL bytes
+  size_t totalSize = sizeof(VkPipelineCacheHeaderVersionOne) + 4;
 
   if(pDataSize && !pData)
     *pDataSize = totalSize;
@@ -437,24 +649,27 @@ VkResult WrappedVulkan::vkGetPipelineCacheData(VkDevice device, VkPipelineCache 
       return VK_INCOMPLETE;
     }
 
-    uint32_t *ptr = (uint32_t *)pData;
+    VkPipelineCacheHeaderVersionOne *header = (VkPipelineCacheHeaderVersionOne *)pData;
 
-    ptr[0] = (uint32_t)totalSize;
-    ptr[1] = VK_PIPELINE_CACHE_HEADER_VERSION_ONE;
+    RDCCOMPILE_ASSERT(sizeof(VkPipelineCacheHeaderVersionOne) == 16 + VK_UUID_SIZE,
+                      "Pipeline cache header size is wrong");
+
+    header->headerSize = sizeof(VkPipelineCacheHeaderVersionOne);
+    header->headerVersion = VK_PIPELINE_CACHE_HEADER_VERSION_ONE;
     // just in case the user expects a valid vendorID/deviceID, write the real one
     // MULTIDEVICE need to get the right physical device for this device
-    ptr[2] = m_PhysicalDeviceData.props.vendorID;
-    ptr[3] = m_PhysicalDeviceData.props.deviceID;
+    header->vendorID = m_PhysicalDeviceData.props.vendorID;
+    header->deviceID = m_PhysicalDeviceData.props.deviceID;
 
     MakeFakeUUID();
 
-    memcpy(ptr + 4, fakeRenderDocUUID, VK_UUID_SIZE);
-    // [4], [5], [6], [7]
+    memcpy(header->pipelineCacheUUID, fakeRenderDocUUID, VK_UUID_SIZE);
 
     RDCCOMPILE_ASSERT(VK_UUID_SIZE == 16, "VK_UUID_SIZE has changed");
 
     // empty bytes
-    ptr[8] = 0;
+    uint32_t *ptr = (uint32_t *)(header + 1);
+    *ptr = 0;
   }
 
   // we don't want the application to use pipeline caches at all, and especially
@@ -502,7 +717,7 @@ VkResult WrappedVulkan::vkGetMemoryWin32HandleKHR(
 }
 
 VkResult WrappedVulkan::vkGetMemoryWin32HandlePropertiesKHR(
-    VkDevice device, VkExternalMemoryHandleTypeFlagBitsKHR handleType, HANDLE handle,
+    VkDevice device, VkExternalMemoryHandleTypeFlagBits handleType, HANDLE handle,
     VkMemoryWin32HandlePropertiesKHR *pMemoryWin32HandleProperties)
 {
   return ObjDisp(device)->GetMemoryWin32HandlePropertiesKHR(Unwrap(device), handleType, handle,
@@ -519,7 +734,7 @@ VkResult WrappedVulkan::vkGetMemoryFdKHR(VkDevice device, const VkMemoryGetFdInf
 }
 
 VkResult WrappedVulkan::vkGetMemoryFdPropertiesKHR(VkDevice device,
-                                                   VkExternalMemoryHandleTypeFlagBitsKHR handleType,
+                                                   VkExternalMemoryHandleTypeFlagBits handleType,
                                                    int fd,
                                                    VkMemoryFdPropertiesKHR *pMemoryFdProperties)
 {
@@ -570,12 +785,85 @@ void WrappedVulkan::vkGetPhysicalDeviceFeatures2(VkPhysicalDevice physicalDevice
     RDCWARN("Forcibly disabling support for protected memory");
     protectedMem->protectedMemory = VK_FALSE;
   }
+
+  // in Vulkan 1.2 buffer_device_address can be used without an extension, so we can't hide the
+  // extension when capture/replay is not supported. Instead we hide the feature bit here.
+  VkPhysicalDeviceVulkan12Features *vulkan12 = (VkPhysicalDeviceVulkan12Features *)FindNextStruct(
+      pFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES);
+
+  if(vulkan12)
+  {
+    if(vulkan12->bufferDeviceAddressCaptureReplay == VK_FALSE)
+    {
+      RDCWARN(
+          "VkPhysicalDeviceVulkan12Features::bufferDeviceAddressCaptureReplay is false, "
+          "can't support capture of bufferDeviceAddress");
+      vulkan12->bufferDeviceAddress = vulkan12->bufferDeviceAddressMultiDevice = VK_FALSE;
+    }
+  }
+
+  // we don't want to report support for mesh shaders + multiview
+  VkPhysicalDeviceMeshShaderFeaturesEXT *mesh =
+      (VkPhysicalDeviceMeshShaderFeaturesEXT *)FindNextStruct(
+          pFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT);
+
+  if(mesh)
+  {
+    if(mesh->multiviewMeshShader)
+    {
+      RDCWARN("Disabling support for multiview + mesh shaders");
+      mesh->multiviewMeshShader = VK_FALSE;
+    }
+  }
+
+  // report features depending on extensions not supported in RenderDoc as not supported
+  VkPhysicalDeviceExtendedDynamicState3FeaturesEXT *dynState3 =
+      (VkPhysicalDeviceExtendedDynamicState3FeaturesEXT *)FindNextStruct(
+          pFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT);
+
+#define DISABLE_EDS3_FEATURE(feature)                                                 \
+  if(dynState3->feature == VK_TRUE)                                                   \
+  {                                                                                   \
+    RDCWARN("Forcibly disabling support for physical device feature '" #feature "'"); \
+    dynState3->feature = VK_FALSE;                                                    \
+  }
+
+  if(dynState3)
+  {
+    // need VK_EXT_blend_operation_advanced
+    DISABLE_EDS3_FEATURE(extendedDynamicState3ColorBlendAdvanced);
+    // need VK_NV_clip_space_w_scaling
+    DISABLE_EDS3_FEATURE(extendedDynamicState3ViewportWScalingEnable);
+    // need VK_NV_viewport_swizzle
+    DISABLE_EDS3_FEATURE(extendedDynamicState3ViewportSwizzle);
+    // need VK_NV_fragment_coverage_to_color
+    DISABLE_EDS3_FEATURE(extendedDynamicState3CoverageToColorEnable);
+    DISABLE_EDS3_FEATURE(extendedDynamicState3CoverageToColorLocation);
+    // need VK_NV_framebuffer_mixed_samples
+    DISABLE_EDS3_FEATURE(extendedDynamicState3CoverageModulationMode);
+    DISABLE_EDS3_FEATURE(extendedDynamicState3CoverageModulationTableEnable);
+    DISABLE_EDS3_FEATURE(extendedDynamicState3CoverageModulationTable);
+    // need VK_NV_coverage_reduction_mode
+    DISABLE_EDS3_FEATURE(extendedDynamicState3CoverageReductionMode);
+    // need VK_NV_representative_fragment_test
+    DISABLE_EDS3_FEATURE(extendedDynamicState3RepresentativeFragmentTestEnable);
+    // VK_NV_shading_rate_image
+    DISABLE_EDS3_FEATURE(extendedDynamicState3ShadingRateImageEnable);
+  }
+
+#undef DISABLE_EDS3_FEATURE
 }
 
 void WrappedVulkan::vkGetPhysicalDeviceProperties2(VkPhysicalDevice physicalDevice,
                                                    VkPhysicalDeviceProperties2 *pProperties)
 {
-  return ObjDisp(physicalDevice)->GetPhysicalDeviceProperties2(Unwrap(physicalDevice), pProperties);
+  ObjDisp(physicalDevice)->GetPhysicalDeviceProperties2(Unwrap(physicalDevice), pProperties);
+
+  MakeFakeUUID();
+
+  memcpy(pProperties->properties.pipelineCacheUUID, fakeRenderDocUUID, VK_UUID_SIZE);
+
+  ClampPhysDevAPIVersion(&pProperties->properties, physicalDevice);
 }
 
 void WrappedVulkan::vkGetPhysicalDeviceQueueFamilyProperties2(
@@ -728,4 +1016,142 @@ VkDeviceAddress WrappedVulkan::vkGetBufferDeviceAddressEXT(VkDevice device,
   VkBufferDeviceAddressInfoEXT unwrappedInfo = *pInfo;
   unwrappedInfo.buffer = Unwrap(unwrappedInfo.buffer);
   return ObjDisp(device)->GetBufferDeviceAddressEXT(Unwrap(device), &unwrappedInfo);
+}
+
+VkResult WrappedVulkan::vkGetPipelineExecutablePropertiesKHR(
+    VkDevice device, const VkPipelineInfoKHR *pPipelineInfo, uint32_t *pExecutableCount,
+    VkPipelineExecutablePropertiesKHR *pProperties)
+{
+  VkPipelineInfoKHR unwrappedInfo = *pPipelineInfo;
+  unwrappedInfo.pipeline = Unwrap(unwrappedInfo.pipeline);
+  return ObjDisp(device)->GetPipelineExecutablePropertiesKHR(Unwrap(device), &unwrappedInfo,
+                                                             pExecutableCount, pProperties);
+}
+
+VkResult WrappedVulkan::vkGetPipelineExecutableStatisticsKHR(
+    VkDevice device, const VkPipelineExecutableInfoKHR *pExecutableInfo, uint32_t *pStatisticCount,
+    VkPipelineExecutableStatisticKHR *pStatistics)
+{
+  VkPipelineExecutableInfoKHR unwrappedInfo = *pExecutableInfo;
+  unwrappedInfo.pipeline = Unwrap(unwrappedInfo.pipeline);
+  return ObjDisp(device)->GetPipelineExecutableStatisticsKHR(Unwrap(device), &unwrappedInfo,
+                                                             pStatisticCount, pStatistics);
+}
+
+VkResult WrappedVulkan::vkGetPipelineExecutableInternalRepresentationsKHR(
+    VkDevice device, const VkPipelineExecutableInfoKHR *pExecutableInfo,
+    uint32_t *pInternalRepresentationCount,
+    VkPipelineExecutableInternalRepresentationKHR *pInternalRepresentations)
+{
+  VkPipelineExecutableInfoKHR unwrappedInfo = *pExecutableInfo;
+  unwrappedInfo.pipeline = Unwrap(unwrappedInfo.pipeline);
+  return ObjDisp(device)->GetPipelineExecutableInternalRepresentationsKHR(
+      Unwrap(device), &unwrappedInfo, pInternalRepresentationCount, pInternalRepresentations);
+}
+
+VkDeviceAddress WrappedVulkan::vkGetBufferDeviceAddress(VkDevice device,
+                                                        VkBufferDeviceAddressInfo *pInfo)
+{
+  VkBufferDeviceAddressInfo unwrappedInfo = *pInfo;
+  unwrappedInfo.buffer = Unwrap(unwrappedInfo.buffer);
+  return ObjDisp(device)->GetBufferDeviceAddress(Unwrap(device), &unwrappedInfo);
+}
+
+uint64_t WrappedVulkan::vkGetBufferOpaqueCaptureAddress(VkDevice device,
+                                                        VkBufferDeviceAddressInfo *pInfo)
+{
+  VkBufferDeviceAddressInfo unwrappedInfo = *pInfo;
+  unwrappedInfo.buffer = Unwrap(unwrappedInfo.buffer);
+  return ObjDisp(device)->GetBufferOpaqueCaptureAddress(Unwrap(device), &unwrappedInfo);
+}
+
+uint64_t WrappedVulkan::vkGetDeviceMemoryOpaqueCaptureAddress(
+    VkDevice device, VkDeviceMemoryOpaqueCaptureAddressInfo *pInfo)
+{
+  VkDeviceMemoryOpaqueCaptureAddressInfo unwrappedInfo = *pInfo;
+  unwrappedInfo.memory = Unwrap(unwrappedInfo.memory);
+  return ObjDisp(device)->GetDeviceMemoryOpaqueCaptureAddress(Unwrap(device), &unwrappedInfo);
+}
+
+VkResult WrappedVulkan::vkGetPhysicalDeviceToolProperties(VkPhysicalDevice physicalDevice,
+                                                          uint32_t *pToolCount,
+                                                          VkPhysicalDeviceToolProperties *pToolProperties)
+{
+  // check how many tools are downstream. The function pointer will be NULL if no-one else supports
+  // this extension except us.
+  uint32_t downstreamCount = 0;
+  if(ObjDisp(physicalDevice)->GetPhysicalDeviceToolProperties != NULL)
+    ObjDisp(physicalDevice)
+        ->GetPhysicalDeviceToolProperties(Unwrap(physicalDevice), &downstreamCount, NULL);
+
+  // if we're just enumerating, pToolProperties is NULL, so set the tool count and return
+  if(pToolCount && pToolProperties == NULL)
+  {
+    *pToolCount = downstreamCount + 1;
+    return VK_SUCCESS;
+  }
+
+  // otherwise we expect both to be non-NULL
+  if(pToolCount == NULL || pToolProperties == NULL)
+    return VK_INCOMPLETE;
+
+  // this is how much space is in the array, don't forget it
+  uint32_t availableCount = *pToolCount;
+
+  VkResult vkr = VK_SUCCESS;
+
+  if(ObjDisp(physicalDevice)->GetPhysicalDeviceToolProperties != NULL)
+  {
+    // call downstream to populate the array (up to what's available)
+    // this writes up to availableCount properties into pToolProperties, and sets the number written
+    // in pToolCount
+    vkr = ObjDisp(physicalDevice)
+              ->GetPhysicalDeviceToolProperties(Unwrap(physicalDevice), pToolCount, pToolProperties);
+  }
+  else
+  {
+    // nothing written downstream
+    *pToolCount = 0;
+  }
+
+  // if available isn't enough, return VK_INCOMPLETE now
+  if(vkr == VK_INCOMPLETE || availableCount < downstreamCount + 1)
+    return VK_INCOMPLETE;
+
+  // otherwise we write our own properties in after any downstream properties, then increment
+  // pToolCount
+
+  VkPhysicalDeviceToolProperties &props = *(pToolProperties + *pToolCount);
+
+  const rdcstr name = "RenderDoc"_lit;
+  const rdcstr version = StringFormat::Fmt(
+      "%s (%s)", FULL_VERSION_STRING, GitVersionHash[0] == 'N' ? "Unknown revision" : GitVersionHash);
+  const rdcstr description = "Debugging capture layer for RenderDoc"_lit;
+
+  RDCASSERTMSG("Name is too long for VkPhysicalDeviceToolProperties",
+               name.length() < sizeof(props.name));
+  RDCASSERTMSG("Version is too long for VkPhysicalDeviceToolProperties",
+               version.length() < sizeof(props.version));
+  RDCASSERTMSG("Description is too long for VkPhysicalDeviceToolProperties",
+               description.length() < sizeof(props.description));
+
+  memcpy(props.name, name.c_str(), name.length() + 1);
+  memcpy(props.version, version.c_str(), version.length() + 1);
+  props.purposes = VK_TOOL_PURPOSE_TRACING_BIT | VK_TOOL_PURPOSE_DEBUG_MARKERS_BIT_EXT |
+                   VK_TOOL_PURPOSE_MODIFYING_FEATURES_BIT;
+  memcpy(props.description, description.c_str(), description.length() + 1);
+  // do not tell people about the layer
+  RDCEraseEl(props.layer);
+
+  (*pToolCount)++;
+  return VK_SUCCESS;
+}
+
+VkResult WrappedVulkan::vkGetPhysicalDeviceFragmentShadingRatesKHR(
+    VkPhysicalDevice physicalDevice, uint32_t *pFragmentShadingRateCount,
+    VkPhysicalDeviceFragmentShadingRateKHR *pFragmentShadingRates)
+{
+  return ObjDisp(physicalDevice)
+      ->GetPhysicalDeviceFragmentShadingRatesKHR(Unwrap(physicalDevice), pFragmentShadingRateCount,
+                                                 pFragmentShadingRates);
 }

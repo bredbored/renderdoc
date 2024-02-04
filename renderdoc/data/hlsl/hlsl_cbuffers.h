@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2015-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  * Copyright (c) 2014 Crytek
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -27,10 +27,14 @@
 // classes that represent a whole cbuffer
 #if defined(__cplusplus)
 
+#include "maths/matrix.h"
+#include "maths/vec.h"
+
 #define cbuffer struct
 #define float2 Vec2f
 #define float3 Vec3f
 #define uint4 Vec4u
+#define int4 Vec4i
 #define float4 Vec4f
 #define float4x4 Matrix4f
 #define uint uint32_t
@@ -57,10 +61,7 @@ cbuffer FontCBuffer REG(b0)
 cbuffer TexDisplayVSCBuffer REG(b0)
 {
   float2 Position;
-  float2 TextureResolution;
-
-  float2 ScreenAspect;
-  float Scale;
+  float2 VertexScale;
 };
 
 cbuffer TexDisplayPSCBuffer REG(b0)
@@ -105,6 +106,18 @@ cbuffer MeshVertexCBuffer REG(b0)
   row_major float4x4 ModelViewProj;
 
   float2 SpriteSize;
+  uint homogenousInput;
+  float vtxExploderSNorm;
+
+  float3 exploderCentre;
+  float exploderScale;    // Non-zero values imply use of the exploder visualisation.
+
+  uint vertMeshDisplayFormat;
+  uint meshletOffset;
+  uint meshletCount;
+  uint padding1;
+
+  uint4 meshletColours[12];
 };
 
 cbuffer MeshGeometryCBuffer REG(b0)
@@ -131,9 +144,10 @@ cbuffer MeshPickData REG(b0)
 
   uint PickMeshMode;
   uint PickUnproject;
-  float2 Padding;
+  uint PickFlipY;
+  uint PickOrtho;
 
-  row_major float4x4 PickMVP;
+  row_major float4x4 PickTransformMat;
 };
 
 #define HEATMAP_DISABLED 0
@@ -170,6 +184,58 @@ cbuffer HistogramCBufferData REG(b0)
   uint4 HistogramYUVAChannels;
 };
 
+cbuffer DebugMathOperation REG(b0)
+{
+  float4 mathInVal;
+  int mathOp;
+};
+
+cbuffer DebugSampleOperation REG(b0)
+{
+  float4 debugSampleUV;
+  float4 debugSampleDDX;
+  float4 debugSampleDDY;
+  int4 debugSampleUVInt;
+  int debugSampleTexDim;
+  int debugSampleRetType;
+  int debugSampleGatherChannel;
+  int debugSampleSampleIndex;
+  int debugSampleOperation;
+  float debugSampleLodCompare;
+};
+
+#define DEBUG_SAMPLE_MATH_RCP 129
+#define DEBUG_SAMPLE_MATH_RSQ 68
+#define DEBUG_SAMPLE_MATH_EXP 25
+#define DEBUG_SAMPLE_MATH_LOG 47
+#define DEBUG_SAMPLE_MATH_SINCOS 77
+
+#define DEBUG_SAMPLE_TEX_SAMPLE 69
+#define DEBUG_SAMPLE_TEX_SAMPLE_L 72
+#define DEBUG_SAMPLE_TEX_SAMPLE_B 74
+#define DEBUG_SAMPLE_TEX_SAMPLE_D 73
+#define DEBUG_SAMPLE_TEX_SAMPLE_C 70
+#define DEBUG_SAMPLE_TEX_SAMPLE_C_LZ 71
+#define DEBUG_SAMPLE_TEX_GATHER4 109
+#define DEBUG_SAMPLE_TEX_GATHER4_C 126
+#define DEBUG_SAMPLE_TEX_GATHER4_PO 127
+#define DEBUG_SAMPLE_TEX_GATHER4_PO_C 128
+#define DEBUG_SAMPLE_TEX_LOD 108
+#define DEBUG_SAMPLE_TEX_LD 45
+#define DEBUG_SAMPLE_TEX_LD_MS 46
+
+#define DEBUG_SAMPLE_TEX1D 1
+#define DEBUG_SAMPLE_TEX2D 2
+#define DEBUG_SAMPLE_TEX3D 3
+#define DEBUG_SAMPLE_TEXMS 4
+#define DEBUG_SAMPLE_TEXCUBE 5
+
+#define DEBUG_SAMPLE_UNORM 1
+#define DEBUG_SAMPLE_SNORM 2
+#define DEBUG_SAMPLE_INT 3
+#define DEBUG_SAMPLE_UINT 4
+#define DEBUG_SAMPLE_FLOAT 5
+
 // some constants available to both C++ and HLSL for configuring display
 #define CUBEMAP_FACE_RIGHT 0
 #define CUBEMAP_FACE_LEFT 1
@@ -187,10 +253,17 @@ cbuffer HistogramCBufferData REG(b0)
 #define RESTYPE_DEPTH_STENCIL_MS 0x7
 #define RESTYPE_TEX2D_MS 0x9
 
+// first few match Visualisation enum
 #define MESHDISPLAY_SOLID 0x1
 #define MESHDISPLAY_FACELIT 0x2
 #define MESHDISPLAY_SECONDARY 0x3
-#define MESHDISPLAY_SECONDARY_ALPHA 0x4
+#define MESHDISPLAY_EXPLODE 0x4
+#define MESHDISPLAY_MESHLET 0x5
+
+// extra values below
+#define MESHDISPLAY_SECONDARY_ALPHA 0x6
+
+#define MAX_NUM_MESHLETS (512 * 1024)
 
 #define TEXDISPLAY_TYPEMASK 0xF
 #define TEXDISPLAY_NANS 0x0100
@@ -202,6 +275,10 @@ cbuffer HistogramCBufferData REG(b0)
 #ifndef FLT_EPSILON
 #define FLT_EPSILON 1.192092896e-07f
 #endif
+
+// we pick a space that hopefully no-one else will use
+// must match the define in quadoverdraw.hlsl
+#define QUADOVERDRAW_UAV_SPACE 105202922
 
 // histogram/minmax is calculated in blocks of NxN each with MxM tiles.
 // e.g. a tile is 32x32 pixels, then this is arranged in blocks of 32x32 tiles.
@@ -221,3 +298,48 @@ cbuffer HistogramCBufferData REG(b0)
 #define MESH_TRIANGLE_STRIP 2
 #define MESH_TRIANGLE_LIST_ADJ 3
 #define MESH_TRIANGLE_STRIP_ADJ 4
+
+#if defined(SHADER_BASETYPE) && SHADER_BASETYPE == 0
+
+#define FLOAT_TEX 1
+#define UINT_TEX 0
+#define SINT_TEX 0
+
+#elif defined(SHADER_BASETYPE) && SHADER_BASETYPE == 1
+
+#define FLOAT_TEX 0
+#define UINT_TEX 1
+#define SINT_TEX 0
+
+#elif defined(SHADER_BASETYPE) && SHADER_BASETYPE == 2
+
+#define FLOAT_TEX 0
+#define UINT_TEX 0
+#define SINT_TEX 1
+
+#else
+
+#define FLOAT_TEX 1
+#define UINT_TEX 0
+#define SINT_TEX 0
+
+#endif
+
+#if defined(__cplusplus)
+
+struct RD_CustomShader_CBuffer_Type
+{
+  uint4 TexDim;
+  uint SelectedMip;
+  uint TextureType;
+  uint SelectedSliceFace;
+  int SelectedSample;
+  uint4 YUVDownsampleRate;
+  uint4 YUVAChannels;
+  float2 SelectedRange;
+};
+
+// move to an #include since fxc barfs on it
+#include "hlsl_custom_prefix.h"
+
+#endif

@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2017-2019 Baldur Karlsson
+ * Copyright (c) 2019-2023 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -103,7 +103,7 @@ struct TypeConversion<Opaque *, false>
     if(cached_type_info)
       return cached_type_info;
 
-    rdcstr baseTypeName = TypeName<Opaque>();
+    rdcstr baseTypeName = TypeName<typename std::remove_const<Opaque>::type>();
     baseTypeName += " *";
     cached_type_info = SWIG_TypeQuery(baseTypeName.c_str());
 
@@ -124,7 +124,7 @@ struct TypeConversion<Opaque *, false>
     return res;
   }
 
-  static PyObject *ConvertToPy(const Opaque *&in)
+  static PyObject *ConvertToPy(const Opaque *in)
   {
     swig_type_info *type_info = GetTypeInfo();
     if(type_info == NULL)
@@ -132,8 +132,6 @@ struct TypeConversion<Opaque *, false>
 
     return SWIG_InternalNewPointerObj((void *)in, type_info, 0);
   }
-
-  static PyObject *ConvertToPy(Opaque *in) { return ConvertToPy((const Opaque *&)in); }
 };
 
 // specialisations for basic types
@@ -366,6 +364,25 @@ struct TypeConversion<double, false>
   static PyObject *ConvertToPy(const double &in) { return PyFloat_FromDouble(in); }
 };
 
+template <>
+struct TypeConversion<rdhalf, false>
+{
+  static int ConvertFromPy(PyObject *in, rdhalf &out)
+  {
+    if(!PyFloat_Check(in))
+      return SWIG_TypeError;
+
+    out.set(float(PyFloat_AsDouble(in)));
+
+    if(PyErr_Occurred())
+      return SWIG_OverflowError;
+
+    return SWIG_OK;
+  }
+
+  static PyObject *ConvertToPy(const rdhalf &in) { return PyFloat_FromDouble((float)in); }
+};
+
 // partial specialisation for enums, we just convert as their underlying type,
 // whatever integer size that happens to be
 template <typename T>
@@ -409,8 +426,25 @@ struct TypeConversion<rdcdatetime, false>
 
   static PyObject *ConvertToPy(const rdcdatetime &in)
   {
-    return PyDateTime_FromDateAndTime(in.year, in.month, in.day, in.hour, in.minute, in.second,
-                                      in.microsecond);
+    rdcdatetime tmp = in;
+
+// bounds check
+#define BOUND(prop, min, max) \
+  if(tmp.prop < min)          \
+    tmp.prop = min;           \
+  if(tmp.prop > max)          \
+    tmp.prop = max;
+
+    BOUND(year, 1, 9999);
+    BOUND(month, 1, 12);
+    BOUND(day, 1, 31);
+    BOUND(hour, 0, 23);
+    BOUND(minute, 0, 59);
+    BOUND(second, 0, 59);
+    BOUND(microsecond, 0, 999999);
+
+    return PyDateTime_FromDateAndTime(tmp.year, tmp.month, tmp.day, tmp.hour, tmp.minute,
+                                      tmp.second, tmp.microsecond);
   }
 };
 
@@ -540,6 +574,18 @@ struct TypeConversion<rdcarray<U>, false>
   // nicer failure error messages out with the index that failed
   static int ConvertFromPy(PyObject *in, rdcarray<U> &out, int *failIdx)
   {
+    swig_type_info *own_type = GetTypeInfo();
+    if(own_type)
+    {
+      rdcarray<U> *ptr = NULL;
+      int ret = SWIG_ConvertPtr(in, (void **)&ptr, own_type, 0);
+      if(SWIG_IsOK(ret))
+      {
+        out = *ptr;
+        return SWIG_OK;
+      }
+    }
+
     if(!PyList_Check(in))
       return SWIG_TypeError;
 
@@ -602,6 +648,91 @@ struct TypeConversion<rdcarray<U>, false>
   static PyObject *ConvertToPy(const rdcarray<U> &in) { return ConvertToPy(in, NULL); }
 };
 
+template <typename U, size_t N>
+struct TypeConversion<rdcfixedarray<U, N>, false>
+{
+  static swig_type_info *GetTypeInfo()
+  {
+    static swig_type_info *cached_type_info = NULL;
+    static rdcstr typeName = "rdcfixedarray < " + TypeName<U>() + "," + ToStr((uint32_t)N) + " > *";
+
+    if(cached_type_info)
+      return cached_type_info;
+
+    cached_type_info = SWIG_TypeQuery(typeName.c_str());
+
+    return cached_type_info;
+  }
+
+  // we add some extra parameters so the typemaps for array can use these to get
+  // nicer failure error messages out with the index that failed
+  static int ConvertFromPy(PyObject *in, rdcfixedarray<U, N> &out, int *failIdx)
+  {
+    if(!PySequence_Check(in))
+      return SWIG_TypeError;
+
+    Py_ssize_t size = PySequence_Size(in);
+
+    if(size != N)
+      return SWIG_TypeError;
+
+    for(size_t i = 0; i < N; i++)
+    {
+      PyObject *elem = PySequence_GetItem(in, i);
+
+      if(!elem)
+      {
+        if(failIdx)
+          *failIdx = (int)i;
+        return SWIG_TypeError;
+      }
+
+      int ret = TypeConversion<U>::ConvertFromPy(elem, out[i]);
+
+      Py_XDECREF(elem);
+
+      if(!SWIG_IsOK(ret))
+      {
+        if(failIdx)
+          *failIdx = (int)i;
+        return ret;
+      }
+    }
+
+    return SWIG_OK;
+  }
+
+  static int ConvertFromPy(PyObject *in, rdcfixedarray<U, N> &out)
+  {
+    return ConvertFromPy(in, out, NULL);
+  }
+
+  static PyObject *ConvertToPy(const rdcfixedarray<U, N> &in, int *failIdx)
+  {
+    PyObject *ret = PyTuple_New(N);
+    if(!ret)
+      return NULL;
+
+    for(size_t i = 0; i < N; i++)
+    {
+      PyObject *obj = TypeConversion<U>::ConvertToPy(in[i]);
+      if(!obj)
+      {
+        if(failIdx)
+          *failIdx = 0;
+        Py_XDECREF(ret);
+        return NULL;
+      }
+
+      PyTuple_SetItem(ret, i, obj);
+    }
+
+    return ret;
+  }
+
+  static PyObject *ConvertToPy(const rdcfixedarray<U, N> &in) { return ConvertToPy(in, NULL); }
+};
+
 // specialisation for string
 template <>
 struct TypeConversion<rdcstr, false>
@@ -661,6 +792,67 @@ struct TypeConversion<rdcstr, false>
   static PyObject *ConvertToPy(const rdcstr &in)
   {
     return PyUnicode_FromStringAndSize(in.c_str(), in.size());
+  }
+};
+
+template <>
+struct TypeConversion<rdcinflexiblestr, false>
+{
+  static swig_type_info *GetTypeInfo()
+  {
+    static swig_type_info *cached_type_info = NULL;
+
+    if(cached_type_info)
+      return cached_type_info;
+
+    cached_type_info = SWIG_TypeQuery("rdcinflexiblestr *");
+
+    return cached_type_info;
+  }
+
+  static int ConvertFromPy(PyObject *in, rdcinflexiblestr &out)
+  {
+    if(PyUnicode_Check(in))
+    {
+      PyObject *bytes = PyUnicode_AsUTF8String(in);
+
+      if(!bytes)
+        return SWIG_ERROR;
+
+      char *buf = NULL;
+      Py_ssize_t size = 0;
+
+      int ret = PyBytes_AsStringAndSize(bytes, &buf, &size);
+
+      if(ret == 0)
+      {
+        out = rdcstr(buf, size);
+
+        Py_DecRef(bytes);
+
+        return SWIG_OK;
+      }
+
+      Py_DecRef(bytes);
+
+      return SWIG_ERROR;
+    }
+
+    swig_type_info *type_info = GetTypeInfo();
+    if(!type_info)
+      return SWIG_ERROR;
+
+    rdcinflexiblestr *ptr = NULL;
+    int res = SWIG_ConvertPtr(in, (void **)&ptr, type_info, 0);
+    if(SWIG_IsOK(res))
+      out = *ptr;
+
+    return res;
+  }
+
+  static PyObject *ConvertToPy(const rdcinflexiblestr &in)
+  {
+    return PyUnicode_FromString(in.c_str());
   }
 };
 
