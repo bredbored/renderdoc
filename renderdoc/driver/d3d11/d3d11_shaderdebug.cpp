@@ -142,7 +142,8 @@ void D3D11DebugAPIWrapper::FetchSRV(const DXBCDebug::BindingSlot &slot)
   else if(GetShaderType() == DXBC::ShaderType::Compute)
     pSRV = rs->CS.SRVs[slot.shaderRegister];
 
-  DXBCDebug::GlobalState::SRVData &srvData = m_globalState.srvs[slot];
+  DXBCDebug::GlobalState::SRVDataMaker srvDataMaker(m_globalState, slot);
+  DXBCDebug::GlobalState::SRVData &srvData = srvDataMaker.srvData;
 
   if(!pSRV)
     return;
@@ -206,11 +207,14 @@ void D3D11DebugAPIWrapper::FetchUAV(const DXBCDebug::BindingSlot &slot)
 {
   // if the UAV might be dirty from side-effects from the action, replay back to right
   // before it.
-  if(!m_DidReplay)
   {
-    D3D11MarkerRegion region("un-dirtying resources");
-    m_pDevice->ReplayLog(0, m_EventID, eReplay_WithoutDraw);
-    m_DidReplay = true;
+    SCOPED_LOCK(m_immediateContextCS);
+    if(!m_DidReplay)
+    {
+      D3D11MarkerRegion region("un-dirtying resources");
+      m_pDevice->ReplayLog(0, m_EventID, eReplay_WithoutDraw);
+      m_DidReplay = true;
+    }
   }
 
   RDCASSERT(slot.registerSpace == 0);
@@ -224,7 +228,8 @@ void D3D11DebugAPIWrapper::FetchUAV(const DXBCDebug::BindingSlot &slot)
   else if(GetShaderType() == DXBC::ShaderType::Compute)
     pUAV = rs->CSUAVs[slot.shaderRegister];
 
-  DXBCDebug::GlobalState::UAVData &uavData = m_globalState.uavs[slot];
+  DXBCDebug::GlobalState::UAVDataMaker uavDataMaker(m_globalState, slot);
+  DXBCDebug::GlobalState::UAVData &uavData = uavDataMaker.uavData;
 
   if(!pUAV)
     return;

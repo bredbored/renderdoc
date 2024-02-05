@@ -1141,6 +1141,8 @@ ShaderVariable sub(const ShaderVariable &a, const ShaderVariable &b, const VarTy
   return add(a, neg(b, type), type);
 }
 
+Threading::CriticalSection ThreadState::m_atomicCS;
+
 ThreadState::ThreadState(int workgroupIdx, GlobalState &globalState, const DXBC::DXBCContainer *dxbc)
     : global(globalState)
 {
@@ -1981,8 +1983,6 @@ void ThreadState::StepNext(ShaderDebugState *state, DebugAPIWrapper *apiWrapper,
 
   for(size_t i = 1; i < op.operands.size(); i++)
     srcOpers.push_back(GetSrc(op.operands[i], op));
-
-  static Threading::CriticalSection atomicCS;
 
   switch(op.operation)
   {
@@ -2942,21 +2942,21 @@ void ThreadState::StepNext(ShaderDebugState *state, DebugAPIWrapper *apiWrapper,
 
     case OPCODE_IMM_ATOMIC_ALLOC:
     {
-      SCOPED_LOCK(atomicCS);
-
       BindingSlot slot = GetBindingSlotForIdentifier(*program, TYPE_UNORDERED_ACCESS_VIEW,
                                                      srcOpers[0].value.u32v[0]);
-      GlobalState::UAVIterator uav = global.uavs.find(slot);
-      if(uav == global.uavs.end())
-      {
-        apiWrapper->FetchUAV(slot);
-        uav = global.uavs.find(slot);
-      }
+      //GlobalState::UAVIterator uav = global.uavs.find(slot);
+      //if(uav == global.uavs.end())
+      //{
+      //  apiWrapper->FetchUAV(slot);
+      //  uav = global.uavs.find(slot);
+      //}
+      GlobalState::UAVIterator uav = global.GetUAV(apiWrapper, slot);
 
       MarkResourceAccess(state, TYPE_UNORDERED_ACCESS_VIEW, slot);
 
       // if it's not a buffer or the buffer is empty this UAV is NULL/invalid, return 0 for the
       // counter
+      SCOPED_LOCK(m_atomicCS);
       uint32_t count = uav->second.data.empty() ? 0 : uav->second.hiddenCounter++;
       SetDst(state, op.operands[0], op, ShaderVariable(rdcstr(), count, count, count, count));
       break;
@@ -2964,21 +2964,21 @@ void ThreadState::StepNext(ShaderDebugState *state, DebugAPIWrapper *apiWrapper,
 
     case OPCODE_IMM_ATOMIC_CONSUME:
     {
-      SCOPED_LOCK(atomicCS);
-
       BindingSlot slot = GetBindingSlotForIdentifier(*program, TYPE_UNORDERED_ACCESS_VIEW,
                                                      srcOpers[0].value.u32v[0]);
-      GlobalState::UAVIterator uav = global.uavs.find(slot);
-      if(uav == global.uavs.end())
-      {
-        apiWrapper->FetchUAV(slot);
-        uav = global.uavs.find(slot);
-      }
+      //GlobalState::UAVIterator uav = global.uavs.find(slot);
+      //if(uav == global.uavs.end())
+      //{
+      //  apiWrapper->FetchUAV(slot);
+      //  uav = global.uavs.find(slot);
+      //}
+      GlobalState::UAVIterator uav = global.GetUAV(apiWrapper, slot);
 
       MarkResourceAccess(state, TYPE_UNORDERED_ACCESS_VIEW, slot);
 
       // if it's not a buffer or the buffer is empty this UAV is NULL/invalid, return 0 for the
       // counter
+      SCOPED_LOCK(m_atomicCS);
       uint32_t count = uav->second.data.empty() ? 0 : --uav->second.hiddenCounter;
       SetDst(state, op.operands[0], op, ShaderVariable(rdcstr(), count, count, count, count));
       break;
@@ -3095,12 +3095,13 @@ void ThreadState::StepNext(ShaderDebugState *state, DebugAPIWrapper *apiWrapper,
       {
         BindingSlot slot =
             GetBindingSlotForIdentifier(*program, TYPE_UNORDERED_ACCESS_VIEW, resIndex);
-        GlobalState::UAVIterator uav = global.uavs.find(slot);
-        if(uav == global.uavs.end())
-        {
-          apiWrapper->FetchUAV(slot);
-          uav = global.uavs.find(slot);
-        }
+        //GlobalState::UAVIterator uav = global.uavs.find(slot);
+        //if(uav == global.uavs.end())
+        //{
+        //  apiWrapper->FetchUAV(slot);
+        //  uav = global.uavs.find(slot);
+        //}
+        GlobalState::UAVIterator uav = global.GetUAV(apiWrapper, slot);
 
         MarkResourceAccess(state, TYPE_UNORDERED_ACCESS_VIEW, slot);
 
@@ -3148,7 +3149,7 @@ void ThreadState::StepNext(ShaderDebugState *state, DebugAPIWrapper *apiWrapper,
       // Also helper/inactive pixels are not allowed to modify UAVs
       if(data && offset + dstAddress->value.u32v[0] < numElems && !Finished())
       {
-        SCOPED_LOCK(atomicCS);
+        SCOPED_LOCK(m_atomicCS);
 
         uint32_t *udst = (uint32_t *)data;
         int32_t *idst = (int32_t *)data;
@@ -3351,12 +3352,13 @@ void ThreadState::StepNext(ShaderDebugState *state, DebugAPIWrapper *apiWrapper,
 
         if(srv)
         {
-          GlobalState::SRVIterator srvIter = global.srvs.find(slot);
-          if(srvIter == global.srvs.end())
-          {
-            apiWrapper->FetchSRV(slot);
-            srvIter = global.srvs.find(slot);
-          }
+          //GlobalState::SRVIterator srvIter = global.srvs.find(slot);
+          //if(srvIter == global.srvs.end())
+          //{
+          //  apiWrapper->FetchSRV(slot);
+          //  srvIter = global.srvs.find(slot);
+          //}
+          GlobalState::SRVIterator srvIter = global.GetSRV(apiWrapper, slot);
 
           MarkResourceAccess(state, TYPE_RESOURCE, slot);
 
@@ -3368,12 +3370,13 @@ void ThreadState::StepNext(ShaderDebugState *state, DebugAPIWrapper *apiWrapper,
         }
         else
         {
-          GlobalState::UAVIterator uavIter = global.uavs.find(slot);
-          if(uavIter == global.uavs.end())
-          {
-            apiWrapper->FetchUAV(slot);
-            uavIter = global.uavs.find(slot);
-          }
+          //GlobalState::UAVIterator uavIter = global.uavs.find(slot);
+          //if(uavIter == global.uavs.end())
+          //{
+          //  apiWrapper->FetchUAV(slot);
+          //  uavIter = global.uavs.find(slot);
+          //}
+          GlobalState::UAVIterator uavIter = global.GetUAV(apiWrapper, slot);
 
           MarkResourceAccess(state, TYPE_UNORDERED_ACCESS_VIEW, slot);
 
@@ -3949,12 +3952,13 @@ void ThreadState::StepNext(ShaderDebugState *state, DebugAPIWrapper *apiWrapper,
           resourceDim = decl.resource.dim;
 
           resourceBinding = GetBindingSlotForDeclaration(*program, decl);
-          GlobalState::SRVIterator srv = global.srvs.find(resourceBinding);
-          if(srv == global.srvs.end())
-          {
-            apiWrapper->FetchSRV(resourceBinding);
-            srv = global.srvs.find(resourceBinding);
-          }
+          //GlobalState::SRVIterator srv = global.srvs.find(resourceBinding);
+          //if(srv == global.srvs.end())
+          //{
+          //  apiWrapper->FetchSRV(resourceBinding);
+          //  srv = global.srvs.find(resourceBinding);
+          //}
+          GlobalState::SRVIterator srv = global.GetSRV(apiWrapper, resourceBinding);
 
           const byte *data = &srv->second.data[0];
           uint32_t offset = srv->second.firstElement;
@@ -4441,12 +4445,13 @@ void ThreadState::StepNext(ShaderDebugState *state, DebugAPIWrapper *apiWrapper,
       }
 
       BindingSlot slot = GetBindingSlotForIdentifier(*program, TYPE_UNORDERED_ACCESS_VIEW, resIndex);
-      GlobalState::UAVIterator uav = global.uavs.find(slot);
-      if(uav == global.uavs.end())
-      {
-        apiWrapper->FetchUAV(slot);
-        uav = global.uavs.find(slot);
-      }
+      //GlobalState::UAVIterator uav = global.uavs.find(slot);
+      //if(uav == global.uavs.end())
+      //{
+      //  apiWrapper->FetchUAV(slot);
+      //  uav = global.uavs.find(slot);
+      //}
+      GlobalState::UAVIterator uav = global.GetUAV(apiWrapper, slot);
 
       MarkResourceAccess(state, TYPE_UNORDERED_ACCESS_VIEW, slot);
 

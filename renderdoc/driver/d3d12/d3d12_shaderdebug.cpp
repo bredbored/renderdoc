@@ -161,7 +161,8 @@ void D3D12DebugAPIWrapper::FetchSRV(const DXBCDebug::BindingSlot &slot)
     pRootSignature = &rs.graphics;
   }
 
-  DXBCDebug::GlobalState::SRVData &srvData = m_globalState.srvs[slot];
+  DXBCDebug::GlobalState::SRVDataMaker srvDataMaker(m_globalState, slot);
+  DXBCDebug::GlobalState::SRVData &srvData = srvDataMaker.srvData;
 
   if(pRootSignature)
   {
@@ -311,11 +312,14 @@ void D3D12DebugAPIWrapper::FetchUAV(const DXBCDebug::BindingSlot &slot)
 {
   // if the UAV might be dirty from side-effects from the action, replay back to right
   // before it.
-  if(!m_DidReplay)
   {
-    D3D12MarkerRegion region(m_pDevice->GetQueue()->GetReal(), "un-dirtying resources");
-    m_pDevice->ReplayLog(0, m_EventID, eReplay_WithoutDraw);
-    m_DidReplay = true;
+    //SCOPED_LOCK(m_immediateContextCS);
+    if(!m_DidReplay)
+    {
+      D3D12MarkerRegion region(m_pDevice->GetQueue()->GetReal(), "un-dirtying resources");
+      m_pDevice->ReplayLog(0, m_EventID, eReplay_WithoutDraw);
+      m_DidReplay = true;
+    }
   }
 
   const D3D12RenderState &rs = m_pDevice->GetQueue()->GetCommandData()->m_RenderState;
@@ -335,7 +339,8 @@ void D3D12DebugAPIWrapper::FetchUAV(const DXBCDebug::BindingSlot &slot)
     pRootSignature = &rs.graphics;
   }
 
-  DXBCDebug::GlobalState::UAVData &uavData = m_globalState.uavs[slot];
+  DXBCDebug::GlobalState::UAVDataMaker uavDataMaker(m_globalState, slot);
+  DXBCDebug::GlobalState::UAVData &uavData = uavDataMaker.uavData;
 
   if(pRootSignature)
   {
