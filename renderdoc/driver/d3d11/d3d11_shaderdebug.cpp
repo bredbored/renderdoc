@@ -2772,83 +2772,16 @@ ShaderDebugTrace *D3D11Replay::DebugThread(uint32_t eventId,
   InterpretDebugger *interpreter = new InterpretDebugger;
   interpreter->eventId = eventId;
   ShaderDebugTrace *ret = interpreter->BeginDebug(dxbc, refl, cs->GetMapping(), 0);
+  interpreter->PrepareThreadWorkgroup(groupid, threadid);
   GlobalState &global = interpreter->global;
-  ThreadState initialState = interpreter->activeLane();
+  ThreadState &state = interpreter->activeLane();
 
   AddCBuffersToGlobalState(*dxbc->GetDXBCByteCode(), *GetDebugManager(), global, ret->sourceVars,
                            rs->CS, refl, cs->GetMapping());
 
-  for(int i = 0; i < 3; i++)
-  {
-    initialState.semantics.GroupID[i] = groupid[i];
-    initialState.semantics.ThreadID[i] = threadid[i];
-  }
-
   ret->constantBlocks = global.constantBlocks;
 
   dxbc->FillTraceLineInfo(*ret);
-
-  // find the first instruction after the
-  // last blocking sync instruction that
-  // is not inside a loop
-  size_t loopCount = 0;
-  size_t loopNumInstructions = 0;
-  size_t groupNumInstructions = 0;
-  auto program = dxbc->GetDXBCByteCode();
-  for(size_t instructionIndex = program->GetNumInstructions(); instructionIndex;)
-  {
-    const Operation &op = program->GetInstruction(--instructionIndex);
-    if(op.operation == OPCODE_SYNC && DXBCBytecode::Sync_Threads(op.syncFlags))
-    {
-      groupNumInstructions = loopCount ? loopNumInstructions : 1 + instructionIndex;
-      break;
-    }
-    switch(op.operation)
-    {
-      case OPCODE_ENDLOOP:
-        if(!loopCount++)
-          loopNumInstructions = 1 + instructionIndex;
-        break;
-      case OPCODE_LOOP: --loopCount; break;
-      default: break;
-    }
-  }
-
-  interpreter->groupNumInstructions = int(groupNumInstructions);
-
-  // if there aren't any blocking syncs,
-  // assume other threads have no effect on this thread
-  // and only simulate this thread
-  size_t destIdx = 0;
-  if(groupNumInstructions)
-  {
-    // prepare state for all threads in the group
-    auto &workgroup = interpreter->workgroup;
-    auto reflection = dxbc->GetReflection();
-    workgroup.fill(reflection->DispatchThreadsDimension[0] *
-                   reflection->DispatchThreadsDimension[1] *
-                   reflection->DispatchThreadsDimension[2],
-                   initialState);
-    for(size_t i = 0, z = 0; z < reflection->DispatchThreadsDimension[2]; z++)
-    {
-      for(size_t y = 0; y < reflection->DispatchThreadsDimension[1]; y++)
-      {
-        for(size_t x = 0; x < reflection->DispatchThreadsDimension[0]; x++, i++)
-        {
-          ThreadState &state = workgroup[i];
-          state.semantics.ThreadID[0] = uint32_t(x);
-          state.semantics.ThreadID[1] = uint32_t(y);
-          state.semantics.ThreadID[2] = uint32_t(z);
-        }
-      }
-    }
-    destIdx = (threadid[2] * reflection->DispatchThreadsDimension[1] + threadid[1]) *
-                  reflection->DispatchThreadsDimension[0] + threadid[0];
-
-    interpreter->activeLaneIndex = int(destIdx);
-  }
-
-  ThreadState &state = interpreter->activeLane();
 
   // add fake inputs for semantics
   for(size_t i = 0; i < dxbc->GetDXBCByteCode()->GetNumDeclarations(); i++)

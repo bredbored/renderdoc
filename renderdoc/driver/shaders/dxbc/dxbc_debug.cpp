@@ -5604,6 +5604,71 @@ ShaderDebugTrace *InterpretDebugger::BeginDebug(const DXBC::DXBCContainer *dxbcC
   return ret;
 }
 
+void InterpretDebugger::PrepareThreadWorkgroup(const rdcfixedarray<uint32_t, 3> &groupid,
+                                               const rdcfixedarray<uint32_t, 3> &threadid)
+{
+  for(int i = 0; i < 3; i++)
+  {
+    activeLane().semantics.GroupID[i] = groupid[i];
+    activeLane().semantics.ThreadID[i] = threadid[i];
+  }
+
+  // find the first instruction after the
+  // last blocking sync instruction that
+  // is not inside a loop
+  size_t loopCount = 0;
+  size_t loopNumInstructions = 0;
+  auto program = dxbc->GetDXBCByteCode();
+  for(size_t instructionIndex = program->GetNumInstructions(); instructionIndex;)
+  {
+    const Operation &op = program->GetInstruction(--instructionIndex);
+    if(op.operation == OPCODE_SYNC && DXBCBytecode::Sync_Threads(op.syncFlags))
+    {
+      groupNumInstructions = int(loopCount ? loopNumInstructions : 1 + instructionIndex);
+      break;
+    }
+    switch(op.operation)
+    {
+      case OPCODE_ENDLOOP:
+        if(!loopCount++)
+          loopNumInstructions = 1 + instructionIndex;
+        break;
+      case OPCODE_LOOP: --loopCount; break;
+      default: break;
+    }
+  }
+
+  // if there aren't any blocking syncs,
+  // assume other threads have no effect on this thread
+  // and only simulate this thread
+  if(groupNumInstructions)
+  {
+    ThreadState initialState = activeLane();
+
+    // prepare state for all threads in the group
+    auto reflection = dxbc->GetReflection();
+    workgroup.fill(reflection->DispatchThreadsDimension[0] * reflection->DispatchThreadsDimension[1] *
+                       reflection->DispatchThreadsDimension[2],
+                   initialState);
+    for(size_t i = 0, z = 0; z < reflection->DispatchThreadsDimension[2]; z++)
+    {
+      for(size_t y = 0; y < reflection->DispatchThreadsDimension[1]; y++)
+      {
+        for(size_t x = 0; x < reflection->DispatchThreadsDimension[0]; x++, i++)
+        {
+          ThreadState &state = workgroup[i];
+          state.semantics.ThreadID[0] = uint32_t(x);
+          state.semantics.ThreadID[1] = uint32_t(y);
+          state.semantics.ThreadID[2] = uint32_t(z);
+        }
+      }
+    }
+    activeLaneIndex = int((threadid[2] * reflection->DispatchThreadsDimension[1] + threadid[1]) *
+                              reflection->DispatchThreadsDimension[0] +
+                          threadid[0]);
+  }
+}
+
 void InterpretDebugger::CalcActiveMask(rdcarray<bool> &activeMask) const
 {
   // one bool per workgroup thread

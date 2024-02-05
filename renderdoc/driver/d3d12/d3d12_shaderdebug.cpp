@@ -2768,17 +2768,12 @@ ShaderDebugTrace *D3D12Replay::DebugThread(uint32_t eventId,
   InterpretDebugger *interpreter = new InterpretDebugger;
   interpreter->eventId = eventId;
   ShaderDebugTrace *ret = interpreter->BeginDebug(dxbc, refl, pso->CS()->GetMapping(), 0);
+  interpreter->PrepareThreadWorkgroup(groupid, threadid);
   GlobalState &global = interpreter->global;
   ThreadState &state = interpreter->activeLane();
 
   GatherConstantBuffers(m_pDevice, *dxbc->GetDXBCByteCode(), rs.compute, refl,
                         pso->CS()->GetMapping(), global, ret->sourceVars);
-
-  for(int i = 0; i < 3; i++)
-  {
-    state.semantics.GroupID[i] = groupid[i];
-    state.semantics.ThreadID[i] = threadid[i];
-  }
 
   ret->constantBlocks = global.constantBlocks;
 
