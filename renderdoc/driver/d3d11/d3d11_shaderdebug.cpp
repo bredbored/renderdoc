@@ -142,8 +142,7 @@ void D3D11DebugAPIWrapper::FetchSRV(const DXBCDebug::BindingSlot &slot)
   else if(GetShaderType() == DXBC::ShaderType::Compute)
     pSRV = rs->CS.SRVs[slot.shaderRegister];
 
-  DXBCDebug::GlobalState::SRVDataMaker srvDataMaker(m_globalState, slot);
-  DXBCDebug::GlobalState::SRVData &srvData = srvDataMaker.srvData;
+  DXBCDebug::GlobalState::SRVData &srvData = AddSRV(m_globalState, slot);
 
   if(!pSRV)
     return;
@@ -228,8 +227,7 @@ void D3D11DebugAPIWrapper::FetchUAV(const DXBCDebug::BindingSlot &slot)
   else if(GetShaderType() == DXBC::ShaderType::Compute)
     pUAV = rs->CSUAVs[slot.shaderRegister];
 
-  DXBCDebug::GlobalState::UAVDataMaker uavDataMaker(m_globalState, slot);
-  DXBCDebug::GlobalState::UAVData &uavData = uavDataMaker.uavData;
+  DXBCDebug::GlobalState::UAVData &uavData = AddUAV(m_globalState, slot);
 
   if(!pUAV)
     return;

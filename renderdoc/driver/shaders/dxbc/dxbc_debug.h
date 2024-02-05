@@ -93,6 +93,56 @@ enum class GatherChannel : uint8_t
   Alpha = 3,
 };
 
+struct GlobalStateViewFmt
+{
+  int byteWidth = 0;
+  int numComps = 0;
+  CompType fmt = CompType::Typeless;
+  int stride = 0;
+
+  int Stride()
+  {
+    if(stride != 0)
+      return stride;
+
+    if(byteWidth == 10 || byteWidth == 11)
+      return 4;    // 10 10 10 2 or 11 11 10
+
+    return byteWidth * numComps;
+  }
+};
+
+struct GlobalStateUAVData
+{
+  GlobalStateUAVData()
+      : firstElement(0), numElements(0), tex(false), rowPitch(0), depthPitch(0), hiddenCounter(0)
+  {
+  }
+
+  bytebuf data;
+  uint32_t firstElement;
+  uint32_t numElements;
+
+  bool tex;
+  uint32_t rowPitch, depthPitch;
+
+  GlobalStateViewFmt format;
+
+  uint32_t hiddenCounter;
+};
+
+struct GlobalStateSRVData
+{
+  GlobalStateSRVData() : firstElement(0), numElements(0) {}
+  bytebuf data;
+  uint32_t firstElement;
+  uint32_t numElements;
+
+  GlobalStateViewFmt format;
+};
+
+struct GlobalState;
+
 class DebugAPIWrapper
 {
 public:
@@ -124,155 +174,54 @@ public:
                                      float lodOrCompareValue, const uint8_t swizzle[4],
                                      GatherChannel gatherChannel, const char *opString,
                                      ShaderVariable &output) = 0;
+
+protected:
+  using SRVData = GlobalStateSRVData;
+  static SRVData &AddSRV(GlobalState &globalState, const BindingSlot &slot);
+
+  using UAVData = GlobalStateUAVData;
+  static UAVData &AddUAV(GlobalState &globalState, const BindingSlot &slot);
 };
 
 struct GlobalState
 {
+  friend class DebugAPIWrapper;
+
 public:
   GlobalState() {}
   void PopulateGroupshared(const DXBCBytecode::Program *pBytecode);
 
-  struct ViewFmt
-  {
-    int byteWidth = 0;
-    int numComps = 0;
-    CompType fmt = CompType::Typeless;
-    int stride = 0;
+  using ViewFmt = GlobalStateViewFmt;
 
-    int Stride()
-    {
-      if(stride != 0)
-        return stride;
-
-      if(byteWidth == 10 || byteWidth == 11)
-        return 4;    // 10 10 10 2 or 11 11 10
-
-      return byteWidth * numComps;
-    }
-  };
-
-  struct UAVData
-  {
-    UAVData()
-        : firstElement(0), numElements(0), tex(false), rowPitch(0), depthPitch(0), hiddenCounter(0)
-    {
-    }
-
-    bytebuf data;
-    uint32_t firstElement;
-    uint32_t numElements;
-
-    bool tex;
-    uint32_t rowPitch, depthPitch;
-
-    ViewFmt format;
-
-    uint32_t hiddenCounter;
-  };
+  using UAVData = GlobalStateUAVData;
 private:
   std::map<BindingSlot, UAVData> uavs;
 public:
   typedef std::map<BindingSlot, UAVData>::iterator UAVIterator;
   UAVIterator GetUAV(DebugAPIWrapper *apiWrapper, const BindingSlot &slot)
   {
-    {
-      SCOPED_LOCK(cs);
-      UAVIterator uav = uavs.find(slot);
-      if(uav != uavs.end())
-        return uav;
-    }
-    apiWrapper->FetchUAV(slot);
-    {
-      SCOPED_LOCK(cs);
-      return uavs.find(slot);
-    }
-  }
-
-  UAVIterator AddUAV(const BindingSlot &slot, const UAVData &uavData)
-  {
     SCOPED_LOCK(cs);
-    auto result = uavs.insert(std::make_pair(slot, uavData));
-    if (!result.second)
-      result.first->second = uavData;
-    return result.first;
+    UAVIterator uav = uavs.find(slot);
+    if(uav != uavs.end())
+      return uav;
+    apiWrapper->FetchUAV(slot);
+    return uavs.find(slot);
   }
 
-  class UAVDataMaker
-  {
-  public:
-    UAVData uavData;
-
-    UAVDataMaker(GlobalState &globalState, const BindingSlot &slot)
-        : m_globalState(globalState), m_slot(slot)
-    {
-    }
-
-    ~UAVDataMaker()
-    {
-      m_globalState.AddUAV(m_slot, uavData);
-    }
-
-  private:
-    GlobalState &m_globalState;
-    const BindingSlot &m_slot;
-  };
-
-  struct SRVData
-  {
-    SRVData() : firstElement(0), numElements(0) {}
-    bytebuf data;
-    uint32_t firstElement;
-    uint32_t numElements;
-
-    ViewFmt format;
-  };
+  using SRVData = GlobalStateSRVData;
 private:
   std::map<BindingSlot, SRVData> srvs;
 public:
   typedef std::map<BindingSlot, SRVData>::iterator SRVIterator;
   SRVIterator GetSRV(DebugAPIWrapper *apiWrapper, const BindingSlot &slot)
   {
-    {
-      SCOPED_LOCK(cs);
-      SRVIterator srv = srvs.find(slot);
-      if(srv != srvs.end())
-        return srv;
-    }
-    apiWrapper->FetchSRV(slot);
-    {
-      SCOPED_LOCK(cs);
-      return srvs.find(slot);
-    }
-  }
-
-  SRVIterator AddSRV(const BindingSlot &slot, const SRVData &srvData)
-  {
     SCOPED_LOCK(cs);
-    auto result = srvs.insert(std::make_pair(slot, srvData));
-    if (!result.second)
-      result.first->second = srvData;
-    return result.first;
+    SRVIterator srv = srvs.find(slot);
+    if(srv != srvs.end())
+      return srv;
+    apiWrapper->FetchSRV(slot);
+    return srvs.find(slot);
   }
-
-  class SRVDataMaker
-  {
-  public:
-    SRVData srvData;
-
-    SRVDataMaker(GlobalState &globalState, const BindingSlot &slot) :
-        m_globalState(globalState), m_slot(slot)
-    {
-    }
-
-    ~SRVDataMaker()
-    {
-      m_globalState.AddSRV(m_slot, srvData);
-    }
-
-  private:
-    GlobalState &m_globalState;
-    const BindingSlot &m_slot;
-  };
 
   struct groupsharedMem
   {
@@ -329,6 +278,16 @@ private:
   Threading::CriticalSection cs;
 };
 
+inline GlobalState::SRVData &DebugAPIWrapper::AddSRV(GlobalState &globalState, const BindingSlot &slot)
+{
+  return globalState.srvs[slot];
+}
+
+inline GlobalState::UAVData &DebugAPIWrapper::AddUAV(GlobalState &globalState, const BindingSlot &slot)
+{
+  return globalState.uavs[slot];
+}
+
 struct PSInputElement
 {
   PSInputElement(int regster, int element, int numWords, ShaderBuiltin attr, bool inc)
@@ -362,62 +321,6 @@ void GatherPSInputDataForInitialValues(const DXBC::DXBCContainer *dxbc,
                                        rdcarray<PSInputElement> &initialValues,
                                        rdcarray<rdcstr> &floatInputs, rdcarray<rdcstr> &inputVarNames,
                                        rdcstr &psInputDefinition, int &structureStride);
-
-//struct SampleGatherResourceData
-//{
-//  DXBCBytecode::ResourceDimension dim;
-//  DXBC::ResourceRetType retType;
-//  int sampleCount;
-//  BindingSlot binding;
-//};
-//
-//struct SampleGatherSamplerData
-//{
-//  DXBCBytecode::SamplerMode mode;
-//  float bias;
-//  BindingSlot binding;
-//};
-//
-//enum class GatherChannel : uint8_t
-//{
-//  Red = 0,
-//  Green = 1,
-//  Blue = 2,
-//  Alpha = 3,
-//};
-
-//class DebugAPIWrapper
-//{
-//public:
-//  virtual void SetCurrentInstruction(uint32_t instruction) = 0;
-//  virtual void AddDebugMessage(MessageCategory c, MessageSeverity sv, MessageSource src, rdcstr d) = 0;
-//
-//  // During shader debugging, when a new resource is encountered, this will be called to fetch the
-//  // data on demand. Return true if the ShaderDebug::GlobalState data for the slot is populated,
-//  // return false if the resource cannot be found.
-//  virtual void FetchSRV(const BindingSlot &slot) = 0;
-//  virtual void FetchUAV(const BindingSlot &slot) = 0;
-//
-//  virtual bool CalculateMathIntrinsic(DXBCBytecode::OpcodeType opcode, const ShaderVariable &input,
-//                                      ShaderVariable &output1, ShaderVariable &output2) = 0;
-//
-//  virtual ShaderVariable GetSampleInfo(DXBCBytecode::OperandType type, bool isAbsoluteResource,
-//                                       const BindingSlot &slot, const char *opString) = 0;
-//
-//  virtual ShaderVariable GetBufferInfo(DXBCBytecode::OperandType type, const BindingSlot &slot,
-//                                       const char *opString) = 0;
-//  virtual ShaderVariable GetResourceInfo(DXBCBytecode::OperandType type, const BindingSlot &slot,
-//                                         uint32_t mipLevel, int &dim) = 0;
-//
-//  virtual bool CalculateSampleGather(DXBCBytecode::OpcodeType opcode,
-//                                     SampleGatherResourceData resourceData,
-//                                     SampleGatherSamplerData samplerData, ShaderVariable uv,
-//                                     ShaderVariable ddxCalc, ShaderVariable ddyCalc,
-//                                     const int8_t texelOffsets[3], int multisampleIndex,
-//                                     float lodOrCompareValue, const uint8_t swizzle[4],
-//                                     GatherChannel gatherChannel, const char *opString,
-//                                     ShaderVariable &output) = 0;
-//};
 
 class ThreadState
 {

@@ -161,8 +161,7 @@ void D3D12DebugAPIWrapper::FetchSRV(const DXBCDebug::BindingSlot &slot)
     pRootSignature = &rs.graphics;
   }
 
-  DXBCDebug::GlobalState::SRVDataMaker srvDataMaker(m_globalState, slot);
-  DXBCDebug::GlobalState::SRVData &srvData = srvDataMaker.srvData;
+  DXBCDebug::GlobalState::SRVData &srvData = AddSRV(m_globalState, slot);
 
   if(pRootSignature)
   {
@@ -339,8 +338,7 @@ void D3D12DebugAPIWrapper::FetchUAV(const DXBCDebug::BindingSlot &slot)
     pRootSignature = &rs.graphics;
   }
 
-  DXBCDebug::GlobalState::UAVDataMaker uavDataMaker(m_globalState, slot);
-  DXBCDebug::GlobalState::UAVData &uavData = uavDataMaker.uavData;
+  DXBCDebug::GlobalState::UAVData &uavData = AddUAV(m_globalState, slot);
 
   if(pRootSignature)
   {
