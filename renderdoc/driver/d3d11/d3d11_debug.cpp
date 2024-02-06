@@ -1564,6 +1564,14 @@ void D3D11ShaderDebugCache::Release()
   for(auto it = m_OffsetSamplePS.begin(); it != m_OffsetSamplePS.end(); ++it)
     it->second->Release();
   m_OffsetSamplePS.clear();
+
+  SAFE_RELEASE(m_DeferredContext);
+  SAFE_RELEASE(m_ImmediateContext);
+
+  SAFE_RELEASE(m_Query);
+  SAFE_RELEASE(m_ImmediateContext3);
+  CloseHandle(m_hEvent);
+  m_hEvent = NULL;
 }
 
 ID3D11PixelShader *D3D11ShaderDebugCache::GetSamplePS(const int8_t offsets[3])
@@ -1802,6 +1810,58 @@ ID3D11RenderTargetView *&D3D11ShaderDebugCache::GetDummyRTV()
   }
 
   return m_DummyRTV;
+}
+
+ID3D11DeviceContext *&D3D11ShaderDebugCache::GetDeferredContext()
+{
+  if(!m_DeferredContext && m_pDevice)
+    m_pDevice->CreateDeferredContext(0, &m_DeferredContext);
+  return m_DeferredContext;
+}
+
+ID3D11DeviceContext *&D3D11ShaderDebugCache::GetImmediateContext()
+{
+  if(!m_ImmediateContext && m_pDevice)
+    m_pDevice->GetImmediateContext(&m_ImmediateContext);
+  return m_ImmediateContext;
+}
+
+ID3D11Query *&D3D11ShaderDebugCache::GetQuery()
+{
+  if(m_Query)
+    return m_Query;
+
+  if(m_pDevice)
+  {
+    D3D11_QUERY_DESC queryDesc = {};
+    queryDesc.Query = D3D11_QUERY_EVENT;
+    queryDesc.MiscFlags = 0;
+    m_pDevice->CreateQuery(&queryDesc, &m_Query);
+  }
+
+  return m_Query;
+}
+
+ID3D11DeviceContext3 *&D3D11ShaderDebugCache::GetImmediateContext3()
+{
+  if(m_ImmediateContext3)
+    return m_ImmediateContext3;
+
+  if(ID3D11DeviceContext *immediateContext = GetImmediateContext())
+  {
+    void *p = NULL;
+    if(SUCCEEDED(immediateContext->QueryInterface(IID_ID3D11DeviceContext3, &p)))
+      m_ImmediateContext3 = static_cast<ID3D11DeviceContext3 *>(p);
+  }
+
+  return m_ImmediateContext3;
+}
+
+HANDLE &D3D11ShaderDebugCache::GetEvent()
+{
+  if(!m_hEvent)
+    m_hEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+  return m_hEvent;
 }
 
 void D3D11Replay::HistogramMinMax::Init(WrappedID3D11Device *device)

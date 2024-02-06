@@ -121,6 +121,13 @@ public:
   ID3D11Texture2D *&GetDummyTex();
   ID3D11RenderTargetView *&GetDummyRTV();
 
+  ID3D11DeviceContext *&GetDeferredContext();
+  ID3D11DeviceContext *&GetImmediateContext();
+
+  ID3D11Query *&GetQuery();
+  ID3D11DeviceContext3 *&GetImmediateContext3();
+  HANDLE &GetEvent();
+
 private:
   WrappedID3D11Device *m_pDevice;
 
@@ -136,6 +143,13 @@ private:
   ID3D11PixelShader *m_SamplePS = NULL;
   ID3D11Texture2D *m_DummyTex = NULL;
   ID3D11RenderTargetView *m_DummyRTV = NULL;
+
+  ID3D11DeviceContext *m_DeferredContext = NULL;
+  ID3D11DeviceContext *m_ImmediateContext = NULL;
+
+  ID3D11Query *m_Query = NULL;
+  ID3D11DeviceContext3 *m_ImmediateContext3 = NULL;
+  HANDLE m_hEvent = NULL;
 };
 
 class D3D11Replay : public IReplayDriver

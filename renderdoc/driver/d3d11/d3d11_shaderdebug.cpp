@@ -1110,37 +1110,6 @@ bool D3D11DebugAPIWrapper::CalculateSampleGather(
                                          ? *static_cast<D3D11ShaderDebugCache *>(debugCache)
                                          : m_pDevice->GetReplay()->GetDefaultShaderDebugCache();
 
-  struct Temporary
-  {
-    ID3D11DeviceContext *context = NULL;
-    ID3D11DeviceContext *immediateContext = NULL;
-
-    ID3D11ShaderResourceView *usedSRV = NULL;
-    ID3D11SamplerState *usedSamp = NULL;
-
-    ID3D11Query *query = NULL;
-    ID3D11CommandList *commandList = NULL;
-
-    ID3D11DeviceContext3 *immediateContext3 = NULL;
-    HANDLE hEvent = NULL;
-
-    ~Temporary()
-    {
-      CloseHandle(hEvent);
-      SAFE_RELEASE(immediateContext3);
-
-      SAFE_RELEASE(commandList);
-      SAFE_RELEASE(query);
-
-      SAFE_RELEASE(usedSamp);
-      SAFE_RELEASE(usedSRV);
-
-      SAFE_RELEASE(immediateContext);
-      SAFE_RELEASE(context);
-    }
-  }
-  temporary;
-
   for(uint32_t i = 0; i < ddxCalc.columns; i++)
   {
     if(!RDCISFINITE(ddxCalc.value.f32v[i]))
@@ -1249,14 +1218,13 @@ bool D3D11DebugAPIWrapper::CalculateSampleGather(
 
   //D3D11RenderStateTracker tracker(m_pDevice->GetImmediateContext());
 
-  ID3D11DeviceContext *&context = temporary.context;
-  ID3D11DeviceContext *&immediateContext = temporary.immediateContext;
+  ID3D11DeviceContext *context = debugData.GetDeferredContext();
+  ID3D11DeviceContext *immediateContext = debugData.GetImmediateContext();
 
-  m_pDevice->CreateDeferredContext(0, &context);
-  m_pDevice->GetImmediateContext(&immediateContext);
+  // back up SRV/sampler on PS slot 0
 
-  ID3D11ShaderResourceView *&usedSRV = temporary.usedSRV;
-  ID3D11SamplerState *&usedSamp = temporary.usedSamp;
+  ID3D11ShaderResourceView *usedSRV = NULL;
+  ID3D11SamplerState *usedSamp = NULL;
 
   // fetch SRV and sampler from the shader stage we're debugging that this opcode wants to load from
   UINT texSlot = resourceData.binding.shaderRegister;
@@ -1370,30 +1338,22 @@ bool D3D11DebugAPIWrapper::CalculateSampleGather(
 
   context->CopyResource(debugData.GetOutStageBuf(), debugData.GetOutBuf());
 
-  D3D11_QUERY_DESC queryDesc = {};
-  queryDesc.Query = D3D11_QUERY_EVENT;
-  queryDesc.MiscFlags = 0;
-  ID3D11Query *&query = temporary.query;
-  m_pDevice->CreateQuery(&queryDesc, &query);
-
+  ID3D11Query *query = debugData.GetQuery();
   context->End(query);
 
-  ID3D11CommandList *&commandList = temporary.commandList;
+  ID3D11CommandList *commandList = NULL;
   context->FinishCommandList(FALSE, &commandList);
 
-  void *p = NULL;
-  HANDLE &hEvent = temporary.hEvent;
-  ID3D11DeviceContext3 *&immediateContext3 = temporary.immediateContext3;
-  if(SUCCEEDED(immediateContext->QueryInterface(IID_ID3D11DeviceContext3, &p)))
-  {
-    immediateContext3 = static_cast<ID3D11DeviceContext3 *>(p);
-    hEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
-  }
+  HANDLE hEvent = NULL;
+  ID3D11DeviceContext3 *immediateContext3 = debugData.GetImmediateContext3();
+  if(immediateContext3)
+    hEvent = debugData.GetEvent();
 
   ShaderVariable lookupResult("tex", 0.0f, 0.0f, 0.0f, 0.0f);
   {
     SCOPED_LOCK(m_immediateContextCS);
     immediateContext->ExecuteCommandList(commandList, TRUE);
+    SAFE_RELEASE(commandList);
     if(immediateContext3)
       immediateContext3->Flush1(D3D11_CONTEXT_TYPE_ALL, hEvent);
     else
@@ -1442,6 +1402,9 @@ bool D3D11DebugAPIWrapper::CalculateSampleGather(
     }
   }
 
+  SAFE_RELEASE(usedSRV);
+  SAFE_RELEASE(usedSamp);
+
   output = lookupResult;
   return true;
 }
@@ -1468,36 +1431,8 @@ bool D3D11DebugAPIWrapper::CalculateMathIntrinsic(DXBCBytecode::OpcodeType opcod
                                          ? *static_cast<D3D11ShaderDebugCache *>(debugCache)
                                          : m_pDevice->GetReplay()->GetDefaultShaderDebugCache();
 
-  struct Temporary
-  {
-    ID3D11DeviceContext *context = NULL;
-    ID3D11DeviceContext *immediateContext = NULL;
-
-    ID3D11Query *query = NULL;
-    ID3D11CommandList *commandList = NULL;
-
-    ID3D11DeviceContext3 *immediateContext3 = NULL;
-    HANDLE hEvent = NULL;
-
-    ~Temporary()
-    {
-      CloseHandle(hEvent);
-      SAFE_RELEASE(immediateContext3);
-
-      SAFE_RELEASE(commandList);
-      SAFE_RELEASE(query);
-
-      SAFE_RELEASE(immediateContext);
-      SAFE_RELEASE(context);
-    }
-  }
-  temporary;
-
-  ID3D11DeviceContext *&context = temporary.context;
-  ID3D11DeviceContext *&immediateContext = temporary.immediateContext;
-
-  m_pDevice->CreateDeferredContext(0, &context);
-  m_pDevice->GetImmediateContext(&immediateContext);
+  ID3D11DeviceContext *context = debugData.GetDeferredContext();
+  ID3D11DeviceContext *immediateContext = debugData.GetImmediateContext();
 
   D3D11_MAPPED_SUBRESOURCE mapped;
   HRESULT hr = context->Map(debugData.GetParamBuf(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
@@ -1522,28 +1457,20 @@ bool D3D11DebugAPIWrapper::CalculateMathIntrinsic(DXBCBytecode::OpcodeType opcod
 
   context->CopyResource(debugData.GetOutStageBuf(), debugData.GetOutBuf());
 
-  D3D11_QUERY_DESC queryDesc = {};
-  queryDesc.Query = D3D11_QUERY_EVENT;
-  queryDesc.MiscFlags = 0;
-  ID3D11Query *&query = temporary.query;
-  m_pDevice->CreateQuery(&queryDesc, &query);
-
+  ID3D11Query *query = debugData.GetQuery();
   context->End(query);
 
-  ID3D11CommandList *&commandList = temporary.commandList;
+  ID3D11CommandList *commandList = NULL;
   context->FinishCommandList(FALSE, &commandList);
 
-  void *p = NULL;
-  HANDLE &hEvent = temporary.hEvent;
-  ID3D11DeviceContext3 *&immediateContext3 = temporary.immediateContext3;
-  if(SUCCEEDED(immediateContext->QueryInterface(IID_ID3D11DeviceContext3, &p)))
-  {
-    immediateContext3 = static_cast<ID3D11DeviceContext3 *>(p);
-    hEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
-  }
+  HANDLE hEvent = NULL;
+  ID3D11DeviceContext3 *immediateContext3 = debugData.GetImmediateContext3();
+  if(immediateContext3)
+    hEvent = debugData.GetEvent();
 
   SCOPED_LOCK(m_immediateContextCS);
   immediateContext->ExecuteCommandList(commandList, TRUE);
+  SAFE_RELEASE(commandList);
   if(immediateContext3)
     immediateContext3->Flush1(D3D11_CONTEXT_TYPE_ALL, hEvent);
   else
