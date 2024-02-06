@@ -2946,12 +2946,7 @@ void ThreadState::StepNext(ShaderDebugState *state, DebugAPIWrapper *apiWrapper,
     {
       BindingSlot slot = GetBindingSlotForIdentifier(*program, TYPE_UNORDERED_ACCESS_VIEW,
                                                      srcOpers[0].value.u32v[0]);
-      //GlobalState::UAVIterator uav = global.uavs.find(slot);
-      //if(uav == global.uavs.end())
-      //{
-      //  apiWrapper->FetchUAV(slot);
-      //  uav = global.uavs.find(slot);
-      //}
+
       GlobalState::UAVIterator uav = global.GetUAV(apiWrapper, slot);
 
       MarkResourceAccess(state, TYPE_UNORDERED_ACCESS_VIEW, slot);
@@ -2968,12 +2963,7 @@ void ThreadState::StepNext(ShaderDebugState *state, DebugAPIWrapper *apiWrapper,
     {
       BindingSlot slot = GetBindingSlotForIdentifier(*program, TYPE_UNORDERED_ACCESS_VIEW,
                                                      srcOpers[0].value.u32v[0]);
-      //GlobalState::UAVIterator uav = global.uavs.find(slot);
-      //if(uav == global.uavs.end())
-      //{
-      //  apiWrapper->FetchUAV(slot);
-      //  uav = global.uavs.find(slot);
-      //}
+
       GlobalState::UAVIterator uav = global.GetUAV(apiWrapper, slot);
 
       MarkResourceAccess(state, TYPE_UNORDERED_ACCESS_VIEW, slot);
@@ -3097,12 +3087,7 @@ void ThreadState::StepNext(ShaderDebugState *state, DebugAPIWrapper *apiWrapper,
       {
         BindingSlot slot =
             GetBindingSlotForIdentifier(*program, TYPE_UNORDERED_ACCESS_VIEW, resIndex);
-        //GlobalState::UAVIterator uav = global.uavs.find(slot);
-        //if(uav == global.uavs.end())
-        //{
-        //  apiWrapper->FetchUAV(slot);
-        //  uav = global.uavs.find(slot);
-        //}
+
         GlobalState::UAVIterator uav = global.GetUAV(apiWrapper, slot);
 
         MarkResourceAccess(state, TYPE_UNORDERED_ACCESS_VIEW, slot);
@@ -3354,12 +3339,6 @@ void ThreadState::StepNext(ShaderDebugState *state, DebugAPIWrapper *apiWrapper,
 
         if(srv)
         {
-          //GlobalState::SRVIterator srvIter = global.srvs.find(slot);
-          //if(srvIter == global.srvs.end())
-          //{
-          //  apiWrapper->FetchSRV(slot);
-          //  srvIter = global.srvs.find(slot);
-          //}
           GlobalState::SRVIterator srvIter = global.GetSRV(apiWrapper, slot);
 
           MarkResourceAccess(state, TYPE_RESOURCE, slot);
@@ -3372,12 +3351,6 @@ void ThreadState::StepNext(ShaderDebugState *state, DebugAPIWrapper *apiWrapper,
         }
         else
         {
-          //GlobalState::UAVIterator uavIter = global.uavs.find(slot);
-          //if(uavIter == global.uavs.end())
-          //{
-          //  apiWrapper->FetchUAV(slot);
-          //  uavIter = global.uavs.find(slot);
-          //}
           GlobalState::UAVIterator uavIter = global.GetUAV(apiWrapper, slot);
 
           MarkResourceAccess(state, TYPE_UNORDERED_ACCESS_VIEW, slot);
@@ -3954,12 +3927,7 @@ void ThreadState::StepNext(ShaderDebugState *state, DebugAPIWrapper *apiWrapper,
           resourceDim = decl.resource.dim;
 
           resourceBinding = GetBindingSlotForDeclaration(*program, decl);
-          //GlobalState::SRVIterator srv = global.srvs.find(resourceBinding);
-          //if(srv == global.srvs.end())
-          //{
-          //  apiWrapper->FetchSRV(resourceBinding);
-          //  srv = global.srvs.find(resourceBinding);
-          //}
+
           GlobalState::SRVIterator srv = global.GetSRV(apiWrapper, resourceBinding);
 
           const byte *data = &srv->second.data[0];
@@ -4447,12 +4415,7 @@ void ThreadState::StepNext(ShaderDebugState *state, DebugAPIWrapper *apiWrapper,
       }
 
       BindingSlot slot = GetBindingSlotForIdentifier(*program, TYPE_UNORDERED_ACCESS_VIEW, resIndex);
-      //GlobalState::UAVIterator uav = global.uavs.find(slot);
-      //if(uav == global.uavs.end())
-      //{
-      //  apiWrapper->FetchUAV(slot);
-      //  uav = global.uavs.find(slot);
-      //}
+
       GlobalState::UAVIterator uav = global.GetUAV(apiWrapper, slot);
 
       MarkResourceAccess(state, TYPE_UNORDERED_ACCESS_VIEW, slot);
