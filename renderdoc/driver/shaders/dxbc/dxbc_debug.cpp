@@ -2614,7 +2614,8 @@ void ThreadState::StepNext(ShaderDebugState *state, DebugAPIWrapper *apiWrapper,
     {
       ShaderVariable calcResultA("calcA", 0.0f, 0.0f, 0.0f, 0.0f);
       ShaderVariable calcResultB("calcB", 0.0f, 0.0f, 0.0f, 0.0f);
-      if(apiWrapper->CalculateMathIntrinsic(op.operation, srcOpers[0], calcResultA, calcResultB))
+      if(apiWrapper->CalculateMathIntrinsic(op.operation, srcOpers[0], calcResultA, calcResultB,
+                                            m_debug.cache.get()))
       {
         SetDst(state, op.operands[0], op, calcResultA);
       }
@@ -2628,7 +2629,8 @@ void ThreadState::StepNext(ShaderDebugState *state, DebugAPIWrapper *apiWrapper,
     {
       ShaderVariable calcResultA("calcA", 0.0f, 0.0f, 0.0f, 0.0f);
       ShaderVariable calcResultB("calcB", 0.0f, 0.0f, 0.0f, 0.0f);
-      if(apiWrapper->CalculateMathIntrinsic(OPCODE_SINCOS, srcOpers[1], calcResultA, calcResultB))
+      if(apiWrapper->CalculateMathIntrinsic(OPCODE_SINCOS, srcOpers[1], calcResultA, calcResultB,
+                                            m_debug.cache.get()))
       {
         if(op.operands[0].type != TYPE_NULL)
           SetDst(state, op.operands[0], op, calcResultA);
@@ -4115,7 +4117,7 @@ void ThreadState::StepNext(ShaderDebugState *state, DebugAPIWrapper *apiWrapper,
       if(apiWrapper->CalculateSampleGather(op.operation, resourceData, samplerData, uv, ddxCalc,
                                            ddyCalc, op.texelOffset, multisampleIndex,
                                            lodOrCompareValue, swizzle, gatherChannel,
-                                           op.str.c_str(), lookupResult))
+                                           op.str.c_str(), lookupResult, m_debug.cache.get()))
       {
         // should be a better way of doing this
         if(destOperand.comps[1] == 0xff)
@@ -5643,7 +5645,7 @@ void InterpretDebugger::PrepareThreadWorkgroup(const rdcfixedarray<uint32_t, 3> 
   // and only simulate this thread
   if(groupNumInstructions)
   {
-    ThreadState initialState = activeLane();
+    ThreadState initialState = std::move(activeLane());
 
     // prepare state for all threads in the group
     auto reflection = dxbc->GetReflection();

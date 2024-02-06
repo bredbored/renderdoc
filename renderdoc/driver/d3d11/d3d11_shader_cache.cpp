@@ -81,6 +81,8 @@ struct D3DBlobShaderCallbacks
   pD3DCreateBlob m_BlobCreate = NULL;
 } D3D11ShaderCacheCallbacks;
 
+thread_local bool D3D11ShaderCache::m_CacheShaders = false;
+
 D3D11ShaderCache::D3D11ShaderCache(WrappedID3D11Device *wrapper)
 {
   m_pDevice = wrapper;

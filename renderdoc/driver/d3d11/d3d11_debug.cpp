@@ -1515,209 +1515,65 @@ void D3D11Replay::PixelPicking::Release()
   SAFE_RELEASE(StageTexture);
 }
 
-void ShaderDebugging::Init(WrappedID3D11Device *device)
+D3D11ShaderDebugCache::D3D11ShaderDebugCache(WrappedID3D11Device *device) : m_pDevice(device)
 {
-  D3D11ShaderCache *shaderCache = device->GetShaderCache();
+}
 
-  HRESULT hr = S_OK;
+D3D11ShaderDebugCache::~D3D11ShaderDebugCache()
+{
+  Release();
+}
 
-  rdcstr hlsl = GetEmbeddedResource(shaderdebug_hlsl);
-
-  MathCS = shaderCache->MakeCShader(hlsl.c_str(), "RENDERDOC_DebugMathOp", "cs_5_0");
-  SampleVS = shaderCache->MakeVShader(hlsl.c_str(), "RENDERDOC_DebugSampleVS", "vs_5_0");
-  SamplePS = shaderCache->MakePShader(hlsl.c_str(), "RENDERDOC_DebugSamplePS", "ps_5_0");
-
-  D3D11_BUFFER_DESC bDesc;
-
-  bDesc.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
-  bDesc.ByteWidth = 6 * sizeof(Vec4f);
-  bDesc.CPUAccessFlags = 0;
-  bDesc.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
-  bDesc.StructureByteStride = 6 * sizeof(Vec4f);
-  bDesc.Usage = D3D11_USAGE_DEFAULT;
-
-  hr = device->CreateBuffer(&bDesc, NULL, &OutBuf);
-
-  if(FAILED(hr))
-    RDCERR("Failed to create shader debugging output buffer HRESULT: %s", ToStr(hr).c_str());
-
-  bDesc.BindFlags = 0;
-  bDesc.MiscFlags = 0;
-  bDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-  bDesc.Usage = D3D11_USAGE_STAGING;
-
-  hr = device->CreateBuffer(&bDesc, NULL, &OutStageBuf);
-
-  if(FAILED(hr))
-    RDCERR("Failed to create shader debugging staging buffer HRESULT: %s", ToStr(hr).c_str());
-
-  bDesc.ByteWidth = 16 * sizeof(Vec4f);
-  bDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-  bDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-  bDesc.Usage = D3D11_USAGE_DYNAMIC;
-
-  hr = device->CreateBuffer(&bDesc, NULL, &ParamBuf);
-
-  if(FAILED(hr))
-    RDCERR("Failed to create shader debugging parameter buffer HRESULT: %s", ToStr(hr).c_str());
-
-  D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
-
-  uavDesc.Format = DXGI_FORMAT_UNKNOWN;
-  uavDesc.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
-  uavDesc.Buffer.FirstElement = 0;
-  uavDesc.Buffer.NumElements = 1;
-  uavDesc.Buffer.Flags = 0;
-
-  if(OutBuf)
-    hr = device->CreateUnorderedAccessView(OutBuf, &uavDesc, &OutUAV);
-
-  if(FAILED(hr))
-    RDCERR("Failed to create shader debugging UAV HRESULT: %s", ToStr(hr).c_str());
-
-  D3D11_TEXTURE2D_DESC tdesc = {};
-
-  tdesc.ArraySize = 1;
-  tdesc.BindFlags = D3D11_BIND_RENDER_TARGET;
-  tdesc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
-  tdesc.Width = 1;
-  tdesc.Height = 1;
-  tdesc.SampleDesc.Count = 1;
-
-  hr = device->CreateTexture2D(&tdesc, NULL, &DummyTex);
-
-  if(FAILED(hr))
-    RDCERR("Failed to create shader debugging dummy texture HRESULT: %s", ToStr(hr).c_str());
-
-  D3D11_RENDER_TARGET_VIEW_DESC rtDesc;
-
-  rtDesc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
-  rtDesc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
-  rtDesc.Texture2D.MipSlice = 0;
-
-  if(DummyTex)
-    hr = device->CreateRenderTargetView(DummyTex, &rtDesc, &DummyRTV);
-
-  if(FAILED(hr))
-    RDCERR("Failed to create shader debugging dummy RTV HRESULT: %s", ToStr(hr).c_str());
+void D3D11ShaderDebugCache::Init(WrappedID3D11Device *device)
+{
+  Release();
 
   m_pDevice = device;
+  if(!m_pDevice)
+    return;
+
+  GetMathCS();
+  GetSampleVS();
+  GetSamplePS();
+
+  GetOutBuf();
+  GetOutStageBuf();
+  GetParamBuf();
+
+  GetOutUAV();
+
+  GetDummyTex();
+  GetDummyRTV();
 }
 
-void ShaderDebugging::Init(const ShaderDebugging &debugData)
+void D3D11ShaderDebugCache::Release()
 {
-  HRESULT hr = S_OK;
+  m_pDevice = NULL;
 
-  MathCS = debugData.MathCS;
-  SampleVS = debugData.SampleVS;
-  SamplePS = debugData.SamplePS;
+  SAFE_RELEASE(m_MathCS);
+  SAFE_RELEASE(m_SampleVS);
+  SAFE_RELEASE(m_SamplePS);
+  SAFE_RELEASE(m_ParamBuf);
+  SAFE_RELEASE(m_OutBuf);
+  SAFE_RELEASE(m_OutStageBuf);
+  SAFE_RELEASE(m_OutUAV);
 
-  MathCS->AddRef();
-  SampleVS->AddRef();
-  SamplePS->AddRef();
-
-  m_pDevice = debugData.m_pDevice;
-
-  D3D11_BUFFER_DESC bDesc;
-
-  bDesc.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
-  bDesc.ByteWidth = 6 * sizeof(Vec4f);
-  bDesc.CPUAccessFlags = 0;
-  bDesc.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
-  bDesc.StructureByteStride = 6 * sizeof(Vec4f);
-  bDesc.Usage = D3D11_USAGE_DEFAULT;
-
-  hr = m_pDevice->CreateBuffer(&bDesc, NULL, &OutBuf);
-
-  if(FAILED(hr))
-    RDCERR("Failed to create shader debugging output buffer HRESULT: %s", ToStr(hr).c_str());
-
-  bDesc.BindFlags = 0;
-  bDesc.MiscFlags = 0;
-  bDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-  bDesc.Usage = D3D11_USAGE_STAGING;
-
-  hr = m_pDevice->CreateBuffer(&bDesc, NULL, &OutStageBuf);
-
-  if(FAILED(hr))
-    RDCERR("Failed to create shader debugging staging buffer HRESULT: %s", ToStr(hr).c_str());
-
-  bDesc.ByteWidth = 16 * sizeof(Vec4f);
-  bDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-  bDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-  bDesc.Usage = D3D11_USAGE_DYNAMIC;
-
-  hr = m_pDevice->CreateBuffer(&bDesc, NULL, &ParamBuf);
-
-  if(FAILED(hr))
-    RDCERR("Failed to create shader debugging parameter buffer HRESULT: %s", ToStr(hr).c_str());
-
-  D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
-
-  uavDesc.Format = DXGI_FORMAT_UNKNOWN;
-  uavDesc.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
-  uavDesc.Buffer.FirstElement = 0;
-  uavDesc.Buffer.NumElements = 1;
-  uavDesc.Buffer.Flags = 0;
-
-  if(OutBuf)
-    hr = m_pDevice->CreateUnorderedAccessView(OutBuf, &uavDesc, &OutUAV);
-
-  if(FAILED(hr))
-    RDCERR("Failed to create shader debugging UAV HRESULT: %s", ToStr(hr).c_str());
-
-  D3D11_TEXTURE2D_DESC tdesc = {};
-
-  tdesc.ArraySize = 1;
-  tdesc.BindFlags = D3D11_BIND_RENDER_TARGET;
-  tdesc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
-  tdesc.Width = 1;
-  tdesc.Height = 1;
-  tdesc.SampleDesc.Count = 1;
-
-  hr = m_pDevice->CreateTexture2D(&tdesc, NULL, &DummyTex);
-
-  if(FAILED(hr))
-    RDCERR("Failed to create shader debugging dummy texture HRESULT: %s", ToStr(hr).c_str());
-
-  D3D11_RENDER_TARGET_VIEW_DESC rtDesc;
-
-  rtDesc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
-  rtDesc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
-  rtDesc.Texture2D.MipSlice = 0;
-
-  if(DummyTex)
-    hr = m_pDevice->CreateRenderTargetView(DummyTex, &rtDesc, &DummyRTV);
-
-  if(FAILED(hr))
-    RDCERR("Failed to create shader debugging dummy RTV HRESULT: %s", ToStr(hr).c_str());
-}
-
-void ShaderDebugging::Release()
-{
-  SAFE_RELEASE(MathCS);
-  SAFE_RELEASE(SampleVS);
-  SAFE_RELEASE(SamplePS);
-  SAFE_RELEASE(ParamBuf);
-  SAFE_RELEASE(OutBuf);
-  SAFE_RELEASE(OutStageBuf);
-  SAFE_RELEASE(OutUAV);
-
-  SAFE_RELEASE(DummyTex);
-  SAFE_RELEASE(DummyRTV);
+  SAFE_RELEASE(m_DummyTex);
+  SAFE_RELEASE(m_DummyRTV);
 
   for(auto it = m_OffsetSamplePS.begin(); it != m_OffsetSamplePS.end(); ++it)
     it->second->Release();
+  m_OffsetSamplePS.clear();
 }
 
-ID3D11PixelShader *ShaderDebugging::GetSamplePS(const int8_t offsets[3])
+ID3D11PixelShader *D3D11ShaderDebugCache::GetSamplePS(const int8_t offsets[3])
 {
   uint32_t offsKey = offsets[0] | (offsets[1] << 8) | (offsets[2] << 16);
   if(offsKey == 0)
-    return SamplePS;
+    return GetSamplePS();
 
-  ID3D11PixelShader *ps = m_OffsetSamplePS[offsKey];
-  if(ps)
+  ID3D11PixelShader *&ps = m_OffsetSamplePS[offsKey];
+  if(ps || !m_pDevice)
     return ps;
 
   D3D11ShaderCache *shaderCache = m_pDevice->GetShaderCache();
@@ -1729,12 +1585,223 @@ ID3D11PixelShader *ShaderDebugging::GetSamplePS(const int8_t offsets[3])
   hlsl = StringFormat::Fmt("#define debugSampleOffsets int4(%d,%d,%d,0)\n\n%s", offsets[0],
                            offsets[1], offsets[2], hlsl.c_str());
 
-  ps = m_OffsetSamplePS[offsKey] =
-      shaderCache->MakePShader(hlsl.c_str(), "RENDERDOC_DebugSamplePS", "ps_5_0");
+  ps = shaderCache->MakePShader(hlsl.c_str(), "RENDERDOC_DebugSamplePS", "ps_5_0");
 
   shaderCache->SetCaching(false);
 
   return ps;
+}
+
+ID3D11ComputeShader *&D3D11ShaderDebugCache::GetMathCS()
+{
+  if(!m_MathCS && m_pDevice)
+  {
+    if(D3D11Replay *replay = m_pDevice->GetReplay())
+    {
+      D3D11ShaderDebugCache &debugData = replay->GetDefaultShaderDebugCache();
+      if(this != &debugData)
+      {
+        m_MathCS = debugData.GetMathCS();
+        m_MathCS->AddRef();
+        return m_MathCS;
+      }
+    }
+    rdcstr hlsl = GetEmbeddedResource(shaderdebug_hlsl);
+    D3D11ShaderCache *shaderCache = m_pDevice->GetShaderCache();
+    m_MathCS = shaderCache->MakeCShader(hlsl.c_str(), "RENDERDOC_DebugMathOp", "cs_5_0");
+  }
+  return m_MathCS;
+}
+
+ID3D11Buffer *&D3D11ShaderDebugCache::GetParamBuf()
+{
+  if(m_ParamBuf || !m_pDevice)
+    return m_ParamBuf;
+
+  D3D11_BUFFER_DESC bDesc;
+
+  bDesc.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+  bDesc.ByteWidth = 6 * sizeof(Vec4f);
+  bDesc.CPUAccessFlags = 0;
+  bDesc.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+  bDesc.StructureByteStride = 6 * sizeof(Vec4f);
+  bDesc.Usage = D3D11_USAGE_DEFAULT;
+
+  bDesc.BindFlags = 0;
+  bDesc.MiscFlags = 0;
+  bDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+  bDesc.Usage = D3D11_USAGE_STAGING;
+
+  bDesc.ByteWidth = 16 * sizeof(Vec4f);
+  bDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+  bDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+  bDesc.Usage = D3D11_USAGE_DYNAMIC;
+
+  HRESULT hr = m_pDevice->CreateBuffer(&bDesc, NULL, &m_ParamBuf);
+
+  if(FAILED(hr))
+    RDCERR("Failed to create shader debugging parameter buffer HRESULT: %s", ToStr(hr).c_str());
+
+  return m_ParamBuf;
+}
+
+ID3D11Buffer *&D3D11ShaderDebugCache::GetOutBuf()
+{
+  if(m_OutBuf || !m_pDevice)
+    return m_OutBuf;
+
+  D3D11_BUFFER_DESC bDesc;
+
+  bDesc.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+  bDesc.ByteWidth = 6 * sizeof(Vec4f);
+  bDesc.CPUAccessFlags = 0;
+  bDesc.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+  bDesc.StructureByteStride = 6 * sizeof(Vec4f);
+  bDesc.Usage = D3D11_USAGE_DEFAULT;
+
+  HRESULT hr = m_pDevice->CreateBuffer(&bDesc, NULL, &m_OutBuf);
+
+  if(FAILED(hr))
+    RDCERR("Failed to create shader debugging output buffer HRESULT: %s", ToStr(hr).c_str());
+
+  return m_OutBuf;
+}
+
+ID3D11Buffer *&D3D11ShaderDebugCache::GetOutStageBuf()
+{
+  if(m_OutStageBuf || !m_pDevice)
+    return m_OutStageBuf;
+
+  D3D11_BUFFER_DESC bDesc;
+
+  bDesc.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+  bDesc.ByteWidth = 6 * sizeof(Vec4f);
+  bDesc.CPUAccessFlags = 0;
+  bDesc.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+  bDesc.StructureByteStride = 6 * sizeof(Vec4f);
+  bDesc.Usage = D3D11_USAGE_DEFAULT;
+
+  bDesc.BindFlags = 0;
+  bDesc.MiscFlags = 0;
+  bDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+  bDesc.Usage = D3D11_USAGE_STAGING;
+
+  HRESULT hr = m_pDevice->CreateBuffer(&bDesc, NULL, &m_OutStageBuf);
+
+  if(FAILED(hr))
+    RDCERR("Failed to create shader debugging staging buffer HRESULT: %s", ToStr(hr).c_str());
+
+  return m_OutStageBuf;
+}
+
+ID3D11UnorderedAccessView *&D3D11ShaderDebugCache::GetOutUAV()
+{
+  if(m_OutUAV || !m_pDevice)
+    return m_OutUAV;
+
+  if(ID3D11Buffer *OutBuf = GetOutBuf())
+  {
+    D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
+
+    uavDesc.Format = DXGI_FORMAT_UNKNOWN;
+    uavDesc.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+    uavDesc.Buffer.FirstElement = 0;
+    uavDesc.Buffer.NumElements = 1;
+    uavDesc.Buffer.Flags = 0;
+
+    HRESULT hr = m_pDevice->CreateUnorderedAccessView(OutBuf, &uavDesc, &m_OutUAV);
+
+    if(FAILED(hr))
+      RDCERR("Failed to create shader debugging UAV HRESULT: %s", ToStr(hr).c_str());
+  }
+
+  return m_OutUAV;
+}
+
+ID3D11VertexShader *&D3D11ShaderDebugCache::GetSampleVS()
+{
+  if(!m_SampleVS && m_pDevice)
+  {
+    if(D3D11Replay *replay = m_pDevice->GetReplay())
+    {
+      D3D11ShaderDebugCache &debugData = replay->GetDefaultShaderDebugCache();
+      if(this != &debugData)
+      {
+        m_SampleVS = debugData.GetSampleVS();
+        m_SampleVS->AddRef();
+        return m_SampleVS;
+      }
+    }
+    rdcstr hlsl = GetEmbeddedResource(shaderdebug_hlsl);
+    D3D11ShaderCache *shaderCache = m_pDevice->GetShaderCache();
+    m_SampleVS = shaderCache->MakeVShader(hlsl.c_str(), "RENDERDOC_DebugSampleVS", "vs_5_0");
+  }
+  return m_SampleVS;
+}
+
+ID3D11PixelShader *&D3D11ShaderDebugCache::GetSamplePS()
+{
+  if(!m_SamplePS && m_pDevice)
+  {
+    if(D3D11Replay *replay = m_pDevice->GetReplay())
+    {
+      D3D11ShaderDebugCache &debugData = replay->GetDefaultShaderDebugCache();
+      if(this != &debugData)
+      {
+        m_SamplePS = debugData.GetSamplePS();
+        m_SamplePS->AddRef();
+        return m_SamplePS;
+      }
+    }
+    rdcstr hlsl = GetEmbeddedResource(shaderdebug_hlsl);
+    D3D11ShaderCache *shaderCache = m_pDevice->GetShaderCache();
+    m_SamplePS = shaderCache->MakePShader(hlsl.c_str(), "RENDERDOC_DebugSamplePS", "ps_5_0");
+  }
+  return m_SamplePS;
+}
+
+ID3D11Texture2D *&D3D11ShaderDebugCache::GetDummyTex()
+{
+  if(m_DummyTex || !m_pDevice)
+    return m_DummyTex;
+
+  D3D11_TEXTURE2D_DESC tdesc = {};
+
+  tdesc.ArraySize = 1;
+  tdesc.BindFlags = D3D11_BIND_RENDER_TARGET;
+  tdesc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+  tdesc.Width = 1;
+  tdesc.Height = 1;
+  tdesc.SampleDesc.Count = 1;
+
+  HRESULT hr = m_pDevice->CreateTexture2D(&tdesc, NULL, &m_DummyTex);
+
+  if(FAILED(hr))
+    RDCERR("Failed to create shader debugging dummy texture HRESULT: %s", ToStr(hr).c_str());
+
+  return m_DummyTex;
+}
+
+ID3D11RenderTargetView *&D3D11ShaderDebugCache::GetDummyRTV()
+{
+  if(m_DummyRTV || !m_pDevice)
+    return m_DummyRTV;
+
+  if(ID3D11Texture2D *DummyTex = GetDummyTex())
+  {
+    D3D11_RENDER_TARGET_VIEW_DESC rtDesc;
+
+    rtDesc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+    rtDesc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+    rtDesc.Texture2D.MipSlice = 0;
+
+    HRESULT hr = m_pDevice->CreateRenderTargetView(DummyTex, &rtDesc, &m_DummyRTV);
+
+    if(FAILED(hr))
+      RDCERR("Failed to create shader debugging dummy RTV HRESULT: %s", ToStr(hr).c_str());
+  }
+
+  return m_DummyRTV;
 }
 
 void D3D11Replay::HistogramMinMax::Init(WrappedID3D11Device *device)

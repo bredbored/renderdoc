@@ -70,7 +70,8 @@ public:
   void FetchUAV(const DXBCDebug::BindingSlot &slot);
 
   bool CalculateMathIntrinsic(DXBCBytecode::OpcodeType opcode, const ShaderVariable &input,
-                              ShaderVariable &output1, ShaderVariable &output2);
+                              ShaderVariable &output1, ShaderVariable &output2,
+                              DXBCDebug::ShaderDebugCache *debugCache);
 
   ShaderVariable GetSampleInfo(DXBCBytecode::OperandType type, bool isAbsoluteResource,
                                const DXBCDebug::BindingSlot &slot, const char *opString);
@@ -86,7 +87,7 @@ public:
                              const int8_t texelOffsets[3], int multisampleIndex,
                              float lodOrCompareValue, const uint8_t swizzle[4],
                              DXBCDebug::GatherChannel gatherChannel, const char *opString,
-                             ShaderVariable &output);
+                             ShaderVariable &output, DXBCDebug::ShaderDebugCache *debugCache);
 
 private:
   DXBC::ShaderType GetShaderType() { return m_dxbc ? m_dxbc->m_Type : DXBC::ShaderType::Pixel; }
@@ -1069,7 +1070,7 @@ bool D3D11DebugAPIWrapper::CalculateSampleGather(
     DXBCDebug::SampleGatherSamplerData samplerData, ShaderVariable uv, ShaderVariable ddxCalc,
     ShaderVariable ddyCalc, const int8_t texelOffsets[3], int multisampleIndex,
     float lodOrCompareValue, const uint8_t swizzle[4], DXBCDebug::GatherChannel gatherChannel,
-    const char *opString, ShaderVariable &output)
+    const char *opString, ShaderVariable &output, DXBCDebug::ShaderDebugCache *debugCache)
 {
   using namespace DXBCBytecode;
 
@@ -1100,12 +1101,12 @@ bool D3D11DebugAPIWrapper::CalculateSampleGather(
   RDCCOMPILE_ASSERT((int)DXBCBytecode::OPCODE_LD_MS == DEBUG_SAMPLE_TEX_LD_MS,
                     "Opcode enum doesn't match shader define");
 
-  //ShaderDebugging &debugData = m_pDevice->GetReplay()->GetShaderDebuggingData();
+  D3D11ShaderDebugCache &debugData = debugCache
+                                         ? *static_cast<D3D11ShaderDebugCache *>(debugCache)
+                                         : m_pDevice->GetReplay()->GetDefaultShaderDebugCache();
 
   struct Temporary
   {
-    ShaderDebugging debugData;
-
     ID3D11DeviceContext *context = NULL;
     ID3D11DeviceContext *immediateContext = NULL;
 
@@ -1131,15 +1132,9 @@ bool D3D11DebugAPIWrapper::CalculateSampleGather(
 
       SAFE_RELEASE(immediateContext);
       SAFE_RELEASE(context);
-
-      debugData.Release();
     }
   }
   temporary;
-
-  ShaderDebugging &debugData = temporary.debugData;
-  //debugData.Init(m_pDevice);
-  debugData.Init(m_pDevice->GetReplay()->GetShaderDebuggingData());
 
   for(uint32_t i = 0; i < ddxCalc.columns; i++)
   {
@@ -1331,11 +1326,11 @@ bool D3D11DebugAPIWrapper::CalculateSampleGather(
   context->IASetInputLayout(NULL);
   context->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
-  context->VSSetShader(debugData.SampleVS, NULL, 0);
+  context->VSSetShader(debugData.GetSampleVS(), NULL, 0);
   context->PSSetShader(debugData.GetSamplePS(texelOffsets), NULL, 0);
 
   D3D11_MAPPED_SUBRESOURCE mapped;
-  HRESULT hr = context->Map(debugData.ParamBuf, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+  HRESULT hr = context->Map(debugData.GetParamBuf(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
   if(FAILED(hr))
   {
     RDCERR("Failed to map parameters HRESULT: %s", ToStr(hr).c_str());    // @NoCoverage
@@ -1344,10 +1339,10 @@ bool D3D11DebugAPIWrapper::CalculateSampleGather(
 
   memcpy(mapped.pData, &cbufferData, sizeof(cbufferData));
 
-  context->Unmap(debugData.ParamBuf, 0);
+  context->Unmap(debugData.GetParamBuf(), 0);
 
-  context->VSSetConstantBuffers(0, 1, &debugData.ParamBuf);
-  context->PSSetConstantBuffers(0, 1, &debugData.ParamBuf);
+  context->VSSetConstantBuffers(0, 1, &debugData.GetParamBuf());
+  context->PSSetConstantBuffers(0, 1, &debugData.GetParamBuf());
 
   D3D11_VIEWPORT view = {0.0f, 0.0f, 1.0f, 1.0f, 0.0f, 1.0f};
   context->RSSetViewports(1, &view);
@@ -1364,11 +1359,11 @@ bool D3D11DebugAPIWrapper::CalculateSampleGather(
   context->OMSetDepthStencilState(NULL, 0);
 
   UINT uavCount = ~0U;
-  context->OMSetRenderTargetsAndUnorderedAccessViews(1, &debugData.DummyRTV, NULL, 1, 1,
-                                                     &debugData.OutUAV, &uavCount);
+  context->OMSetRenderTargetsAndUnorderedAccessViews(1, &debugData.GetDummyRTV(), NULL, 1, 1,
+                                                     &debugData.GetOutUAV(), &uavCount);
   context->Draw(3, 0);
 
-  context->CopyResource(debugData.OutStageBuf, debugData.OutBuf);
+  context->CopyResource(debugData.GetOutStageBuf(), debugData.GetOutBuf());
 
   D3D11_QUERY_DESC queryDesc = {};
   queryDesc.Query = D3D11_QUERY_EVENT;
@@ -1402,7 +1397,7 @@ bool D3D11DebugAPIWrapper::CalculateSampleGather(
     {
       if(immediateContext->GetData(query, NULL, 0, D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK)
       {
-        hr = immediateContext->Map(debugData.OutStageBuf, 0, D3D11_MAP_READ, 0, &mapped);
+        hr = immediateContext->Map(debugData.GetOutStageBuf(), 0, D3D11_MAP_READ, 0, &mapped);
 
         if(FAILED(hr))
         {
@@ -1430,7 +1425,7 @@ bool D3D11DebugAPIWrapper::CalculateSampleGather(
             lookupResult.value.f32v[i] = retFloats[swizzle[i]];
         }
 
-        immediateContext->Unmap(debugData.OutStageBuf, 0);
+        immediateContext->Unmap(debugData.GetOutStageBuf(), 0);
         break;
       }
       m_immediateContextCS.Unlock();
@@ -1448,7 +1443,8 @@ bool D3D11DebugAPIWrapper::CalculateSampleGather(
 
 bool D3D11DebugAPIWrapper::CalculateMathIntrinsic(DXBCBytecode::OpcodeType opcode,
                                                   const ShaderVariable &input,
-                                                  ShaderVariable &output1, ShaderVariable &output2)
+                                                  ShaderVariable &output1, ShaderVariable &output2,
+                                                  DXBCDebug::ShaderDebugCache *debugCache)
 {
   //D3D11RenderStateTracker tracker(m_pDevice->GetImmediateContext());
 
@@ -1463,10 +1459,12 @@ bool D3D11DebugAPIWrapper::CalculateMathIntrinsic(DXBCBytecode::OpcodeType opcod
   RDCCOMPILE_ASSERT((int)DXBCBytecode::OPCODE_SINCOS == DEBUG_SAMPLE_MATH_SINCOS,
                     "Opcode enum doesn't match shader define");
 
+  D3D11ShaderDebugCache &debugData = debugCache
+                                         ? *static_cast<D3D11ShaderDebugCache *>(debugCache)
+                                         : m_pDevice->GetReplay()->GetDefaultShaderDebugCache();
+
   struct Temporary
   {
-    ShaderDebugging debugData;
-
     ID3D11DeviceContext *context = NULL;
     ID3D11DeviceContext *immediateContext = NULL;
 
@@ -1486,8 +1484,6 @@ bool D3D11DebugAPIWrapper::CalculateMathIntrinsic(DXBCBytecode::OpcodeType opcod
 
       SAFE_RELEASE(immediateContext);
       SAFE_RELEASE(context);
-
-      debugData.Release();
     }
   }
   temporary;
@@ -1498,13 +1494,8 @@ bool D3D11DebugAPIWrapper::CalculateMathIntrinsic(DXBCBytecode::OpcodeType opcod
   m_pDevice->CreateDeferredContext(0, &context);
   m_pDevice->GetImmediateContext(&immediateContext);
 
-  //const ShaderDebugging &debugData = m_pDevice->GetReplay()->GetShaderDebuggingData();
-  //temporary.debugData.Init(m_pDevice);
-  temporary.debugData.Init(m_pDevice->GetReplay()->GetShaderDebuggingData());
-  const ShaderDebugging &debugData = temporary.debugData;
-
   D3D11_MAPPED_SUBRESOURCE mapped;
-  HRESULT hr = context->Map(debugData.ParamBuf, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+  HRESULT hr = context->Map(debugData.GetParamBuf(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
   if(FAILED(hr))
   {
     RDCERR("Failed to map parameters HRESULT: %s", ToStr(hr).c_str());    // @NoCoverage
@@ -1517,14 +1508,14 @@ bool D3D11DebugAPIWrapper::CalculateMathIntrinsic(DXBCBytecode::OpcodeType opcod
 
   memcpy(mapped.pData, &data, sizeof(data));
 
-  context->Unmap(debugData.ParamBuf, 0);
+  context->Unmap(debugData.GetParamBuf(), 0);
 
-  context->CSSetConstantBuffers(0, 1, &debugData.ParamBuf);
-  context->CSSetShader(debugData.MathCS, NULL, 0);
-  context->CSSetUnorderedAccessViews(1, 1, &debugData.OutUAV, NULL);
+  context->CSSetConstantBuffers(0, 1, &debugData.GetParamBuf());
+  context->CSSetShader(debugData.GetMathCS(), NULL, 0);
+  context->CSSetUnorderedAccessViews(1, 1, &debugData.GetOutUAV(), NULL);
   context->Dispatch(1, 1, 1);
 
-  context->CopyResource(debugData.OutStageBuf, debugData.OutBuf);
+  context->CopyResource(debugData.GetOutStageBuf(), debugData.GetOutBuf());
 
   D3D11_QUERY_DESC queryDesc = {};
   queryDesc.Query = D3D11_QUERY_EVENT;
@@ -1556,7 +1547,7 @@ bool D3D11DebugAPIWrapper::CalculateMathIntrinsic(DXBCBytecode::OpcodeType opcod
   {
     if(immediateContext->GetData(query, NULL, 0, D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK)
     {
-      hr = immediateContext->Map(debugData.OutStageBuf, 0, D3D11_MAP_READ, 0, &mapped);
+      hr = immediateContext->Map(debugData.GetOutStageBuf(), 0, D3D11_MAP_READ, 0, &mapped);
 
       if(FAILED(hr))
       {
@@ -1570,7 +1561,7 @@ bool D3D11DebugAPIWrapper::CalculateMathIntrinsic(DXBCBytecode::OpcodeType opcod
       memcpy(output1.value.u32v.data(), resA, sizeof(uint32_t) * 4);
       memcpy(output2.value.u32v.data(), resB, sizeof(uint32_t) * 4);
 
-      immediateContext->Unmap(debugData.OutStageBuf, 0);
+      immediateContext->Unmap(debugData.GetOutStageBuf(), 0);
       break;
     }
     m_immediateContextCS.Unlock();
@@ -2775,6 +2766,9 @@ ShaderDebugTrace *D3D11Replay::DebugThread(uint32_t eventId,
   interpreter->PrepareThreadWorkgroup(groupid, threadid);
   GlobalState &global = interpreter->global;
   ThreadState &state = interpreter->activeLane();
+
+  for(auto &&thread : interpreter->workgroup)
+    thread.SetShaderDebugCache(std::make_unique<D3D11ShaderDebugCache>(m_pDevice));
 
   AddCBuffersToGlobalState(*dxbc->GetDXBCByteCode(), *GetDebugManager(), global, ret->sourceVars,
                            rs->CS, refl, cs->GetMapping());

@@ -84,7 +84,8 @@ public:
   void FetchUAV(const DXBCDebug::BindingSlot &slot);
 
   bool CalculateMathIntrinsic(DXBCBytecode::OpcodeType opcode, const ShaderVariable &input,
-                              ShaderVariable &output1, ShaderVariable &output2);
+                              ShaderVariable &output1, ShaderVariable &output2,
+                              DXBCDebug::ShaderDebugCache *debugCache);
 
   ShaderVariable GetSampleInfo(DXBCBytecode::OperandType type, bool isAbsoluteResource,
                                const DXBCDebug::BindingSlot &slot, const char *opString);
@@ -103,7 +104,7 @@ public:
                              const int8_t texelOffsets[3], int multisampleIndex,
                              float lodOrCompareValue, const uint8_t swizzle[4],
                              DXBCDebug::GatherChannel gatherChannel, const char *opString,
-                             ShaderVariable &output);
+                             ShaderVariable &output, DXBCDebug::ShaderDebugCache *debugCache);
 
 private:
   DXBC::ShaderType GetShaderType() { return m_dxbc ? m_dxbc->m_Type : DXBC::ShaderType::Pixel; }
@@ -493,7 +494,8 @@ void D3D12DebugAPIWrapper::FetchUAV(const DXBCDebug::BindingSlot &slot)
 
 bool D3D12DebugAPIWrapper::CalculateMathIntrinsic(DXBCBytecode::OpcodeType opcode,
                                                   const ShaderVariable &input,
-                                                  ShaderVariable &output1, ShaderVariable &output2)
+                                                  ShaderVariable &output1, ShaderVariable &output2,
+                                                  DXBCDebug::ShaderDebugCache *debugCache)
 {
   D3D12MarkerRegion region(m_pDevice->GetQueue()->GetReal(), "CalculateMathIntrinsic");
 
@@ -1146,7 +1148,7 @@ bool D3D12DebugAPIWrapper::CalculateSampleGather(
     DXBCDebug::SampleGatherSamplerData samplerData, ShaderVariable uv, ShaderVariable ddxCalc,
     ShaderVariable ddyCalc, const int8_t texelOffsets[3], int multisampleIndex,
     float lodOrCompareValue, const uint8_t swizzle[4], DXBCDebug::GatherChannel gatherChannel,
-    const char *opString, ShaderVariable &output)
+    const char *opString, ShaderVariable &output, DXBCDebug::ShaderDebugCache *debugCache)
 {
   using namespace DXBCBytecode;
 

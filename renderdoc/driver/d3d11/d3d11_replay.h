@@ -27,6 +27,7 @@
 
 #include "api/replay/renderdoc_replay.h"
 #include "core/core.h"
+#include "driver/shaders/dxbc/dxbc_debug.h"
 #include "replay/replay_driver.h"
 #include "d3d11_common.h"
 #include "d3d11_renderstate.h"
@@ -98,29 +99,43 @@ enum TexDisplayFlags
   eTexDisplay_RemapSInt = 0x8,
 };
 
-struct ShaderDebugging
+class D3D11ShaderDebugCache : public DXBCDebug::ShaderDebugCache
 {
+public:
+  explicit D3D11ShaderDebugCache(WrappedID3D11Device *device = nullptr);
+  virtual ~D3D11ShaderDebugCache() override;
+
   void Init(WrappedID3D11Device *device);
-  void Init(const ShaderDebugging& debugData);
   void Release();
 
   ID3D11PixelShader *GetSamplePS(const int8_t offsets[3]);
 
-  ID3D11ComputeShader *MathCS = NULL;
-  ID3D11Buffer *ParamBuf = NULL;
-  ID3D11Buffer *OutBuf = NULL;
-  ID3D11Buffer *OutStageBuf = NULL;
-  ID3D11UnorderedAccessView *OutUAV = NULL;
+  ID3D11ComputeShader *&GetMathCS();
+  ID3D11Buffer *&GetParamBuf();
+  ID3D11Buffer *&GetOutBuf();
+  ID3D11Buffer *&GetOutStageBuf();
+  ID3D11UnorderedAccessView *&GetOutUAV();
 
-  ID3D11VertexShader *SampleVS = NULL;
-  ID3D11PixelShader *SamplePS = NULL;
-  ID3D11Texture2D *DummyTex = NULL;
-  ID3D11RenderTargetView *DummyRTV = NULL;
+  ID3D11VertexShader *&GetSampleVS();
+  ID3D11PixelShader *&GetSamplePS();
+  ID3D11Texture2D *&GetDummyTex();
+  ID3D11RenderTargetView *&GetDummyRTV();
 
 private:
   WrappedID3D11Device *m_pDevice;
 
   std::map<uint32_t, ID3D11PixelShader *> m_OffsetSamplePS;
+
+  ID3D11ComputeShader *m_MathCS = NULL;
+  ID3D11Buffer *m_ParamBuf = NULL;
+  ID3D11Buffer *m_OutBuf = NULL;
+  ID3D11Buffer *m_OutStageBuf = NULL;
+  ID3D11UnorderedAccessView *m_OutUAV = NULL;
+
+  ID3D11VertexShader *m_SampleVS = NULL;
+  ID3D11PixelShader *m_SamplePS = NULL;
+  ID3D11Texture2D *m_DummyTex = NULL;
+  ID3D11RenderTargetView *m_DummyRTV = NULL;
 };
 
 class D3D11Replay : public IReplayDriver
@@ -173,7 +188,7 @@ public:
   {
     m_D3D11PipelineState = d3d11;
   }
-  ShaderDebugging &GetShaderDebuggingData() { return m_ShaderDebug; }
+  D3D11ShaderDebugCache &GetDefaultShaderDebugCache() { return m_ShaderDebug; }
   void SavePipelineState(uint32_t eventId);
   void FreeTargetResource(ResourceId id);
   void FreeCustomShader(ResourceId id);
@@ -493,7 +508,7 @@ private:
     ID3D11Texture2D *StageTexture = NULL;
   } m_PixelPick;
 
-  ShaderDebugging m_ShaderDebug;
+  D3D11ShaderDebugCache m_ShaderDebug;
 
   struct HistogramMinMax
   {

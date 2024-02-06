@@ -45,7 +45,7 @@ public:
   ID3D11PixelShader *MakePShader(const char *source, const char *entry, const char *profile);
   ID3D11ComputeShader *MakeCShader(const char *source, const char *entry, const char *profile);
 
-  void SetCaching(bool enabled) { m_CacheShaders = enabled; }
+  static void SetCaching(bool enabled) { m_CacheShaders = enabled; }
 private:
   static const uint32_t m_ShaderCacheMagic = 0xf000baba;
   static const uint32_t m_ShaderCacheVersion = 3;
@@ -54,7 +54,8 @@ private:
 
   uint32_t m_CompileFlags = 0;
 
-  bool m_ShaderCacheDirty = false, m_CacheShaders = false;
+  bool m_ShaderCacheDirty = false;
+  static thread_local bool m_CacheShaders;
   std::map<uint32_t, ID3DBlob *> m_ShaderCache;
 
   Threading::CriticalSection m_CS;

@@ -28,6 +28,7 @@
 #include "common/common.h"
 #include "common/threading.h"
 #include "dxbc_bytecode.h"
+#include <memory>
 
 namespace DXBC
 {
@@ -143,6 +144,11 @@ struct GlobalStateSRVData
 
 struct GlobalState;
 
+struct ShaderDebugCache
+{
+  virtual ~ShaderDebugCache() = default;
+};
+
 class DebugAPIWrapper
 {
 public:
@@ -156,7 +162,8 @@ public:
   virtual void FetchUAV(const BindingSlot &slot) = 0;
 
   virtual bool CalculateMathIntrinsic(DXBCBytecode::OpcodeType opcode, const ShaderVariable &input,
-                                      ShaderVariable &output1, ShaderVariable &output2) = 0;
+                                      ShaderVariable &output1, ShaderVariable &output2,
+                                      ShaderDebugCache *debugCache) = 0;
 
   virtual ShaderVariable GetSampleInfo(DXBCBytecode::OperandType type, bool isAbsoluteResource,
                                        const BindingSlot &slot, const char *opString) = 0;
@@ -173,7 +180,7 @@ public:
                                      const int8_t texelOffsets[3], int multisampleIndex,
                                      float lodOrCompareValue, const uint8_t swizzle[4],
                                      GatherChannel gatherChannel, const char *opString,
-                                     ShaderVariable &output) = 0;
+                                     ShaderVariable &output, ShaderDebugCache *debugCache) = 0;
 
 protected:
   using SRVData = GlobalStateSRVData;
@@ -348,6 +355,11 @@ public:
   void StepNext(ShaderDebugState *state, DebugAPIWrapper *apiWrapper,
                 const rdcarray<ThreadState> &prevWorkgroup);
 
+  void SetShaderDebugCache(std::unique_ptr<ShaderDebugCache> cache)
+  {
+    m_debug.cache = std::move(cache);
+  }
+
 private:
   // index in the pixel quad
   int workgroupIndex;
@@ -381,6 +393,19 @@ private:
 
   rdcarray<BindpointIndex> m_accessedSRVs;
   rdcarray<BindpointIndex> m_accessedUAVs;
+
+  struct Debug
+  {
+    std::unique_ptr<ShaderDebugCache> cache;
+
+    Debug() = default;
+    Debug(const Debug &) {}
+    Debug(Debug &&) noexcept = default;
+    Debug &operator=(const Debug &) { return *this; }
+    Debug &operator=(Debug &&) noexcept = default;
+  };
+
+  Debug m_debug;
 
   static Threading::CriticalSection m_atomicCS;
 };
