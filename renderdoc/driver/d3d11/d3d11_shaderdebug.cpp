@@ -89,6 +89,11 @@ public:
                              DXBCDebug::GatherChannel gatherChannel, const char *opString,
                              ShaderVariable &output, DXBCDebug::ShaderDebugCache *debugCache);
 
+  std::shared_ptr<DXBCDebug::ShaderDebugCache> NewShaderDebugCache()
+  {
+    return std::make_shared<D3D11ShaderDebugCache>(m_pDevice);
+  }
+
 private:
   DXBC::ShaderType GetShaderType() { return m_dxbc ? m_dxbc->m_Type : DXBC::ShaderType::Pixel; }
 
@@ -2766,9 +2771,6 @@ ShaderDebugTrace *D3D11Replay::DebugThread(uint32_t eventId,
   interpreter->PrepareThreadWorkgroup(groupid, threadid);
   GlobalState &global = interpreter->global;
   ThreadState &state = interpreter->activeLane();
-
-  for(auto &&thread : interpreter->workgroup)
-    thread.SetShaderDebugCache(std::make_unique<D3D11ShaderDebugCache>(m_pDevice));
 
   AddCBuffersToGlobalState(*dxbc->GetDXBCByteCode(), *GetDebugManager(), global, ret->sourceVars,
                            rs->CS, refl, cs->GetMapping());

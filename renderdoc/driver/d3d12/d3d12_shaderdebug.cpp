@@ -106,6 +106,11 @@ public:
                              DXBCDebug::GatherChannel gatherChannel, const char *opString,
                              ShaderVariable &output, DXBCDebug::ShaderDebugCache *debugCache);
 
+  std::shared_ptr<DXBCDebug::ShaderDebugCache> NewShaderDebugCache()
+  {
+    return NULL;
+  }
+
 private:
   DXBC::ShaderType GetShaderType() { return m_dxbc ? m_dxbc->m_Type : DXBC::ShaderType::Pixel; }
   WrappedID3D12Device *m_pDevice;

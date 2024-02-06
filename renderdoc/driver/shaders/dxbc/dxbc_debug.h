@@ -182,6 +182,8 @@ public:
                                      GatherChannel gatherChannel, const char *opString,
                                      ShaderVariable &output, ShaderDebugCache *debugCache) = 0;
 
+  virtual std::shared_ptr<ShaderDebugCache> NewShaderDebugCache() = 0;
+
 protected:
   using SRVData = GlobalStateSRVData;
   static SRVData &AddSRV(GlobalState &globalState, const BindingSlot &slot);
@@ -355,7 +357,7 @@ public:
   void StepNext(ShaderDebugState *state, DebugAPIWrapper *apiWrapper,
                 const rdcarray<ThreadState> &prevWorkgroup);
 
-  void SetShaderDebugCache(std::unique_ptr<ShaderDebugCache> cache)
+  void SetShaderDebugCache(std::shared_ptr<ShaderDebugCache> cache)
   {
     m_debug.cache = std::move(cache);
   }
@@ -396,7 +398,7 @@ private:
 
   struct Debug
   {
-    std::unique_ptr<ShaderDebugCache> cache;
+    std::shared_ptr<ShaderDebugCache> cache;
 
     Debug() = default;
     Debug(const Debug &) {}

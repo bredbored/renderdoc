@@ -5784,6 +5784,17 @@ rdcarray<ShaderDebugState> InterpretDebugger::ContinueDebug(DXBCDebug::DebugAPIW
                                    : threadCount * waveIndex + threadRemainder;
           size_t threadEnd = threadBegin + threadCount;
 
+          // create a shader debug cache for the threads in this wave
+          if(std::shared_ptr<DXBCDebug::ShaderDebugCache> debugCache =
+                 apiWrapper->NewShaderDebugCache())
+          {
+            for(size_t threadIndex = threadBegin; threadIndex != threadEnd; ++threadIndex)
+            {
+              workgroup[threadIndex].SetShaderDebugCache(debugCache);
+              oldworkgroup[threadIndex].SetShaderDebugCache(debugCache);
+            }
+          }
+
           // simulate all threads up to the last group instruction, or until the user cancels
           bool finished = false, synced = true;
           while(!finished)
