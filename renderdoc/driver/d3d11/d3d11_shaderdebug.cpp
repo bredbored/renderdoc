@@ -102,15 +102,17 @@ private:
   WrappedID3D11Device *m_pDevice;
   const DXBC::DXBCContainer *m_dxbc;
   DXBCDebug::GlobalState &m_globalState;
-  uint32_t m_instruction;
+  static thread_local uint32_t m_instruction;
   uint32_t m_EventID;
   bool m_DidReplay = false;
 };
 
+thread_local uint32_t D3D11DebugAPIWrapper::m_instruction;
+
 D3D11DebugAPIWrapper::D3D11DebugAPIWrapper(WrappedID3D11Device *device,
                                            const DXBC::DXBCContainer *dxbc,
                                            DXBCDebug::GlobalState &globalState, uint32_t eid)
-    : m_pDevice(device), m_dxbc(dxbc), m_globalState(globalState), m_instruction(0), m_EventID(eid)
+    : m_pDevice(device), m_dxbc(dxbc), m_globalState(globalState), m_EventID(eid)
 {
 }
 
