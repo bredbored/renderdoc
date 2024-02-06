@@ -5583,7 +5583,7 @@ void InterpretDebugger::PrepareThreadWorkgroup(const rdcfixedarray<uint32_t, 3> 
   // is not inside a loop
   size_t loopCount = 0;
   size_t loopNumInstructions = 0;
-  auto program = dxbc->GetDXBCByteCode();
+  const DXBCBytecode::Program *program = dxbc->GetDXBCByteCode();
   for(size_t instructionIndex = program->GetNumInstructions(); instructionIndex;)
   {
     const Operation &op = program->GetInstruction(--instructionIndex);
@@ -5611,7 +5611,7 @@ void InterpretDebugger::PrepareThreadWorkgroup(const rdcfixedarray<uint32_t, 3> 
     ThreadState initialState = std::move(activeLane());
 
     // prepare state for all threads in the group
-    auto reflection = dxbc->GetReflection();
+    const DXBC::Reflection *reflection = dxbc->GetReflection();
     workgroup.fill(reflection->DispatchThreadsDimension[0] * reflection->DispatchThreadsDimension[1] *
                        reflection->DispatchThreadsDimension[2],
                    initialState);
@@ -5762,7 +5762,7 @@ rdcarray<ShaderDebugState> InterpretDebugger::ContinueDebug(DXBCDebug::DebugAPIW
     if(groupNumInstructions)
     {
       // prepare state for all threads in the group
-      auto program = dxbc->GetDXBCByteCode();
+      const DXBCBytecode::Program *program = dxbc->GetDXBCByteCode();
 
       // allocate threads to "waves" based on the number of hardware contexts available
       std::mutex mutex;
