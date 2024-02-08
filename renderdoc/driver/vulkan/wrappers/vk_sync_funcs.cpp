@@ -22,6 +22,7 @@
  * THE SOFTWARE.
  ******************************************************************************/
 
+#include <limits.h>
 #include "../vk_core.h"
 #include "../vk_debug.h"
 
@@ -884,7 +885,7 @@ bool WrappedVulkan::Serialise_vkCmdWaitEvents(
           {
             GetDebugManager()->FillWithDiscardPattern(
                 commandBuffer, DiscardType::UndefinedTransition, b.image, b.newLayout,
-                b.subresourceRange, {{0, 0}, {~0U, ~0U}});
+                b.subresourceRange, {{0, 0}, {INT_MAX, INT_MAX}});
           }
         }
       }
@@ -1402,7 +1403,7 @@ bool WrappedVulkan::Serialise_vkCmdWaitEvents2(SerialiserType &ser, VkCommandBuf
             {
               GetDebugManager()->FillWithDiscardPattern(
                   commandBuffer, DiscardType::UndefinedTransition, b.image, b.newLayout,
-                  b.subresourceRange, {{0, 0}, {~0U, ~0U}});
+                  b.subresourceRange, {{0, 0}, {INT_MAX, INT_MAX}});
             }
           }
         }
