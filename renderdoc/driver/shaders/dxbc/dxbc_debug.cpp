@@ -496,379 +496,333 @@ void DoubleGet(const ShaderVariable &var, double out[2])
   out[1] = var.value.f64v[1];
 }
 
-void TypedUAVStore(GlobalState::ViewFmt &fmt, byte *d, const uint8_t mask[4],
-                   const ShaderVariable &var, const uint8_t swizzle[4])
+void TypedUAVStore(GlobalState::ViewFmt &fmt, void *target, uint8_t const mask[4],
+                   const ShaderVariable &source, uint8_t const swizzle[4])
 {
-  if(fmt.byteWidth == 10)
+  switch(fmt.fmt)
   {
-    uint32_t u;
-    memcpy(&u, d, sizeof(uint32_t));
-
-    if(fmt.fmt == CompType::UInt)
+    case CompType::Float:
     {
-      for(int c = 0; c < fmt.numComps; c++)
+      switch(fmt.byteWidth)
       {
-        uint32_t shift = mask[c] * 10;
-        uint32_t bitmask = mask[c] < 3 ? 0x3ff : 3;
-        u &= ~(bitmask << shift);
-        u |= (var.value.u32v[swizzle[c]] & bitmask) << shift;
-      }
-    }
-    else if(fmt.fmt == CompType::UNorm)
-    {
-      Vec4f v = ConvertFromR10G10B10A2(u);
-      for(int c = 0; c < fmt.numComps; c++)
-      {
-        if (mask[c] < 4)
-          v.fv[mask[c]] = var.value.f32v[swizzle[c]];
-      }
-      u = ConvertToR10G10B10A2(v);
-    }
-    else
-    {
-      RDCERR("Unexpected format type on buffer resource");
-    }
-    memcpy(d, &u, sizeof(uint32_t));
-  }
-  else if(fmt.byteWidth == 11)
-  {
-    uint32_t u;
-    memcpy(&u, d, sizeof(uint32_t));
-    Vec3f v = ConvertFromR11G11B10(u);
-    for(int c = 0; c < fmt.numComps; c++)
-    {
-      if(mask[c] < fmt.numComps)
-        v.fv[mask[c]] = var.value.f32v[swizzle[c]];
-    }
-    u = ConvertToR11G11B10(v);
-    memcpy(d, &u, sizeof(uint32_t));
-  }
-  else if(fmt.byteWidth == 4)
-  {
-    uint32_t *u = (uint32_t *)d;
-
-    for(int c = 0; c < fmt.numComps; c++)
-    {
-      if(mask[c] < fmt.numComps)
-        u[mask[c]] = var.value.u32v[swizzle[c]];
-    }
-  }
-  else if(fmt.byteWidth == 2)
-  {
-    if(fmt.fmt == CompType::Float)
-    {
-      uint16_t *u = (uint16_t *)d;
-
-      for(int c = 0; c < fmt.numComps; c++)
-      {
-        if(mask[c] < fmt.numComps)
-          u[mask[c]] = ConvertToHalf(var.value.f32v[swizzle[c]]);
-      }
-    }
-    else if(fmt.fmt == CompType::UInt)
-    {
-      uint16_t *u = (uint16_t *)d;
-
-      for(int c = 0; c < fmt.numComps; c++)
-      {
-        if(mask[c] < fmt.numComps)
-          u[mask[c]] = var.value.u32v[swizzle[c]] & 0xffff;
-      }
-    }
-    else if(fmt.fmt == CompType::SInt)
-    {
-      int16_t *i = (int16_t *)d;
-
-      for(int c = 0; c < fmt.numComps; c++)
-      {
-        if(mask[c] < fmt.numComps)
-          i[mask[c]] =
-              (int16_t)RDCCLAMP(var.value.s32v[swizzle[c]], (int32_t)INT16_MIN, (int32_t)INT16_MAX);
-      }
-    }
-    else if(fmt.fmt == CompType::UNorm || fmt.fmt == CompType::UNormSRGB)
-    {
-      uint16_t *u = (uint16_t *)d;
-
-      for(int c = 0; c < fmt.numComps; c++)
-      {
-        if(mask[c] < fmt.numComps)
+        case 2:
+          for(int c = 0; c < fmt.numComps; ++c)
+          {
+            if(mask[c] == 0xff)
+              break;
+            static_cast<uint16_t *>(target)[mask[c]] =
+                ConvertToHalf(source.value.f32v[swizzle[c]]);
+          }
+          break;
+        case 4:
+          for(int c = 0; c < fmt.numComps; ++c)
+          {
+            if(mask[c] == 0xff)
+              break;
+            static_cast<float *>(target)[mask[c]] = source.value.f32v[swizzle[c]];
+          }
+          break;
+        case 11:
         {
-          float f = RDCCLAMP(var.value.f32v[swizzle[c]], 0.0f, 1.0f) * float(0xffff) + 0.5f;
-          u[mask[c]] = uint16_t(f);
+          Vec3f intermediate = ConvertFromR11G11B10(*static_cast<uint32_t *>(target));
+          for(int c = 0; c < 3; ++c)
+          {
+            if(mask[c] == 0xff)
+              break;
+            intermediate.fv[mask[c]] = source.value.f32v[swizzle[c]];
+          }
+          *static_cast<uint32_t *>(target) = ConvertToR11G11B10(intermediate);
+          break;
         }
       }
+      break;
     }
-    else if(fmt.fmt == CompType::SNorm)
+    case CompType::UNorm:
     {
-      int16_t *i = (int16_t *)d;
-
-      for(int c = 0; c < fmt.numComps; c++)
+      switch(fmt.byteWidth)
       {
-        if(mask[c] < fmt.numComps)
+        case 1:
+          for(int c = 0; c < fmt.numComps; ++c)
+          {
+            if(mask[c] == 0xff)
+              break;
+            static_cast<uint8_t *>(target)[mask[c]] = uint8_t(RDCCLAMP(source.value.f32v[swizzle[c]], 0.f, 1.f) * float(0xff) +
+                0.5f);
+          }
+          break;
+        case 2:
+          for(int c = 0; c < fmt.numComps; ++c)
+          {
+            if(mask[c] == 0xff)
+              break;
+            static_cast<uint16_t *>(target)[mask[c]] = uint16_t(RDCCLAMP(source.value.f32v[swizzle[c]], 0.f, 1.f) * float(0xffff) +
+                0.5f);
+          }
+          break;
+        case 10:
         {
-          float f = RDCCLAMP(var.value.f32v[swizzle[c]], -1.0f, 1.0f) * 0x7fff;
-          if(f < 0.0f)
-            i[mask[c]] = int16_t(f - 0.5f);
-          else
-            i[mask[c]] = int16_t(f + 0.5f);
+          Vec4f intermediate = ConvertFromR10G10B10A2(*static_cast<uint32_t *>(target));
+          for(int c = 0; c < 4; ++c)
+          {
+            if(mask[c] == 0xff)
+              break;
+            intermediate.fv[mask[c]] = source.value.f32v[swizzle[c]];
+          }
+          *static_cast<uint32_t *>(target) = ConvertToR10G10B10A2(intermediate);
+          break;
         }
       }
+      break;
     }
-    else
+    case CompType::SNorm:
     {
-      RDCERR("Unexpected format type on buffer resource");
-    }
-  }
-  else if(fmt.byteWidth == 1)
-  {
-    if(fmt.fmt == CompType::UInt)
-    {
-      uint8_t *u = (uint8_t *)d;
-
-      for(int c = 0; c < fmt.numComps; c++)
+      switch(fmt.byteWidth)
       {
-        if(mask[c] < fmt.numComps)
-          u[mask[c]] = var.value.u32v[swizzle[c]] & 0xff;
+        case 1:
+          for(int c = 0; c < fmt.numComps; ++c)
+          {
+            if(mask[c] == 0xff)
+              break;
+            float intermediate = RDCCLAMP(source.value.f32v[swizzle[c]], -1.f, 1.f) * float(0x7f);
+            static_cast<int8_t *>(target)[mask[c]] =
+                int8_t(intermediate + (intermediate >= 0.f ? 0.5f : -0.5f));
+          }
+          break;
+        case 2:
+          for(int c = 0; c < fmt.numComps; ++c)
+          {
+            if(mask[c] == 0xff)
+              break;
+            float intermediate = RDCCLAMP(source.value.f32v[swizzle[c]], -1.f, 1.f) * float(0x7fff);
+            static_cast<int16_t *>(target)[mask[c]] =
+                int16_t(intermediate + (intermediate >= 0.f ? 0.5f : -0.5f));
+          }
+          break;
       }
+      break;
     }
-    else if(fmt.fmt == CompType::SInt)
+    case CompType::UInt:
     {
-      int8_t *i = (int8_t *)d;
-
-      for(int c = 0; c < fmt.numComps; c++)
+      switch(fmt.byteWidth)
       {
-        if(mask[c] < fmt.numComps)
-          i[mask[c]] =
-              (int8_t)RDCCLAMP(var.value.s32v[swizzle[c]], (int32_t)INT8_MIN, (int32_t)INT8_MAX);
-      }
-    }
-    else if(fmt.fmt == CompType::UNorm || fmt.fmt == CompType::UNormSRGB)
-    {
-      uint8_t *u = (uint8_t *)d;
-
-      for(int c = 0; c < fmt.numComps; c++)
-      {
-        if(mask[c] < fmt.numComps)
+        case 1:
+          for(int c = 0; c < fmt.numComps; ++c)
+          {
+            if(mask[c] == 0xff)
+              break;
+            static_cast<uint8_t *>(target)[mask[c]] = uint8_t(source.value.u32v[swizzle[c]]);
+          }
+          break;
+        case 2:
+          for(int c = 0; c < fmt.numComps; ++c)
+          {
+            if(mask[c] == 0xff)
+              break;
+            static_cast<uint16_t *>(target)[mask[c]] = uint16_t(source.value.u32v[swizzle[c]]);
+          }
+          break;
+        case 4:
+          for(int c = 0; c < fmt.numComps; ++c)
+          {
+            if(mask[c] == 0xff)
+              break;
+            static_cast<uint32_t *>(target)[mask[c]] = source.value.u32v[swizzle[c]];
+          }
+          break;
+        case 10:
         {
-          float f = RDCCLAMP(var.value.f32v[swizzle[c]], 0.0f, 1.0f) * float(0xff) + 0.5f;
-          u[mask[c]] = uint8_t(f);
+          uint32_t &reference = *static_cast<uint32_t *>(target);
+          for(int c = 0; c < 4; c++)
+          {
+            if(mask[c] == 0xff)
+              break;
+            uint32_t shift = mask[c] * 10;
+            uint32_t bitmask = mask[c] < 3 ? 0x3ff : 3;
+            reference &= ~(bitmask << shift);
+            reference |= (source.value.u32v[swizzle[c]] & bitmask) << shift;
+          }
+          break;
         }
       }
+      break;
     }
-    else if(fmt.fmt == CompType::SNorm)
+    case CompType::SInt:
     {
-      int8_t *i = (int8_t *)d;
-
-      for(int c = 0; c < fmt.numComps; c++)
+      switch(fmt.byteWidth)
       {
-        if(mask[c] < fmt.numComps)
-        {
-          float f = RDCCLAMP(var.value.f32v[swizzle[c]], -1.0f, 1.0f) * 0x7f;
-          if(f < 0.0f)
-            i[mask[c]] = int8_t(f - 0.5f);
-          else
-            i[mask[c]] = int8_t(f + 0.5f);
-        }
+        case 1:
+          for(int c = 0; c < fmt.numComps; ++c)
+          {
+            if(mask[c] == 0xff)
+              break;
+            static_cast<int8_t *>(target)[mask[c]] = int8_t(source.value.s32v[swizzle[c]]);
+          }
+          break;
+        case 2:
+          for(int c = 0; c < fmt.numComps; ++c)
+          {
+            if(mask[c] == 0xff)
+              break;
+            static_cast<int16_t *>(target)[mask[c]] = int16_t(source.value.s32v[swizzle[c]]);
+          }
+          break;
+        case 4:
+          for(int c = 0; c < fmt.numComps; ++c)
+          {
+            if(mask[c] == 0xff)
+              break;
+            static_cast<int32_t *>(target)[mask[c]] = source.value.s32v[swizzle[c]];
+          }
+          break;
       }
+      break;
     }
-    else
-    {
-      RDCERR("Unexpected format type on buffer resource");
-    }
+    default: break;
   }
 }
 
-void TypedUAVLoad(GlobalState::ViewFmt &fmt, ShaderVariable &result, const uint8_t mask[4],
-                  const byte *d, const uint8_t swizzle[4])
+void TypedUAVLoad(ShaderVariable &target, uint8_t const mask[4], GlobalState::ViewFmt &fmt,
+                  void const *source, uint8_t const swizzle[4])
 {
-  if(fmt.byteWidth == 10)
+  switch(fmt.fmt)
   {
-    uint32_t u;
-    memcpy(&u, d, sizeof(uint32_t));
-
-    if(fmt.fmt == CompType::UInt)
+    case CompType::Float:
     {
-      uint32_t res[] = {
-        (u >> 0) & 0x3ff,
-        (u >> 10) & 0x3ff,
-        (u >> 20) & 0x3ff,
-        (u >> 30) & 0x003
-      };
-      for(int c = 0; c < 4; c++)
+      Vec4f intermediate(0.f, 0.f, 0.f, 1.f);
+      switch(fmt.byteWidth)
       {
-        if (mask[c] != 0xff)
-          result.value.u32v[mask[c]] = res[swizzle[c]];
+        case 2:
+          for(int c = 0; c < fmt.numComps; ++c)
+            intermediate.fv[c] = ConvertFromHalf(static_cast<uint16_t const *>(source)[c]);
+          break;
+        case 4:
+          for(int c = 0; c < fmt.numComps; ++c)
+            intermediate.fv[c] = static_cast<float const *>(source)[c];
+          break;
+        case 11:
+        {
+          Vec3f intermediate3 = ConvertFromR11G11B10(*static_cast<uint32_t const *>(source));
+          intermediate.fv[0] = intermediate3.fv[0];
+          intermediate.fv[1] = intermediate3.fv[1];
+          intermediate.fv[2] = intermediate3.fv[2];
+          break;
+        }
       }
+      for(int c = 0; c < 4; ++c)
+      {
+        if(mask[c] == 0xff)
+          break;
+        target.value.f32v[mask[c]] = intermediate.fv[swizzle[c]];
+      }
+      break;
     }
-    else if(fmt.fmt == CompType::UNorm)
+    case CompType::UNorm:
     {
-      Vec4f res = ConvertFromR10G10B10A2(u);
-      for(int c = 0; c < 4; c++)
+      Vec4f intermediate(0.f, 0.f, 0.f, 1.f);
+      switch(fmt.byteWidth)
       {
-        if(mask[c] != 0xff)
-          result.value.f32v[mask[c]] = res.fv[swizzle[c]];
+        case 1:
+          for(int c = 0; c < fmt.numComps; ++c)
+            intermediate.fv[c] = static_cast<uint8_t const *>(source)[c] / 255.f;
+          break;
+        case 2:
+          for(int c = 0; c < fmt.numComps; ++c)
+            intermediate.fv[c] = static_cast<uint16_t const *>(source)[c] / 65535.f;
+          break;
+        case 10:
+          intermediate = ConvertFromR10G10B10A2(*static_cast<uint32_t const *>(source));
+          break;
       }
+      for(int c = 0; c < 4; ++c)
+      {
+        if(mask[c] == 0xff)
+          break;
+        target.value.f32v[mask[c]] = intermediate.fv[swizzle[c]];
+      }
+      break;
     }
-    else
+    case CompType::SNorm:
     {
-      RDCERR("Unexpected format type on buffer resource");
+      Vec4f intermediate(0.f, 0.f, 0.f, 1.f);
+      switch(fmt.byteWidth)
+      {
+        case 1:
+          for(int c = 0; c < fmt.numComps; ++c)
+            intermediate.fv[c] = RDCMAX(int(static_cast<int8_t const *>(source)[c]), -127) / 127.f;
+          break;
+        case 2:
+          for(int c = 0; c < fmt.numComps; ++c)
+            intermediate.fv[c] = RDCMAX(int(static_cast<int16_t const *>(source)[c]), -32767) / 32767.f;
+          break;
+      }
+      for(int c = 0; c < 4; ++c)
+      {
+        if(mask[c] == 0xff)
+          break;
+        target.value.f32v[mask[c]] = intermediate.fv[swizzle[c]];
+      }
+      break;
     }
-  }
-  else if(fmt.byteWidth == 11)
-  {
-    uint32_t u;
-    memcpy(&u, d, sizeof(uint32_t));
-
-    Vec3f res3 = ConvertFromR11G11B10(u);
-    Vec4f res(res3.x, res3.y, res3.z, 1.f);
-    for(int c = 0; c < 4; c++)
+    case CompType::UInt:
     {
-      if(mask[c] != 0xff)
-        result.value.f32v[mask[c]] = res.fv[swizzle[c]];
+      Vec4u intermediate(0, 0, 0, 1);
+      switch(fmt.byteWidth)
+      {
+        case 1:
+          for(int c = 0; c < fmt.numComps; ++c)
+            intermediate.uv[c] = static_cast<uint8_t const *>(source)[c];
+          break;
+        case 2:
+          for(int c = 0; c < fmt.numComps; ++c)
+            intermediate.uv[c] = static_cast<uint16_t const *>(source)[c];
+          break;
+        case 4:
+          for(int c = 0; c < fmt.numComps; ++c)
+            intermediate.uv[c] = static_cast<uint32_t const *>(source)[c];
+          break;
+        case 10:
+          uint32_t v = *static_cast<uint32_t const *>(source);
+          intermediate.uv[0] = v & 0x3ff;
+          intermediate.uv[1] = (v >> 10) & 0x3ff;
+          intermediate.uv[2] = (v >> 20) & 0x3ff;
+          intermediate.uv[3] = (v >> 30) & 0x3;
+          break;
+      }
+      for(int c = 0; c < 4; ++c)
+      {
+        if(mask[c] == 0xff)
+          break;
+        target.value.u32v[mask[c]] = intermediate.uv[swizzle[c]];
+      }
+      break;
     }
-  }
-  else
-  {
-    if(fmt.byteWidth == 4)
+    case CompType::SInt:
     {
-      const uint32_t *u = (const uint32_t *)d;
-
-      for(int c = 0; c < 4; c++)
+      Vec4i intermediate(0, 0, 0, 1);
+      switch(fmt.byteWidth)
       {
-        if(mask[c] != 0xff)
-          result.value.u32v[mask[c]] = swizzle[c] < fmt.numComps    ? u[swizzle[c]]
-                                       : swizzle[c] < 3             ? 0
-                                       : fmt.fmt == CompType::Float ? 0x3f800000
-                                                                    : 1;
+        case 1:
+          for(int c = 0; c < fmt.numComps; ++c)
+            intermediate.uv[c] = static_cast<int8_t const *>(source)[c];
+          break;
+        case 2:
+          for(int c = 0; c < fmt.numComps; ++c)
+            intermediate.uv[c] = static_cast<int16_t const *>(source)[c];
+          break;
+        case 4:
+          for(int c = 0; c < fmt.numComps; ++c)
+            intermediate.uv[c] = static_cast<int32_t const *>(source)[c];
+          break;
       }
+      for(int c = 0; c < 4; ++c)
+      {
+        if(mask[c] == 0xff)
+          break;
+        target.value.s32v[mask[c]] = intermediate.uv[swizzle[c]];
+      }
+      break;
     }
-    else if(fmt.byteWidth == 2)
-    {
-      if(fmt.fmt == CompType::Float)
-      {
-        const uint16_t *u = (const uint16_t *)d;
-
-        for(int c = 0; c < 4; c++)
-        {
-          if(mask[c] != 0xff)
-            result.value.f32v[mask[c]] = swizzle[c] < fmt.numComps ? ConvertFromHalf(u[swizzle[c]])
-                                         : swizzle[c] < 3          ? 0.f
-                                                                   : 1.f;
-        }
-      }
-      else if(fmt.fmt == CompType::UInt)
-      {
-        const uint16_t *u = (const uint16_t *)d;
-
-        for(int c = 0; c < 4; c++)
-        {
-          if(mask[c] != 0xff)
-            result.value.u32v[mask[c]] = swizzle[c] < fmt.numComps ? u[swizzle[c]]
-                                         : swizzle[c] < 3          ? 0
-                                                                   : 1;
-        }
-      }
-      else if(fmt.fmt == CompType::SInt)
-      {
-        const int16_t *in = (const int16_t *)d;
-
-        for(int c = 0; c < 4; c++)
-        {
-          if(mask[c] != 0xff)
-            result.value.s32v[mask[c]] = swizzle[c] < fmt.numComps ? in[swizzle[c]]
-                                         : swizzle[c] < 3          ? 0
-                                                                   : 1;
-        }
-      }
-      else if(fmt.fmt == CompType::UNorm || fmt.fmt == CompType::UNormSRGB)
-      {
-        const uint16_t *u = (const uint16_t *)d;
-
-        for(int c = 0; c < 4; c++)
-        {
-          if(mask[c] != 0xff)
-            result.value.f32v[mask[c]] = swizzle[c] < fmt.numComps ? u[swizzle[c]] / 65535.f
-                                         : swizzle[c] < 3          ? 0.f
-                                                                   : 1.f;
-        }
-      }
-      else if(fmt.fmt == CompType::SNorm)
-      {
-        const int16_t *in = (const int16_t *)d;
-
-        for(int c = 0; c < 4; c++)
-        {
-          // -32768 is mapped to -1, then -32767 to -32767 are mapped to -1 to 1
-          if(mask[c] != 0xff)
-            result.value.f32v[mask[c]] = swizzle[c] < fmt.numComps
-                                             ? RDCMAX(int(in[swizzle[c]]), -32767) / 32767.f
-                                         : swizzle[c] < 3 ? 0.f
-                                                          : 1.f;
-        }
-      }
-      else
-      {
-        RDCERR("Unexpected format type on buffer resource");
-      }
-    }
-    else if(fmt.byteWidth == 1)
-    {
-      if(fmt.fmt == CompType::UInt)
-      {
-        const uint8_t *u = (const uint8_t *)d;
-
-        for(int c = 0; c < 4; c++)
-        {
-          if(mask[c] != 0xff)
-            result.value.u32v[mask[c]] = swizzle[c] < fmt.numComps ? u[swizzle[c]]
-                                         : swizzle[c] < 3          ? 0
-                                                                   : 1;
-        }
-      }
-      else if(fmt.fmt == CompType::SInt)
-      {
-        const int8_t *in = (const int8_t *)d;
-
-        for(int c = 0; c < 4; c++)
-        {
-          if(mask[c] != 0xff)
-            result.value.s32v[mask[c]] = swizzle[c] < fmt.numComps ? in[swizzle[c]]
-                                         : swizzle[c] < 3          ? 0
-                                                                   : 1;
-        }
-      }
-      else if(fmt.fmt == CompType::UNorm || fmt.fmt == CompType::UNormSRGB)
-      {
-        const uint8_t *u = (const uint8_t *)d;
-
-        for(int c = 0; c < 4; c++)
-        {
-          if(mask[c] != 0xff)
-            result.value.f32v[mask[c]] = swizzle[c] < fmt.numComps ? u[swizzle[c]] / 255.f
-                                         : swizzle[c] < 3          ? 0.f
-                                                                   : 1.f;
-        }
-      }
-      else if(fmt.fmt == CompType::SNorm)
-      {
-        const int8_t *in = (const int8_t *)d;
-
-        for(int c = 0; c < 4; c++)
-        {
-          // -128 is mapped to -1, then -127 to 127 are mapped to -1 to 1
-          if(mask[c] != 0xff)
-            result.value.f32v[mask[c]] = swizzle[c] < fmt.numComps
-                                             ? RDCMAX(int(in[swizzle[c]]), -127) / 127.f
-                                         : swizzle[c] < 3 ? 0.f
-                                                          : 1.f;
-        }
-      }
-      else
-      {
-        RDCERR("Unexpected format type on buffer resource");
-      }
-    }
+    default: break;
   }
 }
 
@@ -3518,7 +3472,7 @@ void ThreadState::StepNext(ShaderDebugState *state, DebugAPIWrapper *apiWrapper,
         if(load)
         {
           ShaderVariable fetch("", 0U, 0U, 0U, 0U);
-          TypedUAVLoad(fmt, fetch, op.operands[0].comps, data, resComps);
+          TypedUAVLoad(fetch, op.operands[0].comps, fmt, data, resComps);
 
           // if we are assigning into a scalar, SetDst expects the result to be in .x (as normally
           // we are assigning FROM a scalar also).
@@ -4001,7 +3955,7 @@ void ThreadState::StepNext(ShaderDebugState *state, DebugAPIWrapper *apiWrapper,
           ShaderVariable fetch("", 0U, 0U, 0U, 0U);
           if(srcOpers[0].value.u32v[0] < numElems &&
              data + srcOpers[0].value.u32v[0] * fmt.Stride() <= srv->second.data.end())
-            TypedUAVLoad(fmt, fetch, destOperand.comps,
+            TypedUAVLoad(fetch, destOperand.comps, fmt,
                          data + srcOpers[0].value.u32v[0] * fmt.Stride(), resourceOperand.comps);
 
           // if we are assigning into a scalar, SetDst expects the result to be in .x (as normally
