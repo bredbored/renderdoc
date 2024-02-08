@@ -513,7 +513,7 @@ void TypedUAVStore(GlobalState::ViewFmt &fmt, void *target, uint8_t const mask[4
             static_cast<uint16_t *>(target)[mask[c]] =
                 ConvertToHalf(source.value.f32v[swizzle[c]]);
           }
-          break;
+          return;
         case 4:
           for(int c = 0; c < fmt.numComps; ++c)
           {
@@ -521,7 +521,7 @@ void TypedUAVStore(GlobalState::ViewFmt &fmt, void *target, uint8_t const mask[4
               break;
             static_cast<float *>(target)[mask[c]] = source.value.f32v[swizzle[c]];
           }
-          break;
+          return;
         case 11:
         {
           Vec3f intermediate = ConvertFromR11G11B10(*static_cast<uint32_t *>(target));
@@ -532,7 +532,7 @@ void TypedUAVStore(GlobalState::ViewFmt &fmt, void *target, uint8_t const mask[4
             intermediate.fv[mask[c]] = source.value.f32v[swizzle[c]];
           }
           *static_cast<uint32_t *>(target) = ConvertToR11G11B10(intermediate);
-          break;
+          return;
         }
       }
       break;
@@ -549,7 +549,7 @@ void TypedUAVStore(GlobalState::ViewFmt &fmt, void *target, uint8_t const mask[4
             static_cast<uint8_t *>(target)[mask[c]] = uint8_t(RDCCLAMP(source.value.f32v[swizzle[c]], 0.f, 1.f) * float(0xff) +
                 0.5f);
           }
-          break;
+          return;
         case 2:
           for(int c = 0; c < fmt.numComps; ++c)
           {
@@ -558,7 +558,7 @@ void TypedUAVStore(GlobalState::ViewFmt &fmt, void *target, uint8_t const mask[4
             static_cast<uint16_t *>(target)[mask[c]] = uint16_t(RDCCLAMP(source.value.f32v[swizzle[c]], 0.f, 1.f) * float(0xffff) +
                 0.5f);
           }
-          break;
+          return;
         case 10:
         {
           Vec4f intermediate = ConvertFromR10G10B10A2(*static_cast<uint32_t *>(target));
@@ -569,7 +569,7 @@ void TypedUAVStore(GlobalState::ViewFmt &fmt, void *target, uint8_t const mask[4
             intermediate.fv[mask[c]] = source.value.f32v[swizzle[c]];
           }
           *static_cast<uint32_t *>(target) = ConvertToR10G10B10A2(intermediate);
-          break;
+          return;
         }
       }
       break;
@@ -587,7 +587,7 @@ void TypedUAVStore(GlobalState::ViewFmt &fmt, void *target, uint8_t const mask[4
             static_cast<int8_t *>(target)[mask[c]] =
                 int8_t(intermediate + (intermediate >= 0.f ? 0.5f : -0.5f));
           }
-          break;
+          return;
         case 2:
           for(int c = 0; c < fmt.numComps; ++c)
           {
@@ -597,7 +597,7 @@ void TypedUAVStore(GlobalState::ViewFmt &fmt, void *target, uint8_t const mask[4
             static_cast<int16_t *>(target)[mask[c]] =
                 int16_t(intermediate + (intermediate >= 0.f ? 0.5f : -0.5f));
           }
-          break;
+          return;
       }
       break;
     }
@@ -612,7 +612,7 @@ void TypedUAVStore(GlobalState::ViewFmt &fmt, void *target, uint8_t const mask[4
               break;
             static_cast<uint8_t *>(target)[mask[c]] = uint8_t(source.value.u32v[swizzle[c]]);
           }
-          break;
+          return;
         case 2:
           for(int c = 0; c < fmt.numComps; ++c)
           {
@@ -620,7 +620,7 @@ void TypedUAVStore(GlobalState::ViewFmt &fmt, void *target, uint8_t const mask[4
               break;
             static_cast<uint16_t *>(target)[mask[c]] = uint16_t(source.value.u32v[swizzle[c]]);
           }
-          break;
+          return;
         case 4:
           for(int c = 0; c < fmt.numComps; ++c)
           {
@@ -628,7 +628,7 @@ void TypedUAVStore(GlobalState::ViewFmt &fmt, void *target, uint8_t const mask[4
               break;
             static_cast<uint32_t *>(target)[mask[c]] = source.value.u32v[swizzle[c]];
           }
-          break;
+          return;
         case 10:
         {
           uint32_t &reference = *static_cast<uint32_t *>(target);
@@ -641,7 +641,7 @@ void TypedUAVStore(GlobalState::ViewFmt &fmt, void *target, uint8_t const mask[4
             reference &= ~(bitmask << shift);
             reference |= (source.value.u32v[swizzle[c]] & bitmask) << shift;
           }
-          break;
+          return;
         }
       }
       break;
@@ -657,7 +657,7 @@ void TypedUAVStore(GlobalState::ViewFmt &fmt, void *target, uint8_t const mask[4
               break;
             static_cast<int8_t *>(target)[mask[c]] = int8_t(source.value.s32v[swizzle[c]]);
           }
-          break;
+          return;
         case 2:
           for(int c = 0; c < fmt.numComps; ++c)
           {
@@ -665,7 +665,7 @@ void TypedUAVStore(GlobalState::ViewFmt &fmt, void *target, uint8_t const mask[4
               break;
             static_cast<int16_t *>(target)[mask[c]] = int16_t(source.value.s32v[swizzle[c]]);
           }
-          break;
+          return;
         case 4:
           for(int c = 0; c < fmt.numComps; ++c)
           {
@@ -673,12 +673,14 @@ void TypedUAVStore(GlobalState::ViewFmt &fmt, void *target, uint8_t const mask[4
               break;
             static_cast<int32_t *>(target)[mask[c]] = source.value.s32v[swizzle[c]];
           }
-          break;
+          return;
       }
       break;
     }
     default: break;
   }
+
+  RDCERR("Unexpected format type on buffer resource");
 }
 
 void TypedUAVLoad(ShaderVariable &target, uint8_t const mask[4], GlobalState::ViewFmt &fmt,
@@ -707,6 +709,7 @@ void TypedUAVLoad(ShaderVariable &target, uint8_t const mask[4], GlobalState::Vi
           intermediate.fv[2] = intermediate3.fv[2];
           break;
         }
+        default: RDCERR("Unexpected format type on buffer resource"); return;
       }
       for(int c = 0; c < 4; ++c)
       {
@@ -732,6 +735,7 @@ void TypedUAVLoad(ShaderVariable &target, uint8_t const mask[4], GlobalState::Vi
         case 10:
           intermediate = ConvertFromR10G10B10A2(*static_cast<uint32_t const *>(source));
           break;
+        default: RDCERR("Unexpected format type on buffer resource"); return;
       }
       for(int c = 0; c < 4; ++c)
       {
@@ -754,6 +758,7 @@ void TypedUAVLoad(ShaderVariable &target, uint8_t const mask[4], GlobalState::Vi
           for(int c = 0; c < fmt.numComps; ++c)
             intermediate.fv[c] = RDCMAX(int(static_cast<int16_t const *>(source)[c]), -32767) / 32767.f;
           break;
+        default: RDCERR("Unexpected format type on buffer resource"); return;
       }
       for(int c = 0; c < 4; ++c)
       {
@@ -781,12 +786,15 @@ void TypedUAVLoad(ShaderVariable &target, uint8_t const mask[4], GlobalState::Vi
             intermediate.uv[c] = static_cast<uint32_t const *>(source)[c];
           break;
         case 10:
+        {
           uint32_t v = *static_cast<uint32_t const *>(source);
           intermediate.uv[0] = v & 0x3ff;
           intermediate.uv[1] = (v >> 10) & 0x3ff;
           intermediate.uv[2] = (v >> 20) & 0x3ff;
           intermediate.uv[3] = (v >> 30) & 0x3;
           break;
+        }
+        default: RDCERR("Unexpected format type on buffer resource"); return;
       }
       for(int c = 0; c < 4; ++c)
       {
@@ -813,6 +821,7 @@ void TypedUAVLoad(ShaderVariable &target, uint8_t const mask[4], GlobalState::Vi
           for(int c = 0; c < fmt.numComps; ++c)
             intermediate.uv[c] = static_cast<int32_t const *>(source)[c];
           break;
+        default: RDCERR("Unexpected format type on buffer resource"); return;
       }
       for(int c = 0; c < 4; ++c)
       {
@@ -822,7 +831,7 @@ void TypedUAVLoad(ShaderVariable &target, uint8_t const mask[4], GlobalState::Vi
       }
       break;
     }
-    default: break;
+    default: RDCERR("Unexpected format type on buffer resource"); return;
   }
 }
 
