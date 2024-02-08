@@ -2777,7 +2777,7 @@ ShaderDebugTrace *D3D12Replay::DebugThread(uint32_t eventId,
   InterpretDebugger *interpreter = new InterpretDebugger;
   interpreter->eventId = eventId;
   ShaderDebugTrace *ret = interpreter->BeginDebug(dxbc, refl, pso->CS()->GetMapping(), 0);
-  interpreter->PrepareThreadWorkgroup(groupid, threadid);
+  interpreter->PrepareComputeWorkgroup(groupid, threadid);
   GlobalState &global = interpreter->global;
   ThreadState &state = interpreter->activeLane();
 

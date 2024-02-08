@@ -417,8 +417,8 @@ struct InterpretDebugger : public ShaderDebugger
   ShaderDebugTrace *BeginDebug(const DXBC::DXBCContainer *dxbcContainer, const ShaderReflection &refl,
                                const ShaderBindpointMapping &mapping, int activeIndex);
 
-  void PrepareThreadWorkgroup(const rdcfixedarray<uint32_t, 3> &groupid,
-                              const rdcfixedarray<uint32_t, 3> &threadid);
+  void PrepareComputeWorkgroup(const rdcfixedarray<uint32_t, 3> &groupid,
+                               const rdcfixedarray<uint32_t, 3> &threadid);
 
   GlobalState global;
   uint32_t eventId;

@@ -496,23 +496,33 @@ void DoubleGet(const ShaderVariable &var, double out[2])
   out[1] = var.value.f64v[1];
 }
 
-void TypedUAVStore(GlobalState::ViewFmt &fmt, byte *d, ShaderVariable var)
+void TypedUAVStore(GlobalState::ViewFmt &fmt, byte *d, const uint8_t mask[4],
+                   const ShaderVariable &var, const uint8_t swizzle[4])
 {
   if(fmt.byteWidth == 10)
   {
-    uint32_t u = 0;
+    uint32_t u;
+    memcpy(&u, d, sizeof(uint32_t));
 
     if(fmt.fmt == CompType::UInt)
     {
-      u |= (var.value.u32v[0] & 0x3ff) << 0;
-      u |= (var.value.u32v[1] & 0x3ff) << 10;
-      u |= (var.value.u32v[2] & 0x3ff) << 20;
-      u |= (var.value.u32v[3] & 0x3) << 30;
+      for(int c = 0; c < fmt.numComps; c++)
+      {
+        uint32_t shift = mask[c] * 10;
+        uint32_t bitmask = mask[c] < 3 ? 0x3ff : 3;
+        u &= ~(bitmask << shift);
+        u |= (var.value.u32v[swizzle[c]] & bitmask) << shift;
+      }
     }
     else if(fmt.fmt == CompType::UNorm)
     {
-      u = ConvertToR10G10B10A2(
-          Vec4f(var.value.f32v[0], var.value.f32v[1], var.value.f32v[2], var.value.f32v[3]));
+      Vec4f v = ConvertFromR10G10B10A2(u);
+      for(int c = 0; c < fmt.numComps; c++)
+      {
+        if (mask[c] < 4)
+          v.fv[mask[c]] = var.value.f32v[swizzle[c]];
+      }
+      u = ConvertToR10G10B10A2(v);
     }
     else
     {
@@ -522,7 +532,15 @@ void TypedUAVStore(GlobalState::ViewFmt &fmt, byte *d, ShaderVariable var)
   }
   else if(fmt.byteWidth == 11)
   {
-    uint32_t u = ConvertToR11G11B10(Vec3f(var.value.f32v[0], var.value.f32v[1], var.value.f32v[2]));
+    uint32_t u;
+    memcpy(&u, d, sizeof(uint32_t));
+    Vec3f v = ConvertFromR11G11B10(u);
+    for(int c = 0; c < fmt.numComps; c++)
+    {
+      if(mask[c] < fmt.numComps)
+        v.fv[mask[c]] = var.value.f32v[swizzle[c]];
+    }
+    u = ConvertToR11G11B10(v);
     memcpy(d, &u, sizeof(uint32_t));
   }
   else if(fmt.byteWidth == 4)
@@ -530,7 +548,10 @@ void TypedUAVStore(GlobalState::ViewFmt &fmt, byte *d, ShaderVariable var)
     uint32_t *u = (uint32_t *)d;
 
     for(int c = 0; c < fmt.numComps; c++)
-      u[c] = var.value.u32v[c];
+    {
+      if(mask[c] < fmt.numComps)
+        u[mask[c]] = var.value.u32v[swizzle[c]];
+    }
   }
   else if(fmt.byteWidth == 2)
   {
@@ -539,21 +560,31 @@ void TypedUAVStore(GlobalState::ViewFmt &fmt, byte *d, ShaderVariable var)
       uint16_t *u = (uint16_t *)d;
 
       for(int c = 0; c < fmt.numComps; c++)
-        u[c] = ConvertToHalf(var.value.f32v[c]);
+      {
+        if(mask[c] < fmt.numComps)
+          u[mask[c]] = ConvertToHalf(var.value.f32v[swizzle[c]]);
+      }
     }
     else if(fmt.fmt == CompType::UInt)
     {
       uint16_t *u = (uint16_t *)d;
 
       for(int c = 0; c < fmt.numComps; c++)
-        u[c] = var.value.u32v[c] & 0xffff;
+      {
+        if(mask[c] < fmt.numComps)
+          u[mask[c]] = var.value.u32v[swizzle[c]] & 0xffff;
+      }
     }
     else if(fmt.fmt == CompType::SInt)
     {
       int16_t *i = (int16_t *)d;
 
       for(int c = 0; c < fmt.numComps; c++)
-        i[c] = (int16_t)RDCCLAMP(var.value.s32v[c], (int32_t)INT16_MIN, (int32_t)INT16_MAX);
+      {
+        if(mask[c] < fmt.numComps)
+          i[mask[c]] =
+              (int16_t)RDCCLAMP(var.value.s32v[swizzle[c]], (int32_t)INT16_MIN, (int32_t)INT16_MAX);
+      }
     }
     else if(fmt.fmt == CompType::UNorm || fmt.fmt == CompType::UNormSRGB)
     {
@@ -561,8 +592,11 @@ void TypedUAVStore(GlobalState::ViewFmt &fmt, byte *d, ShaderVariable var)
 
       for(int c = 0; c < fmt.numComps; c++)
       {
-        float f = RDCCLAMP(var.value.f32v[c], 0.0f, 1.0f) * float(0xffff) + 0.5f;
-        u[c] = uint16_t(f);
+        if(mask[c] < fmt.numComps)
+        {
+          float f = RDCCLAMP(var.value.f32v[swizzle[c]], 0.0f, 1.0f) * float(0xffff) + 0.5f;
+          u[mask[c]] = uint16_t(f);
+        }
       }
     }
     else if(fmt.fmt == CompType::SNorm)
@@ -571,12 +605,14 @@ void TypedUAVStore(GlobalState::ViewFmt &fmt, byte *d, ShaderVariable var)
 
       for(int c = 0; c < fmt.numComps; c++)
       {
-        float f = RDCCLAMP(var.value.f32v[c], -1.0f, 1.0f) * 0x7fff;
-
-        if(f < 0.0f)
-          i[c] = int16_t(f - 0.5f);
-        else
-          i[c] = int16_t(f + 0.5f);
+        if(mask[c] < fmt.numComps)
+        {
+          float f = RDCCLAMP(var.value.f32v[swizzle[c]], -1.0f, 1.0f) * 0x7fff;
+          if(f < 0.0f)
+            i[mask[c]] = int16_t(f - 0.5f);
+          else
+            i[mask[c]] = int16_t(f + 0.5f);
+        }
       }
     }
     else
@@ -591,14 +627,21 @@ void TypedUAVStore(GlobalState::ViewFmt &fmt, byte *d, ShaderVariable var)
       uint8_t *u = (uint8_t *)d;
 
       for(int c = 0; c < fmt.numComps; c++)
-        u[c] = var.value.u32v[c] & 0xff;
+      {
+        if(mask[c] < fmt.numComps)
+          u[mask[c]] = var.value.u32v[swizzle[c]] & 0xff;
+      }
     }
     else if(fmt.fmt == CompType::SInt)
     {
       int8_t *i = (int8_t *)d;
 
       for(int c = 0; c < fmt.numComps; c++)
-        i[c] = (int8_t)RDCCLAMP(var.value.s32v[c], (int32_t)INT8_MIN, (int32_t)INT8_MAX);
+      {
+        if(mask[c] < fmt.numComps)
+          i[mask[c]] =
+              (int8_t)RDCCLAMP(var.value.s32v[swizzle[c]], (int32_t)INT8_MIN, (int32_t)INT8_MAX);
+      }
     }
     else if(fmt.fmt == CompType::UNorm || fmt.fmt == CompType::UNormSRGB)
     {
@@ -606,8 +649,11 @@ void TypedUAVStore(GlobalState::ViewFmt &fmt, byte *d, ShaderVariable var)
 
       for(int c = 0; c < fmt.numComps; c++)
       {
-        float f = RDCCLAMP(var.value.f32v[c], 0.0f, 1.0f) * float(0xff) + 0.5f;
-        u[c] = uint8_t(f);
+        if(mask[c] < fmt.numComps)
+        {
+          float f = RDCCLAMP(var.value.f32v[swizzle[c]], 0.0f, 1.0f) * float(0xff) + 0.5f;
+          u[mask[c]] = uint8_t(f);
+        }
       }
     }
     else if(fmt.fmt == CompType::SNorm)
@@ -616,12 +662,14 @@ void TypedUAVStore(GlobalState::ViewFmt &fmt, byte *d, ShaderVariable var)
 
       for(int c = 0; c < fmt.numComps; c++)
       {
-        float f = RDCCLAMP(var.value.f32v[c], -1.0f, 1.0f) * 0x7f;
-
-        if(f < 0.0f)
-          i[c] = int8_t(f - 0.5f);
-        else
-          i[c] = int8_t(f + 0.5f);
+        if(mask[c] < fmt.numComps)
+        {
+          float f = RDCCLAMP(var.value.f32v[swizzle[c]], -1.0f, 1.0f) * 0x7f;
+          if(f < 0.0f)
+            i[mask[c]] = int8_t(f - 0.5f);
+          else
+            i[mask[c]] = int8_t(f + 0.5f);
+        }
       }
     }
     else
@@ -631,10 +679,9 @@ void TypedUAVStore(GlobalState::ViewFmt &fmt, byte *d, ShaderVariable var)
   }
 }
 
-ShaderVariable TypedUAVLoad(GlobalState::ViewFmt &fmt, const byte *d)
+void TypedUAVLoad(GlobalState::ViewFmt &fmt, ShaderVariable &result, const uint8_t mask[4],
+                  const byte *d, const uint8_t swizzle[4])
 {
-  ShaderVariable result("", 0.0f, 0.0f, 0.0f, 0.0f);
-
   if(fmt.byteWidth == 10)
   {
     uint32_t u;
@@ -642,18 +689,26 @@ ShaderVariable TypedUAVLoad(GlobalState::ViewFmt &fmt, const byte *d)
 
     if(fmt.fmt == CompType::UInt)
     {
-      result.value.u32v[0] = (u >> 0) & 0x3ff;
-      result.value.u32v[1] = (u >> 10) & 0x3ff;
-      result.value.u32v[2] = (u >> 20) & 0x3ff;
-      result.value.u32v[3] = (u >> 30) & 0x003;
+      uint32_t res[] = {
+        (u >> 0) & 0x3ff,
+        (u >> 10) & 0x3ff,
+        (u >> 20) & 0x3ff,
+        (u >> 30) & 0x003
+      };
+      for(int c = 0; c < 4; c++)
+      {
+        if (mask[c] != 0xff)
+          result.value.u32v[mask[c]] = res[swizzle[c]];
+      }
     }
     else if(fmt.fmt == CompType::UNorm)
     {
       Vec4f res = ConvertFromR10G10B10A2(u);
-      result.value.f32v[0] = res.x;
-      result.value.f32v[1] = res.y;
-      result.value.f32v[2] = res.z;
-      result.value.f32v[3] = res.w;
+      for(int c = 0; c < 4; c++)
+      {
+        if(mask[c] != 0xff)
+          result.value.f32v[mask[c]] = res.fv[swizzle[c]];
+      }
     }
     else
     {
@@ -665,11 +720,13 @@ ShaderVariable TypedUAVLoad(GlobalState::ViewFmt &fmt, const byte *d)
     uint32_t u;
     memcpy(&u, d, sizeof(uint32_t));
 
-    Vec3f res = ConvertFromR11G11B10(u);
-    result.value.f32v[0] = res.x;
-    result.value.f32v[1] = res.y;
-    result.value.f32v[2] = res.z;
-    result.value.f32v[3] = 1.0f;
+    Vec3f res3 = ConvertFromR11G11B10(u);
+    Vec4f res(res3.x, res3.y, res3.z, 1.f);
+    for(int c = 0; c < 4; c++)
+    {
+      if(mask[c] != 0xff)
+        result.value.f32v[mask[c]] = res.fv[swizzle[c]];
+    }
   }
   else
   {
@@ -677,8 +734,14 @@ ShaderVariable TypedUAVLoad(GlobalState::ViewFmt &fmt, const byte *d)
     {
       const uint32_t *u = (const uint32_t *)d;
 
-      for(int c = 0; c < fmt.numComps; c++)
-        result.value.u32v[c] = u[c];
+      for(int c = 0; c < 4; c++)
+      {
+        if(mask[c] != 0xff)
+          result.value.u32v[mask[c]] = swizzle[c] < fmt.numComps    ? u[swizzle[c]]
+                                       : swizzle[c] < 3             ? 0
+                                       : fmt.fmt == CompType::Float ? 0x3f800000
+                                                                    : 1;
+      }
     }
     else if(fmt.byteWidth == 2)
     {
@@ -686,41 +749,62 @@ ShaderVariable TypedUAVLoad(GlobalState::ViewFmt &fmt, const byte *d)
       {
         const uint16_t *u = (const uint16_t *)d;
 
-        for(int c = 0; c < fmt.numComps; c++)
-          result.value.f32v[c] = ConvertFromHalf(u[c]);
+        for(int c = 0; c < 4; c++)
+        {
+          if(mask[c] != 0xff)
+            result.value.f32v[mask[c]] = swizzle[c] < fmt.numComps ? ConvertFromHalf(u[swizzle[c]])
+                                         : swizzle[c] < 3          ? 0.f
+                                                                   : 1.f;
+        }
       }
       else if(fmt.fmt == CompType::UInt)
       {
         const uint16_t *u = (const uint16_t *)d;
 
-        for(int c = 0; c < fmt.numComps; c++)
-          result.value.u32v[c] = u[c];
+        for(int c = 0; c < 4; c++)
+        {
+          if(mask[c] != 0xff)
+            result.value.u32v[mask[c]] = swizzle[c] < fmt.numComps ? u[swizzle[c]]
+                                         : swizzle[c] < 3          ? 0
+                                                                   : 1;
+        }
       }
       else if(fmt.fmt == CompType::SInt)
       {
         const int16_t *in = (const int16_t *)d;
 
-        for(int c = 0; c < fmt.numComps; c++)
-          result.value.s32v[c] = in[c];
+        for(int c = 0; c < 4; c++)
+        {
+          if(mask[c] != 0xff)
+            result.value.s32v[mask[c]] = swizzle[c] < fmt.numComps ? in[swizzle[c]]
+                                         : swizzle[c] < 3          ? 0
+                                                                   : 1;
+        }
       }
       else if(fmt.fmt == CompType::UNorm || fmt.fmt == CompType::UNormSRGB)
       {
         const uint16_t *u = (const uint16_t *)d;
 
-        for(int c = 0; c < fmt.numComps; c++)
-          result.value.f32v[c] = float(u[c]) / float(0xffff);
+        for(int c = 0; c < 4; c++)
+        {
+          if(mask[c] != 0xff)
+            result.value.f32v[mask[c]] = swizzle[c] < fmt.numComps ? u[swizzle[c]] / 65535.f
+                                         : swizzle[c] < 3          ? 0.f
+                                                                   : 1.f;
+        }
       }
       else if(fmt.fmt == CompType::SNorm)
       {
         const int16_t *in = (const int16_t *)d;
 
-        for(int c = 0; c < fmt.numComps; c++)
+        for(int c = 0; c < 4; c++)
         {
           // -32768 is mapped to -1, then -32767 to -32767 are mapped to -1 to 1
-          if(in[c] == -32768)
-            result.value.f32v[c] = -1.0f;
-          else
-            result.value.f32v[c] = float(in[c]) / 32767.0f;
+          if(mask[c] != 0xff)
+            result.value.f32v[mask[c]] = swizzle[c] < fmt.numComps
+                                             ? RDCMAX(int(in[swizzle[c]]), -32767) / 32767.f
+                                         : swizzle[c] < 3 ? 0.f
+                                                          : 1.f;
         }
       }
       else
@@ -734,34 +818,50 @@ ShaderVariable TypedUAVLoad(GlobalState::ViewFmt &fmt, const byte *d)
       {
         const uint8_t *u = (const uint8_t *)d;
 
-        for(int c = 0; c < fmt.numComps; c++)
-          result.value.u32v[c] = u[c];
+        for(int c = 0; c < 4; c++)
+        {
+          if(mask[c] != 0xff)
+            result.value.u32v[mask[c]] = swizzle[c] < fmt.numComps ? u[swizzle[c]]
+                                         : swizzle[c] < 3          ? 0
+                                                                   : 1;
+        }
       }
       else if(fmt.fmt == CompType::SInt)
       {
         const int8_t *in = (const int8_t *)d;
 
-        for(int c = 0; c < fmt.numComps; c++)
-          result.value.s32v[c] = in[c];
+        for(int c = 0; c < 4; c++)
+        {
+          if(mask[c] != 0xff)
+            result.value.s32v[mask[c]] = swizzle[c] < fmt.numComps ? in[swizzle[c]]
+                                         : swizzle[c] < 3          ? 0
+                                                                   : 1;
+        }
       }
       else if(fmt.fmt == CompType::UNorm || fmt.fmt == CompType::UNormSRGB)
       {
         const uint8_t *u = (const uint8_t *)d;
 
-        for(int c = 0; c < fmt.numComps; c++)
-          result.value.f32v[c] = float(u[c]) / float(0xff);
+        for(int c = 0; c < 4; c++)
+        {
+          if(mask[c] != 0xff)
+            result.value.f32v[mask[c]] = swizzle[c] < fmt.numComps ? u[swizzle[c]] / 255.f
+                                         : swizzle[c] < 3          ? 0.f
+                                                                   : 1.f;
+        }
       }
       else if(fmt.fmt == CompType::SNorm)
       {
         const int8_t *in = (const int8_t *)d;
 
-        for(int c = 0; c < fmt.numComps; c++)
+        for(int c = 0; c < 4; c++)
         {
-          // -128 is mapped to -1, then -127 to -127 are mapped to -1 to 1
-          if(in[c] == -128)
-            result.value.f32v[c] = -1.0f;
-          else
-            result.value.f32v[c] = float(in[c]) / 127.0f;
+          // -128 is mapped to -1, then -127 to 127 are mapped to -1 to 1
+          if(mask[c] != 0xff)
+            result.value.f32v[mask[c]] = swizzle[c] < fmt.numComps
+                                             ? RDCMAX(int(in[swizzle[c]]), -127) / 127.f
+                                         : swizzle[c] < 3 ? 0.f
+                                                          : 1.f;
         }
       }
       else
@@ -769,19 +869,7 @@ ShaderVariable TypedUAVLoad(GlobalState::ViewFmt &fmt, const byte *d)
         RDCERR("Unexpected format type on buffer resource");
       }
     }
-
-    // fill in alpha with 1.0 or 1 as appropriate
-    if(fmt.numComps < 4)
-    {
-      if(fmt.fmt == CompType::UNorm || fmt.fmt == CompType::UNormSRGB ||
-         fmt.fmt == CompType::SNorm || fmt.fmt == CompType::Float)
-        result.value.f32v[3] = 1.0f;
-      else
-        result.value.u32v[3] = 1;
-    }
   }
-
-  return result;
 }
 
 // "NaN has special handling. If one source operand is NaN, then the other source operand is
@@ -3411,9 +3499,6 @@ void ThreadState::StepNext(ShaderDebugState *state, DebugAPIWrapper *apiWrapper,
           maxIndex = (stride - structOffset) / sizeof(uint32_t);
           fmt.byteWidth = 4;
           fmt.numComps = 4;
-          if(op.operands[0].comps[0] != 0xff && op.operands[0].comps[1] == 0xff &&
-             op.operands[0].comps[2] == 0xff && op.operands[0].comps[3] == 0xff)
-            fmt.numComps = 1;
           fmt.fmt = CompType::UInt;
         }
         // raw loads/stores can come from any component (as long as it's within range of the data!)
@@ -3427,51 +3512,26 @@ void ThreadState::StepNext(ShaderDebugState *state, DebugAPIWrapper *apiWrapper,
           fmt.numComps = RDCMIN(fmt.numComps, int(numElems - elemIdx) / 4);
           maxIndex = fmt.numComps;
 
-          if(op.operands[0].comps[0] != 0xff && op.operands[0].comps[1] == 0xff &&
-             op.operands[0].comps[2] == 0xff && op.operands[0].comps[3] == 0xff)
-            fmt.numComps = 1;
           fmt.fmt = CompType::UInt;
         }
 
         if(load)
         {
-          ShaderVariable result = TypedUAVLoad(fmt, data);
-
-          // apply the swizzle on the resource operand
           ShaderVariable fetch("", 0U, 0U, 0U, 0U);
+          TypedUAVLoad(fmt, fetch, op.operands[0].comps, data, resComps);
 
-          for(int c = 0; c < 4; c++)
-          {
-            uint8_t comp = resComps[c];
-            if(comp == 0xff)
-              comp = 0;
-
-            fetch.value.u32v[c] = result.value.u32v[comp];
-          }
-
-          if(op.operation != OPCODE_LD_RAW && op.operation != OPCODE_LD_STRUCTURED)
-          {
-            // if we are assigning into a scalar, SetDst expects the result to be in .x (as normally
-            // we are assigning FROM a scalar also).
-            // to match this expectation, propogate the component across.
-            if(op.operands[0].comps[0] != 0xff && op.operands[0].comps[1] == 0xff &&
-               op.operands[0].comps[2] == 0xff && op.operands[0].comps[3] == 0xff)
-              fetch.value.u32v[0] = fetch.value.u32v[op.operands[0].comps[0]];
-          }
+          // if we are assigning into a scalar, SetDst expects the result to be in .x (as normally
+          // we are assigning FROM a scalar also).
+          // to match this expectation, propogate the component across.
+          if(op.operands[0].comps[0] != 0xff && op.operands[0].comps[1] == 0xff &&
+             op.operands[0].comps[2] == 0xff && op.operands[0].comps[3] == 0xff)
+            fetch.value.u32v[0] = fetch.value.u32v[op.operands[0].comps[0]];
 
           SetDst(state, op.operands[0], op, fetch);
         }
         else if(!Finished())    // helper/inactive pixels can't modify UAVs
         {
-          for(int i = 0; i < 4; i++)
-          {
-            uint8_t comp = op.operands[0].comps[i];
-            // masks must be contiguous from x, if we reach the 'end' we're done
-            if(comp == 0xff || comp >= maxIndex)
-              break;
-
-            TypedUAVStore(fmt, data, srcOpers[srcIdx]);
-          }
+          TypedUAVStore(fmt, data, op.operands[0].comps, srcOpers[srcIdx], resComps);
         }
       }
 
@@ -3938,26 +3998,11 @@ void ThreadState::StepNext(ShaderDebugState *state, DebugAPIWrapper *apiWrapper,
 
           data += fmt.Stride() * offset;
 
-          ShaderVariable result;
-
-          {
-            result = ShaderVariable(rdcstr(), 0.0f, 0.0f, 0.0f, 0.0f);
-
-            if(srcOpers[0].value.u32v[0] < numElems &&
-               data + srcOpers[0].value.u32v[0] * fmt.Stride() <= srv->second.data.end())
-              result = TypedUAVLoad(fmt, data + srcOpers[0].value.u32v[0] * fmt.Stride());
-          }
-
           ShaderVariable fetch("", 0U, 0U, 0U, 0U);
-
-          for(int c = 0; c < 4; c++)
-          {
-            uint8_t comp = resourceOperand.comps[c];
-            if(resourceOperand.comps[c] == 0xff)
-              comp = 0;
-
-            fetch.value.u32v[c] = result.value.u32v[comp];
-          }
+          if(srcOpers[0].value.u32v[0] < numElems &&
+             data + srcOpers[0].value.u32v[0] * fmt.Stride() <= srv->second.data.end())
+            TypedUAVLoad(fmt, fetch, destOperand.comps,
+                         data + srcOpers[0].value.u32v[0] * fmt.Stride(), resourceOperand.comps);
 
           // if we are assigning into a scalar, SetDst expects the result to be in .x (as normally
           // we are assigning FROM a scalar also).
@@ -5569,8 +5614,8 @@ ShaderDebugTrace *InterpretDebugger::BeginDebug(const DXBC::DXBCContainer *dxbcC
   return ret;
 }
 
-void InterpretDebugger::PrepareThreadWorkgroup(const rdcfixedarray<uint32_t, 3> &groupid,
-                                               const rdcfixedarray<uint32_t, 3> &threadid)
+void InterpretDebugger::PrepareComputeWorkgroup(const rdcfixedarray<uint32_t, 3> &groupid,
+                                                const rdcfixedarray<uint32_t, 3> &threadid)
 {
   for(int i = 0; i < 3; i++)
   {
