@@ -3453,15 +3453,17 @@ void ThreadState::StepNext(ShaderDebugState *state, DebugAPIWrapper *apiWrapper,
       {
         data += dataOffset;
 
-        int maxIndex = fmt.numComps;
-
         uint32_t srcIdx = 1;
         if(op.operation == OPCODE_STORE_STRUCTURED || op.operation == OPCODE_LD_STRUCTURED)
         {
           srcIdx = 2;
-          maxIndex = (stride - structOffset) / sizeof(uint32_t);
           fmt.byteWidth = 4;
+
+          // normally we can read 4 elements
           fmt.numComps = 4;
+          // clamp to out of bounds based on dataOffset
+          fmt.numComps = RDCMIN(fmt.numComps, int(numElems * stride - dataOffset) / 4);
+
           fmt.fmt = CompType::UInt;
         }
         // raw loads/stores can come from any component (as long as it's within range of the data!)
@@ -3473,7 +3475,6 @@ void ThreadState::StepNext(ShaderDebugState *state, DebugAPIWrapper *apiWrapper,
           fmt.numComps = 4;
           // clamp to out of bounds based on numElems
           fmt.numComps = RDCMIN(fmt.numComps, int(numElems - elemIdx) / 4);
-          maxIndex = fmt.numComps;
 
           fmt.fmt = CompType::UInt;
         }
