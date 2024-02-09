@@ -690,22 +690,23 @@ void TypedUAVLoad(ShaderVariable &target, uint8_t const mask[4], GlobalState::Vi
   {
     case CompType::Float:
     {
-      Vec4f swizzled(0.f, 0.f, 0.f, 1.f);
+      Vec4f intermediate(0.f, 0.f, 0.f, 1.f);
       switch(fmt.byteWidth)
       {
         case 2:
           for(int c = 0; c < fmt.numComps; ++c)
-            swizzled.fv[c] = ConvertFromHalf(static_cast<uint16_t const *>(source)[swizzle[c]]);
+            intermediate.fv[c] = ConvertFromHalf(static_cast<uint16_t const *>(source)[c]);
           break;
         case 4:
           for(int c = 0; c < fmt.numComps; ++c)
-            swizzled.fv[c] = static_cast<float const *>(source)[swizzle[c]];
+            intermediate.fv[c] = static_cast<float const *>(source)[c];
           break;
         case 11:
         {
-          Vec3f intermediate = ConvertFromR11G11B10(*static_cast<uint32_t const *>(source));
-          for(int c = 0; c < 4; ++c)
-            swizzled.fv[c] = swizzle[c] < 3 ? intermediate.fv[swizzle[c]] : 1.f;
+          Vec3f intermediate3 = ConvertFromR11G11B10(*static_cast<uint32_t const *>(source));
+          intermediate.fv[0] = intermediate3.fv[0];
+          intermediate.fv[1] = intermediate3.fv[1];
+          intermediate.fv[2] = intermediate3.fv[2];
           break;
         }
         default: RDCERR("Unexpected format type on buffer resource"); return;
@@ -714,54 +715,48 @@ void TypedUAVLoad(ShaderVariable &target, uint8_t const mask[4], GlobalState::Vi
       {
         if(mask[c] == 0xff)
           break;
-        target.value.f32v[mask[c]] = swizzled.fv[c];
+        target.value.f32v[mask[c]] = intermediate.fv[swizzle[c]];
       }
       break;
     }
     case CompType::UNorm:
     {
-      Vec4f swizzled(0.f, 0.f, 0.f, 1.f);
+      Vec4f intermediate(0.f, 0.f, 0.f, 1.f);
       switch(fmt.byteWidth)
       {
         case 1:
           for(int c = 0; c < fmt.numComps; ++c)
-            swizzled.fv[c] = static_cast<uint8_t const *>(source)[swizzle[c]] / 255.f;
+            intermediate.fv[c] = static_cast<uint8_t const *>(source)[c] / 255.f;
           break;
         case 2:
           for(int c = 0; c < fmt.numComps; ++c)
-            swizzled.fv[c] = static_cast<uint16_t const *>(source)[swizzle[c]] / 65535.f;
+            intermediate.fv[c] = static_cast<uint16_t const *>(source)[c] / 65535.f;
           break;
         case 10:
-        {
-          Vec4f intermediate = ConvertFromR10G10B10A2(*static_cast<uint32_t const *>(source));
-          for(int c = 0; c < 4; ++c)
-            swizzled.fv[c] = intermediate.fv[swizzle[c]];
+          intermediate = ConvertFromR10G10B10A2(*static_cast<uint32_t const *>(source));
           break;
-        }
         default: RDCERR("Unexpected format type on buffer resource"); return;
       }
       for(int c = 0; c < 4; ++c)
       {
         if(mask[c] == 0xff)
           break;
-        target.value.f32v[mask[c]] = swizzled.fv[c];
+        target.value.f32v[mask[c]] = intermediate.fv[swizzle[c]];
       }
       break;
     }
     case CompType::SNorm:
     {
-      Vec4f swizzled(0.f, 0.f, 0.f, 1.f);
+      Vec4f intermediate(0.f, 0.f, 0.f, 1.f);
       switch(fmt.byteWidth)
       {
         case 1:
           for(int c = 0; c < fmt.numComps; ++c)
-            swizzled.fv[c] =
-                RDCMAX(int(static_cast<int8_t const *>(source)[swizzle[c]]), -127) / 127.f;
+            intermediate.fv[c] = RDCMAX(int(static_cast<int8_t const *>(source)[c]), -127) / 127.f;
           break;
         case 2:
           for(int c = 0; c < fmt.numComps; ++c)
-            swizzled.fv[c] =
-                RDCMAX(int(static_cast<int16_t const *>(source)[swizzle[c]]), -32767) / 32767.f;
+            intermediate.fv[c] = RDCMAX(int(static_cast<int16_t const *>(source)[c]), -32767) / 32767.f;
           break;
         default: RDCERR("Unexpected format type on buffer resource"); return;
       }
@@ -769,33 +764,34 @@ void TypedUAVLoad(ShaderVariable &target, uint8_t const mask[4], GlobalState::Vi
       {
         if(mask[c] == 0xff)
           break;
-        target.value.f32v[mask[c]] = swizzled.fv[c];
+        target.value.f32v[mask[c]] = intermediate.fv[swizzle[c]];
       }
       break;
     }
     case CompType::UInt:
     {
-      Vec4u swizzled(0, 0, 0, 1);
+      Vec4u intermediate(0, 0, 0, 1);
       switch(fmt.byteWidth)
       {
         case 1:
           for(int c = 0; c < fmt.numComps; ++c)
-            swizzled.uv[c] = static_cast<uint8_t const *>(source)[swizzle[c]];
+            intermediate.uv[c] = static_cast<uint8_t const *>(source)[c];
           break;
         case 2:
           for(int c = 0; c < fmt.numComps; ++c)
-            swizzled.uv[c] = static_cast<uint16_t const *>(source)[swizzle[c]];
+            intermediate.uv[c] = static_cast<uint16_t const *>(source)[c];
           break;
         case 4:
           for(int c = 0; c < fmt.numComps; ++c)
-            swizzled.uv[c] = static_cast<uint32_t const *>(source)[swizzle[c]];
+            intermediate.uv[c] = static_cast<uint32_t const *>(source)[c];
           break;
         case 10:
         {
           uint32_t v = *static_cast<uint32_t const *>(source);
-          Vec4u intermediate(v & 0x3ff, (v >> 10) & 0x3ff, (v >> 20) & 0x3ff, (v >> 30) & 3);
-          for(int c = 0; c < 4; ++c)
-            swizzled.uv[c] = intermediate.uv[swizzle[c]];
+          intermediate.uv[0] = v & 0x3ff;
+          intermediate.uv[1] = (v >> 10) & 0x3ff;
+          intermediate.uv[2] = (v >> 20) & 0x3ff;
+          intermediate.uv[3] = (v >> 30) & 0x3;
           break;
         }
         default: RDCERR("Unexpected format type on buffer resource"); return;
@@ -804,26 +800,26 @@ void TypedUAVLoad(ShaderVariable &target, uint8_t const mask[4], GlobalState::Vi
       {
         if(mask[c] == 0xff)
           break;
-        target.value.u32v[mask[c]] = swizzled.uv[c];
+        target.value.u32v[mask[c]] = intermediate.uv[swizzle[c]];
       }
       break;
     }
     case CompType::SInt:
     {
-      Vec4i swizzled(0, 0, 0, 1);
+      Vec4i intermediate(0, 0, 0, 1);
       switch(fmt.byteWidth)
       {
         case 1:
           for(int c = 0; c < fmt.numComps; ++c)
-            swizzled.uv[c] = static_cast<int8_t const *>(source)[swizzle[c]];
+            intermediate.uv[c] = static_cast<int8_t const *>(source)[c];
           break;
         case 2:
           for(int c = 0; c < fmt.numComps; ++c)
-            swizzled.uv[c] = static_cast<int16_t const *>(source)[swizzle[c]];
+            intermediate.uv[c] = static_cast<int16_t const *>(source)[c];
           break;
         case 4:
           for(int c = 0; c < fmt.numComps; ++c)
-            swizzled.uv[c] = static_cast<int32_t const *>(source)[swizzle[c]];
+            intermediate.uv[c] = static_cast<int32_t const *>(source)[c];
           break;
         default: RDCERR("Unexpected format type on buffer resource"); return;
       }
@@ -831,7 +827,7 @@ void TypedUAVLoad(ShaderVariable &target, uint8_t const mask[4], GlobalState::Vi
       {
         if(mask[c] == 0xff)
           break;
-        target.value.s32v[mask[c]] = swizzled.uv[c];
+        target.value.s32v[mask[c]] = intermediate.uv[swizzle[c]];
       }
       break;
     }
