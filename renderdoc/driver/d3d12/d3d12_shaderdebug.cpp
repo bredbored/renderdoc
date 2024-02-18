@@ -320,7 +320,6 @@ void D3D12DebugAPIWrapper::FetchUAV(const DXBCDebug::BindingSlot &slot)
   // if the UAV might be dirty from side-effects from the action, replay back to right
   // before it.
   {
-    //SCOPED_LOCK(m_immediateContextCS);
     if(!m_DidReplay)
     {
       D3D12MarkerRegion region(m_pDevice->GetQueue()->GetReal(), "un-dirtying resources");

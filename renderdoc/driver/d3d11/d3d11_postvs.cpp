@@ -206,6 +206,8 @@ void D3D11Replay::InitPostVSBuffers(uint32_t eventId)
 
   D3D11MarkerRegion postvs(StringFormat::Fmt("PostVS for %u", eventId));
 
+  SCOPED_LOCK(m_pDevice->GetDebugManager()->GetImmediateContextCS());
+
   D3D11RenderStateTracker tracker(m_pImmediateContext);
 
   ID3D11VertexShader *vs = NULL;

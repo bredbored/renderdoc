@@ -118,6 +118,7 @@ TextureShaderDetails D3D11DebugManager::GetShaderDetails(ResourceId id, CompType
 
       details.previewCopy = cache.srvResource;
 
+      SCOPED_LOCK(m_pDevice->GetDebugManager()->GetImmediateContextCS());
       m_pImmediateContext->CopyResource(details.previewCopy, details.srvResource);
 
       details.srvResource = details.previewCopy;
@@ -220,6 +221,7 @@ TextureShaderDetails D3D11DebugManager::GetShaderDetails(ResourceId id, CompType
          mode == TEXDISPLAY_DEPTH_TARGET)
         msaaDepth = true;
 
+      SCOPED_LOCK(m_pDevice->GetDebugManager()->GetImmediateContextCS());
       m_pImmediateContext->CopyResource(details.previewCopy, details.srvResource);
 
       details.srvResource = details.previewCopy;
@@ -275,6 +277,7 @@ TextureShaderDetails D3D11DebugManager::GetShaderDetails(ResourceId id, CompType
 
       details.previewCopy = cache.srvResource;
 
+      SCOPED_LOCK(m_pDevice->GetDebugManager()->GetImmediateContextCS());
       m_pImmediateContext->CopyResource(details.previewCopy, details.srvResource);
 
       details.srvResource = details.previewCopy;
@@ -533,6 +536,8 @@ bool D3D11Replay::RenderTextureInternal(TextureDisplay cfg, TexDisplayFlags flag
 
   if(details.texFmt == DXGI_FORMAT_UNKNOWN)
     return false;
+
+  SCOPED_LOCK(m_pDevice->GetDebugManager()->GetImmediateContextCS());
 
   D3D11RenderStateTracker tracker(m_pImmediateContext);
 

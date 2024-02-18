@@ -116,6 +116,8 @@ ID3D11Buffer *D3D11DebugManager::MakeCBuffer(UINT size)
 
 void D3D11DebugManager::FillCBuffer(ID3D11Buffer *buf, const void *data, size_t size)
 {
+  SCOPED_LOCK(m_immediateContextCS);
+
   D3D11_MAPPED_SUBRESOURCE mapped;
 
   HRESULT hr = m_pImmediateContext->GetReal()->Map(UNWRAP(WrappedID3D11Buffer, buf), 0,
@@ -402,6 +404,8 @@ void D3D11DebugManager::FillWithDiscardPattern(DiscardType type, ID3D11Resource 
         // staging buffers can be read-only, at which point we can't write to them
         if(desc.CPUAccessFlags & D3D11_CPU_ACCESS_WRITE)
         {
+          SCOPED_LOCK(m_immediateContextCS);
+
           D3D11_MAPPED_SUBRESOURCE mapped = {};
           D3D11_MAP mapping =
               (desc.Usage == D3D11_USAGE_DYNAMIC) ? D3D11_MAP_WRITE_DISCARD : D3D11_MAP_WRITE;
@@ -435,6 +439,8 @@ void D3D11DebugManager::FillWithDiscardPattern(DiscardType type, ID3D11Resource 
 
         for(size_t i = 0; i < pattern.size(); i += 4)
           memcpy(&pattern[i], &value, sizeof(uint32_t));
+
+        SCOPED_LOCK(m_immediateContextCS);
 
         // default buffers can be updated
         D3D11_BOX box = {};
@@ -502,6 +508,8 @@ void D3D11DebugManager::FillWithDiscardPattern(DiscardType type, ID3D11Resource 
     // depth-stencil resources can't be sub-copied, so we need to render to them
     if(IsDepthFormat(key.fmt) || key.samp.Count > 1)
     {
+      SCOPED_LOCK(m_immediateContextCS);
+
       D3D11MarkerRegion::Set("Depth/MSAA texture");
 
       D3D11_RENDER_TARGET_VIEW_DESC rtvDesc;
@@ -705,6 +713,8 @@ void D3D11DebugManager::FillWithDiscardPattern(DiscardType type, ID3D11Resource 
       if(key.dim == 3)
         z = slice;
 
+      SCOPED_LOCK(m_immediateContextCS);
+
       for(UINT r = 0; r < NumRects; r++)
       {
         D3D11_RECT rect = pRect[r];
@@ -864,6 +874,8 @@ void D3D11DebugManager::FillWithDiscardPattern(DiscardType type, ID3D11View *vie
 
 uint32_t D3D11DebugManager::GetStructCount(ID3D11UnorderedAccessView *uav)
 {
+  SCOPED_LOCK(m_immediateContextCS);
+
   m_pImmediateContext->CopyStructureCount(StageBuffer, 0, uav);
 
   D3D11_MAPPED_SUBRESOURCE mapped;
@@ -941,6 +953,7 @@ void D3D11DebugManager::GetBufferData(ID3D11Buffer *buffer, uint64_t offset, uin
     if(box.right - box.left == 0)
       break;
 
+    SCOPED_LOCK(m_immediateContextCS);
     m_pImmediateContext->GetReal()->CopySubresourceRegion(
         UNWRAP(WrappedID3D11Buffer, StageBuffer), 0, 0, 0, 0, UNWRAP(WrappedID3D11Buffer, buffer),
         0, &box);
@@ -968,6 +981,8 @@ void D3D11DebugManager::GetBufferData(ID3D11Buffer *buffer, uint64_t offset, uin
 
 void D3D11DebugManager::RenderForPredicate()
 {
+  SCOPED_LOCK(m_immediateContextCS);
+
   // just somehow draw a quad that renders some pixels to fill the predicate with TRUE
   m_pImmediateContext->ClearState();
   D3D11_VIEWPORT viewport = {0, 0, 1, 1, 0.0f, 1.0f};

@@ -234,6 +234,8 @@ bool D3D11Replay::CheckResizeOutputWindow(uint64_t id)
     outw.width = w;
     outw.height = h;
 
+    SCOPED_LOCK(m_pDevice->GetDebugManager()->GetImmediateContextCS());
+
     D3D11RenderStateTracker tracker(m_pImmediateContext);
 
     m_pImmediateContext->OMSetRenderTargets(0, 0, 0);
@@ -369,6 +371,8 @@ void D3D11Replay::GetOutputWindowData(uint64_t id, bytebuf &retData)
     }
   }
 
+  SCOPED_LOCK(m_pDevice->GetDebugManager()->GetImmediateContextCS());
+
   ID3D11DeviceContext *ctx = m_pDevice->GetImmediateContext();
 
   if(outw.multisampled)
@@ -420,6 +424,7 @@ void D3D11Replay::ClearOutputWindowColor(uint64_t id, FloatVector col)
   if(id == 0 || m_OutputWindows.find(id) == m_OutputWindows.end())
     return;
 
+  SCOPED_LOCK(m_pDevice->GetDebugManager()->GetImmediateContextCS());
   m_pImmediateContext->ClearRenderTargetView(m_OutputWindows[id].rtv, &col.x);
 }
 
@@ -429,8 +434,11 @@ void D3D11Replay::ClearOutputWindowDepth(uint64_t id, float depth, uint8_t stenc
     return;
 
   if(m_OutputWindows[id].dsv)
+  {
+    SCOPED_LOCK(m_pDevice->GetDebugManager()->GetImmediateContextCS());
     m_pImmediateContext->ClearDepthStencilView(
         m_OutputWindows[id].dsv, D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, depth, stencil);
+  }
 }
 
 void D3D11Replay::BindOutputWindow(uint64_t id, bool depth)
@@ -443,6 +451,8 @@ void D3D11Replay::BindOutputWindow(uint64_t id, bool depth)
 
   m_RealState.active = true;
   m_RealState.state.CopyState(*m_pImmediateContext->GetCurrentPipelineState());
+
+  SCOPED_LOCK(m_pDevice->GetDebugManager()->GetImmediateContextCS());
 
   m_pImmediateContext->OMSetRenderTargets(
       1, &m_OutputWindows[id].rtv, depth && m_OutputWindows[id].dsv ? m_OutputWindows[id].dsv : NULL);
@@ -469,6 +479,8 @@ void D3D11Replay::FlipOutputWindow(uint64_t id)
 {
   if(id == 0 || m_OutputWindows.find(id) == m_OutputWindows.end())
     return;
+
+  SCOPED_LOCK(m_pDevice->GetDebugManager()->GetImmediateContextCS());
 
   if(m_OutputWindows[id].swap)
   {

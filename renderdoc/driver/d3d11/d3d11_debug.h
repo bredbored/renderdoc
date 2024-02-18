@@ -174,6 +174,8 @@ public:
 
   CacheElem &GetCachedElem(ResourceId id, CompType typeCast, bool raw);
 
+  Threading::CriticalSection &GetImmediateContextCS() const { return m_immediateContextCS; }
+
 private:
   void InitCommonResources();
   void InitReplayResources();
@@ -186,6 +188,8 @@ private:
 
   std::map<ResourceId, ID3D11UnorderedAccessView *> m_CounterBufferToUAV;
   std::map<ID3D11UnorderedAccessView *, ResourceId> m_UAVToCounterBuffer;
+
+  mutable Threading::CriticalSection m_immediateContextCS;
 
   WrappedID3D11Device *m_pDevice = NULL;
   WrappedID3D11DeviceContext *m_pImmediateContext = NULL;

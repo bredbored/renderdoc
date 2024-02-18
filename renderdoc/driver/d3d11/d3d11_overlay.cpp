@@ -148,6 +148,8 @@ ResourceId D3D11Replay::RenderOverlay(ResourceId texid, FloatVector clearCol, De
     realTexDesc.SampleDesc.Quality = details.sampleQuality;
   }
 
+  SCOPED_LOCK(GetDebugManager()->GetImmediateContextCS());
+
   D3D11RenderStateTracker tracker(m_pImmediateContext);
 
   D3D11_TEXTURE2D_DESC customTexDesc;

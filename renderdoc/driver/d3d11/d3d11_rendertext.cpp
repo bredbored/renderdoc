@@ -28,6 +28,7 @@
 #include "strings/string_utils.h"
 #include "d3d11_context.h"
 #include "d3d11_device.h"
+#include "d3d11_debug.h"
 #include "d3d11_resources.h"
 #include "d3d11_shader_cache.h"
 
@@ -202,6 +203,8 @@ D3D11TextRenderer::D3D11TextRenderer(WrappedID3D11Device *wrapper)
     glyphData[(i + 1) * 2 + 1] = Vec4f(b->x0, b->y0, b->x1, b->y1);
   }
 
+  SCOPED_LOCK(m_pDevice->GetDebugManager()->GetImmediateContextCS());
+
   D3D11_MAPPED_SUBRESOURCE mapped;
 
   hr = m_pImmediateContext->Map(GlyphData, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
@@ -368,6 +371,8 @@ void D3D11TextRenderer::RenderTextInternal(float x, float y, const rdcstr &text)
 
   data.CharacterSize.x = 1.0f / float(FONT_TEX_WIDTH);
   data.CharacterSize.y = 1.0f / float(FONT_TEX_HEIGHT);
+
+  SCOPED_LOCK(m_pDevice->GetDebugManager()->GetImmediateContextCS());
 
   D3D11_MAPPED_SUBRESOURCE mapped;
 

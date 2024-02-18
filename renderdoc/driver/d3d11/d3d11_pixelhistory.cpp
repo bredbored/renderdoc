@@ -163,6 +163,8 @@ static const uint32_t pixstoreStride = 4;
 void D3D11DebugManager::PixelHistoryCopyPixel(D3D11CopyPixelParams &p, size_t eventSlot,
                                               uint32_t storeSlot)
 {
+  SCOPED_LOCK(m_pDevice->GetDebugManager()->GetImmediateContextCS());
+
   // perform a subresource copy if the real source tex couldn't be directly bound as SRV
   if(p.sourceTex != p.srvTex && p.sourceTex && p.srvTex)
     m_pImmediateContext->CopySubresourceRegion(p.srvTex, p.subres, 0, 0, 0, p.sourceTex, p.subres,
@@ -304,6 +306,8 @@ rdcarray<PixelModification> D3D11Replay::PixelHistory(rdcarray<EventUsage> event
   uint32_t slice = sub.slice;
   uint32_t mip = sub.mip;
   uint32_t sampleIdx = sub.sample;
+
+  SCOPED_LOCK(m_pDevice->GetDebugManager()->GetImmediateContextCS());
 
   D3D11MarkerRegion historyMarker(StringFormat::Fmt(
       "Doing PixelHistory on %s, (%u,%u) %u, %u, %u over %u events", ToStr(target).c_str(), x, y,

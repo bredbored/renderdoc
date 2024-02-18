@@ -1383,7 +1383,11 @@ RDResult WrappedID3D11Device::ReadLogInitialisation(RDCFile *rdc, bool storeStru
     if(m_pInfoQueue)
       startMessage = m_pInfoQueue->GetNumStoredMessagesAllowedByRetrievalFilter();
 
-    bool success = ProcessChunk(ser, context);
+    bool success;
+    {
+      SCOPED_LOCK(GetDebugManager()->GetImmediateContextCS());
+      success = ProcessChunk(ser, context);
+    }
 
     ser.EndChunk();
 
@@ -1445,6 +1449,8 @@ RDResult WrappedID3D11Device::ReadLogInitialisation(RDCFile *rdc, bool storeStru
 
       // read the remaining data into memory and pass to immediate context
       frameDataSize = reader->GetSize() - reader->GetOffset();
+
+      SCOPED_LOCK(GetDebugManager()->GetImmediateContextCS());
 
       m_pImmediateContext->SetFrameReader(new StreamReader(reader, frameDataSize));
 

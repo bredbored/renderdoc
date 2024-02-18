@@ -97,8 +97,6 @@ public:
 private:
   DXBC::ShaderType GetShaderType() { return m_dxbc ? m_dxbc->m_Type : DXBC::ShaderType::Pixel; }
 
-  Threading::CriticalSection m_immediateContextCS;
-
   WrappedID3D11Device *m_pDevice;
   const DXBC::DXBCContainer *m_dxbc;
   DXBCDebug::GlobalState &m_globalState;
@@ -121,6 +119,7 @@ D3D11DebugAPIWrapper::~D3D11DebugAPIWrapper()
   // if we replayed to before the action for fetching some UAVs, replay back to after the action to
   // keep
   // the state consistent.
+  SCOPED_LOCK(m_pDevice->GetDebugManager()->GetImmediateContextCS());
   if(m_DidReplay)
   {
     D3D11MarkerRegion region("ResetReplay");
@@ -215,7 +214,7 @@ void D3D11DebugAPIWrapper::FetchUAV(const DXBCDebug::BindingSlot &slot)
   // if the UAV might be dirty from side-effects from the action, replay back to right
   // before it.
   {
-    SCOPED_LOCK(m_immediateContextCS);
+    SCOPED_LOCK(m_pDevice->GetDebugManager()->GetImmediateContextCS());
     if(!m_DidReplay)
     {
       D3D11MarkerRegion region("un-dirtying resources");
@@ -367,6 +366,8 @@ void D3D11DebugAPIWrapper::FetchUAV(const DXBCDebug::BindingSlot &slot)
         ID3D11Texture2D *stagingTex = NULL;
         m_pDevice->CreateTexture2D(&desc, NULL, &stagingTex);
 
+        SCOPED_LOCK(m_pDevice->GetDebugManager()->GetImmediateContextCS());
+
         pContext->CopyResource(stagingTex, res);
 
         // MipSlice in union is shared between Texture2D and Texture2DArray unions, so safe to
@@ -410,6 +411,8 @@ void D3D11DebugAPIWrapper::FetchUAV(const DXBCDebug::BindingSlot &slot)
 
         ID3D11Texture3D *stagingTex = NULL;
         m_pDevice->CreateTexture3D(&desc, NULL, &stagingTex);
+
+        SCOPED_LOCK(m_pDevice->GetDebugManager()->GetImmediateContextCS());
 
         pContext->CopyResource(stagingTex, res);
 
@@ -459,7 +462,7 @@ ShaderVariable D3D11DebugAPIWrapper::GetSampleInfo(DXBCBytecode::OperandType typ
     ID3D11DepthStencilView *dsv = NULL;
 
     {
-      SCOPED_LOCK(m_immediateContextCS);
+      SCOPED_LOCK(m_pDevice->GetDebugManager()->GetImmediateContextCS());
       context->OMGetRenderTargets(8, rtv, &dsv);
     }
 
@@ -499,7 +502,7 @@ ShaderVariable D3D11DebugAPIWrapper::GetSampleInfo(DXBCBytecode::OperandType typ
   {
     ID3D11ShaderResourceView *srv = NULL;
     {
-      SCOPED_LOCK(m_immediateContextCS);
+      SCOPED_LOCK(m_pDevice->GetDebugManager()->GetImmediateContextCS());
       switch(GetShaderType())
       {
         case DXBC::ShaderType::Vertex:
@@ -596,7 +599,7 @@ ShaderVariable D3D11DebugAPIWrapper::GetBufferInfo(DXBCBytecode::OperandType typ
   {
     ID3D11UnorderedAccessView *uav = NULL;
     {
-      SCOPED_LOCK(m_immediateContextCS);
+      SCOPED_LOCK(m_pDevice->GetDebugManager()->GetImmediateContextCS());
       if(GetShaderType() == DXBC::ShaderType::Compute)
         context->CSGetUnorderedAccessViews(slot.shaderRegister, 1, &uav);
       else
@@ -641,7 +644,7 @@ ShaderVariable D3D11DebugAPIWrapper::GetBufferInfo(DXBCBytecode::OperandType typ
   {
     ID3D11ShaderResourceView *srv = NULL;
     {
-      SCOPED_LOCK(m_immediateContextCS);
+      SCOPED_LOCK(m_pDevice->GetDebugManager()->GetImmediateContextCS());
       switch(GetShaderType())
       {
         case DXBC::ShaderType::Vertex:
@@ -722,7 +725,7 @@ ShaderVariable D3D11DebugAPIWrapper::GetResourceInfo(DXBCBytecode::OperandType t
   {
     ID3D11ShaderResourceView *srv = NULL;
     {
-      SCOPED_LOCK(m_immediateContextCS);
+      SCOPED_LOCK(m_pDevice->GetDebugManager()->GetImmediateContextCS());
       switch(GetShaderType())
       {
         case DXBC::ShaderType::Vertex:
@@ -938,7 +941,7 @@ ShaderVariable D3D11DebugAPIWrapper::GetResourceInfo(DXBCBytecode::OperandType t
     ID3D11UnorderedAccessView *uav = NULL;
     if(GetShaderType() == DXBC::ShaderType::Compute)
     {
-      SCOPED_LOCK(m_immediateContextCS);
+      SCOPED_LOCK(m_pDevice->GetDebugManager()->GetImmediateContextCS());
       context->CSGetUnorderedAccessViews(slot.shaderRegister, 1, &uav);
     }
     else
@@ -946,7 +949,7 @@ ShaderVariable D3D11DebugAPIWrapper::GetResourceInfo(DXBCBytecode::OperandType t
       ID3D11RenderTargetView *rtvs[8] = {0};
       ID3D11DepthStencilView *dsv = NULL;
       {
-        SCOPED_LOCK(m_immediateContextCS);
+        SCOPED_LOCK(m_pDevice->GetDebugManager()->GetImmediateContextCS());
         context->OMGetRenderTargetsAndUnorderedAccessViews(0, rtvs, &dsv,
                                                            slot.shaderRegister, 1, &uav);
       }
@@ -1232,7 +1235,7 @@ bool D3D11DebugAPIWrapper::CalculateSampleGather(
   UINT texSlot = resourceData.binding.shaderRegister;
   UINT samplerSlot = samplerData.binding.shaderRegister;
   {
-    SCOPED_LOCK(m_immediateContextCS);
+    SCOPED_LOCK(m_pDevice->GetDebugManager()->GetImmediateContextCS());
     switch(GetShaderType())
     {
       case DXBC::ShaderType::Vertex:
@@ -1353,7 +1356,7 @@ bool D3D11DebugAPIWrapper::CalculateSampleGather(
 
   ShaderVariable lookupResult("tex", 0.0f, 0.0f, 0.0f, 0.0f);
   {
-    SCOPED_LOCK(m_immediateContextCS);
+    SCOPED_LOCK(m_pDevice->GetDebugManager()->GetImmediateContextCS());
     immediateContext->ExecuteCommandList(commandList, TRUE);
     SAFE_RELEASE(commandList);
     if(immediateContext3)
@@ -1395,12 +1398,12 @@ bool D3D11DebugAPIWrapper::CalculateSampleGather(
         immediateContext->Unmap(debugData.GetOutStageBuf(), 0);
         break;
       }
-      m_immediateContextCS.Unlock();
+      m_pDevice->GetDebugManager()->GetImmediateContextCS().Unlock();
       if(hEvent)
         WaitForSingleObject(hEvent, INFINITE);
       else
         Threading::Sleep(1);
-      m_immediateContextCS.Lock();
+      m_pDevice->GetDebugManager()->GetImmediateContextCS().Lock();
     }
   }
 
@@ -1470,7 +1473,7 @@ bool D3D11DebugAPIWrapper::CalculateMathIntrinsic(DXBCBytecode::OpcodeType opcod
   if(immediateContext3)
     hEvent = debugData.GetEvent();
 
-  SCOPED_LOCK(m_immediateContextCS);
+  SCOPED_LOCK(m_pDevice->GetDebugManager()->GetImmediateContextCS());
   immediateContext->ExecuteCommandList(commandList, TRUE);
   SAFE_RELEASE(commandList);
   if(immediateContext3)
@@ -1498,12 +1501,12 @@ bool D3D11DebugAPIWrapper::CalculateMathIntrinsic(DXBCBytecode::OpcodeType opcod
       immediateContext->Unmap(debugData.GetOutStageBuf(), 0);
       break;
     }
-    m_immediateContextCS.Unlock();
+    m_pDevice->GetDebugManager()->GetImmediateContextCS().Unlock();
     if(hEvent)
       WaitForSingleObject(hEvent, INFINITE);
     else
       Threading::Sleep(1);
-    m_immediateContextCS.Lock();
+    m_pDevice->GetDebugManager()->GetImmediateContextCS().Lock();
   }
 
   return true;
@@ -1535,6 +1538,8 @@ ShaderDebugTrace *D3D11Replay::DebugVertex(uint32_t eventId, uint32_t vertid, ui
 {
   using namespace DXBCBytecode;
   using namespace DXBCDebug;
+
+  SCOPED_LOCK(m_pDevice->GetDebugManager()->GetImmediateContextCS());
 
   D3D11MarkerRegion region(
       StringFormat::Fmt("DebugVertex @ %u of (%u,%u,%u)", eventId, vertid, instid, idx));
@@ -1901,6 +1906,8 @@ ShaderDebugTrace *D3D11Replay::DebugPixel(uint32_t eventId, uint32_t x, uint32_t
 {
   using namespace DXBCBytecode;
   using namespace DXBCDebug;
+
+  SCOPED_LOCK(m_pDevice->GetDebugManager()->GetImmediateContextCS());
 
   D3D11MarkerRegion region(
       StringFormat::Fmt("DebugPixel @ %u of (%u,%u) %u / %u", eventId, x, y, sample, primitive));
@@ -2667,6 +2674,8 @@ ShaderDebugTrace *D3D11Replay::DebugThread(uint32_t eventId,
 {
   using namespace DXBCBytecode;
   using namespace DXBCDebug;
+
+  SCOPED_LOCK(m_pDevice->GetDebugManager()->GetImmediateContextCS());
 
   D3D11MarkerRegion region(StringFormat::Fmt("DebugThread @ %u: [%u, %u, %u] (%u, %u, %u)", eventId,
                                              groupid[0], groupid[1], groupid[2], threadid[0],

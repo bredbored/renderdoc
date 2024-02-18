@@ -1671,6 +1671,8 @@ RDResult D3D11Replay::ReadLogInitialisation(RDCFile *rdc, bool storeStructuredBu
 
 void D3D11Replay::ReplayLog(uint32_t endEventID, ReplayLogType replayType)
 {
+  SCOPED_LOCK(GetDebugManager()->GetImmediateContextCS());
+
   m_pDevice->ReplayLog(0, endEventID, replayType);
 
   // if this is a fresh replay from start, update the render state with the bindings at this event
@@ -1731,6 +1733,8 @@ ResourceId D3D11Replay::GetLiveID(ResourceId id)
 void D3D11Replay::PickPixel(ResourceId texture, uint32_t x, uint32_t y, const Subresource &sub,
                             CompType typeCast, float pixel[4])
 {
+  SCOPED_LOCK(m_pDevice->GetDebugManager()->GetImmediateContextCS());
+
   D3D11RenderStateTracker tracker(m_pImmediateContext);
 
   D3D11MarkerRegion marker("PickPixel");
@@ -1859,6 +1863,8 @@ bool D3D11Replay::GetMinMax(ResourceId texid, const Subresource &sub, CompType t
 
   if(details.texFmt == DXGI_FORMAT_UNKNOWN)
     return false;
+  
+  SCOPED_LOCK(m_pDevice->GetDebugManager()->GetImmediateContextCS());
 
   D3D11RenderStateTracker tracker(m_pImmediateContext);
 
@@ -1978,6 +1984,8 @@ bool D3D11Replay::GetHistogram(ResourceId texid, const Subresource &sub, CompTyp
 
   if(details.texFmt == DXGI_FORMAT_UNKNOWN)
     return false;
+
+  SCOPED_LOCK(m_pDevice->GetDebugManager()->GetImmediateContextCS());
 
   D3D11RenderStateTracker tracker(m_pImmediateContext);
 
@@ -2126,6 +2134,8 @@ void D3D11Replay::GetBufferData(ResourceId buff, uint64_t offset, uint64_t lengt
 void D3D11Replay::GetTextureData(ResourceId tex, const Subresource &sub,
                                  const GetTextureDataParams &params, bytebuf &data)
 {
+  SCOPED_LOCK(m_pDevice->GetDebugManager()->GetImmediateContextCS());
+
   D3D11RenderStateTracker tracker(m_pImmediateContext);
 
   ID3D11Resource *dummyTex = NULL;
@@ -2886,6 +2896,8 @@ bool D3D11Replay::RenderTexture(TextureDisplay cfg)
 
 void D3D11Replay::RenderCheckerboard(FloatVector dark, FloatVector light)
 {
+  SCOPED_LOCK(m_pDevice->GetDebugManager()->GetImmediateContextCS());
+
   D3D11RenderStateTracker tracker(m_pImmediateContext);
 
   CheckerboardCBuffer pixelData = {};
@@ -2922,6 +2934,8 @@ void D3D11Replay::RenderCheckerboard(FloatVector dark, FloatVector light)
 
 void D3D11Replay::RenderHighlightBox(float w, float h, float scale)
 {
+  SCOPED_LOCK(m_pDevice->GetDebugManager()->GetImmediateContextCS());
+
   D3D11RenderStateTracker tracker(m_pImmediateContext);
 
   ID3D11Buffer *pconst = NULL;
@@ -3032,6 +3046,8 @@ uint32_t D3D11Replay::PickVertex(uint32_t eventId, int32_t width, int32_t height
 {
   if(cfg.position.numIndices == 0)
     return ~0U;
+
+  SCOPED_LOCK(m_pDevice->GetDebugManager()->GetImmediateContextCS());
 
   D3D11RenderStateTracker tracker(m_pImmediateContext);
 
@@ -3592,6 +3608,8 @@ ResourceId D3D11Replay::ApplyCustomShader(TextureDisplay &display)
       GetDebugManager()->GetShaderDetails(display.resourceId, display.typeCast, false);
 
   CreateCustomShaderTex(details.texWidth, details.texHeight);
+
+  SCOPED_LOCK(m_pDevice->GetDebugManager()->GetImmediateContextCS());
 
   D3D11RenderStateTracker tracker(m_pImmediateContext);
 

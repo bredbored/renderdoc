@@ -52,6 +52,8 @@ void D3D11Replay::RenderMesh(uint32_t eventId, const rdcarray<MeshFormat> &secon
   if(cfg.position.vertexResourceId == ResourceId() || cfg.position.numIndices == 0)
     return;
 
+  SCOPED_LOCK(m_pDevice->GetDebugManager()->GetImmediateContextCS());
+
   D3D11MarkerRegion renderMesh(
       StringFormat::Fmt("RenderMesh with %zu secondary draws", secondaryDraws.size()));
 
