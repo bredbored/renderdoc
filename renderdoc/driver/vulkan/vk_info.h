@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2023 Baldur Karlsson
+ * Copyright (c) 2019-2024 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -53,7 +53,7 @@ enum VulkanDynamicStateIndex
   VkDynamicExclusiveScissorNV,
   VkDynamicExclusiveScissorEnableNV,
   VkDynamicShadingRateKHR,
-  VkDynamicLineStippleEXT,
+  VkDynamicLineStippleKHR,
   VkDynamicCullMode,
   VkDynamicFrontFace,
   VkDynamicPrimitiveTopology,
@@ -414,8 +414,8 @@ struct VulkanCreationInfo
     VkConservativeRasterizationModeEXT conservativeRasterizationMode;
     float extraPrimitiveOverestimationSize;
 
-    // VkPipelineRasterizationLineStateCreateInfoEXT
-    VkLineRasterizationModeEXT lineRasterMode;
+    // VkPipelineRasterizationLineStateCreateInfoKHR
+    VkLineRasterizationModeKHR lineRasterMode;
     bool stippleEnabled;
     uint32_t stippleFactor;
     uint16_t stipplePattern;
@@ -626,7 +626,7 @@ struct VulkanCreationInfo
     VkMemoryRequirements mrq;
   };
   std::unordered_map<ResourceId, Buffer> m_Buffer;
-  rdcflatmap<uint64_t, ResourceId> m_BufferAddresses;
+  rdcsortedflatmap<uint64_t, ResourceId> m_BufferAddresses;
 
   struct BufferView
   {

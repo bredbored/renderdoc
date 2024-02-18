@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2023 Baldur Karlsson
+ * Copyright (c) 2019-2024 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -4837,5 +4837,29 @@ void WrappedID3D12Device::ReplayLog(uint32_t startEventID, uint32_t endEventID,
     CheckHRESULT(list->Close());
 
     ExecuteLists();
+  }
+}
+
+void WrappedID3D12Device::ReplayDraw(ID3D12GraphicsCommandListX *cmd, const ActionDescription &action)
+{
+  if(action.drawIndex == 0)
+  {
+    if(action.flags & ActionFlags::MeshDispatch)
+      cmd->DispatchMesh(action.dispatchDimension[0], action.dispatchDimension[1],
+                        action.dispatchDimension[2]);
+    else if(action.flags & ActionFlags::Indexed)
+      cmd->DrawIndexedInstanced(action.numIndices, action.numInstances, action.indexOffset,
+                                action.baseVertex, action.instanceOffset);
+    else
+      cmd->DrawInstanced(action.numIndices, action.numInstances, action.vertexOffset,
+                         action.instanceOffset);
+  }
+  else
+  {
+    // TODO: support replay of draws not in callback
+    D3D12CommandData *cmdData = m_Queue->GetCommandData();
+    RDCASSERT(cmdData->m_IndirectData.commandSig != NULL);
+    cmd->ExecuteIndirect(cmdData->m_IndirectData.commandSig, 1, cmdData->m_IndirectData.argsBuffer,
+                         cmdData->m_IndirectData.argsOffset, NULL, 0);
   }
 }

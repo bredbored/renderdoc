@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2023 Baldur Karlsson
+ * Copyright (c) 2023-2024 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -88,8 +88,6 @@
 #include "d3d12_debug.h"
 #include "d3d12_replay.h"
 #include "d3d12_shader_cache.h"
-
-RDOC_EXTERN_CONFIG(bool, D3D12_PixelHistory);
 
 struct D3D12CopyPixelParams
 {
@@ -242,25 +240,6 @@ DXGI_FORMAT GetDepthCopyFormat(DXGI_FORMAT format)
   if(format == DXGI_FORMAT_D16_UNORM)
     return DXGI_FORMAT_R16_TYPELESS;
   return DXGI_FORMAT_R32_TYPELESS;
-}
-
-void ReplayDraw(ID3D12GraphicsCommandListX *cmd, const ActionDescription &action)
-{
-  // TODO: Once this is fully supported for indirect draws, this should be moved to WrappedID3D12Device
-  if(action.drawIndex == 0)
-  {
-    if(action.flags & ActionFlags::Indexed)
-      cmd->DrawIndexedInstanced(action.numIndices, action.numInstances, action.indexOffset,
-                                action.baseVertex, action.instanceOffset);
-    else
-      cmd->DrawInstanced(action.numIndices, action.numInstances, action.vertexOffset,
-                         action.instanceOffset);
-  }
-  else
-  {
-    // TODO: Support replay of single indirect draws
-    RDCERR("Indirect draws are NYI with ReplayDraw");
-  }
 }
 
 }
@@ -698,6 +677,30 @@ protected:
     return targetIndex;
   }
 
+  D3D12_RESOURCE_STATES GetImageState(ID3D12Resource *target, uint32_t planeSlice,
+                                      D3D12_RESOURCE_STATES fallback)
+  {
+    RDCASSERTMSG("This function is not meant for use with the non-capture resources.",
+                 target != m_CallbackInfo.colorImage && target != m_CallbackInfo.dsImage);
+
+    D3D12CommandData &cmdData = *m_pDevice->GetQueue()->GetCommandData();
+    SubresourceStateVector targetStates =
+        cmdData.m_BakedCmdListInfo[cmdData.m_LastCmdListID].GetState(m_pDevice, GetResID(target));
+
+    uint32_t baseMip = m_CallbackInfo.targetSubresource.mip;
+    uint32_t baseSlice = m_CallbackInfo.targetSubresource.slice;
+
+    uint32_t subresource =
+        D3D12CalcSubresource(baseMip, baseSlice, planeSlice, m_CallbackInfo.targetDesc.MipLevels,
+                             m_CallbackInfo.targetDesc.DepthOrArraySize);
+
+    if(targetStates.size() > subresource && targetStates[subresource].IsStates())
+    {
+      return targetStates[subresource].ToStates();
+    }
+    return fallback;
+  }
+
   WrappedID3D12Device *m_pDevice;
   D3D12PixelHistoryShaderCache *m_ShaderCache;
   D3D12PixelHistoryCallbackInfo m_CallbackInfo;
@@ -1093,18 +1096,20 @@ private:
     targetCopyParams.sample = m_CallbackInfo.targetSubresource.sample;
     targetCopyParams.mip = m_CallbackInfo.targetSubresource.mip;
     targetCopyParams.arraySlice = m_CallbackInfo.targetSubresource.slice;
-    targetCopyParams.srcImageState = D3D12_RESOURCE_STATE_RENDER_TARGET;
     targetCopyParams.multisampled = (m_CallbackInfo.targetDesc.SampleDesc.Count != 1);
+    D3D12_RESOURCE_STATES fallback = D3D12_RESOURCE_STATE_RENDER_TARGET;
     if(IsDepthFormat(m_CallbackInfo.targetDesc, m_CallbackInfo.compType))
     {
-      targetCopyParams.srcImageState = m_SavedState.dsv.GetDSV().Flags & D3D12_DSV_FLAG_READ_ONLY_DEPTH
-                                           ? D3D12_RESOURCE_STATE_DEPTH_READ
-                                           : D3D12_RESOURCE_STATE_DEPTH_WRITE;
+      fallback = m_SavedState.dsv.GetDSV().Flags & D3D12_DSV_FLAG_READ_ONLY_DEPTH
+                     ? D3D12_RESOURCE_STATE_DEPTH_READ
+                     : D3D12_RESOURCE_STATE_DEPTH_WRITE;
       targetCopyParams.srcImageFormat = GetDepthSRVFormat(m_CallbackInfo.targetDesc.Format, 0);
       targetCopyParams.depthcopy = true;
       targetCopyParams.copyFormat = GetDepthCopyFormat(m_CallbackInfo.targetDesc.Format);
       offset += offsetof(struct D3D12PixelHistoryValue, depth);
     }
+    targetCopyParams.srcImageState =
+        GetImageState(m_CallbackInfo.targetImage, targetCopyParams.planeSlice, fallback);
 
     CopyImagePixel(cmd, targetCopyParams, offset);
 
@@ -1115,10 +1120,11 @@ private:
           GetDepthSRVFormat(m_CallbackInfo.targetImage->GetDesc().Format, 1);
       stencilCopyParams.copyFormat = DXGI_FORMAT_R8_TYPELESS;
       stencilCopyParams.planeSlice = 1;
+      fallback = m_SavedState.dsv.GetDSV().Flags & D3D12_DSV_FLAG_READ_ONLY_STENCIL
+                     ? D3D12_RESOURCE_STATE_DEPTH_READ
+                     : D3D12_RESOURCE_STATE_DEPTH_WRITE;
       stencilCopyParams.srcImageState =
-          m_SavedState.dsv.GetDSV().Flags & D3D12_DSV_FLAG_READ_ONLY_STENCIL
-              ? D3D12_RESOURCE_STATE_DEPTH_READ
-              : D3D12_RESOURCE_STATE_DEPTH_WRITE;
+          GetImageState(m_CallbackInfo.targetImage, stencilCopyParams.planeSlice, fallback);
       CopyImagePixel(cmd, stencilCopyParams, offset + sizeof(float));
     }
 
@@ -1143,9 +1149,10 @@ private:
       depthCopyParams.srcImageFormat = GetDepthSRVFormat(depthFormat, 0);
       depthCopyParams.copyFormat = GetDepthCopyFormat(depthFormat);
       depthCopyParams.depthcopy = true;
-      depthCopyParams.srcImageState = m_SavedState.dsv.GetDSV().Flags & D3D12_DSV_FLAG_READ_ONLY_DEPTH
-                                          ? D3D12_RESOURCE_STATE_DEPTH_READ
-                                          : D3D12_RESOURCE_STATE_DEPTH_WRITE;
+      fallback = m_SavedState.dsv.GetDSV().Flags & D3D12_DSV_FLAG_READ_ONLY_DEPTH
+                     ? D3D12_RESOURCE_STATE_DEPTH_READ
+                     : D3D12_RESOURCE_STATE_DEPTH_WRITE;
+      depthCopyParams.srcImageState = GetImageState(depthImage, depthCopyParams.planeSlice, fallback);
       CopyImagePixel(cmd, depthCopyParams, offset + offsetof(struct D3D12PixelHistoryValue, depth));
 
       if(IsDepthAndStencilFormat(depthFormat))
@@ -1153,10 +1160,11 @@ private:
         depthCopyParams.srcImageFormat = GetDepthSRVFormat(depthFormat, 1);
         depthCopyParams.copyFormat = DXGI_FORMAT_R8_TYPELESS;
         depthCopyParams.planeSlice = 1;
+        fallback = m_SavedState.dsv.GetDSV().Flags & D3D12_DSV_FLAG_READ_ONLY_STENCIL
+                       ? D3D12_RESOURCE_STATE_DEPTH_READ
+                       : D3D12_RESOURCE_STATE_DEPTH_WRITE;
         depthCopyParams.srcImageState =
-            m_SavedState.dsv.GetDSV().Flags & D3D12_DSV_FLAG_READ_ONLY_STENCIL
-                ? D3D12_RESOURCE_STATE_DEPTH_READ
-                : D3D12_RESOURCE_STATE_DEPTH_WRITE;
+            GetImageState(depthImage, depthCopyParams.planeSlice, fallback);
         CopyImagePixel(cmd, depthCopyParams,
                        offset + offsetof(struct D3D12PixelHistoryValue, stencil));
       }
@@ -1180,7 +1188,7 @@ private:
     }
 
     const ActionDescription *action = m_pDevice->GetAction(eventId);
-    ::ReplayDraw(cmd, *action);
+    m_pDevice->ReplayDraw(cmd, *action);
   }
 
   // GetPipelineReplacements creates pipeline replacements that disable all tests,
@@ -1790,7 +1798,7 @@ private:
     m_OcclusionQueries.insert(std::make_pair(rdcpair<uint32_t, uint32_t>(eventId, test), index));
 
     cmd->BeginQuery(m_OcclusionQueryHeap, D3D12_QUERY_TYPE_OCCLUSION, index);
-    ::ReplayDraw(cmd, *m_pDevice->GetAction(eventId));
+    m_pDevice->ReplayDraw(cmd, *m_pDevice->GetAction(eventId));
 
     cmd->EndQuery(m_OcclusionQueryHeap, D3D12_QUERY_TYPE_OCCLUSION, index);
   }
@@ -2051,7 +2059,7 @@ struct D3D12PixelHistoryPerFragmentCallback : D3D12PixelHistoryCallback
         state.ApplyState(m_pDevice, cmd);
 
         const ActionDescription *action = m_pDevice->GetAction(eid);
-        ::ReplayDraw(cmd, *action);
+        m_pDevice->ReplayDraw(cmd, *action);
 
         if(!isPrimPass)
         {
@@ -2114,7 +2122,7 @@ struct D3D12PixelHistoryPerFragmentCallback : D3D12PixelHistoryCallback
       state.ApplyState(m_pDevice, cmd);
 
       const ActionDescription *action = m_pDevice->GetAction(eid);
-      ::ReplayDraw(cmd, *action);
+      m_pDevice->ReplayDraw(cmd, *action);
 
       CopyImagePixel(cmd, colorCopyParams,
                      (fragsProcessed + f) * sizeof(D3D12PerFragmentInfo) +
@@ -2252,7 +2260,11 @@ struct D3D12PixelHistoryPerFragmentCallback : D3D12PixelHistoryCallback
       pipeDesc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
     }
 
-    if(pipeDesc.GS.pShaderBytecode != NULL || pipeDesc.GS.BytecodeLength > 0)
+    if(pipeDesc.MS.pShaderBytecode != NULL || pipeDesc.MS.BytecodeLength > 0)
+    {
+      RDCWARN("Can't get primitive ID at event %u due to mesh shader usage", eid);
+    }
+    else if(pipeDesc.GS.pShaderBytecode != NULL || pipeDesc.GS.BytecodeLength > 0)
     {
       RDCWARN("Can't get primitive ID at event %u due to geometry shader usage", eid);
     }
@@ -2375,7 +2387,7 @@ struct D3D12PixelHistoryDiscardedFragmentsCallback : D3D12PixelHistoryCallback
       // for this fragment.
       // TODO replay with a dummy index buffer so that all primitives other than the target
       // one are degenerate - that way the vertex index etc is still the same as it should be.
-      ::ReplayDraw(cmd, action);
+      m_pDevice->ReplayDraw(cmd, action);
       cmd->EndQuery(m_OcclusionQueryHeap, D3D12_QUERY_TYPE_OCCLUSION, queryId);
 
       m_OcclusionQueries[make_rdcpair<uint32_t, uint32_t>(eid, primId)] = queryId;
@@ -2678,16 +2690,315 @@ bool IsDirectWrite(ResourceUsage usage)
           usage == ResourceUsage::GenMips);
 }
 
-void FillInColor(ResourceFormat fmt, const D3D12PixelHistoryValue &value, ModificationValue &mod)
+// NOTE: This function is quite similar to formatpacking.cpp::DecodeFormattedComponents,
+//  but it doesn't convert everything to a float since the pixel history viewer will expect
+//  them to be in the target's format.
+void PixelHistoryDecode(const ResourceFormat &fmt, const byte *data, PixelValue &out)
 {
-  FloatVector v4 = DecodeFormattedComponents(fmt, value.color);
-  memcpy(mod.col.floatValue.data(), &v4, sizeof(v4));
+  if(fmt.compType == CompType::UInt || fmt.compType == CompType::SInt || fmt.compCount == 4)
+    out.floatValue[3] = 0.0f;
+
+  if(fmt.type == ResourceFormatType::R10G10B10A2)
+  {
+    if(fmt.compType == CompType::SNorm)
+    {
+      Vec4f v = ConvertFromR10G10B10A2SNorm(*(const uint32_t *)data);
+      out.floatValue[0] = v.x;
+      out.floatValue[1] = v.y;
+      out.floatValue[2] = v.z;
+      out.floatValue[3] = v.w;
+    }
+    else if(fmt.compType == CompType::UNorm)
+    {
+      Vec4f v = ConvertFromR10G10B10A2(*(const uint32_t *)data);
+      out.floatValue[0] = v.x;
+      out.floatValue[1] = v.y;
+      out.floatValue[2] = v.z;
+      out.floatValue[3] = v.w;
+    }
+    else if(fmt.compType == CompType::UInt)
+    {
+      Vec4u v = ConvertFromR10G10B10A2UInt(*(const uint32_t *)data);
+      out.uintValue[0] = v.x;
+      out.uintValue[1] = v.y;
+      out.uintValue[2] = v.z;
+      out.uintValue[3] = v.w;
+    }
+
+    // the different types are a union so we can ignore format and just treat it as a data swap
+    if(fmt.BGRAOrder())
+      std::swap(out.uintValue[0], out.uintValue[2]);
+  }
+  else if(fmt.type == ResourceFormatType::R11G11B10)
+  {
+    Vec3f v = ConvertFromR11G11B10(*(const uint32_t *)data);
+    out.floatValue[0] = v.x;
+    out.floatValue[1] = v.y;
+    out.floatValue[2] = v.z;
+  }
+  else if(fmt.type == ResourceFormatType::R5G5B5A1)
+  {
+    Vec4f v = ConvertFromB5G5R5A1(*(const uint16_t *)data);
+    out.floatValue[0] = v.x;
+    out.floatValue[1] = v.y;
+    out.floatValue[2] = v.z;
+    out.floatValue[3] = v.w;
+
+    // conversely we *expect* BGRA order for this format and the above conversion implicitly flips
+    // when bit-unpacking. So if the format wasn't BGRA order, flip it back
+    if(!fmt.BGRAOrder())
+      std::swap(out.floatValue[0], out.floatValue[2]);
+  }
+  else if(fmt.type == ResourceFormatType::R5G6B5)
+  {
+    Vec3f v = ConvertFromB5G6R5(*(const uint16_t *)data);
+    out.floatValue[0] = v.x;
+    out.floatValue[1] = v.y;
+    out.floatValue[2] = v.z;
+
+    // conversely we *expect* BGRA order for this format and the above conversion implicitly flips
+    // when bit-unpacking. So if the format wasn't BGRA order, flip it back
+    if(!fmt.BGRAOrder())
+      std::swap(out.floatValue[0], out.floatValue[2]);
+  }
+  else if(fmt.type == ResourceFormatType::R4G4B4A4)
+  {
+    Vec4f v = ConvertFromB4G4R4A4(*(const uint16_t *)data);
+    out.floatValue[0] = v.x;
+    out.floatValue[1] = v.y;
+    out.floatValue[2] = v.z;
+    out.floatValue[3] = v.w;
+
+    // conversely we *expect* BGRA order for this format and the above conversion implicitly flips
+    // when bit-unpacking. So if the format wasn't BGRA order, flip it back
+    if(!fmt.BGRAOrder())
+      std::swap(out.floatValue[0], out.floatValue[2]);
+  }
+  else if(fmt.type == ResourceFormatType::R4G4)
+  {
+    Vec4f v = ConvertFromR4G4(*(const uint8_t *)data);
+    out.floatValue[0] = v.x;
+    out.floatValue[1] = v.y;
+  }
+  else if(fmt.type == ResourceFormatType::R9G9B9E5)
+  {
+    Vec3f v = ConvertFromR9G9B9E5(*(const uint32_t *)data);
+    out.floatValue[0] = v.x;
+    out.floatValue[1] = v.y;
+    out.floatValue[2] = v.z;
+  }
+  else if(fmt.type == ResourceFormatType::D16S8)
+  {
+    uint32_t val = *(const uint32_t *)data;
+    out.floatValue[0] = float(val & 0x00ffff) / 65535.0f;
+    out.floatValue[1] = float((val & 0xff0000) >> 16) / 255.0f;
+    out.floatValue[2] = 0.0f;
+  }
+  else if(fmt.type == ResourceFormatType::D24S8)
+  {
+    uint32_t val = *(const uint32_t *)data;
+    out.floatValue[0] = float(val & 0x00ffffff) / 16777215.0f;
+    out.floatValue[1] = float((val & 0xff000000) >> 24) / 255.0f;
+    out.floatValue[2] = 0.0f;
+  }
+  else if(fmt.type == ResourceFormatType::D32S8)
+  {
+    struct ds
+    {
+      float f;
+      uint32_t s;
+    } val;
+    val = *(const ds *)data;
+    out.floatValue[0] = val.f;
+    out.floatValue[1] = float(val.s) / 255.0f;
+    out.floatValue[2] = 0.0f;
+  }
+  else if(fmt.type == ResourceFormatType::Regular || fmt.type == ResourceFormatType::A8 ||
+          fmt.type == ResourceFormatType::S8)
+  {
+    CompType compType = fmt.compType;
+    for(size_t c = 0; c < fmt.compCount; c++)
+    {
+      // alpha is never interpreted as sRGB
+      if(compType == CompType::UNormSRGB && c == 3)
+        compType = CompType::UNorm;
+
+      if(fmt.compByteWidth == 8)
+      {
+        // we just downcast
+        const uint64_t *u64 = (const uint64_t *)data;
+        const int64_t *i64 = (const int64_t *)data;
+
+        if(compType == CompType::Float)
+        {
+          out.floatValue[c] = float(*(const double *)u64);
+        }
+        else if(compType == CompType::UInt)
+        {
+          out.uintValue[c] = uint32_t(*u64);
+        }
+        else if(compType == CompType::UScaled)
+        {
+          out.floatValue[c] = float(*u64);
+        }
+        else if(compType == CompType::SInt)
+        {
+          out.intValue[c] = int32_t(*i64);
+        }
+        else if(compType == CompType::SScaled)
+        {
+          out.floatValue[c] = float(*i64);
+        }
+      }
+      else if(fmt.compByteWidth == 4)
+      {
+        const uint32_t *u32 = (const uint32_t *)data;
+        const int32_t *i32 = (const int32_t *)data;
+
+        if(compType == CompType::Float || compType == CompType::Depth)
+        {
+          out.floatValue[c] = *(const float *)u32;
+        }
+        else if(compType == CompType::UInt)
+        {
+          out.uintValue[c] = uint32_t(*u32);
+        }
+        else if(compType == CompType::UScaled)
+        {
+          out.floatValue[c] = float(*u32);
+        }
+        else if(compType == CompType::SInt)
+        {
+          out.intValue[c] = int32_t(*i32);
+        }
+        else if(compType == CompType::SScaled)
+        {
+          out.floatValue[c] = float(*i32);
+        }
+      }
+      else if(fmt.compByteWidth == 3 && compType == CompType::Depth)
+      {
+        // 24-bit depth is a weird edge case we need to assemble it by hand
+        const uint8_t *u8 = (const uint8_t *)data;
+
+        uint32_t depth = 0;
+        depth |= uint32_t(u8[0]);
+        depth |= uint32_t(u8[1]) << 8;
+        depth |= uint32_t(u8[2]) << 16;
+
+        out.floatValue[c] = float(depth) / float(16777215.0f);
+      }
+      else if(fmt.compByteWidth == 2)
+      {
+        const uint16_t *u16 = (const uint16_t *)data;
+        const int16_t *i16 = (const int16_t *)data;
+
+        if(compType == CompType::Float)
+        {
+          out.floatValue[c] = ConvertFromHalf(*u16);
+        }
+        else if(compType == CompType::UInt)
+        {
+          out.uintValue[c] = uint32_t(*u16);
+        }
+        else if(compType == CompType::UScaled)
+        {
+          out.floatValue[c] = float(*u16);
+        }
+        else if(compType == CompType::SInt)
+        {
+          out.intValue[c] = int32_t(*i16);
+        }
+        else if(compType == CompType::SScaled)
+        {
+          out.floatValue[c] = float(*i16);
+        }
+        // 16-bit depth is UNORM
+        else if(compType == CompType::UNorm || compType == CompType::Depth)
+        {
+          out.floatValue[c] = float(*u16) / 65535.0f;
+        }
+        else if(compType == CompType::SNorm)
+        {
+          float f = -1.0f;
+
+          if(*i16 == -32768)
+            f = -1.0f;
+          else
+            f = ((float)*i16) / 32767.0f;
+
+          out.floatValue[c] = f;
+        }
+      }
+      else if(fmt.compByteWidth == 1)
+      {
+        const uint8_t *u8 = (const uint8_t *)data;
+        const int8_t *i8 = (const int8_t *)data;
+
+        if(compType == CompType::UInt)
+        {
+          out.uintValue[c] = uint32_t(*u8);
+        }
+        else if(compType == CompType::UScaled)
+        {
+          out.floatValue[c] = float(*u8);
+        }
+        else if(compType == CompType::SInt)
+        {
+          out.intValue[c] = int32_t(*i8);
+        }
+        else if(compType == CompType::SScaled)
+        {
+          out.floatValue[c] = float(*i8);
+        }
+        else if(compType == CompType::UNormSRGB)
+        {
+          out.floatValue[c] = ConvertFromSRGB8(*u8);
+        }
+        else if(compType == CompType::UNorm)
+        {
+          out.floatValue[c] = float(*u8) / 255.0f;
+        }
+        else if(compType == CompType::SNorm)
+        {
+          float f = -1.0f;
+
+          if(*i8 == -128)
+            f = -1.0f;
+          else
+            f = ((float)*i8) / 127.0f;
+
+          out.floatValue[c] = f;
+        }
+      }
+      else
+      {
+        RDCERR("Unexpected format to convert from %u %u", fmt.compByteWidth, compType);
+      }
+
+      data += fmt.compByteWidth;
+    }
+
+    if(fmt.type == ResourceFormatType::A8)
+    {
+      out.floatValue[2] = out.floatValue[0];
+      out.floatValue[0] = 0.0f;
+    }
+    else if(fmt.type == ResourceFormatType::S8)
+    {
+      out.uintValue[1] = out.uintValue[0];
+      out.uintValue[0] = 0;
+    }
+
+    // the different types are a union so we can ignore format and just treat it as a data swap
+    if(fmt.BGRAOrder())
+      std::swap(out.uintValue[0], out.uintValue[2]);
+  }
 }
 
-void FillInColor(ResourceFormat fmt, const byte *pValue, ModificationValue &mod)
+void FillInColor(ResourceFormat fmt, const D3D12PixelHistoryValue &value, ModificationValue &mod)
 {
-  FloatVector v4 = DecodeFormattedComponents(fmt, pValue);
-  memcpy(mod.col.floatValue.data(), &v4, sizeof(v4));
+  PixelHistoryDecode(fmt, value.color, mod.col);
 }
 
 void ConvertAndFillInColor(ResourceFormat srcFmt, ResourceFormat outFmt,
@@ -2722,9 +3033,6 @@ rdcarray<PixelModification> D3D12Replay::PixelHistory(rdcarray<EventUsage> event
                                                       const Subresource &sub, CompType typeCast)
 {
   rdcarray<PixelModification> history;
-
-  if(!D3D12_PixelHistory())
-    return history;
 
   if(events.empty())
     return history;

@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2023 Baldur Karlsson
+ * Copyright (c) 2019-2024 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -4047,6 +4047,10 @@ bool WrappedID3D12GraphicsCommandList::Serialise_ExecuteIndirect(
                   MaxCommandCount);
           for(uint32_t i = 0; i < count; i++)
           {
+            m_Cmd->m_IndirectData.commandSig = pCommandSignature;
+            m_Cmd->m_IndirectData.argsBuffer = patched.first;
+            m_Cmd->m_IndirectData.argsOffset = patched.second;
+
             uint32_t eventId = m_Cmd->HandlePreCallback(list, ActionFlags::Drawcall,
                                                         (i + 1) * comSig->sig.arguments.count());
 
@@ -4060,6 +4064,10 @@ bool WrappedID3D12GraphicsCommandList::Serialise_ExecuteIndirect(
                                             patched.second, NULL, 0);
               m_Cmd->m_ActionCallback->PostRedraw(eventId, list);
             }
+
+            m_Cmd->m_IndirectData.commandSig = NULL;
+            m_Cmd->m_IndirectData.argsBuffer = NULL;
+            m_Cmd->m_IndirectData.argsOffset = 0;
 
             patched.second += comSig->sig.ByteStride;
           }
@@ -5098,8 +5106,15 @@ bool WrappedID3D12GraphicsCommandList::Serialise_ResolveSubresource(
       if(m_Cmd->InRerecordRange(m_Cmd->m_LastCmdListID))
       {
         ID3D12GraphicsCommandListX *list = m_Cmd->RerecordCmdList(m_Cmd->m_LastCmdListID);
+        uint32_t eventId = m_Cmd->HandlePreCallback(list, ActionFlags::Resolve);
         Unwrap(list)->ResolveSubresource(Unwrap(pDstResource), DstSubresource, Unwrap(pSrcResource),
                                          SrcSubresource, Format);
+        if(eventId && m_Cmd->m_ActionCallback->PostMisc(eventId, ActionFlags::Resolve, list))
+        {
+          Unwrap(list)->ResolveSubresource(Unwrap(pDstResource), DstSubresource,
+                                           Unwrap(pSrcResource), SrcSubresource, Format);
+          m_Cmd->m_ActionCallback->PostRemisc(eventId, ActionFlags::Resolve, list);
+        }
       }
     }
     else

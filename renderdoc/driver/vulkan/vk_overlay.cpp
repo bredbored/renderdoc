@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2023 Baldur Karlsson
+ * Copyright (c) 2019-2024 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -3357,7 +3357,7 @@ ResourceId VulkanReplay::RenderOverlay(ResourceId texid, FloatVector clearCol, D
                 if(fmt.indexByteStride == 4)
                   idxtype = VK_INDEX_TYPE_UINT32;
                 else if(fmt.indexByteStride == 1)
-                  idxtype = VK_INDEX_TYPE_UINT8_EXT;
+                  idxtype = VK_INDEX_TYPE_UINT8_KHR;
 
                 if(fmt.indexResourceId != ResourceId())
                 {

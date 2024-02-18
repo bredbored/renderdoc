@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2020-2023 Baldur Karlsson
+ * Copyright (c) 2020-2024 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -4013,6 +4013,7 @@ ShaderDebugTrace *VulkanReplay::DebugVertex(uint32_t eventId, uint32_t vertid, u
     builtins[ShaderBuiltin::VertexIndex] = ShaderVariable(rdcstr(), vertid + vertOffset, 0U, 0U, 0U);
   builtins[ShaderBuiltin::InstanceIndex] = ShaderVariable(rdcstr(), instid + instOffset, 0U, 0U, 0U);
   builtins[ShaderBuiltin::ViewportIndex] = ShaderVariable(rdcstr(), view, 0U, 0U, 0U);
+  builtins[ShaderBuiltin::MultiViewIndex] = ShaderVariable(rdcstr(), view, 0U, 0U, 0U);
 
   rdcarray<ShaderVariable> &locations = apiWrapper->location_inputs;
   for(const VkVertexInputAttributeDescription2EXT &attr : state.vertexAttributes)
@@ -4354,6 +4355,11 @@ ShaderDebugTrace *VulkanReplay::DebugPixel(uint32_t eventId, uint32_t x, uint32_
   VkGraphicsPipelineCreateInfo graphicsInfo = {};
 
   m_pDriver->GetShaderCache()->MakeGraphicsPipelineInfo(graphicsInfo, state.graphics.pipeline);
+
+  // use the load RP if an RP is specified
+  if(graphicsInfo.renderPass != VK_NULL_HANDLE)
+    graphicsInfo.renderPass =
+        c.m_RenderPass[GetResID(graphicsInfo.renderPass)].loadRPs[graphicsInfo.subpass];
 
   // struct size is PSHit header plus 5x structStride = base, ddxcoarse, ddycoarse, ddxfine, ddyfine
   uint32_t structSize = sizeof(PSHit) + structStride * 5;

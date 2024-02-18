@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2023 Baldur Karlsson
+ * Copyright (c) 2019-2024 Baldur Karlsson
  * Copyright (c) 2014 Crytek
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -1109,6 +1109,11 @@ to apply to multiple related things - see :data:`ClipDistance`, :data:`CullDista
 .. data:: OutputIndices
 
   An output containing the indices for a meshlet.
+
+.. data:: MultiViewIndex
+
+  An input specifying the view being rendered to in multiview rendering. Only valid when multiview rendering is enabled.
+
 )");
 enum class ShaderBuiltin : uint32_t
 {
@@ -1166,6 +1171,7 @@ enum class ShaderBuiltin : uint32_t
   Barycentrics,
   CullPrimitive,
   OutputIndices,
+  MultiViewIndex,
   Count,
 };
 
