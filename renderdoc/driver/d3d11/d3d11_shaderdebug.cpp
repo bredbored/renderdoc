@@ -1272,10 +1272,23 @@ bool D3D11DebugAPIWrapper::CalculateSampleGather(
   context->PSSetShaderResources(texSlot, 1, &usedSRV);
   if(opcode == OPCODE_SAMPLE_B && samplerData.bias != 0.0f)
   {
-    RDCASSERT(usedSamp);
+    D3D11_SAMPLER_DESC desc = {};
 
-    D3D11_SAMPLER_DESC desc;
-    usedSamp->GetDesc(&desc);
+    if(usedSamp)
+    {
+      usedSamp->GetDesc(&desc);
+    }
+    else
+    {
+      desc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+      desc.AddressU = desc.AddressV = desc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+      desc.MipLODBias = 0.0f;
+      desc.MaxAnisotropy = 1;
+      desc.ComparisonFunc = D3D11_COMPARISON_NEVER;
+      desc.BorderColor[0] = desc.BorderColor[1] = desc.BorderColor[2] = desc.BorderColor[3] = 1.0f;
+      desc.MinLOD = -FLT_MAX;
+      desc.MaxLOD = FLT_MAX;
+    }
 
     desc.MipLODBias = RDCCLAMP(desc.MipLODBias + samplerData.bias, -15.99f, 15.99f);
 
@@ -1901,11 +1914,14 @@ ShaderDebugTrace *D3D11Replay::DebugVertex(uint32_t eventId, uint32_t vertid, ui
   return ret;
 }
 
-ShaderDebugTrace *D3D11Replay::DebugPixel(uint32_t eventId, uint32_t x, uint32_t y, uint32_t sample,
-                                          uint32_t primitive)
+ShaderDebugTrace *D3D11Replay::DebugPixel(uint32_t eventId, uint32_t x, uint32_t y,
+                                          const DebugPixelInputs &inputs)
 {
   using namespace DXBCBytecode;
   using namespace DXBCDebug;
+
+  uint32_t sample = inputs.sample;
+  uint32_t primitive = inputs.primitive;
 
   SCOPED_LOCK(m_pDevice->GetDebugManager()->GetImmediateContextCS());
 

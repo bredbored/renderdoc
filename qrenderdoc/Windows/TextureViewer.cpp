@@ -93,6 +93,7 @@ static QMap<QString, ShaderEncoding> encodingExtensions = {
     {lit("frag"), ShaderEncoding::GLSL},
     {lit("spvasm"), ShaderEncoding::SPIRVAsm},
     {lit("spvasm"), ShaderEncoding::OpenGLSPIRVAsm},
+    {lit("slang"), ShaderEncoding::Slang},
 };
 
 Q_DECLARE_METATYPE(Following);
@@ -4097,8 +4098,12 @@ void TextureViewer::on_debugPixelContext_clicked()
   bool done = false;
   ShaderDebugTrace *trace = NULL;
 
-  m_Ctx.Replay().AsyncInvoke([this, &trace, &done, x, y](IReplayController *r) {
-    trace = r->DebugPixel((uint32_t)x, (uint32_t)y, m_TexDisplay.subresource.sample, ~0U);
+  uint32_t view = m_TexDisplay.subresource.slice - m_Following.GetFirstArraySlice(m_Ctx);
+  m_Ctx.Replay().AsyncInvoke([this, &trace, &done, x, y, view](IReplayController *r) {
+    DebugPixelInputs inputs;
+    inputs.sample = m_TexDisplay.subresource.sample;
+    inputs.view = view;
+    trace = r->DebugPixel((uint32_t)x, (uint32_t)y, inputs);
 
     if(trace->debugger == NULL)
     {
@@ -4157,7 +4162,8 @@ void TextureViewer::on_pixelHistory_clicked()
   if(m_TexDisplay.flipY)
     y = (int)(mipHeight - 1) - y;
 
-  IPixelHistoryView *hist = m_Ctx.ViewPixelHistory(texptr->resourceId, x, y, m_TexDisplay);
+  uint32_t view = m_TexDisplay.subresource.slice - m_Following.GetFirstArraySlice(m_Ctx);
+  IPixelHistoryView *hist = m_Ctx.ViewPixelHistory(texptr->resourceId, x, y, view, m_TexDisplay);
 
   m_Ctx.AddDockWindow(hist->Widget(), DockReference::TransientPopupArea, this, 0.3f);
 
@@ -4586,7 +4592,7 @@ void TextureViewer::on_customCreate_clicked()
 
   QString src;
 
-  if(enc == ShaderEncoding::HLSL)
+  if(enc == ShaderEncoding::HLSL || enc == ShaderEncoding::Slang)
   {
     src =
         lit("float4 main(float4 pos : SV_Position, float4 uv : TEXCOORD0) : SV_Target0\n"

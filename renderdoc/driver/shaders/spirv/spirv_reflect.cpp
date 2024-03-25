@@ -621,13 +621,26 @@ void Reflector::RegisterOp(Iter it)
       }
     }
 
-    sources.push_back({source.sourceLanguage, strings[source.file], source.source});
+    sourceLanguage = source.sourceLanguage;
+
+    rdcstr name = strings[source.file];
+    // don't add empty source statements as actual files
+    if(!name.empty() || !source.source.empty())
+    {
+      if(name.empty())
+        name = "unnamed_shader";
+
+      sources.push_back({name, source.source});
+    }
   }
   else if(opdata.op == Op::SourceContinued)
   {
     OpSourceContinued continued(it);
 
-    sources.back().contents += continued.continuedSource;
+    // in theory someone could do OpSource with no source then OpSourceContinued. We treat this mostly
+    // as garbage-in, garbage-out, but just in case we have no files don't crash here and instead ignore it.
+    if(!sources.empty())
+      sources.back().contents += continued.continuedSource;
   }
   else if(opdata.op == Op::Label)
   {
@@ -647,23 +660,39 @@ void Reflector::RegisterOp(Iter it)
     {
       if(dbg.inst == ShaderDbg::Source)
       {
-        debugSources[dbg.result] = sources.size();
-        sources.push_back({
-            SourceLanguage::Unknown,
-            strings[dbg.arg<Id>(0)],
-            dbg.params.size() > 1 ? strings[dbg.arg<Id>(1)] : rdcstr(),
-        });
+        rdcstr name = strings[dbg.arg<Id>(0)];
+        if(name.empty())
+          name = "unnamed_shader";
+        rdcstr source = dbg.params.size() > 1 ? strings[dbg.arg<Id>(1)] : rdcstr();
+
+        // don't add empty source statements as actual files
+        if(!name.empty() || !source.empty())
+        {
+          debugSources[dbg.result] = sources.size();
+          sources.push_back({name, source});
+        }
       }
       else if(dbg.inst == ShaderDbg::SourceContinued)
       {
-        sources.back().contents += strings[dbg.arg<Id>(0)];
+        // in theory someone could do OpSource with no source then OpSourceContinued. We treat this
+        // mostly as garbage-in, garbage-out, but just in case we have no files don't crash here and
+        // instead ignore it.
+        if(!sources.empty())
+          sources.back().contents += strings[dbg.arg<Id>(0)];
       }
       else if(dbg.inst == ShaderDbg::Function)
       {
         LineColumnInfo &info = debugFuncToLocation[dbg.result];
 
-        info.fileIndex = (int32_t)debugSources[dbg.arg<Id>(2)];
-        info.lineStart = info.lineEnd = EvaluateConstant(dbg.arg<Id>(3), {}).value.u32v[0];
+        debugFuncName[dbg.result] = strings[dbg.arg<Id>(0)];
+
+        // check this source file exists - we won't have registered it if there was no source code
+        auto srcit = debugSources.find(dbg.arg<Id>(2));
+        if(srcit != debugSources.end())
+        {
+          info.fileIndex = (int32_t)srcit->second;
+          info.lineStart = info.lineEnd = EvaluateConstant(dbg.arg<Id>(3), {}).value.u32v[0];
+        }
       }
       else if(dbg.inst == ShaderDbg::FunctionDefinition)
       {
@@ -671,10 +700,11 @@ void Reflector::RegisterOp(Iter it)
       }
       else if(dbg.inst == ShaderDbg::CompilationUnit)
       {
-        sources[debugSources[dbg.arg<Id>(2)]].lang =
-            (SourceLanguage)EvaluateConstant(dbg.arg<Id>(3), {}).value.u32v[0];
+        sourceLanguage = (SourceLanguage)EvaluateConstant(dbg.arg<Id>(3), {}).value.u32v[0];
 
-        compUnitToFileIndex[dbg.result] = debugSources[dbg.arg<Id>(2)];
+        auto srcit = debugSources.find(dbg.arg<Id>(2));
+        if(srcit != debugSources.end())
+          compUnitToFileIndex[dbg.result] = srcit->second;
       }
       else if(dbg.inst == ShaderDbg::EntryPoint)
       {
@@ -947,25 +977,28 @@ void Reflector::MakeReflection(const GraphicsAPI sourceAPI, const ShaderStage st
         reflection.dispatchThreadsDimension[2] = 0;
   }
 
+  switch(sourceLanguage)
+  {
+    case SourceLanguage::ESSL:
+    case SourceLanguage::GLSL: reflection.debugInfo.encoding = ShaderEncoding::GLSL; break;
+    case SourceLanguage::HLSL: reflection.debugInfo.encoding = ShaderEncoding::HLSL; break;
+    case SourceLanguage::Slang: reflection.debugInfo.encoding = ShaderEncoding::Slang; break;
+    case SourceLanguage::OpenCL_C:
+    case SourceLanguage::OpenCL_CPP:
+    case SourceLanguage::CPP_for_OpenCL:
+    case SourceLanguage::Unknown:
+    case SourceLanguage::Invalid:
+    case SourceLanguage::SYCL:
+    case SourceLanguage::HERO_C:
+    case SourceLanguage::NZSL:
+    case SourceLanguage::WGSL:
+    case SourceLanguage::Zig:
+    case SourceLanguage::Max: break;
+  }
+
   for(size_t i = 0; i < sources.size(); i++)
   {
-    switch(sources[i].lang)
-    {
-      case SourceLanguage::ESSL:
-      case SourceLanguage::GLSL: reflection.debugInfo.encoding = ShaderEncoding::GLSL; break;
-      case SourceLanguage::HLSL: reflection.debugInfo.encoding = ShaderEncoding::HLSL; break;
-      case SourceLanguage::OpenCL_C:
-      case SourceLanguage::OpenCL_CPP:
-      case SourceLanguage::CPP_for_OpenCL:
-      case SourceLanguage::Unknown:
-      case SourceLanguage::Invalid:
-      case SourceLanguage::SYCL:
-      case SourceLanguage::HERO_C:
-      case SourceLanguage::Max: break;
-    }
-
-    if(!sources[i].name.empty() || !sources[i].contents.empty())
-      reflection.debugInfo.files.push_back({sources[i].name, sources[i].contents});
+    reflection.debugInfo.files.push_back({sources[i].name, sources[i].contents});
   }
 
   switch(m_Generator)
@@ -986,6 +1019,9 @@ void Reflector::MakeReflection(const GraphicsAPI sourceAPI, const ShaderStage st
                                           : KnownShaderTool::spirv_as;
       break;
     case Generator::spiregg: reflection.debugInfo.compiler = KnownShaderTool::dxcSPIRV; break;
+    case Generator::SlangCompiler:
+      reflection.debugInfo.compiler = KnownShaderTool::slangSPIRV;
+      break;
     default: reflection.debugInfo.compiler = KnownShaderTool::Unknown; break;
   }
 
@@ -995,10 +1031,15 @@ void Reflector::MakeReflection(const GraphicsAPI sourceAPI, const ShaderStage st
   reflection.debugInfo.compileFlags.flags.push_back(
       {"@spirver", StringFormat::Fmt("spirv%d.%d", m_MajorVersion, m_MinorVersion)});
 
+  reflection.debugInfo.entrySourceName = entryPoint;
+
   {
     auto it = funcToDebugFunc.find(entry->id);
     if(it != funcToDebugFunc.end())
     {
+      rdcstr debugEntryName = debugFuncName[it->second];
+      if(!debugEntryName.empty())
+        reflection.debugInfo.entrySourceName = debugEntryName;
       reflection.debugInfo.entryLocation = debugFuncToLocation[it->second];
       if(debugFuncToCmdLine.find(it->second) != debugFuncToCmdLine.end())
         reflection.debugInfo.compileFlags.flags = {{"@cmdline", debugFuncToCmdLine[it->second]}};

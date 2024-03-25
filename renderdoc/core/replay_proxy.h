@@ -504,8 +504,14 @@ public:
 
   IMPLEMENT_FUNCTION_PROXIED(void, InitPostVSBuffers, uint32_t eventId);
   IMPLEMENT_FUNCTION_PROXIED(void, InitPostVSBuffers, const rdcarray<uint32_t> &passEvents);
-  IMPLEMENT_FUNCTION_PROXIED(MeshFormat, GetPostVSBuffers, uint32_t eventId, uint32_t instID,
-                             uint32_t viewID, MeshDataStage stage);
+  IMPLEMENT_FUNCTION_PROXIED(rdcarray<MeshFormat>, GetBatchPostVSBuffers, uint32_t eventId,
+                             const rdcarray<uint32_t> &instIDs, uint32_t viewID, MeshDataStage stage);
+
+  // if this gets called individually, just forward to the batch implementation for simplicity
+  MeshFormat GetPostVSBuffers(uint32_t eventId, uint32_t instID, uint32_t viewID, MeshDataStage stage)
+  {
+    return GetBatchPostVSBuffers(eventId, {instID}, viewID, stage)[0];
+  }
 
   IMPLEMENT_FUNCTION_PROXIED(ResourceId, RenderOverlay, ResourceId texid, FloatVector clearCol,
                              DebugOverlay overlay, uint32_t eventId,
@@ -527,7 +533,7 @@ public:
   IMPLEMENT_FUNCTION_PROXIED(ShaderDebugTrace *, DebugVertex, uint32_t eventId, uint32_t vertid,
                              uint32_t instid, uint32_t idx, uint32_t view);
   IMPLEMENT_FUNCTION_PROXIED(ShaderDebugTrace *, DebugPixel, uint32_t eventId, uint32_t x,
-                             uint32_t y, uint32_t sample, uint32_t primitive);
+                             uint32_t y, const DebugPixelInputs &inputs);
   IMPLEMENT_FUNCTION_PROXIED(ShaderDebugTrace *, DebugThread, uint32_t eventId,
                              const rdcfixedarray<uint32_t, 3> &groupid,
                              const rdcfixedarray<uint32_t, 3> &threadid,

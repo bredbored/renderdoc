@@ -178,6 +178,20 @@ public:
   virtual MeshFormat GetPostVSBuffers(uint32_t eventId, uint32_t instID, uint32_t viewID,
                                       MeshDataStage stage) = 0;
 
+  // this is a helper/batch query for the above, that's only necessary because Android is a shit
+  // platform and its proxying has significant per-call overhead. This is overridden in the proxy,
+  // but otherwise will call to this default implementation
+  virtual rdcarray<MeshFormat> GetBatchPostVSBuffers(uint32_t eventId,
+                                                     const rdcarray<uint32_t> &instIDs,
+                                                     uint32_t viewID, MeshDataStage stage)
+  {
+    rdcarray<MeshFormat> ret;
+    ret.reserve(instIDs.size());
+    for(uint32_t instID : instIDs)
+      ret.push_back(GetPostVSBuffers(eventId, instID, viewID, stage));
+    return ret;
+  }
+
   virtual void GetBufferData(ResourceId buff, uint64_t offset, uint64_t len, bytebuf &retData) = 0;
   virtual void GetTextureData(ResourceId tex, const Subresource &sub,
                               const GetTextureDataParams &params, bytebuf &data) = 0;
@@ -203,8 +217,8 @@ public:
                                                    CompType typeCast) = 0;
   virtual ShaderDebugTrace *DebugVertex(uint32_t eventId, uint32_t vertid, uint32_t instid,
                                         uint32_t idx, uint32_t view) = 0;
-  virtual ShaderDebugTrace *DebugPixel(uint32_t eventId, uint32_t x, uint32_t y, uint32_t sample,
-                                       uint32_t primitive) = 0;
+  virtual ShaderDebugTrace *DebugPixel(uint32_t eventId, uint32_t x, uint32_t y,
+                                       const DebugPixelInputs &inputs) = 0;
   virtual ShaderDebugTrace *DebugThread(uint32_t eventId, const rdcfixedarray<uint32_t, 3> &groupid,
                                         const rdcfixedarray<uint32_t, 3> &threadid, std::function<bool()> cancelled) = 0;
   virtual rdcarray<ShaderDebugState> ContinueDebug(ShaderDebugger *debugger) = 0;

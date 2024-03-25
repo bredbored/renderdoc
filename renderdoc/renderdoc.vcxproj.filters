@@ -1139,6 +1139,9 @@
     <None Include="data\hlsl\depth_copy.hlsl">
       <Filter>Resources\hlsl</Filter>
     </None>
+    <None Include="data\hlsl\raytracing.hlsl">
+      <Filter>Resources\hlsl</Filter>
+    </None>
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="data\renderdoc.rc">

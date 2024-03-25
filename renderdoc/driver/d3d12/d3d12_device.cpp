@@ -26,6 +26,7 @@
 #include <algorithm>
 #include "core/core.h"
 #include "core/settings.h"
+#include "data/hlsl/hlsl_cbuffers.h"
 #include "driver/dxgi/dxgi_common.h"
 #include "driver/dxgi/dxgi_wrapped.h"
 #include "driver/ihv/amd/amd_rgp.h"
@@ -863,6 +864,9 @@ WrappedID3D12Device::~WrappedID3D12Device()
     SAFE_RELEASE(it->second);
   }
 
+  SAFE_RELEASE(m_blasAddressBufferResource);
+  SAFE_RELEASE(m_blasAddressBufferUploadResource);
+
   m_Replay->DestroyResources();
 
   DestroyInternalResources();
@@ -1529,6 +1533,10 @@ void WrappedID3D12Device::ApplyInitialContents()
   initStateCurList = NULL;
 
   GetResourceManager()->ApplyInitialContents();
+
+  // Upload all buffer addresses as all of the referenced buffer resources would have been
+  // created and addresses had been tracked
+  UploadBLASBufferAddresses();
 
   // close the final list
   if(initStateCurList)
@@ -3068,6 +3076,109 @@ bool WrappedID3D12Device::DiscardFrameCapture(DeviceOwnedWindow devWnd)
   return true;
 }
 
+void WrappedID3D12Device::UploadBLASBufferAddresses()
+{
+  if(m_addressBufferUploaded)
+    return;
+
+  rdcarray<BlasAddressPair> blasAddressPair;
+  D3D12ResourceManager *resManager = GetResourceManager();
+
+  for(size_t i = 0; i < m_OrigGPUAddresses.addresses.size(); i++)
+  {
+    GPUAddressRange addressRange = m_OrigGPUAddresses.addresses[i];
+    ResourceId resId = addressRange.id;
+    if(resManager->HasLiveResource(resId))
+    {
+      WrappedID3D12Resource *wrappedRes = (WrappedID3D12Resource *)resManager->GetLiveResource(resId);
+      if(wrappedRes->IsAccelerationStructureResource())
+      {
+        BlasAddressPair addressPair;
+        addressPair.oldAddress.start = addressRange.start;
+        addressPair.oldAddress.end = addressRange.realEnd;
+
+        addressPair.newAddress.start = wrappedRes->GetGPUVirtualAddress();
+        addressPair.newAddress.end = addressPair.newAddress.start + wrappedRes->GetDesc().Width;
+        blasAddressPair.push_back(addressPair);
+      }
+    }
+  }
+
+  uint64_t requiredSize = blasAddressPair.size() * sizeof(BlasAddressPair);
+
+  D3D12_RESOURCE_DESC addressBufferResDesc;
+  addressBufferResDesc.Alignment = 0;
+  addressBufferResDesc.DepthOrArraySize = 1;
+  addressBufferResDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+  addressBufferResDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
+  addressBufferResDesc.Format = DXGI_FORMAT_UNKNOWN;
+  addressBufferResDesc.Height = 1;
+  addressBufferResDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+  addressBufferResDesc.MipLevels = 1;
+  addressBufferResDesc.SampleDesc.Count = 1;
+  addressBufferResDesc.SampleDesc.Quality = 0;
+  addressBufferResDesc.Width = RDCMAX(8ULL, requiredSize);
+
+  D3D12_HEAP_PROPERTIES heapProps;
+  heapProps.Type = D3D12_HEAP_TYPE_UPLOAD;
+  heapProps.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+  heapProps.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+  heapProps.CreationNodeMask = 1;
+  heapProps.VisibleNodeMask = 1;
+
+  HRESULT hr = CreateCommittedResource(
+      &heapProps, D3D12_HEAP_FLAG_NONE, &addressBufferResDesc, D3D12_RESOURCE_STATE_GENERIC_READ,
+      NULL, __uuidof(ID3D12Resource), (void **)&m_blasAddressBufferUploadResource);
+
+  if(!SUCCEEDED(hr))
+  {
+    RDCERR("Unable to create upload buffer for BLAS address");
+  }
+  else
+  {
+    D3D12_RANGE readRange = {0, 0};
+    void *ptr = NULL;
+    HRESULT result = m_blasAddressBufferUploadResource->Map(0, &readRange, &ptr);
+
+    if(!SUCCEEDED(result))
+    {
+      RDCERR("Unable to map the resource for uploading old addresses");
+    }
+    else
+    {
+      memcpy((byte *)ptr, blasAddressPair.data(), (size_t)requiredSize);
+      m_blasAddressBufferUploadResource->Unmap(0, NULL);
+    }
+  }
+
+  heapProps.Type = D3D12_HEAP_TYPE_DEFAULT;
+  hr = CreateCommittedResource(&heapProps, D3D12_HEAP_FLAG_NONE, &addressBufferResDesc,
+                               D3D12_RESOURCE_STATE_COPY_DEST, NULL, __uuidof(ID3D12Resource),
+                               (void **)&m_blasAddressBufferResource);
+
+  if(!SUCCEEDED(hr))
+  {
+    RDCERR("Unable to create upload buffer for BLAS address");
+  }
+  else
+  {
+    ID3D12GraphicsCommandList *initList = GetInitialStateList();
+    initList->CopyBufferRegion(m_blasAddressBufferResource, 0, m_blasAddressBufferUploadResource, 0,
+                               requiredSize);
+
+    D3D12_RESOURCE_BARRIER resBarrier;
+    resBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    resBarrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+    resBarrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    resBarrier.Transition.StateAfter = D3D12_RESOURCE_STATE_GENERIC_READ;
+    resBarrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    resBarrier.Transition.pResource = m_blasAddressBufferResource;
+    initList->ResourceBarrier(1, &resBarrier);
+  }
+
+  m_addressBufferUploaded = true;
+}
+
 void WrappedID3D12Device::ReleaseResource(ID3D12DeviceChild *res)
 {
   ResourceId id = GetResID(res);
@@ -3463,13 +3574,14 @@ bool WrappedID3D12Device::Serialise_SetName(SerialiserType &ser, ID3D12DeviceChi
 
 void WrappedID3D12Device::SetName(ID3D12DeviceChild *pResource, const char *Name)
 {
-  // don't allow naming device contexts or command lists so we know this chunk
-  // is always on a pre-capture chunk.
-  if(IsCaptureMode(m_State) && !WrappedID3D12GraphicsCommandList::IsAlloc(pResource) &&
-     !WrappedID3D12CommandQueue::IsAlloc(pResource))
+  if(IsCaptureMode(m_State))
   {
     D3D12ResourceRecord *record = GetRecord(pResource);
 
+    if(WrappedID3D12CommandQueue::IsAlloc(pResource))
+      record = ((WrappedID3D12CommandQueue *)pResource)->GetCreationRecord();
+    if(WrappedID3D12GraphicsCommandList::IsAlloc(pResource))
+      record = ((WrappedID3D12GraphicsCommandList *)pResource)->GetCreationRecord();
     if(record == NULL)
       record = m_DeviceRecord;
 
@@ -3479,23 +3591,25 @@ void WrappedID3D12Device::SetName(ID3D12DeviceChild *pResource, const char *Name
 
       Serialise_SetName(ser, pResource, Name);
 
-      // don't serialise many SetName chunks to the
-      // object record, but we can't afford to drop any.
-      record->LockChunks();
-      while(record->HasChunks())
+      // don't serialise many SetName chunks to the object record, but we can't afford to drop any.
+      if(record != m_DeviceRecord)
       {
-        Chunk *end = record->GetLastChunk();
-
-        if(end->GetChunkType<D3D12Chunk>() == D3D12Chunk::SetName)
+        record->LockChunks();
+        while(record->HasChunks())
         {
-          end->Delete();
-          record->PopChunk();
-          continue;
-        }
+          Chunk *end = record->GetLastChunk();
 
-        break;
+          if(end->GetChunkType<D3D12Chunk>() == D3D12Chunk::SetName)
+          {
+            end->Delete();
+            record->PopChunk();
+            continue;
+          }
+
+          break;
+        }
+        record->UnlockChunks();
       }
-      record->UnlockChunks();
 
       record->AddChunk(scope.Get());
     }
@@ -3825,18 +3939,26 @@ void WrappedID3D12Device::CreateInternalResources()
     m_QueueReadbackData.Resize(4 * 1024 * 1024);
     InternalRef();
 
-    for(D3D12_COMMAND_LIST_TYPE type :
-        {D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_LIST_TYPE_COMPUTE,
-         D3D12_COMMAND_LIST_TYPE_COPY})
     {
-      CreateCommandAllocator(type, __uuidof(ID3D12CommandAllocator),
-                             (void **)&m_QueueReadbackData.allocs[type]);
+      D3D12_COMMAND_QUEUE_DESC desc = {};
+      desc.Type = D3D12_COMMAND_LIST_TYPE_COPY;
+      // make this queue as unwrapped so that it doesn't get included in captures
+      GetReal()->CreateCommandQueue(&desc, __uuidof(ID3D12CommandQueue),
+                                    (void **)&m_QueueReadbackData.unwrappedQueue);
       InternalRef();
-      CreateCommandList(0, type, m_QueueReadbackData.allocs[type], NULL,
-                        __uuidof(ID3D12GraphicsCommandList),
-                        (void **)&m_QueueReadbackData.lists[type]);
+      m_QueueReadbackData.unwrappedQueue->SetName(L"m_QueueReadbackData.queue");
+      CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY, __uuidof(ID3D12CommandAllocator),
+                             (void **)&m_QueueReadbackData.alloc);
+      m_QueueReadbackData.alloc->SetName(L"m_QueueReadbackData.alloc");
       InternalRef();
-      m_QueueReadbackData.lists[type]->Close();
+      CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, m_QueueReadbackData.alloc, NULL,
+                        __uuidof(ID3D12GraphicsCommandList), (void **)&m_QueueReadbackData.list);
+      InternalRef();
+      m_QueueReadbackData.list->Close();
+      CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence),
+                  (void **)&m_QueueReadbackData.fence);
+      m_QueueReadbackData.fence->SetName(L"m_QueueReadbackData.fence");
+      InternalRef();
     }
   }
 
@@ -3844,6 +3966,7 @@ void WrappedID3D12Device::CreateInternalResources()
                          (void **)&m_Alloc);
   InternalRef();
   CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), (void **)&m_GPUSyncFence);
+  m_GPUSyncFence->SetName(L"m_GPUSyncFence");
   InternalRef();
   m_GPUSyncHandle = ::CreateEvent(NULL, FALSE, FALSE, NULL);
 
@@ -3908,6 +4031,7 @@ void WrappedID3D12Device::CreateInternalResources()
   m_Replay->CreateResources();
 
   WrappedID3D12Shader::InternalResources(false);
+  GetResourceManager()->GetRaytracingResourceAndUtilHandler()->InitInternalResources();
 }
 
 void WrappedID3D12Device::DestroyInternalResources()
@@ -3929,10 +4053,10 @@ void WrappedID3D12Device::DestroyInternalResources()
     SAFE_RELEASE(m_DataUploadList[i]);
   SAFE_RELEASE(m_DataUploadAlloc);
 
-  for(size_t i = 0; i < ARRAY_COUNT(m_QueueReadbackData.allocs); i++)
-    SAFE_RELEASE(m_QueueReadbackData.allocs[i]);
-  for(size_t i = 0; i < ARRAY_COUNT(m_QueueReadbackData.lists); i++)
-    SAFE_RELEASE(m_QueueReadbackData.lists[i]);
+  SAFE_RELEASE(m_QueueReadbackData.unwrappedQueue);
+  SAFE_RELEASE(m_QueueReadbackData.alloc);
+  SAFE_RELEASE(m_QueueReadbackData.list);
+  SAFE_RELEASE(m_QueueReadbackData.fence);
   m_QueueReadbackData.Resize(0);
 
   SAFE_RELEASE(m_Alloc);
@@ -4218,6 +4342,10 @@ bool WrappedID3D12Device::ProcessChunk(ReadSerialiser &ser, D3D12Chunk context)
     case D3D12Chunk::Device_CreateReservedResource2:
       return Serialise_CreateReservedResource2(ser, NULL, D3D12_BARRIER_LAYOUT_COMMON, NULL, NULL,
                                                0, NULL, IID(), NULL);
+    case D3D12Chunk::Device_CreateStateObject:
+      return Serialise_CreateStateObject(ser, NULL, IID(), NULL);
+    case D3D12Chunk::Device_AddToStateObject:
+      return Serialise_AddToStateObject(ser, NULL, NULL, IID(), NULL);
 
     // in order to get a warning if we miss a case, we explicitly handle the list/queue chunks here.
     // If we actually encounter one it's an error (we should hit CaptureBegin first and switch to
@@ -4311,6 +4439,11 @@ bool WrappedID3D12Device::ProcessChunk(ReadSerialiser &ser, D3D12Chunk context)
     case D3D12Chunk::List_IASetIndexBufferStripCutValue:
     case D3D12Chunk::List_Barrier:
     case D3D12Chunk::List_DispatchMesh:
+    case D3D12Chunk::List_BuildRaytracingAccelerationStructure:
+    case D3D12Chunk::List_CopyRaytracingAccelerationStructure:
+    case D3D12Chunk::List_EmitRaytracingAccelerationStructurePostbuildInfo:
+    case D3D12Chunk::List_DispatchRays:
+    case D3D12Chunk::List_SetPipelineState1:
       RDCERR("Unexpected chunk while processing initialisation: %s", ToStr(context).c_str());
       return false;
 

@@ -24,11 +24,13 @@
 
 #include "d3d12_manager.h"
 #include <algorithm>
+#include "driver/dx/official/d3dcompiler.h"
 #include "driver/dxgi/dxgi_common.h"
 #include "d3d12_command_list.h"
 #include "d3d12_command_queue.h"
 #include "d3d12_device.h"
 #include "d3d12_resources.h"
+#include "d3d12_shader_cache.h"
 
 void D3D12Descriptor::Init(const D3D12_SAMPLER_DESC2 *pDesc)
 {
@@ -682,6 +684,558 @@ D3D12Descriptor *DescriptorFromPortableHandle(D3D12ResourceManager *manager, Por
 #define BARRIER_ASSERT(...)
 #endif
 
+D3D12RaytracingResourceAndUtilHandler::D3D12RaytracingResourceAndUtilHandler(WrappedID3D12Device *device)
+    : m_wrappedDevice(device),
+      m_cmdList(NULL),
+      m_cmdAlloc(NULL),
+      m_cmdQueue(NULL),
+      m_gpuFence(NULL),
+      m_gpuSyncHandle(NULL),
+      m_gpuSyncCounter(0u)
+{
+  if(m_wrappedDevice)
+  {
+    ID3D12Device *realDevice = m_wrappedDevice->GetReal();
+
+    if(realDevice)
+    {
+      HRESULT result = realDevice->CreateCommandAllocator(
+          D3D12_COMMAND_LIST_TYPE_DIRECT, __uuidof(ID3D12CommandAllocator), (void **)&m_cmdAlloc);
+
+      if(!SUCCEEDED(result))
+        RDCERR("D3D12 Command allocator creation failed with error %s", ToStr(result).c_str());
+
+      if(m_cmdAlloc != NULL)
+      {
+        ID3D12GraphicsCommandList *cmd = NULL;
+        result = realDevice->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, m_cmdAlloc, NULL,
+                                               __uuidof(ID3D12GraphicsCommandList), (void **)(&cmd));
+
+        if(!SUCCEEDED(result))
+          RDCERR("D3D12 Command list creation failed with error %s", ToStr(result).c_str());
+
+        m_cmdList = (ID3D12GraphicsCommandListX *)cmd;
+        m_cmdList->Close();
+      }
+
+      D3D12_COMMAND_QUEUE_DESC cmdQueueDesc;
+      cmdQueueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+      cmdQueueDesc.NodeMask = 0;
+      cmdQueueDesc.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
+      cmdQueueDesc.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
+      result = realDevice->CreateCommandQueue(&cmdQueueDesc, __uuidof(ID3D12CommandQueue),
+                                              (void **)&m_cmdQueue);
+
+      if(!SUCCEEDED(result))
+        RDCERR("D3D12 Command queue creation failed with error %s", ToStr(result).c_str());
+
+      result = realDevice->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence),
+                                       (void **)&m_gpuFence);
+
+      if(!SUCCEEDED(result))
+        RDCERR("D3D12 fence creation failed with error %s", ToStr(result).c_str());
+
+      m_gpuSyncHandle = ::CreateEvent(NULL, FALSE, FALSE, NULL);
+    }
+  }
+}
+
+void D3D12RaytracingResourceAndUtilHandler::SyncGpuForRtWork()
+{
+  m_gpuSyncCounter++;
+
+  HRESULT hr = m_cmdQueue->Signal(m_gpuFence, m_gpuSyncCounter);
+  if(!SUCCEEDED(hr))
+    RDCERR("Command queue fence signaling failed with error %s ", ToStr(hr).c_str());
+
+  hr = m_gpuFence->SetEventOnCompletion(m_gpuSyncCounter, m_gpuSyncHandle);
+  if(!SUCCEEDED(hr))
+    RDCERR("Fence completion event signaling failed with error %s ", ToStr(hr).c_str());
+
+  WaitForSingleObject(m_gpuSyncHandle, 10000);
+}
+
+void D3D12RaytracingResourceAndUtilHandler::InitInternalResources()
+{
+  if(IsReplayMode(m_wrappedDevice->GetState()))
+  {
+    InitReplayBlasPatchingResources();
+  }
+}
+
+void D3D12RaytracingResourceAndUtilHandler::InitReplayBlasPatchingResources()
+{
+  // Root Signature
+  rdcarray<D3D12_ROOT_PARAMETER1> rootParameters;
+  rootParameters.reserve((uint16_t)D3D12PatchAccStructRootParamIndices::Count);
+
+  {
+    D3D12_ROOT_PARAMETER1 rootParam;
+    rootParam.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    rootParam.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    rootParam.Constants.ShaderRegister = 0;
+    rootParam.Constants.RegisterSpace = 0;
+    rootParam.Constants.Num32BitValues = 1;
+    rootParameters.push_back(rootParam);
+  }
+
+  {
+    D3D12_ROOT_PARAMETER1 rootParam;
+    rootParam.ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    rootParam.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    rootParam.Descriptor.ShaderRegister = 0;
+    rootParam.Descriptor.RegisterSpace = 0;
+    rootParam.Descriptor.Flags = D3D12_ROOT_DESCRIPTOR_FLAG_NONE;
+    rootParameters.push_back(rootParam);
+  }
+
+  {
+    D3D12_ROOT_PARAMETER1 rootParam;
+    rootParam.ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    rootParam.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    rootParam.Descriptor.ShaderRegister = 0;
+    rootParam.Descriptor.RegisterSpace = 0;
+    rootParam.Descriptor.Flags = D3D12_ROOT_DESCRIPTOR_FLAG_NONE;
+    rootParameters.push_back(rootParam);
+  }
+
+  D3D12ShaderCache *shaderCache = m_wrappedDevice->GetShaderCache();
+
+  if(shaderCache != NULL)
+  {
+    ID3DBlob *rootSig = shaderCache->MakeRootSig(rootParameters, D3D12_ROOT_SIGNATURE_FLAG_NONE);
+
+    if(rootSig)
+    {
+      HRESULT result = m_wrappedDevice->GetReal()->CreateRootSignature(
+          0, rootSig->GetBufferPointer(), rootSig->GetBufferSize(), __uuidof(ID3D12RootSignature),
+          (void **)&m_accStructPatchInfo.m_rootSignature);
+
+      if(!SUCCEEDED(result))
+        RDCERR("Unable to create root signature for patching the BLAS");
+
+      // PipelineState
+      ID3DBlob *shader = NULL;
+      rdcstr hlsl = GetEmbeddedResource(raytracing_hlsl);
+      shaderCache->GetShaderBlob(hlsl.c_str(), "RENDERDOC_PatchAccStructAddressCS",
+                                 D3DCOMPILE_WARNINGS_ARE_ERRORS, {}, "cs_6_0", &shader);
+
+      if(shader)
+      {
+        D3D12_COMPUTE_PIPELINE_STATE_DESC pipeline;
+        pipeline.Flags = D3D12_PIPELINE_STATE_FLAG_NONE;
+        pipeline.NodeMask = 0;
+        pipeline.CS = {(void *)shader->GetBufferPointer(), shader->GetBufferSize()};
+        pipeline.CachedPSO = {NULL, 0};
+        pipeline.pRootSignature = m_accStructPatchInfo.m_rootSignature;
+
+        result = m_wrappedDevice->GetReal()->CreateComputePipelineState(
+            &pipeline, __uuidof(ID3D12PipelineState), (void **)&m_accStructPatchInfo.m_pipeline);
+
+        if(!SUCCEEDED(result))
+          RDCERR("Unable to create pipeline for patching the BLAS");
+      }
+
+      SAFE_RELEASE(rootSig);
+    }
+  }
+  else
+  {
+    RDCERR("Shadercache not available");
+  }
+}
+
+D3D12GpuBufferAllocator *D3D12GpuBufferAllocator::m_bufferAllocator = NULL;
+
+bool D3D12GpuBufferAllocator::CopyBufferRegion(WrappedID3D12GraphicsCommandList *wrappedCmd,
+                                               const D3D12GpuBuffer &destBuffer,
+                                               D3D12_GPU_VIRTUAL_ADDRESS srcAddress,
+                                               uint64_t dataSize)
+{
+  if(D3D12GpuBuffer() != destBuffer && dataSize > 0)
+  {
+    ResourceId srcResourceId;
+    D3D12BufferOffset srcResourceOffset;
+
+    rdcarray<D3D12_RESOURCE_BARRIER> resBarriers;
+    rdcarray<D3D12_RESOURCE_BARRIER> finalBarriers;
+
+    {
+      D3D12_RESOURCE_BARRIER resBarrier;
+      resBarrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+      resBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+      resBarrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+      resBarrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+      resBarrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+      resBarrier.Transition.pResource = destBuffer.Resource();
+      resBarriers.push_back(resBarrier);
+
+      resBarrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+      resBarrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+      finalBarriers.push_back(resBarrier);
+    }
+
+    WrappedID3D12Resource::GetResIDFromAddr(srcAddress, srcResourceId, srcResourceOffset);
+
+    if(srcResourceId != ResourceId())
+    {
+      D3D12_RESOURCE_STATES srResourceState =
+          wrappedCmd->GetWrappedDevice()->GetSubresourceStates(srcResourceId)[0].ToStates();
+
+      ID3D12Resource *srcResource = NULL;
+      srcResource = wrappedCmd->GetWrappedDevice()
+                        ->GetResourceManager()
+                        ->GetCurrentAs<WrappedID3D12Resource>(srcResourceId)
+                        ->GetReal();
+
+      if(!(srResourceState & D3D12_RESOURCE_STATE_COPY_SOURCE))
+      {
+        D3D12_RESOURCE_BARRIER resBarrier;
+        resBarrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+        resBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        resBarrier.Transition.StateBefore = srResourceState;
+        resBarrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        resBarrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        resBarrier.Transition.pResource = srcResource;
+        resBarriers.push_back(resBarrier);
+
+        resBarrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        resBarrier.Transition.StateAfter = srResourceState;
+        finalBarriers.push_back(resBarrier);
+      }
+
+      wrappedCmd->GetReal()->ResourceBarrier((UINT)resBarriers.size(), resBarriers.data());
+      wrappedCmd->GetReal()->CopyBufferRegion(destBuffer.Resource(), destBuffer.Offset(),
+                                              srcResource, srcResourceOffset, dataSize);
+      wrappedCmd->GetReal()->ResourceBarrier((UINT)finalBarriers.size(), finalBarriers.data());
+
+      return true;
+    }
+  }
+
+  return false;
+}
+
+bool D3D12GpuBufferAllocator::CopyBufferRegion(WrappedID3D12GraphicsCommandList *wrappedCmd,
+                                               const D3D12GpuBuffer &destBuffer,
+                                               const D3D12GpuBuffer &sourceBuffer, uint64_t dataSize)
+{
+  // This will only handle if both are on default heap
+  if(destBuffer.GetD3D12HeapType() != D3D12_HEAP_TYPE_DEFAULT ||
+     sourceBuffer.GetD3D12HeapType() != D3D12_HEAP_TYPE_DEFAULT)
+  {
+    return false;
+  }
+
+  rdcarray<D3D12_RESOURCE_BARRIER> initBarriers;
+  rdcarray<D3D12_RESOURCE_BARRIER> finalBarriers;
+
+  {
+    D3D12_RESOURCE_BARRIER resBarrier;
+    resBarrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+    resBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    resBarrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    resBarrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    resBarrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    resBarrier.Transition.pResource = sourceBuffer.Resource();
+    initBarriers.push_back(resBarrier);
+
+    resBarrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    resBarrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+    finalBarriers.push_back(resBarrier);
+  }
+
+  {
+    D3D12_RESOURCE_BARRIER resBarrier;
+    resBarrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+    resBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    resBarrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    resBarrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    resBarrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    resBarrier.Transition.pResource = destBuffer.Resource();
+    initBarriers.push_back(resBarrier);
+
+    resBarrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    resBarrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+    finalBarriers.push_back(resBarrier);
+  }
+
+  wrappedCmd->GetReal()->ResourceBarrier((UINT)initBarriers.size(), initBarriers.data());
+  wrappedCmd->GetReal()->CopyBufferRegion(destBuffer.Resource(), destBuffer.Offset(),
+                                          sourceBuffer.Resource(), sourceBuffer.Offset(), dataSize);
+  wrappedCmd->GetReal()->ResourceBarrier((UINT)finalBarriers.size(), finalBarriers.data());
+  return true;
+}
+
+bool D3D12GpuBufferAllocator::D3D12GpuBufferResource::CreateCommittedResourceBuffer(
+    ID3D12Device *device, const D3D12_HEAP_PROPERTIES &heapProperty, D3D12_RESOURCE_STATES initState,
+    uint64_t size, bool allowUav, D3D12GpuBufferResource **bufferResource)
+{
+  if(device && bufferResource)
+  {
+    ID3D12Resource *newBufferResource = NULL;
+
+    D3D12_RESOURCE_DESC bufferResDesc;
+    bufferResDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bufferResDesc.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+    bufferResDesc.DepthOrArraySize = 1u;
+    bufferResDesc.MipLevels = 1u;
+    bufferResDesc.Height = 1u;
+    bufferResDesc.Flags =
+        allowUav ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE;
+    bufferResDesc.Format = DXGI_FORMAT_UNKNOWN;
+    bufferResDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    bufferResDesc.SampleDesc = {1, 0};
+    bufferResDesc.Width = size;
+
+    D3D12GpuBufferResource *retBufferRes = NULL;
+
+    // Create committed resource
+    HRESULT opResult = device->CreateCommittedResource(
+        &heapProperty, D3D12_HEAP_FLAG_NONE, &bufferResDesc, initState, NULL,
+        __uuidof(ID3D12Resource), (void **)&newBufferResource);
+
+    if(SUCCEEDED(opResult) && newBufferResource != NULL)
+    {
+      retBufferRes = new D3D12GpuBufferResource(newBufferResource, heapProperty.Type);
+    }
+    else
+    {
+      RDCERR("Allocation failed with result code %s", ToStr(opResult).c_str());
+    }
+
+    if(retBufferRes)
+    {
+      *bufferResource = retBufferRes;
+      return true;
+    }
+  }
+
+  return false;
+}
+
+bool D3D12GpuBufferAllocator::D3D12GpuBufferResource::ReleaseGpuBufferResource(
+    D3D12GpuBufferResource *bufferResource)
+{
+  delete bufferResource;
+  bufferResource = NULL;
+  return true;
+}
+
+D3D12GpuBufferAllocator::D3D12GpuBufferResource::D3D12GpuBufferResource(ID3D12Resource *resource,
+                                                                        D3D12_HEAP_TYPE heapType)
+    : m_resource(resource), m_heapType(heapType)
+
+{
+  if(m_resource)
+  {
+    m_resDesc = m_resource->GetDesc();
+    m_resourceGpuAddressRange.start = resource->GetGPUVirtualAddress();
+    m_resourceGpuAddressRange.realEnd = m_resourceGpuAddressRange.start + m_resDesc.Width;
+  }
+}
+
+bool D3D12GpuBufferAllocator::D3D12GpuBufferPool::Alloc(WrappedID3D12Device *wrappedDevice,
+                                                        D3D12GpuBufferHeapMemoryFlag heapMem,
+                                                        uint64_t size, uint64_t alignment,
+                                                        D3D12GpuBuffer &gpuBuffer)
+{
+  if(heapMem == D3D12GpuBufferHeapMemoryFlag::Default)
+  {
+    if(size > m_bufferInitSize)
+    {
+      m_bufferInitSize = size;
+    }
+
+    D3D12_GPU_VIRTUAL_ADDRESS gpuAddress = 0;
+    for(D3D12GpuBufferResource *bufferRes : m_bufferResourceList)
+    {
+      if(bufferRes->SubAlloc(size, alignment, gpuAddress))
+      {
+        gpuBuffer = D3D12GpuBuffer(m_bufferPoolHeapType, D3D12GpuBufferHeapMemoryFlag::Default,
+                                   size, alignment, gpuAddress, bufferRes->Resource());
+        return true;
+      }
+    }
+
+    D3D12GpuBufferResource *newBufferResource = NULL;
+    if(D3D12GpuBufferAllocator::CreateBufferResource(wrappedDevice, m_bufferPoolHeapType,
+                                                     m_bufferInitSize, &newBufferResource))
+    {
+      m_bufferResourceList.push_back(newBufferResource);
+      if(newBufferResource->SubAlloc(size, alignment, gpuAddress))
+      {
+        gpuBuffer = D3D12GpuBuffer(m_bufferPoolHeapType, D3D12GpuBufferHeapMemoryFlag::Default,
+                                   size, alignment, gpuAddress, newBufferResource->Resource());
+        return true;
+      }
+    }
+  }
+  else
+  {
+    D3D12GpuBufferResource *newBufferResource = NULL;
+    if(CreateBufferResource(m_bufferAllocator->m_wrappedDevice, m_bufferPoolHeapType, size,
+                            &newBufferResource))
+    {
+      m_bufferResourceList.push_back(newBufferResource);
+      gpuBuffer = D3D12GpuBuffer(m_bufferPoolHeapType, D3D12GpuBufferHeapMemoryFlag::Dedicated,
+                                 size, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT,
+                                 newBufferResource->Resource()->GetGPUVirtualAddress(),
+                                 newBufferResource->Resource());
+      return true;
+    }
+  }
+
+  RDCERR("Unable to allocate GPU memory");
+  return false;
+}
+
+bool D3D12GpuBufferAllocator::D3D12GpuBufferPool::Free(const D3D12GpuBuffer &gpuBuffer)
+{
+  if(gpuBuffer != D3D12GpuBuffer())
+  {
+    for(D3D12GpuBufferResource *bufferRes : m_bufferResourceList)
+    {
+      if(bufferRes->Resource() == gpuBuffer.Resource())
+      {
+        D3D12GpuBufferHeapMemoryFlag heapMem = gpuBuffer.HeapMemory();
+        if(heapMem == D3D12GpuBufferHeapMemoryFlag::Default)
+        {
+          if(bufferRes->SubAllocationInRange(gpuBuffer.Address()))
+          {
+            return bufferRes->Free(gpuBuffer.Address());
+          }
+        }
+        else if(heapMem == D3D12GpuBufferHeapMemoryFlag::Dedicated)
+        {
+          if(D3D12GpuBufferResource::ReleaseGpuBufferResource(bufferRes))
+          {
+            m_bufferResourceList.removeOne(bufferRes);
+            return true;
+          }
+        }
+      }
+    }
+  }
+
+  return false;
+}
+
+bool D3D12GpuBufferAllocator::Alloc(D3D12GpuBufferHeapType heapType,
+                                    D3D12GpuBufferHeapMemoryFlag heapMem, uint64_t size,
+                                    uint64_t alignment, D3D12GpuBuffer &gpuBuffer)
+{
+  SCOPED_LOCK(m_bufferAllocLock);
+  bool success = false;
+  if(heapType < D3D12GpuBufferHeapType::Count && heapType != D3D12GpuBufferHeapType::UnInitialized)
+  {
+    size_t heap = (size_t)heapType;
+    if(m_bufferPoolList[heap] == NULL)
+    {
+      uint64_t bufferPoolInitSize = D3D12GpuBufferPool::kDefaultWithUavSizeBufferInitSize;
+      if(heapType == D3D12GpuBufferHeapType::AccStructDefaultHeap)
+      {
+        bufferPoolInitSize = D3D12GpuBufferPool::kAccStructBufferPoolInitSize;
+      }
+
+      m_bufferPoolList[heap] = new D3D12GpuBufferPool(heapType, bufferPoolInitSize);
+    }
+
+    if(m_bufferPoolList[heap] != NULL)
+    {
+      success = m_bufferPoolList[heap]->Alloc(m_wrappedDevice, heapMem, size, alignment, gpuBuffer);
+    }
+  }
+
+  if(success)
+  {
+    m_totalAllocatedMemoryInUse += size;
+  }
+
+  return success;
+}
+
+bool D3D12GpuBufferAllocator::Release(const D3D12GpuBuffer &gpuBuffer)
+{
+  SCOPED_LOCK(m_bufferAllocLock);
+  size_t heap = (size_t)gpuBuffer.HeapType();
+  if(gpuBuffer.HeapType() < D3D12GpuBufferHeapType::Count && m_bufferPoolList[heap] != NULL)
+  {
+    return m_bufferPoolList[heap]->Free(gpuBuffer);
+  }
+
+  return false;
+}
+
+bool D3D12GpuBufferAllocator::CreateBufferResource(WrappedID3D12Device *wrappedDevice,
+                                                   D3D12GpuBufferHeapType heapType, uint64_t size,
+                                                   D3D12GpuBufferResource **bufferResource)
+{
+  D3D12_HEAP_PROPERTIES heapProperty;
+  heapProperty.CreationNodeMask = 0;
+  heapProperty.VisibleNodeMask = 0;
+  heapProperty.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+  heapProperty.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+
+  D3D12_RESOURCE_STATES initState = D3D12_RESOURCE_STATE_COMMON;
+  bool allowUav = false;
+  switch(heapType)
+  {
+    case D3D12GpuBufferHeapType::AccStructDefaultHeap:
+    case D3D12GpuBufferHeapType::DefaultHeap:
+    case D3D12GpuBufferHeapType::DefaultHeapWithUav:
+    {
+      heapProperty.Type = D3D12_HEAP_TYPE_DEFAULT;
+      if(heapType == D3D12GpuBufferHeapType::AccStructDefaultHeap)
+      {
+        initState = D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE;
+        allowUav = true;
+      }
+
+      if(heapType == D3D12GpuBufferHeapType::DefaultHeapWithUav)
+      {
+        allowUav = true;
+      }
+
+      break;
+    }
+
+    case D3D12GpuBufferHeapType::ReadBackHeap:
+    {
+      heapProperty.Type = D3D12_HEAP_TYPE_READBACK;
+      initState = D3D12_RESOURCE_STATE_COPY_DEST;
+      break;
+    }
+
+    case D3D12GpuBufferHeapType::UploadHeap:
+    {
+      heapProperty.Type = D3D12_HEAP_TYPE_UPLOAD;
+      initState = D3D12_RESOURCE_STATE_GENERIC_READ;
+      break;
+    }
+
+    case D3D12GpuBufferHeapType::CustomHeapWithUavCpuAccess:
+    {
+      heapProperty.Type = D3D12_HEAP_TYPE_CUSTOM;
+      heapProperty.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_WRITE_BACK;
+      heapProperty.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
+      allowUav = true;
+      break;
+    }
+    default: RDCLOG("Unhandled buffer pool");
+  }
+
+  D3D12GpuBufferResource *newBufferResource = NULL;
+  if(D3D12GpuBufferResource::CreateCommittedResourceBuffer(
+         wrappedDevice->GetReal(), heapProperty, initState, size, allowUav, &newBufferResource))
+  {
+    *bufferResource = newBufferResource;
+    return true;
+  }
+
+  return false;
+}
+
 void D3D12ResourceManager::ApplyBarriers(BarrierSet &barriers,
                                          std::map<ResourceId, SubresourceStateVector> &states)
 {
@@ -919,11 +1473,29 @@ void D3D12ResourceManager::SerialiseResourceStates(
 
       for(size_t m = 0; m < States.size(); m++)
       {
-        const D3D12ResourceLayout srcState = states[liveid][m];
-        const D3D12ResourceLayout dstState = States[m];
+        D3D12ResourceLayout srcState = states[liveid][m];
+        D3D12ResourceLayout dstState = States[m];
+
+        // because of some extreme ugliness on the D3D12 side, resources can be created in new
+        // layouts without the new barriers actually being supported. If that's the case, we just
+        // pretend they're in old COMMON to avoid doing the new barrier
+        if(!m_Device->GetOpts12().EnhancedBarriersSupported && srcState.IsLayout())
+        {
+          RDCASSERT(srcState.ToLayout() == D3D12_BARRIER_LAYOUT_COMMON, srcState.ToLayout());
+          srcState = D3D12ResourceLayout::FromStates(D3D12_RESOURCE_STATE_COMMON);
+        }
+
+        if(!m_Device->GetOpts12().EnhancedBarriersSupported && dstState.IsLayout())
+        {
+          RDCASSERT(dstState.ToLayout() == D3D12_BARRIER_LAYOUT_COMMON, dstState.ToLayout());
+          dstState = D3D12ResourceLayout::FromStates(D3D12_RESOURCE_STATE_COMMON);
+        }
+
         if(srcState != dstState)
+        {
           AddStateResetBarrier(srcState, dstState, (ID3D12Resource *)GetCurrentResource(liveid),
                                (UINT)m, barriers);
+        }
       }
     }
 
@@ -1080,4 +1652,16 @@ void GPUAddressRangeTracker::GetResIDFromAddrAllowOutOfBounds(D3D12_GPU_VIRTUAL_
 
   id = range.id;
   offs = addr - range.start;
+}
+
+bool D3D12GpuBuffer::Release()
+{
+  bool success = D3D12GpuBufferAllocator::Inst()->Release(*this);
+
+  if(success)
+  {
+    *this = {};
+  }
+
+  return success;
 }

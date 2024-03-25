@@ -738,6 +738,17 @@ void WrappedID3D12CommandQueue::ExecuteCommandListsInternal(UINT NumCommandLists
   if(!SkipRealExecute)
   {
     SERIALISE_TIME_CALL(m_pReal->ExecuteCommandLists(NumCommandLists, unwrapped));
+
+    for(UINT i = 0; i < NumCommandLists; i++)
+    {
+      WrappedID3D12GraphicsCommandList *wrapped =
+          (WrappedID3D12GraphicsCommandList *)(ppCommandLists[i]);
+
+      if(!wrapped->ExecuteAccStructPostBuilds())
+      {
+        RDCERR("Unable to execute post build for acc struct");
+      }
+    }
   }
 
   if(IsCaptureMode(m_State))
@@ -908,45 +919,26 @@ void WrappedID3D12CommandQueue::ExecuteCommandListsInternal(UINT NumCommandLists
         {
           QueueReadbackData &queueReadback = m_pDevice->GetQueueReadbackData();
 
-          D3D12_COMMAND_LIST_TYPE type = GetDesc().Type;
+          D3D12_HEAP_PROPERTIES heapProps;
+          res->GetHeapProperties(&heapProps, NULL);
 
-          if(type >= ARRAY_COUNT(queueReadback.lists))
+          if(heapProps.Type == D3D12_HEAP_TYPE_UPLOAD ||
+             heapProps.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE)
           {
-            RDCERR("Unexpected invalid queue type %s", ToStr(type).c_str());
-          }
-          else
-          {
-            ID3D12GraphicsCommandList *list = queueReadback.lists[type];
-            ID3D12CommandAllocator *alloc = queueReadback.allocs[type];
-
             RDCLOG("Doing GPU readback of mapped memory");
 
-            D3D12_HEAP_PROPERTIES heapProps;
-            res->GetHeapProperties(&heapProps, NULL);
+            queueReadback.lock.Lock();
 
-            if(heapProps.Type == D3D12_HEAP_TYPE_UPLOAD ||
-               heapProps.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE)
-            {
-              if(!list)
-              {
-                RDCERR("No readback list prepared for queue type %s", ToStr(type).c_str());
-              }
-              else
-              {
-                queueReadback.lock.Lock();
+            queueReadback.Resize(size);
 
-                queueReadback.Resize(size);
+            queueReadback.list->Reset(queueReadback.alloc, NULL);
+            queueReadback.list->CopyBufferRegion(queueReadback.readbackBuf, 0, res, 0, size);
+            queueReadback.list->Close();
+            ID3D12CommandList *listptr = Unwrap(queueReadback.list);
+            queueReadback.unwrappedQueue->ExecuteCommandLists(1, &listptr);
+            m_pDevice->GPUSync(queueReadback.unwrappedQueue, Unwrap(queueReadback.fence));
 
-                list->Reset(alloc, NULL);
-                list->CopyBufferRegion(queueReadback.readbackBuf, 0, res, 0, size);
-                list->Close();
-                ID3D12CommandList *listptr = Unwrap(list);
-                m_pReal->ExecuteCommandLists(1, &listptr);
-                m_pDevice->GPUSync(this);
-
-                data = queueReadback.readbackMapped;
-              }
-            }
+            data = queueReadback.readbackMapped;
           }
 
           if(ref)

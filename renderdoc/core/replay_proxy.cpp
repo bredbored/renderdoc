@@ -1092,18 +1092,20 @@ void ReplayProxy::InitPostVSBuffers(const rdcarray<uint32_t> &events)
 }
 
 template <typename ParamSerialiser, typename ReturnSerialiser>
-MeshFormat ReplayProxy::Proxied_GetPostVSBuffers(ParamSerialiser &paramser, ReturnSerialiser &retser,
-                                                 uint32_t eventId, uint32_t instID, uint32_t viewID,
-                                                 MeshDataStage stage)
+rdcarray<MeshFormat> ReplayProxy::Proxied_GetBatchPostVSBuffers(ParamSerialiser &paramser,
+                                                                ReturnSerialiser &retser,
+                                                                uint32_t eventId,
+                                                                const rdcarray<uint32_t> &instIDs,
+                                                                uint32_t viewID, MeshDataStage stage)
 {
   const ReplayProxyPacket expectedPacket = eReplayProxy_GetPostVS;
   ReplayProxyPacket packet = eReplayProxy_GetPostVS;
-  MeshFormat ret = {};
+  rdcarray<MeshFormat> ret = {};
 
   {
     BEGIN_PARAMS();
     SERIALISE_ELEMENT(eventId);
-    SERIALISE_ELEMENT(instID);
+    SERIALISE_ELEMENT(instIDs);
     SERIALISE_ELEMENT(viewID);
     SERIALISE_ELEMENT(stage);
     END_PARAMS();
@@ -1112,7 +1114,7 @@ MeshFormat ReplayProxy::Proxied_GetPostVSBuffers(ParamSerialiser &paramser, Retu
   {
     REMOTE_EXECUTION();
     if(paramser.IsReading() && !paramser.IsErrored() && !m_IsErrored)
-      ret = m_Remote->GetPostVSBuffers(eventId, instID, viewID, stage);
+      ret = m_Remote->GetBatchPostVSBuffers(eventId, instIDs, viewID, stage);
   }
 
   SERIALISE_RETURN(ret);
@@ -1120,10 +1122,11 @@ MeshFormat ReplayProxy::Proxied_GetPostVSBuffers(ParamSerialiser &paramser, Retu
   return ret;
 }
 
-MeshFormat ReplayProxy::GetPostVSBuffers(uint32_t eventId, uint32_t instID, uint32_t viewID,
-                                         MeshDataStage stage)
+rdcarray<MeshFormat> ReplayProxy::GetBatchPostVSBuffers(uint32_t eventId,
+                                                        const rdcarray<uint32_t> &instIDs,
+                                                        uint32_t viewID, MeshDataStage stage)
 {
-  PROXY_FUNCTION(GetPostVSBuffers, eventId, instID, viewID, stage);
+  PROXY_FUNCTION(GetBatchPostVSBuffers, eventId, instIDs, viewID, stage);
 }
 
 template <typename ParamSerialiser, typename ReturnSerialiser>
@@ -1574,7 +1577,7 @@ ShaderDebugTrace *ReplayProxy::DebugVertex(uint32_t eventId, uint32_t vertid, ui
 template <typename ParamSerialiser, typename ReturnSerialiser>
 ShaderDebugTrace *ReplayProxy::Proxied_DebugPixel(ParamSerialiser &paramser, ReturnSerialiser &retser,
                                                   uint32_t eventId, uint32_t x, uint32_t y,
-                                                  uint32_t sample, uint32_t primitive)
+                                                  const DebugPixelInputs &inputs)
 {
   const ReplayProxyPacket expectedPacket = eReplayProxy_DebugPixel;
   ReplayProxyPacket packet = eReplayProxy_DebugPixel;
@@ -1585,15 +1588,14 @@ ShaderDebugTrace *ReplayProxy::Proxied_DebugPixel(ParamSerialiser &paramser, Ret
     SERIALISE_ELEMENT(eventId);
     SERIALISE_ELEMENT(x);
     SERIALISE_ELEMENT(y);
-    SERIALISE_ELEMENT(sample);
-    SERIALISE_ELEMENT(primitive);
+    SERIALISE_ELEMENT(inputs);
     END_PARAMS();
   }
 
   {
     REMOTE_EXECUTION();
     if(paramser.IsReading() && !paramser.IsErrored() && !m_IsErrored)
-      ret = m_Remote->DebugPixel(eventId, x, y, sample, primitive);
+      ret = m_Remote->DebugPixel(eventId, x, y, inputs);
     else
       ret = new ShaderDebugTrace;
   }
@@ -1603,10 +1605,10 @@ ShaderDebugTrace *ReplayProxy::Proxied_DebugPixel(ParamSerialiser &paramser, Ret
   return ret;
 }
 
-ShaderDebugTrace *ReplayProxy::DebugPixel(uint32_t eventId, uint32_t x, uint32_t y, uint32_t sample,
-                                          uint32_t primitive)
+ShaderDebugTrace *ReplayProxy::DebugPixel(uint32_t eventId, uint32_t x, uint32_t y,
+                                          const DebugPixelInputs &inputs)
 {
-  PROXY_FUNCTION(DebugPixel, eventId, x, y, sample, primitive);
+  PROXY_FUNCTION(DebugPixel, eventId, x, y, inputs);
 }
 
 template <typename ParamSerialiser, typename ReturnSerialiser>
@@ -2934,7 +2936,7 @@ bool ReplayProxy::Tick(int type)
       InitPostVSBuffers(dummy);
       break;
     }
-    case eReplayProxy_GetPostVS: GetPostVSBuffers(0, 0, 0, MeshDataStage::VSIn); break;
+    case eReplayProxy_GetPostVS: GetBatchPostVSBuffers(0, {}, 0, MeshDataStage::VSIn); break;
     case eReplayProxy_BuildTargetShader:
     {
       rdcstr entry;
@@ -2947,7 +2949,7 @@ bool ReplayProxy::Tick(int type)
     case eReplayProxy_ReplaceResource: ReplaceResource(ResourceId(), ResourceId()); break;
     case eReplayProxy_RemoveReplacement: RemoveReplacement(ResourceId()); break;
     case eReplayProxy_DebugVertex: DebugVertex(0, 0, 0, 0, 0); break;
-    case eReplayProxy_DebugPixel: DebugPixel(0, 0, 0, 0, 0); break;
+    case eReplayProxy_DebugPixel: DebugPixel(0, 0, 0, DebugPixelInputs()); break;
     case eReplayProxy_DebugThread:
     {
       DebugThread(0, {}, {}, nullptr);

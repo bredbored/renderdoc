@@ -31,84 +31,6 @@
 
 struct VulkanCreationInfo;
 
-// linearised version of VkDynamicState
-enum VulkanDynamicStateIndex
-{
-  VkDynamicViewport,
-  VkDynamicScissor,
-  VkDynamicLineWidth,
-  VkDynamicDepthBias,
-  VkDynamicBlendConstants,
-  VkDynamicDepthBounds,
-  VkDynamicStencilCompareMask,
-  VkDynamicStencilWriteMask,
-  VkDynamicStencilReference,
-  VkDynamicViewportWScalingNV,
-  VkDynamicDiscardRectangleEXT,
-  VkDynamicDiscardRectangleEnableEXT,
-  VkDynamicDiscardRectangleModeEXT,
-  VkDynamicSampleLocationsEXT,
-  VkDynamicViewportShadingRatePaletteNV,
-  VkDynamicViewportCoarseSampleOrderNV,
-  VkDynamicExclusiveScissorNV,
-  VkDynamicExclusiveScissorEnableNV,
-  VkDynamicShadingRateKHR,
-  VkDynamicLineStippleKHR,
-  VkDynamicCullMode,
-  VkDynamicFrontFace,
-  VkDynamicPrimitiveTopology,
-  VkDynamicViewportCount,
-  VkDynamicScissorCount,
-  VkDynamicVertexInputBindingStride,
-  VkDynamicDepthTestEnable,
-  VkDynamicDepthWriteEnable,
-  VkDynamicDepthCompareOp,
-  VkDynamicDepthBoundsTestEnable,
-  VkDynamicStencilTestEnable,
-  VkDynamicStencilOp,
-  VkDynamicRayTracingStackSizeKHR,
-  VkDynamicVertexInputEXT,
-  VkDynamicControlPointsEXT,
-  VkDynamicRastDiscard,
-  VkDynamicDepthBiasEnable,
-  VkDynamicLogicOpEXT,
-  VkDynamicPrimRestart,
-  VkDynamicColorWriteEXT,
-  VkDynamicTessDomainOriginEXT,
-  VkDynamicDepthClampEnableEXT,
-  VkDynamicPolygonModeEXT,
-  VkDynamicRasterizationSamplesEXT,
-  VkDynamicSampleMaskEXT,
-  VkDynamicAlphaToCoverageEXT,
-  VkDynamicAlphaToOneEXT,
-  VkDynamicLogicOpEnableEXT,
-  VkDynamicColorBlendEnableEXT,
-  VkDynamicColorBlendEquationEXT,
-  VkDynamicColorWriteMaskEXT,
-  VkDynamicRasterizationStreamEXT,
-  VkDynamicConservativeRastModeEXT,
-  VkDynamicOverstimationSizeEXT,
-  VkDynamicDepthClipEnableEXT,
-  VkDynamicSampleLocationsEnableEXT,
-  VkDynamicStateColorBlendAdvancedEXT,
-  VkDynamicProvokingVertexModeEXT,
-  VkDynamicLineRastModeEXT,
-  VkDynamicLineStippleEnableEXT,
-  VkDynamicDepthClipNegativeOneEXT,
-  VkDynamicViewportWScalingEXT,
-  VkDynamicViewportSwizzleEXT,
-  VkDynamicCoverageToColorEnableEXT,
-  VkDynamicCoverageToColorLocationEXT,
-  VkDynamicCoverageModulationModeEXT,
-  VkDynamicCoverageModulationTableEnableEXT,
-  VkDynamicCoverageModulationTableEXT,
-  VkDynamicShadingRateImageEnableEXT,
-  VkDynamicRepresentativeFragTestEXT,
-  VkDynamicCoverageReductionModeEXT,
-  VkDynamicAttachmentFeedbackLoopEnableEXT,
-  VkDynamicCount,
-};
-
 VkDynamicState ConvertDynamicState(VulkanDynamicStateIndex idx);
 VulkanDynamicStateIndex ConvertDynamicState(VkDynamicState state);
 
@@ -789,6 +711,18 @@ struct VulkanCreationInfo
   };
   std::unordered_map<ResourceId, QueryPool> m_QueryPool;
 
+  struct AccelerationStructure
+  {
+    void Init(VulkanResourceManager *resourceMan, VulkanCreationInfo &info,
+              const VkAccelerationStructureCreateInfoKHR *pCreateInfo);
+
+    ResourceId buffer;
+    uint64_t offset;
+    uint64_t size;
+    VkAccelerationStructureTypeKHR type;
+  };
+  std::unordered_map<ResourceId, AccelerationStructure> m_AccelerationStructure;
+
   std::unordered_map<ResourceId, rdcstr> m_Names;
   std::unordered_map<ResourceId, SwapchainInfo> m_SwapChain;
   std::unordered_map<ResourceId, DescSetLayout> m_DescSetLayout;
@@ -813,6 +747,7 @@ struct VulkanCreationInfo
     m_ImageView.erase(id);
     m_ShaderModule.erase(id);
     m_DescSetPool.erase(id);
+    m_AccelerationStructure.erase(id);
     m_Names.erase(id);
     m_SwapChain.erase(id);
     m_DescSetLayout.erase(id);

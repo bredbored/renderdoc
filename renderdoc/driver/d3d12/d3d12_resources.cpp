@@ -28,6 +28,7 @@
 #include "d3d12_command_queue.h"
 
 GPUAddressRangeTracker WrappedID3D12Resource::m_Addresses;
+rdcarray<ResourceId> WrappedID3D12Resource::m_bufferResources;
 std::map<WrappedID3D12PipelineState::DXBCKey, WrappedID3D12Shader *> WrappedID3D12Shader::m_Shaders;
 bool WrappedID3D12Shader::m_InternalResources = false;
 int32_t WrappedID3D12CommandAllocator::m_ResetEnabled = 1;
@@ -170,6 +171,8 @@ WrappedID3D12Resource::~WrappedID3D12Resource()
     range.id = GetResourceID();
 
     m_Addresses.RemoveFrom(range);
+
+    m_bufferResources.removeOne(GetResourceID());
   }
 
   Shutdown();
@@ -230,6 +233,47 @@ void WrappedID3D12Resource::UnlockMaps()
 WriteSerialiser &WrappedID3D12Resource::GetThreadSerialiser()
 {
   return m_pDevice->GetThreadSerialiser();
+}
+
+size_t WrappedID3D12Resource::DeleteOverlappingAccStructsInRangeAtOffset(D3D12BufferOffset bufferOffset)
+{
+  SCOPED_LOCK(m_accStructResourcesCS);
+
+  if(!m_accelerationStructMap.empty())
+  {
+    rdcarray<D3D12BufferOffset> toBeDeleted;
+    uint64_t accStructAtOffsetSize = m_accelerationStructMap[bufferOffset]->Size();
+
+    for(const rdcpair<D3D12BufferOffset, D3D12AccelerationStructure *> &accStructAtOffset :
+        m_accelerationStructMap)
+    {
+      if(accStructAtOffset.first == bufferOffset)
+      {
+        continue;
+      }
+
+      if(accStructAtOffset.first < bufferOffset &&
+         (accStructAtOffset.first + accStructAtOffset.second->Size()) > bufferOffset)
+      {
+        toBeDeleted.push_back(accStructAtOffset.first);
+      }
+
+      if(accStructAtOffset.first > bufferOffset &&
+         (bufferOffset + accStructAtOffsetSize) > accStructAtOffset.first)
+      {
+        toBeDeleted.push_back(accStructAtOffset.first);
+      }
+    }
+
+    for(D3D12BufferOffset deleting : toBeDeleted)
+    {
+      DeleteAccStructAtOffset(deleting);
+    }
+
+    return toBeDeleted.size();
+  }
+
+  return 0;
 }
 
 HRESULT STDMETHODCALLTYPE WrappedID3D12Resource::Map(UINT Subresource,
@@ -311,6 +355,89 @@ HRESULT STDMETHODCALLTYPE WrappedID3D12Resource::WriteToSubresource(UINT DstSubr
   }
 
   return ret;
+}
+
+WRAPPED_POOL_INST(D3D12AccelerationStructure);
+
+D3D12AccelerationStructure::D3D12AccelerationStructure(
+    WrappedID3D12Device *wrappedDevice, WrappedID3D12Resource *bufferRes,
+    D3D12BufferOffset bufferOffset,
+    const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO &preBldInfo)
+    : WrappedDeviceChild12(NULL, wrappedDevice),
+      m_asbWrappedResource(bufferRes),
+      m_asbWrappedResourceBufferOffset(bufferOffset),
+      m_preBldInfo(preBldInfo)
+{
+}
+
+D3D12AccelerationStructure::~D3D12AccelerationStructure()
+{
+  Shutdown();
+}
+
+bool WrappedID3D12Resource::CreateAccStruct(
+    D3D12BufferOffset bufferOffset,
+    const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO &preBldInfo,
+    D3D12AccelerationStructure **accStruct)
+{
+  SCOPED_LOCK(m_accStructResourcesCS);
+  if(m_accelerationStructMap.find(bufferOffset) == m_accelerationStructMap.end())
+  {
+    m_accelerationStructMap[bufferOffset] =
+        new D3D12AccelerationStructure(m_pDevice, this, bufferOffset, preBldInfo);
+
+    if(accStruct)
+    {
+      *accStruct = m_accelerationStructMap[bufferOffset];
+
+      if(IsCaptureMode(m_pDevice->GetState()))
+      {
+        size_t deletedAccStructCount = DeleteOverlappingAccStructsInRangeAtOffset(bufferOffset);
+        RDCDEBUG("Acc structure created after deleting %u overlapping acc structure(s)",
+                 deletedAccStructCount);
+        deletedAccStructCount;
+      }
+    }
+
+    return true;
+  }
+
+  return false;
+}
+
+bool WrappedID3D12Resource::GetAccStructIfExist(D3D12BufferOffset bufferOffset,
+                                                D3D12AccelerationStructure **accStruct)
+{
+  SCOPED_LOCK(m_accStructResourcesCS);
+  bool found = false;
+
+  if(m_accelerationStructMap.find(bufferOffset) != m_accelerationStructMap.end())
+  {
+    found = true;
+    if(accStruct)
+    {
+      *accStruct = m_accelerationStructMap[bufferOffset];
+    }
+  }
+
+  return found;
+}
+
+bool WrappedID3D12Resource::DeleteAccStructAtOffset(D3D12BufferOffset bufferOffset)
+{
+  SCOPED_LOCK(m_accStructResourcesCS);
+  D3D12AccelerationStructure *accStruct = NULL;
+  if(GetAccStructIfExist(bufferOffset, &accStruct))
+  {
+    if(m_accelerationStructMap[bufferOffset]->Release() == 0)
+    {
+      m_accelerationStructMap.erase(bufferOffset);
+    }
+
+    return true;
+  }
+
+  return false;
 }
 
 void WrappedID3D12Resource::RefBuffers(D3D12ResourceManager *rm)

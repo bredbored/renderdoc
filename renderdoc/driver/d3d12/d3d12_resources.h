@@ -928,14 +928,22 @@ public:
   virtual ~WrappedID3D12QueryHeap() { Shutdown(); }
 };
 
+class D3D12AccelerationStructure;
+
 class WrappedID3D12Resource
     : public WrappedDeviceChild12<ID3D12Resource, ID3D12Resource1, ID3D12Resource2>
 {
   static GPUAddressRangeTracker m_Addresses;
+  static rdcarray<ResourceId> m_bufferResources;
 
   WriteSerialiser &GetThreadSerialiser();
+  size_t DeleteOverlappingAccStructsInRangeAtOffset(D3D12BufferOffset bufferOffset);
 
   WrappedID3D12Heap *m_Heap = NULL;
+
+  Threading::CriticalSection m_accStructResourcesCS;
+  rdcflatmap<D3D12BufferOffset, D3D12AccelerationStructure *> m_accelerationStructMap;
+  bool m_isAccelerationStructureResource = false;
 
 public:
   ALLOCATE_WITH_WRAPPED_POOL(WrappedID3D12Resource, false);
@@ -959,6 +967,25 @@ public:
     if(m_Heap)
       return m_Heap->GetResourceID();
     return this->GetResourceID();
+  }
+
+  bool CreateAccStruct(D3D12BufferOffset bufferOffset,
+                       const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO &preBldInfo,
+                       D3D12AccelerationStructure **accStruct);
+
+  bool GetAccStructIfExist(D3D12BufferOffset bufferOffset,
+                           D3D12AccelerationStructure **accStruct = NULL);
+
+  bool DeleteAccStructAtOffset(D3D12BufferOffset bufferOffset);
+
+  bool IsAccelerationStructureResource() const { return m_isAccelerationStructureResource; }
+  void MarkAsAccelerationStructureResource() { m_isAccelerationStructureResource = true; }
+  static void MarkAllBufferResourceFrameReferenced(D3D12ResourceManager *rm)
+  {
+    for(ResourceId id : m_bufferResources)
+    {
+      rm->MarkResourceFrameReferenced(id, eFrameRef_Read);
+    }
   }
 
   static void RefBuffers(D3D12ResourceManager *rm);
@@ -1028,6 +1055,8 @@ public:
       range.id = GetResourceID();
 
       m_Addresses.AddTo(range);
+
+      m_bufferResources.push_back(GetResourceID());
     }
   }
   virtual ~WrappedID3D12Resource();
@@ -1262,6 +1291,27 @@ public:
   {
     return m_pReal->GetDesc();
   }
+};
+
+// class to represent acceleration structure i.e. BLAS/TLAS
+class D3D12AccelerationStructure : public WrappedDeviceChild12<ID3D12DeviceChild>
+{
+public:
+  ALLOCATE_WITH_WRAPPED_POOL(D3D12AccelerationStructure);
+
+  D3D12AccelerationStructure(WrappedID3D12Device *wrappedDevice, WrappedID3D12Resource *bufferRes,
+                             D3D12BufferOffset bufferOffset,
+                             const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO &preBldInfo);
+
+  ~D3D12AccelerationStructure();
+
+  uint64_t Size() const { return m_preBldInfo.ResultDataMaxSizeInBytes; }
+  ResourceId GetBackingBufferResourceId() const { return m_asbWrappedResource->GetResourceID(); }
+
+private:
+  WrappedID3D12Resource *m_asbWrappedResource;
+  D3D12BufferOffset m_asbWrappedResourceBufferOffset;
+  D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO m_preBldInfo;
 };
 
 #define ALL_D3D12_TYPES                             \

@@ -275,7 +275,7 @@ void DoSerialise(SerialiserType &ser, ShaderDebugInfo &el)
   SERIALISE_MEMBER(sourceDebugInformation);
   SERIALISE_MEMBER(debugStatus);
 
-  SIZE_CHECK(112);
+  SIZE_CHECK(136);
 }
 
 template <typename SerialiserType>
@@ -310,7 +310,7 @@ void DoSerialise(SerialiserType &ser, ShaderReflection &el)
 
   SERIALISE_MEMBER(taskPayload);
 
-  SIZE_CHECK(456);
+  SIZE_CHECK(480);
 }
 
 template <typename SerialiserType>
@@ -989,6 +989,16 @@ void DoSerialise(SerialiserType &ser, ReplayOptions &el)
   SERIALISE_MEMBER(optimisation);
 
   SIZE_CHECK(48);
+}
+
+template <typename SerialiserType>
+void DoSerialise(SerialiserType &ser, DebugPixelInputs &el)
+{
+  SERIALISE_MEMBER(sample);
+  SERIALISE_MEMBER(primitive);
+  SERIALISE_MEMBER(view);
+
+  SIZE_CHECK(12);
 }
 
 #pragma region Common pipeline state
@@ -2474,6 +2484,7 @@ INSTANTIATE_SERIALISE_TYPE(CounterResult)
 INSTANTIATE_SERIALISE_TYPE(CounterValue)
 INSTANTIATE_SERIALISE_TYPE(GPUDevice)
 INSTANTIATE_SERIALISE_TYPE(ReplayOptions)
+INSTANTIATE_SERIALISE_TYPE(DebugPixelInputs)
 INSTANTIATE_SERIALISE_TYPE(D3D11Pipe::Layout)
 INSTANTIATE_SERIALISE_TYPE(D3D11Pipe::InputAssembly)
 INSTANTIATE_SERIALISE_TYPE(D3D11Pipe::View)

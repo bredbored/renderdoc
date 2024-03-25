@@ -1235,6 +1235,10 @@ static const VkExtensionProperties supportedExtensions[] = {
         VK_EXT_TEXEL_BUFFER_ALIGNMENT_SPEC_VERSION,
     },
     {
+        VK_EXT_TEXTURE_COMPRESSION_ASTC_HDR_EXTENSION_NAME,
+        VK_EXT_TEXTURE_COMPRESSION_ASTC_HDR_SPEC_VERSION,
+    },
+    {
         VK_EXT_TOOLING_INFO_EXTENSION_NAME,
         VK_EXT_TOOLING_INFO_SPEC_VERSION,
     },
@@ -2312,8 +2316,11 @@ bool WrappedVulkan::EndFrameCapture(DeviceOwnedWindow devWnd)
       }
     }
 
-    DeadMemories.swap(m_DeviceAddressResources.DeadMemories);
-    DeadBuffers.swap(m_DeviceAddressResources.DeadBuffers);
+    {
+      SCOPED_LOCK(m_DeviceAddressResourcesLock);
+      DeadMemories.swap(m_DeviceAddressResources.DeadMemories);
+      DeadBuffers.swap(m_DeviceAddressResources.DeadBuffers);
+    }
   }
 
   for(VkDeviceMemory m : DeadMemories)
@@ -3988,6 +3995,20 @@ bool WrappedVulkan::ProcessChunk(ReadSerialiser &ser, VulkanChunk chunk)
     case VulkanChunk::vkCmdSetTessellationDomainOriginEXT:
       return Serialise_vkCmdSetTessellationDomainOriginEXT(ser, VK_NULL_HANDLE,
                                                            VK_TESSELLATION_DOMAIN_ORIGIN_MAX_ENUM);
+
+    case VulkanChunk::vkCmdBuildAccelerationStructuresIndirectKHR:
+      return Serialise_vkCmdBuildAccelerationStructuresIndirectKHR(ser, VK_NULL_HANDLE, 0, NULL,
+                                                                   NULL, NULL, NULL);
+    case VulkanChunk::vkCmdBuildAccelerationStructuresKHR:
+      return Serialise_vkCmdBuildAccelerationStructuresKHR(ser, VK_NULL_HANDLE, 0, NULL, NULL);
+    case VulkanChunk::vkCmdCopyAccelerationStructureKHR:
+      return Serialise_vkCmdCopyAccelerationStructureKHR(ser, VK_NULL_HANDLE, NULL);
+    case VulkanChunk::vkCmdCopyAccelerationStructureToMemoryKHR:
+      return Serialise_vkCmdCopyAccelerationStructureToMemoryKHR(ser, VK_NULL_HANDLE, NULL);
+    case VulkanChunk::vkCmdCopyMemoryToAccelerationStructureKHR:
+      return Serialise_vkCmdCopyMemoryToAccelerationStructureKHR(ser, VK_NULL_HANDLE, NULL);
+    case VulkanChunk::vkCreateAccelerationStructureKHR:
+      return Serialise_vkCreateAccelerationStructureKHR(ser, VK_NULL_HANDLE, NULL, NULL, NULL);
 
     // chunks that are reserved but not yet serialised
     case VulkanChunk::vkResetCommandPool:
